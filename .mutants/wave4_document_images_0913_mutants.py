@@ -362,8 +362,8 @@ MUTANTS = [
     # ── the fetch ─────────────────────────────────────────────────────────────
     ('R1', RP, 'over',
      '⛔⛔ ONLY THE FIRST HOP IS CHECKED: a public host 302s to the router and the router is fetched',
-     [('            _doc_img_check_url(url)\n            if time.monotonic() >= deadline:',
-       '            if _hop == 0:\n                _doc_img_check_url(url)\n            if time.monotonic() >= deadline:')]),
+     [('            _doc_img_check_url(url, deadline)\n            if time.monotonic() >= deadline:',
+       '            if _hop == 0:\n                _doc_img_check_url(url, deadline)\n            if time.monotonic() >= deadline:')]),
     ('R2', RP, 'over',
      '⛔ REQUESTS FOLLOWS REDIRECTS ITSELF, past every per-hop check',
      [('            resp = session.get(url, stream=True, allow_redirects=False,',
@@ -442,8 +442,12 @@ MUTANTS = [
        '                        brief_text = p1_new["text"]')]),
     ('K6', RP, 'under',
      '⛔ THE FINALIZE RE-SAVE AND THE CONSOLIDATED BUILD READ UNREHOSTED RESULTS — a salvaged partial overwrites the document with platform URLs',
-     [('            await _rehost_result_texts(results)\n            for name, r in results.items():\n                if r["text"]:',
-       '            for name, r in results.items():\n                if r["text"]:')]),
+     # Wave 10.9: the re-save's test became `_p2_needs_resave(r)` (a kept agent
+     # is not re-written), and on 09-22 the whole block moved into
+     # `_p2_persist_reports` so a test could drive the writes. Re-indented twice;
+     # the mutant — the funnel call deleted — is unchanged both times.
+     [('    await _rehost_result_texts(results)\n    for name, r in results.items():\n        if _p2_needs_resave(r):',
+       '    for name, r in results.items():\n        if _p2_needs_resave(r):')]),
     ('K7', RP, 'under',
      'THE RESUME-WITH-INPUT REGEN RE-SAVE IS UNFUNNELED',
      [('                    # Rewrite documents\n                    await _rehost_result_texts(results)',
@@ -647,7 +651,7 @@ MUTANTS = [
     r"!\[''')]),
     ('N5', RP, 'over',
      'A DEFINITION TITLE ON THE NEXT LINE IS LEFT BEHIND as a stray quoted line',
-     [('r"(?:(?:[ \\t]+|[ \\t]*\\n[ \\t]*)(?:\\"',
+     [('r"(?:(?:[ \\t]+|[ \\t]*\\r?\\n[ \\t]*)(?:\\"',
        'r"(?:(?:[ \\t]+)(?:\\"')]),
     ('S1', RP, 'under',
      'FINDINGS SNIPPETS KEEP IMAGE MARKUP — "Revenue grew 40% !Chart"',
@@ -863,13 +867,15 @@ MUTANTS = [
        '_DOC_IMG_STOP_POLL_SEC = 5.0')]),
 
     # ── repair round 3: what is remembered for the rest of the research ──────
+    # ⭐ Re-aimed 2026-09-21 (wave 10.9, repair round 2): the same rule now also
+    # lets a lookup the CLOCK ended out of the cache (`timed_out`).
     ('CU1', RP, 'under',
      '⛔ AN IMAGE CUT OFF BY THE DOCUMENT\'S SPENT BUDGET IS CACHED AS FAILED: a chart that started with 3 s left is a caption in every later document, each with a fresh budget',
-     [('    if cut_off and time.monotonic() >= run.deadline:\n        return ref\n',
+     [('    if cut_off and (timed_out or time.monotonic() >= run.deadline):\n        return ref\n',
        '')]),
     ('CU2', RP, 'under',
      '⛔ THE CUT-OFF RULE WIDENS to any failure while reading: a dead host that fails at once is refetched by every document',
-     [('    if cut_off and time.monotonic() >= run.deadline:',
+     [('    if cut_off and (timed_out or time.monotonic() >= run.deadline):',
        '    if cut_off:')]),
     ('CU3', RP, 'under',
      'A DEFINITE VERDICT AT THE DEADLINE IS FORGOTTEN: a login-only image answered as the budget ran out is fetched again by every document',
@@ -947,16 +953,18 @@ MUTANTS = [
        '            sock = super()._new_conn()')]),
     ('CN2', RP, 'under',
      'EVERY RESOLVED ADDRESS IS TRIED — the cap goes',
-     [('                                   socket.SOCK_STREAM)[:_DOC_IMG_CONNECT_ADDRS]',
-       '                                   socket.SOCK_STREAM)')]),
+     [('                                allowed_gai_family())[:_DOC_IMG_CONNECT_ADDRS]',
+       '                                allowed_gai_family())')]),
     ('CN3', RP, 'under',
      '⛔ EACH CONNECT GETS THE FULL 5 s whatever is left of the image\'s time',
      [('            sock.settimeout(min(_DOC_IMG_TIMEOUT[0], left))',
        '            sock.settimeout(_DOC_IMG_TIMEOUT[0])')]),
+    # ⭐ Re-aimed 2026-09-21 (wave 10.9): the connect's own deadline check moved into
+    # `_doc_img_lookup`, the one bounded lookup both the URL check and the connect use.
     ('CN4', RP, 'over',
      'A LOOKUP STARTS AFTER THE IMAGE\'S DEADLINE',
-     [('    from urllib3.util.connection import allowed_gai_family\n    if time.monotonic() >= deadline:\n        raise _DocImageRefused("failed")\n',
-       '    from urllib3.util.connection import allowed_gai_family\n')]),
+     [('    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())\n    if left <= 0:\n        raise TimeoutError("lookup")\n',
+       '    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())\n')]),
     ('CN5', RP, 'under',
      'A CONNECT STARTS WITH NO TIME LEFT: a socket is made and a negative timeout raises out of the loop, leaking it',
      [('        left = deadline - time.monotonic()\n        if left <= 0:\n            out_of_time = True\n            break\n',

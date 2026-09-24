@@ -160,8 +160,8 @@ class TestClaudeAskingClarification:
 
 class TestClaudeSendClarificationReply:
     """The auto-reply sender. Tries composer selectors in order, then
-    Send-button selectors in order (mirror paste_followup at
-    research.py:5170), with Enter fallback if no button is enabled."""
+    Send-button selectors in order (mirror `paste_followup`'s send step),
+    with Enter fallback if no button is enabled."""
 
     def _mk_page(self, composer_sel=None, button_sel=None, button_enabled=True):
         """Build a mock page where:

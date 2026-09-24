@@ -212,11 +212,15 @@ MUTANTS = [
      [("        _fe_handoff_begin()\n        try:\n            _ask_with_retries()\n        finally:\n            _fe_handoff_end()",
        "        _ask_with_retries()")]),
 
+    # ⛔ RE-ANCHORED (wave 10.9, 542-5): the single `_drive_once()` inside this
+    # try became `_drive_cloud_phases(...)`, a retry ladder — which is MORE of a
+    # reason to count the drive, not less, since the hold now spans the backoffs
+    # too. The mutant is the same one: the drive runs uncounted.
     ("D6", "research.py", "under",
      "⛔ the P4/P5 drive is not counted — the one whose death costs the user an "
      "entire run",
-     [("        _fe_handoff_begin(drive=True)\n        try:\n            _drive_once()\n        finally:\n            _fe_handoff_end(drive=True)",
-       "        _drive_once()")]),
+     [("        _fe_handoff_begin(drive=True)\n        try:",
+       "        pass\n        try:")]),
 
     ("D7", "research.py", "over",
      "⛔ the counter can go negative, so a stray end() makes a genuine handoff "

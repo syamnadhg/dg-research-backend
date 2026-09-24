@@ -243,16 +243,34 @@ MUTANTS = [
        '    _runctl_ok = (not _runctl_question and bool(_names_a_run)\n                  and not _device_noun)')]),
     ('Q6', SR, 'over',
      '⛔⛔ THE SAME MISTAKE ON SKIP\'S SECOND BRANCH, and the existing suite caught this one. Branch 1 bails on a device noun BY DESIGN so a device message cannot extract a PHASE; branch 2 then catches it and returns a bare skip, which is right. Bailing here too sent `skip the podcast on my computer` on to the PODCAST BRANCH, WHICH FETCHED THE PODCAST',
-     [('            and not _skip_question and _request_names_a_set(t, _skip_run):\n        return None, [_NL_SKIP_ONE_RUN]',
-       '    if False:\n        return None, [_NL_SKIP_ONE_RUN]')]),
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10), TWICE WRONG BEFORE. The edit put an
+     # `if False:` where a `\` continuation expected the rest of a condition, so
+     # it never parsed — and the edit was not even the mistake its words
+     # describe: it disabled the SET refusal, while the words are about giving
+     # branch 2 branch 1's DEVICE-NOUN BAIL. It now makes exactly that mistake.
+     [('            or (_skip_run and re.match(rf"{_NL_LEAD_IN}skip\\b", low))) \\\n'
+       '            and not _skip_question:',
+       '            or (_skip_run and re.match(rf"{_NL_LEAD_IN}skip\\b", low))) \\\n'
+       '            and not _skip_question and not _device_noun:')]),
     ('Q7', SR, 'over',
      '⛔ A BARE VERB STOPS NAMING THE CURRENT RUN. `retry` on its own came back with the catch-all, and a test in the existing suite demands it work',
      [('    _names_a_run = _names_a_run or _runctl_bare',
        '    _names_a_run = _names_a_run')]),
     ('Q8', SR, 'under',
      '⛔⛔ SKIP LOSES ITS SET GATE AGAIN — it was the ONLY mutating act branch in the ladder with none. `skip all my runs`, `skip every run` and `skip both my runs` each executed the bare single-target form against whichever run it landed on, while pause, resume, retry and stop all refuse the same phrasing',
-     [('        if _request_names_a_set(t, _skip_run):\n            return None, [_NL_SKIP_ONE_RUN',
-       '        if False:\n            return None, ["I skip one run at a time.')]),
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). The replacement opened a string it
+     # never closed, so the mutant never parsed. And once it parsed it was
+     # EQUIVALENT: a later round put a set refusal in FRONT of branch 2 ("the set
+     # refusal comes first and does not depend on the object"), so the gate
+     # inside branch 2 can no longer be reached by any `skip` that names a set —
+     # measured on 19 phrasings, 0 answers changed. Skip "loses its set gate"
+     # now only if BOTH go, so both are disabled here.
+     [('            and not _skip_question and _request_names_a_set(t, _skip_run):\n'
+       '        return None, [_NL_SKIP_ONE_RUN]',
+       '            and False:\n'
+       '        return None, [_NL_SKIP_ONE_RUN]'),
+      ('        if _request_names_a_set(t, _skip_run):\n            return None, [_NL_SKIP_ONE_RUN',
+       '        if False:\n            return None, [_NL_SKIP_ONE_RUN')]),
     ('Q9', SR, 'over',
      '⛔⛔ `phones?` LEAVES THE SHARED DEVICE-NOUN LIST, and a PHONE stops counting as a device: `skip the video on my phone` extracts the PHASE and reconfigures a live run instead of returning a bare skip, and `skip the podcast on my phones` loses its set refusal too. ⭐ THE DESCRIPTION HERE WAS WRONG ON THE FIRST RUN — it claimed the mutant copied the question guard while the edit narrowed the noun list. A mutant whose words do not match its edit measures one thing and reports another, which is a harness fault',
      [('    _device_noun = re.search(rf"\\b({_MACHINE_NOUNS_SAID})\\b", low)\n    _runctl_question',

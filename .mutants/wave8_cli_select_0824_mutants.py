@@ -77,9 +77,12 @@ _GIVEUP = """    print(f"  {_c(_WARN, '⚠')}  Could not read a choice. Nothing 
 
 # ⛔ WIDENED: `for _ in range(3):` appears four times in this file, so the narrow
 # anchor mutated a place this mutant was never about and reported a kill.
+# ⚠ 2026-09-19 re-anchored: the read is wrapped so a background thread cannot
+# print over the question.
 _RETRY = """    for _ in range(3):
         try:
-            answer = input(f"  {_c(_ACCENT, '>')}  Choose ")"""
+            with _console_quiet_for_prompt():
+                answer = input(f"  {_c(_ACCENT, '>')}  Choose ")"""
 
 _ECHO = """            if picked:
                 print(f"     {_c(_DIM, f'Sending {len(picked)} run(s).')}")"""
@@ -105,8 +108,9 @@ _CONSENT_CALL = """    for line in _send_logs_consent_lines(
             len(only_runs) if only_runs is not None else n_runs,
             chosen_exactly=only_runs is not None):"""
 
+# Re-anchored 2026-09-21 (#539): the call gained a `keep_uid=` line after this.
 _BUILDER_CALL = """        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
-                                    only_runs=only_runs)"""
+                                    only_runs=only_runs,"""
 
 _EXACT_COPY = """        first = ("no runs — this machine's own log files only" if n == 0 else
                  f"the {n} run{'' if n == 1 else 's'} you chose, and only those")"""
@@ -168,7 +172,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("P3", "under", "there is no retry, so one typo abandons the send",
      [(_RETRY, "    for _ in range(1):\n"
                "        try:\n"
-               "            answer = input(f\"  {_c(_ACCENT, '>')}  Choose \")")],
+               "            with _console_quiet_for_prompt():\n"
+               "                answer = input(f\"  {_c(_ACCENT, '>')}  Choose \")")],
      [T_NEW]),
     ("P4", "under", "the prompt stops echoing what it understood, so a person "
      "who typed something ambiguous never learns how it was read",
@@ -200,7 +205,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "accepted and ignored — and every stub in the suite takes `**k`, so nothing "
      "else would notice",
      [(_BUILDER_CALL,
-       "        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs)")],
+       "        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,")],
      [T_NEW, T_CLI]),
     ("C3", "under", "the disclosure is printed BEFORE the choice, so the screen "
      "names a number the person has not chosen yet and then builds a different "

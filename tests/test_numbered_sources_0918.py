@@ -40,6 +40,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import research  # noqa: E402
+from conftest import code_only, web_file  # noqa: E402
 
 
 #: The web's own token regex, ported character for character from
@@ -116,11 +117,8 @@ class TestTheGrammarIsNotTheWebsToken:
         It reads the sibling checkout when there is one. SKIPPED is the honest
         answer where there is not — a shipped wheel has no web repo beside it —
         and the skip names what went unmeasured rather than passing quietly."""
-        ts = (Path(__file__).resolve().parents[2]
-              / "dg-research" / "src" / "lib" / "doc-sources.ts")
-        if not ts.exists():
-            pytest.skip("no dg-research checkout beside this repo: the web's "
-                        "SOURCE_TOKEN_RE was NOT compared against the port")
+        ts = web_file("the web's SOURCE_TOKEN_RE, against this port",
+                      "src/lib/doc-sources.ts")
         m = re.search(r"export const SOURCE_TOKEN_RE = /(?P<body>.+?)/[gimsuy]*;",
                       ts.read_text(encoding="utf-8"))
         assert m, "SOURCE_TOKEN_RE is no longer declared the way this reads it"
@@ -243,7 +241,7 @@ class TestTheMarkerSurvivesTheRenderer:
             "##### Sources\n"
             "\n"
             "1. [Battery prices](https://bnef.example.com/packs) — bnef.example.com\n"
-            "2. [Battery prices](https://iea.example.org/ev-outlook) — iea.example.org\n"
+            "2. [the agency](https://iea.example.org/ev-outlook) — iea.example.org\n"
         )
 
     def test_no_marker_is_ever_glued_to_the_tail_of_a_bare_url(self):
@@ -317,15 +315,25 @@ class TestOrderAndIdempotency:
 # ── the bibliography row ──────────────────────────────────────────────────────
 
 class TestTheBibliographyRow:
-    def test_two_sources_under_one_heading_are_told_apart_by_their_host(self):
-        """⛔ `_extract_findings`' title is the nearest heading IN OUR OWN
-        DOCUMENT, not the page's name, so both rows here arrive called "Battery
-        prices". Without the host column the list tells a reader nothing about
-        where either number goes."""
+    def test_a_link_label_names_its_own_page_and_a_bare_url_falls_to_the_heading(self):
+        """⛔⛔ THIS TEST USED TO PIN THE DEFECT. It was called
+        `test_two_sources_under_one_heading_are_told_apart_by_their_host` and it
+        asserted that BOTH rows read "Battery prices" — the heading in our own
+        markdown — on the reasoning that the host column would tell them apart.
+        On 2026-09-19 that reasoning met its worst case: a report whose twelve
+        references all sat under one trailing heading produced twelve rows
+        reading "Final synthesis, appendices, and references".
+
+        Row 2 is a markdown link, so the report already names that page and the
+        title ladder uses it. Row 1 is a bare URL in prose with nothing naming
+        it, so the heading is still the best available answer — the heading rung
+        did not go away, it stopped being the ONLY rung.
+
+        The host column stays, now as provenance rather than as a workaround."""
         tail = research._document_with_sources(REPORT).split(SOURCES_TAIL)[-1]
         assert tail == (
             "1. [Battery prices](https://bnef.example.com/packs) — bnef.example.com\n"
-            "2. [Battery prices](https://iea.example.org/ev-outlook) — iea.example.org\n")
+            "2. [the agency](https://iea.example.org/ev-outlook) — iea.example.org\n")
 
     def test_a_row_whose_title_is_already_its_host_does_not_say_it_twice(self):
         assert research._doc_sources_row(3, "https://www.e.example.com/a", "e.example.com") == (
@@ -507,7 +515,7 @@ CITED_REPORT = (
 )
 
 
-def _drive_the_phase_two_write(monkeypatch, tmp_path, report):
+def _drive_the_phase_two_write(monkeypatch, tmp_path, report, snapshot=None):
     """The REAL write site — `extract_and_record_agent` — driven end to end.
 
     Only the browser, the network and Firestore are stubbed; the extraction, the
@@ -530,6 +538,11 @@ def _drive_the_phase_two_write(monkeypatch, tmp_path, report):
         return None
 
     runtime = _Runtime()
+    if snapshot is not None:
+        # The panel scrape, as the live pipeline would have left it. Seeding it
+        # here is what makes the source_items rung reachable from the CONSUMER
+        # rather than only from the extractor helper.
+        runtime.agent_progress_snapshots["chatgpt"] = snapshot
     monkeypatch.setattr(research, "_runtime", runtime, raising=False)
     monkeypatch.setattr(research, "extract_chatgpt_response", _extract)
     monkeypatch.setattr(research, "reject_off_topic_text", lambda text, *a, **k: text)
@@ -605,15 +618,24 @@ def test_every_document_write_site_routes_through_the_numbering_funnel():
     other three were bought outright. `code_only_deep` blanks comments AND
     docstrings, so a mention of the call is no longer a call; per-function
     counts stop a new site anywhere from paying for a deleted one somewhere
-    else."""
+    else.
+
+    ⭐ Wave 10.9, 2026-09-22 — a FOURTH key, not a lowered total. The finalize
+    re-save moved into `_p2_persist_reports` (so a test could drive the writes
+    against a fake Firestore), so `run_pipeline` keeps the two regen sites and
+    the helper owns one. Splitting the key is the whole point of counting per
+    function: had the helper's site been folded into the old total, deleting it
+    and adding a regen site would still have read as three."""
     from conftest import code_only_deep
 
     sites = {fn.__name__: code_only_deep(fn).count("_document_with_sources(")
-             for fn in (research.run_pipeline, research.run_phase2,
-                        research.extract_and_record_agent)}
+             for fn in (research.run_pipeline, research._p2_persist_reports,
+                        research.run_phase2, research.extract_and_record_agent)}
     assert sites == {
-        # the finalize re-save + the two regen re-saves
-        "run_pipeline": 3,
+        # the two regen re-saves
+        "run_pipeline": 2,
+        # the finalize re-save, which wave 10.9 moved out of run_pipeline
+        "_p2_persist_reports": 1,
         # nothing: phase 2 records through extract_and_record_agent
         "run_phase2": 0,
         # the per-agent save, the site the executed test above drives
@@ -637,3 +659,180 @@ def test_a_destination_we_would_not_put_behind_a_number(bad):
     href — another way to render a number that opens somewhere other than where
     it says."""
     assert research._doc_is_linkable_url(bad) is False
+
+
+# ── the source title is the PAGE's name, not our heading (2026-09-19) ─────────
+#
+# ⛔⛔ THE DELIVERED DOCUMENT THE OWNER READ. All twelve rows of the ChatGPT
+# research document said "Final synthesis, appendices, and references" — the
+# nearest `##` heading in OUR OWN markdown, because that report puts every
+# citation in one trailing references block. The bibliography named the same
+# thing twelve times and told the reader nothing.
+#
+# ⛔ AND THE REPO HAD WRITTEN IT DOWN AS INTENDED. `_doc_sources_row`'s docstring
+# described this exact symptom and offered the ` — host` suffix as the
+# mitigation, and the test above this block asserted the duplicate rows were
+# correct. A fix therefore had to move the rationale and the test with it, or
+# the codebase would go on arguing against itself.
+#
+# The heading did not go away. It moved from being the ONLY rule to being the
+# third of four, behind what the report itself calls the page.
+
+
+class TestTheSourceTitleIsThePagesOwnName:
+    #: Two entries copied from the real report in the incident
+    #: (`queues/Golden_Retriver_20260919_130403/documents/chatgpt.md`), in the
+    #: shape ChatGPT actually emits: publisher, *title*, note, then the bare URL
+    #: wrapped onto its own line.
+    REFS = (
+        "# ChatGPT Deep Research\n\n"
+        "## Final synthesis, appendices, and references\n\n"
+        "**References**\n\n"
+        "American Kennel Club. *Golden Retriever breed information.* "
+        "Current breed materials.  \n"
+        "https://www.akc.org/dog-breeds/golden-retriever/ \n\n"
+        "Orthopedic Foundation for Animals. "
+        "*Canine Health Information Center / CHIC Programs.*  \n"
+        "https://ofa.org/chic-programs/ \n"
+    )
+
+    def test_a_reference_block_gives_every_row_its_own_title(self):
+        """⛔⛔ THE INCIDENT. Today's code walks the heading list and keeps the
+        last heading at or before each URL; `## Final synthesis, appendices, and
+        references` precedes BOTH, so there is no path by which it produces two
+        different strings. Neither expected title is the heading, neither is a
+        host, and they differ from each other — only reading the citation line's
+        own emphasised title can satisfy this."""
+        got = [f["sourceTitle"] for f in research._extract_findings(self.REFS, [])]
+        assert got == ["Golden Retriever breed information.",
+                       "Canine Health Information Center / CHIC Programs."]
+
+    def test_the_document_a_reader_sees_carries_those_titles(self):
+        """The consumer, not the helper. This is the string that was wrong in
+        the delivered file, byte for byte."""
+        tail = research._document_with_sources(self.REFS).split(SOURCES_TAIL)[-1]
+        assert tail == (
+            "1. [Golden Retriever breed information.]"
+            "(https://www.akc.org/dog-breeds/golden-retriever/) — akc.org\n"
+            "2. [Canine Health Information Center / CHIC Programs.]"
+            "(https://ofa.org/chic-programs/) — ofa.org\n")
+
+    def test_a_link_label_is_the_best_evidence_there_is(self):
+        md = ("## Market overview\n\nRevenue grew per "
+              "[Reuters annual outlook](https://www.reuters.com/markets/a) "
+              "today, the agency said.\n")
+        assert research._extract_findings(md, [])[0]["sourceTitle"] == (
+            "Reuters annual outlook")
+
+    def test_an_emphasised_title_immediately_before_the_url_counts(self):
+        """The one-line citation shape: nothing but punctuation between the
+        title and the link."""
+        md = ("## Topic\n\nSee *The lithium pack price survey.* "
+              "https://bnef.example.com/packs for the underlying numbers.\n")
+        assert research._extract_findings(md, [])[0]["sourceTitle"] == (
+            "The lithium pack price survey.")
+
+    def test_a_bold_lead_in_is_never_stolen_as_a_page_title(self):
+        """⛔⛔ THE GUARD THAT MAKES THE EMPHASIS RUNG SAFE, and the reason it is
+        gated on STRUCTURE rather than on a character budget.
+
+        Emphasis is also how prose opens a paragraph. A length threshold cannot
+        separate the two: the real reference line's gap between the emphasis and
+        the URL (" Current breed materials.  \n", 28 chars) is SHORTER than this
+        sentence's (" Prices fell by a fifth, reported at ", 37), so any budget
+        loose enough to accept the first accepts this too.
+
+        What actually differs is shape — the reference's URL stands alone on its
+        own line; a sentence's does not. Titling this row "Appendix: method."
+        would be a confident, silent lie, which is strictly worse than the
+        duplicate heading the whole change exists to remove."""
+        prose = ("## Battery prices\n\n**Appendix: method.** Prices fell by a "
+                 "fifth, reported at https://bnef.example.com/packs in a note.\n")
+        assert research._extract_findings(prose, [])[0]["sourceTitle"] == (
+            "Battery prices")
+
+    def test_the_panel_title_is_used_when_the_report_names_nothing(
+            self, monkeypatch, tmp_path):
+        """⛔ PINNED AT THE CONSUMER. The extractor gained a parameter, but the
+        titles die one layer up: the progress SNAPSHOT copied `source_urls` and
+        dropped `source_items`, so the platform's own scraped titles never
+        reached the extractor at all. A helper-level test would pass with that
+        still broken.
+
+        The panel's spelling carries the platform's tracking parameter and the
+        report's does not, which is why the lookup is keyed on the NORMALISED
+        url — a raw-string dict misses every time and falls silently back to
+        the heading."""
+        _runtime, _saved, local = _drive_the_phase_two_write(
+            monkeypatch, tmp_path, CITED_REPORT,
+            snapshot={
+                "source_urls": ["https://bnef.example.com/packs"],
+                "source_items": [{
+                    "url": "https://bnef.example.com/packs?utm_source=chatgpt.com",
+                    "title": "Lithium pack price survey"}],
+            })
+        assert local.endswith(
+            SOURCES_TAIL +
+            "1. [Lithium pack price survey](https://bnef.example.com/packs)"
+            " — bnef.example.com\n")
+
+    def test_an_empty_panel_title_falls_through_instead_of_shadowing(
+            self, monkeypatch, tmp_path):
+        """The inline-activity capture path writes `{"url": u, "title": ""}` by
+        construction — it is the path that runs whenever the side panel is shut.
+        An empty title must not win over the heading."""
+        _runtime, _saved, local = _drive_the_phase_two_write(
+            monkeypatch, tmp_path, CITED_REPORT,
+            snapshot={
+                "source_urls": ["https://bnef.example.com/packs"],
+                "source_items": [{"url": "https://bnef.example.com/packs",
+                                  "title": ""}],
+            })
+        assert local.endswith(
+            SOURCES_TAIL +
+            "1. [Battery prices](https://bnef.example.com/packs)"
+            " — bnef.example.com\n")
+
+    def test_the_snapshot_writer_keeps_the_panel_titles(self):
+        """The line that was missing. Source-level, because the writer sits in
+        the middle of a polling loop no unit test drives — but paired with the
+        consumer test above, which is what proves the value arrives."""
+        src = code_only(open(research.__file__, encoding="utf-8").read())
+        assert '"source_items": list(progress.get("source_items", []) or [])' in src
+
+    def test_the_report_beats_the_panel_when_both_name_the_page(
+            self, monkeypatch, tmp_path):
+        """Order matters: what the author wrote in the report outranks what a
+        scraper read off a panel."""
+        md = ("## Battery prices\n\nPack prices fell, per "
+              "[the BNEF survey](https://bnef.example.com/packs), by a fifth "
+              "over the year.\n")
+        _runtime, _saved, local = _drive_the_phase_two_write(
+            monkeypatch, tmp_path, md,
+            snapshot={
+                "source_urls": ["https://bnef.example.com/packs"],
+                "source_items": [{"url": "https://bnef.example.com/packs",
+                                  "title": "Scraped panel name"}],
+            })
+        assert "1. [the BNEF survey]" in local
+        assert "Scraped panel name" not in local
+
+
+def test_the_real_report_from_the_incident_gets_twelve_distinct_titles():
+    """⛔⛔ THE WHOLE DEFECT, MEASURED ON THE ARTEFACT THAT CAUSED IT. Skipped
+    when the run directory has been cleared; when it is there, this is the only
+    test in the repo that reads the actual delivered document.
+
+    The markers and the appended bibliography are stripped first because
+    production extracts from the CLEAN report — numbering happens after."""
+    from pathlib import Path
+    p = (Path(research.__file__).parent / "queues"
+         / "Golden_Retriver_20260919_130403" / "documents" / "chatgpt.md")
+    if not p.exists():
+        pytest.skip("the 2026-09-19 run directory is not in this checkout")
+    md = p.read_text(encoding="utf-8").split(SOURCES_TAIL.strip())[0]
+    clean = re.sub(r"\[\\\[\d{1,3}\\\]\]\([^)]*\)", "", md)
+    titles = [f["sourceTitle"] for f in research._extract_findings(clean, [])]
+    assert len(titles) == 12
+    assert len(set(titles)) == 12, titles
+    assert "Final synthesis, appendices, and references" not in titles

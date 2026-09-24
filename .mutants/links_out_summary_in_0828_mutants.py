@@ -83,29 +83,35 @@ MUTANTS = [
        '                _suppressed = lambda *a, **k: None\n'
        '                _suppressed("phase_skipped", phase=3, reason=_p3_audio_reason,')]),
 
+    # ⛔ RE-ANCHORED, wave 10.9 repair: the three sentences moved into
+    # `_p3_no_podcast_report` so a test could RUN them — and so the phase could
+    # stop telling a run that keeps nothing its podcast was still on the
+    # research computer. Same claim, same kill, new address: the branch now
+    # decides by ASKING, and a gate that decides for itself is the bug.
     ("P5", "under",
      "⛔ the skip stops distinguishing the two failures, so a user whose podcast "
      "is sitting on the research computer is told only that the phase did not "
      "finish",
-     [('                _p3_audio_reason = (\n'
-       '                    "audio_generated_but_upload_failed" if audio_path\n'
-       '                    else "no_audio_generated")',
-       '                _p3_audio_reason = "no_audio_generated"')]),
+     [('                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(\n'
+       '                    audio_path, _fb_research_id)',
+       '                _p3_audio_reason, _p3_audio_detail = ("no_audio_generated", "")')]),
 
+    # ⛔ RE-ANCHORED, wave 10.9: these three writes moved out of
+    # `run_phase3_audio` into `_p3_publish_audio` so a test could RUN the
+    # decision instead of reading it. Same claims, same kills, new addresses.
     ("P6", "over",
      "⛔ the Storage URL is set from the local path, so the gate is satisfied by "
      "a file that never uploaded — the same lie with a new name",
-     [("                audio_stored_url = audio_url",
-       "                audio_stored_url = str(audio_path)")]),
+     [("            return audio_url",
+       "            return str(audio_path)")]),
 
     ("P7", "under",
-     "⛔ the assignment leaves the `if audio_url:` guard, so a failed upload "
+     "⛔ the answer leaves the `if audio_url:` guard, so a failed upload "
      "still sets the artefact",
-     [("            if audio_url:\n"
-       "                update_link_in_firestore(\"audio_file\", audio_url,",
-       "            audio_stored_url = audio_url or \"\"\n"
-       "            if audio_url:\n"
-       "                update_link_in_firestore(\"audio_file\", audio_url,")]),
+     [("        if audio_url:\n"
+       "            update_link_in_firestore(\"audio_file\", audio_url,",
+       "        if True:\n"
+       "            update_link_in_firestore(\"audio_file\", audio_url,")]),
 
     ("P8", "under",
      "⛔ the function stops returning the artefact, so the gate reads \"\" on every "
@@ -113,11 +119,29 @@ MUTANTS = [
      [('    return {"audio_path": audio_path, "audio_stored_url": audio_stored_url}',
        '    return {"audio_path": audio_path}')]),
 
-    ("P9", "under",
-     "⛔ the initialisation goes, so any of the eight early returns raises "
-     "UnboundLocalError instead of reporting no audio",
-     [('    audio_stored_url = ""\n\n    # ── The audio SHARE page: REMOVED',
-       "    # ── The audio SHARE page: REMOVED")]),
+    # ⛔ RE-ANCHORED TWICE, and the first re-anchor is the lesson. The claim was
+    # "the artefact is defined before every return", held by an initialiser at
+    # the top of the phase; with the writes extracted there is no initialiser to
+    # delete, so wave 10.9 pointed P9 at the publisher answering `None` instead
+    # of `""` on its swallow path. That mutant CANNOT FAIL: all three consumers
+    # read the answer through a truthiness test or an `or` fallback
+    # (`if _p3_no_skip and _p3_audio_stored`, `update_delivery(audio_url=… or …)`,
+    # `log(f"  Podcast: {… or 'N/A'}")`), so None and "" produce byte-identical
+    # behaviour everywhere. It was scored as killed only by an `assert out == ""`
+    # — a string-identity check with no production meaning. An EQUIVALENT mutant
+    # is a harness fault, not a hole, and a slot reporting a kill while measuring
+    # nothing is the one thing this directory exists to prevent.
+    # ⭐ So P9 now refuses a decision at the same seam that a consumer CAN see:
+    # the bail asks whether the podcast is on the disk, not whether the phase
+    # happens to be holding a name for it.
+    ("P9", "over",
+     "⛔⛔ the bail asks only whether a NAME was minted, so a NotebookLM "
+     "download that never landed is probed, uploaded, written as an `audios` "
+     "row and stamped into links.audio_file — a podcast row that plays nothing",
+     [('    if not (audio_path and audio_path.exists()):\n'
+       '        return ""',
+       '    if not audio_path:\n'
+       '        return ""')]),
 
     ("P10", "under",
      "⛔⛔ THE AUTO-RETRY LEG READS THE REMOVED KEY AGAIN. `.get(…, \"\")` on a "
@@ -206,10 +230,19 @@ MUTANTS = [
      "hours-later failure in the whole wave",
      [('        _url = _r.get("url") or ""', '        _url = ""')]),
 
+    # ⛔⛔ R7 WAS AN EQUIVALENT MUTANT, NOT A SURVIVOR (re-measured 2026-09-22).
+    # Wave 10.9's repair round 2 gave `_p2_to_p3_link_for` its own
+    # `off_topic_rejected` veto, because a KEPT agent has no address for the
+    # inline blank to act on. From then on the refused leg was dropped by
+    # whichever veto was left standing, so mutating the inline one alone changed
+    # nothing but a log line — and the survivor it reported was a harness fault
+    # read as a suite gap. It now removes BOTH, the way `link_sinks_removed_0902`
+    # H4 does, so it measures the decision rather than one of its two copies.
     ("R7", "under",
      "⛔ the handoff stops dropping an off-topic leg's link, so the 11:08 run's "
      "unrelated conversation ships to NotebookLM as a source again",
-     [('        if _url and _r.get("off_topic_rejected"):', "        if False:")]),
+     [('        if _url and _r.get("off_topic_rejected"):', "        if False:"),
+      ('    if r.get("off_topic_rejected"):\n        return ""', '    if False:\n        return ""')]),
 
     ("R8", "under",
      "⛔ the handoff stops dropping a conversation that predates the run",

@@ -57,6 +57,8 @@ import shutil
 import argparse
 import subprocess
 import collections
+import threading        # the console-quiet flag below `log()` needs it at import time
+import contextlib       # ditto — `_console_quiet_for_prompt` is a contextmanager
 import logging          # only to reshape uvicorn's own records — see _uvicorn_log_config
 # The content-free tier. ⭐ Imports NOTHING from this file, so instrumenting a
 # call site can never create a circular import, and a telemetry failure can
@@ -166,6 +168,8 @@ from models import (
     record_probe,
     record_known_good,
     stepped_back_to,
+    version_key,
+    version_text,
 )
 
 # Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
@@ -261,7 +265,7 @@ def _prog_name() -> str:
 # matches the actual invocation (drop-in `superresearch …` vs `python research.py …`).
 _PROG = _prog_name()
 
-# Stamped by argparse dispatch in __main__ (research.py:~31320). Worker 1 is
+# Stamped by the argparse dispatch in `main()`. Worker 1 is
 # the primary serve (FE-facing port 8000, heartbeats, currentRunId writes,
 # orphan-sweeps, hard_reset orchestration). Workers ≥2 are silent siblings
 # that share the same deviceId but run pipelines from their own profile dirs.
@@ -354,8 +358,8 @@ def _profile_matches_cmdline(profile: str, cmdline: str) -> bool:
 # worker dequeues — same code path as the queue_dir creation — and is
 # discoverable by sibling rehydration without knowing the run_id.
 #
-# Why not a Firestore signal: both claim paths (start-listener at
-# research.py:4138-4141 and idle-rescan at 26895-26899) delete the
+# Why not a Firestore signal: both claim paths (the start listener's
+# `on_snapshot` and `_rescan_queue_for_unclaimed`) delete the
 # device-queue doc immediately after a successful claim. By the time a
 # rebooting sibling's rehydration runs (4s later in the repro), no
 # Firestore doc exists to query.
@@ -459,12 +463,55 @@ def _worker_dead_marker_path(worker_id: int) -> Path:
     return Path(__file__).parent / "queues" / f".worker.{worker_id}.dead"
 
 
+# ⭐ "AUTOMATIC RECOVERY IS EXHAUSTED FOR THIS RUN." Written beside the
+# checkpoint when `run_pipeline` gives up and shows the terminal card, and read
+# by the paths that would otherwise start the run again with nobody asking:
+# the supervised boot rehydration and the disk restore. A HUMAN pressing Retry
+# clears it — the budget is theirs to spend — which is the whole reason this is
+# not `.stop`.
+NO_AUTO_RETRY_MARKER = ".no_auto_retry"
+
+
+def _no_auto_retry_marked(queue_dir) -> bool:
+    """Has this run already used up every automatic attempt?"""
+    try:
+        return (Path(queue_dir) / NO_AUTO_RETRY_MARKER).exists()
+    except Exception:
+        return False
+
+
+def _clear_no_auto_retry(queue_dir) -> None:
+    """A person asked for another go. Give them a clean budget."""
+    try:
+        (Path(queue_dir) / NO_AUTO_RETRY_MARKER).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as _err:
+        log(f"[no-auto-retry] could not clear marker (non-fatal): {_err}", "DEBUG")
+
+
 def _write_worker_dead_marker(worker_id: int, *, pid: "int | None" = None,
-                              crash_count: int = 0) -> None:
+                              crash_count: int = 0,
+                              reason: str = "crash_loop") -> None:
     """Supervisor-side: durably record that `worker_id` was declared dead.
     Atomic tmp+os.replace (mirrors _write_worker_lock) so a concurrent worker-1
     scan never reads a half-written file. The `.dead.tmp` suffix is excluded from
-    the reader's `.worker.*.dead` glob. Best-effort; failures logged DEBUG."""
+    the reader's `.worker.*.dead` glob. Best-effort; failures logged DEBUG.
+
+    ⛔⛔ `reason` EXISTS BECAUSE THIS WAS WRITTEN ON ONE DEATH PATH IN FOUR, and
+    the literal "crash_loop" it used to hardcode is why nobody noticed. The
+    supervisor gives up on a worker in four places — the initial fleet spawn
+    failing, a respawn after a watchdog kill failing, the crash loop, and a
+    respawn after a crash failing — and only the crash loop wrote a marker. The
+    other three left `{"_dead": True}` in the table and nothing on disk, so
+    worker 1's reconciler never saw them and their abandoned runs stayed frozen
+    "ongoing" with no Resume: exactly the state the KNOWN LIMITATION comment 160
+    lines below the reconciler still describes, for three cases out of four.
+
+    Nothing READS this field — `_read_dead_worker_ids` keys on `worker_id` and
+    `died_at` alone — so it is diagnostics, and diagnostics that name one cause
+    for four outcomes are how a gap this size stays invisible.
+    """
     tmp = None
     try:
         lock_dir = Path(__file__).parent / "queues"
@@ -475,7 +522,7 @@ def _write_worker_dead_marker(worker_id: int, *, pid: "int | None" = None,
             "worker_id": worker_id,
             "pid": pid,
             "died_at": int(time.time() * 1000),
-            "reason": "crash_loop",
+            "reason": reason,
             "crash_count": crash_count,
             "supervisor_pid": os.getpid(),
         }), encoding="utf-8")
@@ -847,7 +894,8 @@ def _save_api_key_to_env_file(name: str, value: str, path=None) -> bool:
 
     Returns True on successful write, False on bad name / IO failure.
     Uses atomic write-then-rename so a crash mid-write doesn't corrupt
-    the file."""
+    the file, and the file is owner-only (0600) from its first byte —
+    see `_write_owner_only_text`."""
     if not _LOCAL_KEY_NAME_RE.match(name):
         log(f"[save-api-key-local] invalid env var name: {name!r}", "WARN")
         return False
@@ -876,9 +924,12 @@ def _save_api_key_to_env_file(name: str, value: str, path=None) -> bool:
         out = "\n".join(new_lines)
         if not out.endswith("\n"):
             out += "\n"
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(out, encoding="utf-8")
-        tmp.replace(target)
+        # ⛔⛔ #538: NOT `tmp.write_text(out); tmp.replace(target)`. The rename
+        # hands the target the TEMP file's inode, so that pair re-created this
+        # file at the umask's 0644 on every save — throwing away the seed's
+        # 0600 — and the fixed-name `.tmp` held the key world-readable while it
+        # was being written.
+        _write_owner_only_text(target, out)
         return True
     except Exception as e:
         log(f"[save-api-key-local] write {target} failed: {e}", "WARN")
@@ -972,9 +1023,9 @@ def _clear_api_key_from_env_file(name: str, path=None) -> bool:
         out = "\n".join(new_lines)
         if out and not out.endswith("\n"):
             out += "\n"
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(out, encoding="utf-8")
-        tmp.replace(target)
+        # Same writer as the save, same reason: the rewrite still carries every
+        # OTHER key in the file, and a plain rename would publish them at 0644.
+        _write_owner_only_text(target, out)
         return True
     except Exception as e:
         log(f"[clear-api-key-local] clear {target} failed: {e}", "WARN")
@@ -1100,15 +1151,6 @@ def _migrate_legacy_api_keys() -> None:
         pass
 
 
-def get_env(name):
-    """os.environ first, User-scope Windows env as fallback. Keeps the
-    legacy contract for callers that just want 'whatever env has this
-    name'. See resolve_api_key for CUA key resolution order, which is
-    deliberately reversed."""
-    val = os.environ.get(name, "")
-    if not val:
-        val = _read_user_scope_env(name)
-    return val
 
 
 def _read_device_key_doc(uid: str, device_id: str) -> dict:
@@ -1639,6 +1681,10 @@ def title_refusal_verdict(title: str, topic: str, corpus: str) -> str:
         Security Boundaries' — it shares none of the topic's distinctive terms
         (nemoclaw, nemohermes, nemotron, openshell).
 
+    (Quoted as it was written that day. The line now prints the title's LENGTH
+    rather than the title — `backend.log` is the machine's and its tail ships in
+    the owner's support bundle; see `_log_job_ref`.)
+
     NVIDIA is the vendor of Nemotron. The sources were docs.nvidia.com and
     build.nvidia.com. The corpus had already been through `apply_off_topic_sweep`
     and passed — no "OFF-TOPIC text REJECTED" line anywhere in the run. So the
@@ -1702,6 +1748,19 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
     _findings = _corpus[:5000]
     if not _topic and not _brief and not _findings:
         return
+    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH (wave 10.9, last repair). The
+    # worker is a raw thread with a model call in front of its write, and the
+    # run can end while that call is out: teardown clears the pipeline globals,
+    # the worker dequeues the next member's run at once, and setup points them
+    # at THAT person's research. Read at write time, this run's title — made
+    # from its topic and findings — went onto their record, into their sidebar.
+    # So the worker reads and writes the research that dispatched it, by name.
+    _uid, _rid = _fb_uid, _fb_research_id
+    # ⛔ AND A RUN THAT KEEPS NOTHING DISPATCHES NO REFRESH AT ALL. Its record is
+    # purged when it ends, so a better name is worth nothing to it — and the
+    # worker is a model call on its private topic and findings that outlives it.
+    if _is_incognito_research(_rid):
+        return
 
     def _worker():
         try:
@@ -1711,10 +1770,10 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
             # post-P2 with richer findings. Asymmetric with the FE startup
             # /api/title (which has its own heuristic guard) — both honor
             # the lock.
-            if _firebase_db and _fb_uid and _fb_research_id:
+            if _firebase_db and _uid and _rid:
                 try:
-                    snap = _firebase_db.collection("users").document(_fb_uid) \
-                        .collection("researches").document(_fb_research_id).get()
+                    snap = _firebase_db.collection("users").document(_uid) \
+                        .collection("researches").document(_rid).get()
                     if snap.exists:
                         data = snap.to_dict() or {}
                         if bool(data.get("titleLocked")):
@@ -1754,33 +1813,52 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                     # is the part that was never in doubt: drop the title, keep
                     # the topic-derived name, which is what `smart_title` reads
                     # and what P3 types into the notebook.
+                    # ⛔⛔ NOT THE TITLE — see `_log_job_ref`. The generated
+                    # title is a research subject, and both of these lines go to
+                    # the machine-wide `backend.log`, whose tail ships in the
+                    # OWNER's support bundle: measured 2026-09-22 in this
+                    # owner's live log, 57 characters of another member's title
+                    # in the archive that goes to support. Its LENGTH is what
+                    # this line is read for; the title itself is on the research
+                    # doc. ⭐ The anchors stay, for the reason the Phase 1 gate
+                    # gives, and the bundle takes them out of the copy that
+                    # travels. (A run that keeps nothing never gets here — it
+                    # dispatches no refresh.)
+                    _anchor_words = ", ".join(_t_anchors[:6])
                     if _verdict == "refuse_loud":
-                        log(f"[title-refresh] REFUSING the generated title {text!r} — it "
-                            f"shares none of the topic's distinctive terms "
-                            f"({', '.join(_t_anchors[:6])}), AND neither does the "
-                            f"corpus it was written from. The research went "
-                            f"off-topic.", "ERROR")
+                        log(f"[title-refresh] REFUSING the generated title "
+                            f"({len(text)} chars) — it shares none of the topic's "
+                            f"distinctive terms ({_anchor_words}), AND "
+                            f"neither does the corpus it was written from. The "
+                            f"research went off-topic.", "ERROR")
+                        # ⛔⛔ ONLY WHILE THIS RUN IS STILL THE ONE RUNNING.
+                        # `emit_event` writes to whatever research the globals
+                        # name NOW, and this card quotes the generated title —
+                        # after the run has ended it would land in the next
+                        # member's chat. A card about a run that has ended is
+                        # one nobody reads, so it is simply not raised.
                         try:
-                            emit_event(
-                                "pipeline_warning", phase=2,
-                                # `message=`, not `error=`: the web app's warning
-                                # branch reads message/warning and falls back to
-                                # the literal string "Backend warning", which is
-                                # what the user saw on the card.
-                                message="The findings may not match your topic",
-                                details=(f"We named this research from its own findings "
-                                         f"and got \"{text}\", which does not mention "
-                                         f"your topic at all — and neither does the "
-                                         f"research it was written from. One of the "
-                                         f"agents may have reported on something else."),
-                                # Explicit empty list, not omitted: the web app
-                                # invents a [Skip] for a phase alert whose actions
-                                # are undefined, and phase 2 is already Complete
-                                # by the time this can fire — there is nothing to
-                                # skip. `[]` means "informational", and it is what
-                                # every other warning in this file already passes.
-                                actions=[], alert_id="phase2_topic_mismatch",
-                                alertType="warn", dismissible=True)
+                            if (_fb_uid, _fb_research_id) == (_uid, _rid):
+                                emit_event(
+                                    "pipeline_warning", phase=2,
+                                    # `message=`, not `error=`: the web app's warning
+                                    # branch reads message/warning and falls back to
+                                    # the literal string "Backend warning", which is
+                                    # what the user saw on the card.
+                                    message="The findings may not match your topic",
+                                    details=(f"We named this research from its own findings "
+                                             f"and got \"{text}\", which does not mention "
+                                             f"your topic at all — and neither does the "
+                                             f"research it was written from. One of the "
+                                             f"agents may have reported on something else."),
+                                    # Explicit empty list, not omitted: the web app
+                                    # invents a [Skip] for a phase alert whose actions
+                                    # are undefined, and phase 2 is already Complete
+                                    # by the time this can fire — there is nothing to
+                                    # skip. `[]` means "informational", and it is what
+                                    # every other warning in this file already passes.
+                                    actions=[], alert_id="phase2_topic_mismatch",
+                                    alertType="warn", dismissible=True)
                         except Exception:
                             pass
                     else:
@@ -1790,12 +1868,13 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                         # nothing is shown. Logged, because "the title we picked
                         # was thrown away" should still be greppable.
                         log(f"[title-refresh] keeping the topic-derived name: the "
-                            f"generated title {text!r} shares none of the topic's "
-                            f"distinctive terms ({', '.join(_t_anchors[:6])}), but "
-                            f"the corpus does — no alert raised.", "WARN")
+                            f"generated title ({len(text)} chars) shares none of the "
+                            f"topic's distinctive terms "
+                            f"({_anchor_words}), but the corpus does "
+                            f"— no alert raised.", "WARN")
                     text = ""
             if text:
-                _update_firestore_research({"title": text, "updatedAt": int(time.time() * 1000)})
+                _update_research_doc(_uid, _rid, {"title": text, "updatedAt": int(time.time() * 1000)})
         except Exception as e:
             try:
                 log(f"[title-refresh] worker failed: {e}", "WARN")
@@ -1803,7 +1882,13 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
                 pass
 
     try:
-        _threading.Thread(target=_worker, name="research-title-refresh", daemon=True).start()
+        # ⛔ UNDER A COPY OF THE RUN'S CONTEXT (wave 10.10). A raw thread starts
+        # with an empty one, so its lines had no run origin and went into
+        # whatever folder was armed when they were written — the next run's,
+        # after a long model call. The copy carries `_LOG_RUN`, so a late line
+        # stays out of another run's folder (`_line_is_another_runs`).
+        _threading.Thread(target=_log_contextvars.copy_context().run, args=(_worker,),
+                          name="research-title-refresh", daemon=True).start()
     except Exception as e:
         try:
             log(f"[title-refresh] dispatch failed: {e}", "WARN")
@@ -1973,13 +2058,20 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
     _findings = (findings_text or "").strip()[:5000]
     if not _topic and not _brief and not _findings:
         return
+    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH, and no summary at all for a
+    # run that keeps nothing — see `_refresh_research_title_async`. A summary is
+    # "what the research found": written at write time, it landed on the next
+    # member's /researches tile.
+    _uid, _rid = _fb_uid, _fb_research_id
+    if _is_incognito_research(_rid):
+        return
 
     def _worker():
         try:
             text = _try_llm_summary(_topic, _brief, _findings) or _fallback_summary(_topic, _brief, _findings)
             text = _shape_summary(text)
             if text:
-                _update_firestore_research({"summary": text})
+                _update_research_doc(_uid, _rid, {"summary": text})
         except Exception as e:
             try:
                 log(f"[summary] worker failed: {e}", "WARN")
@@ -1987,7 +2079,9 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
                 pass
 
     try:
-        _threading.Thread(target=_worker, name="research-summary", daemon=True).start()
+        # ⛔ Under a copy of the run's context — see the title refresh above.
+        _threading.Thread(target=_log_contextvars.copy_context().run, args=(_worker,),
+                          name="research-summary", daemon=True).start()
     except Exception as e:
         try:
             log(f"[summary] dispatch failed: {e}", "WARN")
@@ -2183,6 +2277,109 @@ def _log_date_marker(day: str, ts: str) -> "str | None":
     return f"[{ts}] [INFO] {LOG_DATE_PREFIX} {day}"
 
 
+# ⛔⛔ 2026-09-19 — THE CONSOLE GOES QUIET WHILE SOMEONE IS BEING ASKED A
+# QUESTION. What the owner saw, verbatim:
+#
+#     >  Send this to the team? [y/N]: [18:48:25] [INFO] [date] 2026-09-19
+#   [18:48:25] [DEBUG] [telemetry] telemetry: no id-token accessor (ImportError)…
+#   y
+#
+# Their words: "because of the noise, it's very unclear what to even type."
+#
+# The lines land INSIDE the prompt because a daemon thread writes them. The
+# telemetry flusher starts at the top of `main()` and posts in the background;
+# its stdlib `log.debug` reaches `log()` through the bridge, which is attached
+# at DEBUG on purpose. So the main thread is parked in `input()` and another
+# thread is printing over the question — nothing about ordering on the main
+# thread can fix it.
+#
+# ⚠ WITHHELD FROM THE SCREEN, NEVER FROM THE FILES. Every line still goes to the
+# run file through `_log_write_through` on its normal path, and to this
+# command's session log THE MOMENT IT ARRIVES (see `_console_print`); only the
+# screen copy waits for the answer. A prompt that ate diagnostics would trade a
+# cosmetic problem for a real one — the next support bundle is assembled from
+# exactly these lines.
+#
+# ⛔⛔ THE SCREEN COPY IS BOUNDED, AND THIS COMMENT USED TO PROMISE MORE (wave
+# 10.10). It said "never discarded" while every line after the 500th of a long
+# prompt was
+# neither shown nor kept: the session log is a copy of what reaches the screen,
+# so a line held back from the screen and then dropped reached no file at all.
+# Now the file gets every line as it arrives, the screen replays the NEWEST 500
+# when the answer is read, and one line says how many earlier ones are only in
+# the session log.
+_CONSOLE_QUIET = threading.Event()
+#: `(text, tee)` per held line — `tee` is the session mirror the line was
+#: already written to, or None when this command keeps no session log.
+_CONSOLE_HELD: list = []
+_CONSOLE_HELD_LOCK = threading.Lock()
+#: A held buffer is a courtesy, not a queue. A prompt left open overnight must
+#: not grow one line per telemetry flush until the process dies.
+_CONSOLE_HELD_MAX = 500
+#: How many held lines fell off the front of the buffer during this prompt.
+_CONSOLE_HELD_DROPPED = [0]
+
+
+def _console_print(text: str) -> None:
+    """`print`, unless a question is on screen — then hold it for replay.
+
+    ⭐ A HELD LINE REACHES THE SESSION LOG NOW. `print` would have put it there
+    through the tee on `sys.stdout`; holding it must not change that, so it is
+    written to the same writer directly and only the screen copy waits."""
+    if not _CONSOLE_QUIET.is_set():
+        print(text)
+        return
+    tee = sys.stdout if isinstance(sys.stdout, _SessionTee) else None
+    if tee is not None:
+        try:
+            tee._writer.write_line(_visible_text(text))
+        except Exception:
+            tee = None
+    with _CONSOLE_HELD_LOCK:
+        _CONSOLE_HELD.append((text, tee))
+        if len(_CONSOLE_HELD) > _CONSOLE_HELD_MAX:
+            del _CONSOLE_HELD[0]
+            _CONSOLE_HELD_DROPPED[0] += 1
+
+
+def _console_replay(text: str, tee) -> None:
+    """Put one held line on the screen — and ONLY the screen when the session
+    log already has it, or the file would hold every held line twice."""
+    if tee is None:
+        print(text)
+        return
+    try:
+        tee._stream.write(text + "\n")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _console_quiet_for_prompt():
+    """Hold console log output for the duration of an interactive read.
+
+    Re-entrant-safe and never swallows the replay: the `finally` runs on
+    Ctrl+C and on EOF too, both of which callers here rely on propagating.
+    """
+    _CONSOLE_QUIET.set()
+    try:
+        yield
+    finally:
+        _CONSOLE_QUIET.clear()
+        with _CONSOLE_HELD_LOCK:
+            held, _CONSOLE_HELD[:] = list(_CONSOLE_HELD), []
+            dropped, _CONSOLE_HELD_DROPPED[0] = _CONSOLE_HELD_DROPPED[0], 0
+        if dropped:
+            _writer = next((t._writer for _x, t in held if t is not None), None)
+            _where = (f"all of them are in the session log {_writer.primary}"
+                      if _writer is not None else
+                      "this command keeps no session log, so they were not kept")
+            log(f"[console] {dropped} earlier line(s) arrived while the question "
+                f"was open and are not shown here — {_where}", "INFO")
+        for line, tee in held:
+            _console_replay(line, tee)
+
+
 def log(msg, level="INFO"):
     # ⭐ ONE strftime for both halves. The printed line's format is unchanged
     # byte-for-byte; the date is sliced off the same call rather than costing a
@@ -2191,10 +2388,13 @@ def log(msg, level="INFO"):
     ts = _stamp[11:]
     marker = _log_date_marker(_stamp[:10], ts)
     if marker:
-        print(marker)
+        _console_print(marker)
         _log_write_through(marker, "INFO")
     line = f"[{ts}] [{level}] {msg}"
-    print(line)
+    # ⛔⛔ EXCEPT A LINE OF A RUN THAT KEEPS NOTHING, which the console — i.e.
+    # the machine's `backend.log` — never sees. See `_console_withholds_line`.
+    if not _console_withholds_line():
+        _console_print(line)
     # ⭐ The printed format is byte-for-byte what it always was. The second
     # sink is the armed per-run folder — see `_log_write_through`, which is a
     # no-op when nothing is armed and can never recurse back through here.
@@ -2531,6 +2731,399 @@ def _resolve_run_submitter(tree_uid, claimed_by) -> "tuple[str | None, str]":
     return None, "disputed"
 
 
+def _owner_control_refused(data, where: str) -> bool:
+    """True when a queue doc names SOMEBODY ELSE'S run and its writer is not
+    the device owner. Logs the reason.
+
+    ⛔⛔ THE HOLE THIS CLOSES, FOUND 2026-09-21. The Firestore rule pinned
+    `submittedBy` — the field this listener does NOT act on — and left `uid`
+    free, which is the one it reads to decide whose tree to write into and
+    whose run to stop. The identity guard that would have caught the divergence
+    is scoped to `action == "start"`, below the line that skips every other
+    action. So one client write let any member of a shared computer cancel,
+    purge or force-resume another member's run, and the victim's chat said
+    "Stopped by the device owner" — false, and unattributed. A cancel carrying
+    `ownerControl` additionally sets `cancelled: True`, which drives the web's
+    delete-on-close cascade, so the research went with it.
+
+    ⭐ THE DIVERGENCE ITSELF IS A REAL FEATURE AND STAYS. It is exactly how the
+    owner's "Shared with" popup stops a sharer's run — the web writes
+    `uid=<sharer>, submittedBy=<owner>` on purpose. What changes is WHO may do
+    it: the paired owner of this machine, and nobody else.
+
+    ⭐⭐ AND IT IS HERE AS WELL AS IN THE RULES BECAUSE THE RULES DEPLOY
+    SEPARATELY FROM THE CODE. A rule is one command and a wheel is a release;
+    the two are never in step, and this listener is the thing that acts.
+
+    ⛔⛔ AND "ABSENT IS NOT DISAGREEING" DOES NOT HOLD HERE, which round two of
+    cross-verify executed against this listener: the disagreement below needs
+    BOTH fields, so a doc that carried another member's `uid` and simply left
+    `submittedBy` off disagreed with nobody and skipped the whole gate. It
+    resumed their run, merged the sender's config into their config.json and
+    wrote `{status: "stopped", cancelled: True}` into THEIR tree — worse than
+    the hole above, whose status write at least landed on the sender.
+
+    ⭐ REFUSING IT COSTS NOTHING, which is why the start guard's rule is not
+    copied here. `devices/{id}/queue` has required `submittedBy ==
+    request.auth.uid` on create since the collection existed (2026-05-20), and
+    every writer stamps it: the web's `buildQueuePayload` and
+    `ownerControlPipeline`, and the agent's start, resume and cancel. Nothing
+    else creates a document here — this machine consumes and deletes them, and
+    the phone only reads. So there is no legacy unsigned shape to keep working;
+    only the one shape no honest client writes.
+    """
+    # ⛔⛔ THE UNSIGNED DOC IS ANSWERED FIRST, because the disagreement cannot
+    # see it: it is a claim about a run with nobody behind it.
+    claimed = str((data or {}).get("submittedBy") or "").strip()
+    if not claimed:
+        unsigned = str((data or {}).get("uid") or "").strip()
+        if unsigned:
+            log(f"[{where}] refusing {(data or {}).get('action', '?')} — it names "
+                f"a run (uid={unsigned[:8]}…) and no writer at all; every client "
+                f"that may write this queue stamps submittedBy", "WARN")
+            return True
+    # ⭐ THE DISAGREEMENT IS DEFINED ONCE, and this reuses it rather than
+    # restating it — the file's own note beside that helper says why ("one
+    # definition, two claim sites"), and a second copy of the same two lines
+    # also made another harness's anchor match twice, which the sweep caught.
+    # What differs here is only WHO is allowed to disagree.
+    conflict = _start_doc_identity_conflict(data)
+    if conflict is None:
+        return False
+    uid, claimed = conflict
+    owner = ""
+    try:
+        owner = str(load_paired_uid() or "").strip()
+    except Exception:
+        owner = ""
+    if owner and claimed == owner:
+        return False
+    log(f"[{where}] refusing {(data or {}).get('action', '?')} — it names "
+        f"another person's run (uid={uid[:8]}…) and its writer "
+        f"(submittedBy={claimed[:8]}…) is not this machine's owner", "WARN")
+    return True
+
+
+def _refuse_owner_control(doc, data, where: str) -> bool:
+    """Refuse a cross-person queue doc: drop it and say so. True when refused.
+
+    ⛔⛔ THE WHOLE REFUSAL, NOT JUST THE VERDICT, and round three of cross-verify
+    is why. The two dispatch branches each carried their own copy of
+    `if _owner_control_refused(...): delete; continue`, and the tests pinned
+    them by searching the branch's parse tree for the NAME. I built the two
+    mutants myself and ran the suite's own logic against them: wrapping the call
+    as `if False and _owner_control_refused(...)` stayed green, and so did
+    keeping the call and replacing its body with a log — which is this wave's
+    founding defect, verbatim, back in the tree with every assertion passing.
+    A helper that performs the refusal can be EXECUTED against a fake document
+    and asked whether the delete actually fired.
+    """
+    if not _owner_control_refused(data, where):
+        return False
+    try:
+        doc.reference.delete()
+    except Exception:
+        pass
+    return True
+
+
+def _job_is_another_persons(job, target_uid: str) -> bool:
+    """Does this in-flight job belong to somebody other than the named person?
+
+    ⛔⛔ THE HALF THE IDENTITY GUARD CANNOT SEE, found by round three. Both
+    layers of the owner-control fix ask the same question — does `uid` disagree
+    with `submittedBy` — and neither asks whether the `researchId` belongs to
+    `uid`. So a member of a shared computer signs honestly as themselves and
+    names somebody else's run: no divergence, the rule passes, the machine's
+    guard passes, and the cancel handler matches its target on `research_id`
+    ALONE. It then requests a stop, touches `.stop` — which is permanent, and
+    as of this wave every later Resume is answered "This run was stopped for
+    good" — and schedules the exit. The status write lands in the ATTACKER's
+    own tree, so the victim is told nothing at all. The material is published:
+    `queueOwners` carries `{uid, runId}` and every sharer may read the device
+    document whole.
+
+    ⭐ THE JOB ITSELF CARRIES THE ANSWER. `_safe_enqueue` refuses anything with
+    no uid, so a running job always names its owner — this is a lookup, not a
+    round trip.
+
+    ⛔ ABSENT IS NOT DISAGREEING, the same rule the identity guards state: a job
+    dict with no uid is a shape from before that gate and is left alone.
+    """
+    owner = str((job or {}).get("uid") or "").strip()
+    wanted = str(target_uid or "").strip()
+    return bool(owner and wanted and owner != wanted)
+
+
+def _another_persons_run_locally(jobs, research_id: str, target_uid: str) -> bool:
+    """True when any job this process knows about for `research_id` is somebody
+    else's.
+
+    ⭐ ONE GATE, NOT FIVE. The cancel handler matches its target in five places
+    — the gate-pending job, the running job, both of their race re-checks, and
+    the deque scan — and a check added to some of them is not a check.
+
+    ⛔⛔ AND IT CANNOT SEE A RUN NOBODY HERE HOLDS, which this docstring used to
+    claim it could. A deferred run sits in Firestore unclaimed, so no local job
+    names it and this returns False — and on a multi-worker machine every
+    sibling that does not hold a job reaches the deferred path even when the
+    holder refuses. That path asks its own question, of the START doc's own
+    uid: `_deferred_start_doc_id`.
+    """
+    rid = str(research_id or "").strip()
+    if not rid:
+        return False
+    for j in jobs or ():
+        if str((j or {}).get("research_id") or "").strip() != rid:
+            continue
+        if _job_is_another_persons(j, target_uid):
+            return True
+    return False
+
+
+def _refuse_foreign_run(doc, jobs, research_id: str, target_uid: str,
+                        where: str, verb: str = "cancel") -> bool:
+    """Refuse a cancel or resume aimed at somebody else's run: drop it and say
+    so. `verb` only names the request in the log line.
+
+    ⛔⛔ A MUTANT SURVIVED THE FIRST VERSION OF THIS, and it is the same disease
+    the guard beside it was extracted to cure. The branch read
+    `if _another_persons_run_locally(...)` and the test asked whether that NAME
+    appeared in the branch and whether its line came before `request_stop`.
+    Wrapping the call as `if False and _another_persons_run_locally(...)` keeps
+    the name, keeps the line number and keeps the ordering — so the test passed
+    while the victim's run was stopped anyway. Name-presence in a parse tree is
+    not a measurement of what a branch DOES; that is the third time this wave
+    has paid for the lesson.
+
+    ⭐ SO THE REFUSAL IS PERFORMED HERE, where a test can hand it a fake
+    document and ask whether the delete actually fired — and the consumer is
+    pinned on its SHAPE (a bare call, a bare `continue`) rather than on the
+    words it contains.
+    """
+    if not _another_persons_run_locally(jobs, research_id, target_uid):
+        return False
+    log(f"[{where}] refusing {verb} of {str(research_id)[:8]}… — the run this "
+        f"names belongs to another person on this computer", "WARN")
+    try:
+        doc.reference.delete()
+    except Exception:
+        pass
+    return True
+
+
+def _jobs_held_locally(job_queue) -> list:
+    """Every job this process holds: the running one and the deque. Empty slots
+    come back as `{}`, which matches nothing.
+
+    ⛔ A THIRD SLOT LIVED HERE — `gate_pending_job`, the job a worker held while
+    it waited on the PREVIOUS run's cloud tail. That wait is gone (wave 10.9,
+    N8), and with it the only window in which a dequeued job was held by this
+    process and named by neither of the two slots left. The cancel gate that
+    reads this list has no ownership clause of its own, so a slot that still
+    existed and was not read here would be a run another member could stop —
+    which is why the slot is REMOVED rather than left reading `{}` for ever."""
+    jobs = [_QUEUE_STATE.get("current_job") or {}]
+    try:
+        jobs.extend(list(job_queue._queue))
+    except Exception:
+        pass
+    return jobs
+
+
+def _deferred_start_doc_id(docs, research_id: str, uid: str) -> "str | None":
+    """The id of the queued START doc a cancel may delete, or None.
+
+    ⛔⛔ FOUND 2026-09-21 (wave 10.9): THIS SCAN MATCHED ON `researchId` ALONE.
+    A deferred run is unclaimed by definition, so no worker holds it and the
+    local ownership gate has nothing to look at. A member who signed a cancel
+    honestly as themselves and named somebody else's research id — published on
+    the device document in `queueOwners` — deleted that person's start doc. The
+    status write then landed in the SENDER's tree, so the victim's tile sat on
+    "queued" with nothing behind it, and no one was told.
+
+    ⭐ THE START DOC CARRIES ITS OWNER, so the answer is on the document being
+    deleted. The owner's Stop on a sharer's queued run writes `uid=<sharer>` —
+    the same uid that sharer's start doc carries — so that path is unchanged.
+
+    ⛔ STRICT, NOT "ABSENT IS NOT DISAGREEING". A start doc with no uid never
+    runs (the start branch deletes it as missing a field), so refusing to match
+    it costs nothing; matching it would let anyone who knows the id delete it.
+    """
+    rid = str(research_id or "").strip()
+    who = str(uid or "").strip()
+    if not rid or not who:
+        return None
+    for snap in docs or ():
+        d = snap.to_dict() or {}
+        if (d.get("action") or "start") != "start":
+            continue
+        if str(d.get("researchId") or "").strip() != rid:
+            continue
+        if str(d.get("uid") or "").strip() != who:
+            log(f"Cancel: the queued start doc for {rid[:8]}… belongs to another "
+                f"person — leaving it", "WARN")
+            continue
+        return snap.id
+    return None
+
+
+def _owner_record_admits(owner, uid) -> bool:
+    """Does a run directory's `owner.json` leave THIS person free to act on it?
+
+    ⛔ ABSENT IS NOT DISAGREEING. `setup_firestore_run` writes both halves of
+    the record, so a record naming no uid is an older or hand-made shape and
+    decides nothing; a record naming somebody else decides everything.
+    """
+    recorded = str((owner or {}).get("uid") or "").strip()
+    return not recorded or recorded == str(uid or "").strip()
+
+
+def _run_dir_inside_queues(claimed_run_id) -> "Path | None":
+    """`queues/<claim>` when the claim is a plain NAME sitting directly inside
+    `queues/`, else None.
+
+    ⛔⛔ A RUN ID IS A NAME, AND IT WAS BEING USED AS A PATH (found by round two
+    of wave 10.9's cross-verify, executed both ways against the real listener).
+    Every ownership check here asks `queues/<claim>/owner.json` whose run it is,
+    and a directory with no readable record deliberately keeps its claim — so a
+    claim that is a PATH walked past all of it:
+
+      · `<somebody's run>/documents` is a real directory with no `owner.json` of
+        its own, so the claim was kept. The resume then merged the sender's
+        config into that folder, removed the `.pause` above it and enqueued the
+        remaining phases rooted inside somebody else's run.
+      · an ABSOLUTE claim leaves `queues/` altogether — `Path("/a") / "/b"` is
+        `/b` — so any directory this account can write became a run folder: its
+        `config.json` was merged over, its `.pause` unlinked, and `run_pipeline`
+        given it as the run directory.
+
+    ⭐ THE FILESYSTEM ANSWERS, NOT A SPELLING RULE. The separator test refuses
+    what a run id never contains — `safe_name` collapses both slashes into `_`,
+    so neither can reach a real one; the containment test asks where the join
+    actually LANDS, which is what settles `.`, `..`, a doubled separator, and a
+    symlink inside `queues/` pointing out of it. Neither needs the directory to
+    exist — a claim naming a run whose folder is gone is an ordinary "artifacts
+    gone" refusal further down, not an attack.
+
+    ⛔ AND NOT A DATE-SHAPED PATTERN, which is the tempting version of this and
+    is wrong: `safe_name` returns "" for a topic of pure punctuation, so a real
+    run id can be `_20260921_101500`, and a pattern insisting on a name before
+    the stamp would refuse its owner's own resume for ever.
+    """
+    claimed = str(claimed_run_id or "").strip()
+    if not claimed or "/" in claimed or "\\" in claimed:
+        return None
+    root = Path(__file__).parent / "queues"
+    candidate = root / claimed
+    try:
+        if candidate.resolve().parent != root.resolve():
+            return None
+    except (OSError, ValueError):
+        # An embedded NUL raises ValueError; a symlink loop raises OSError.
+        return None
+    return candidate
+
+
+def _corroborated_run_id(claimed_run_id: str, research_id: str, uid: str) -> str:
+    """A client-supplied `backendRunId`, kept only if the disk agrees it is this
+    research's run AND this person's. Returns "" when it cannot be corroborated
+    as belonging to them, which sends the caller to the research document
+    instead.
+
+    ⛔⛔ THE FIELD IS READ STRAIGHT OFF THE QUEUE DOCUMENT ON PURPOSE — that is
+    how a synth user who cannot read the research doc still resumes — so
+    nothing upstream checks that the run it names is the research it names.
+    Unchecked it resumes another person's run directory under this person's
+    research, clearing their `.no_auto_retry` and their `.pause` on the way.
+
+    ⛔⛔ AND MATCHING THE RESEARCH WAS HALF THE QUESTION (wave 10.9). Research
+    ids are not secret — `queueOwners` publishes them to every member — and the
+    rules let a member create a research document with ANY id in their own
+    tree. So "this run belongs to research X" proved nothing about the person
+    asking: a member named X, the research matched, and the remaining phases of
+    somebody else's run were written into the sender's tree, with `owner.json`
+    rewritten to them on the way. The record names the person too; ask it.
+
+    ⛔⛔ AND THE FIRST VERSION WAS AN `if` INSIDE THE LISTENER, WHICH A MUTANT
+    SURVIVED: `if False and backend_run_id:` left every name the test looked
+    for exactly where it was. Extracted, the decision can be EXECUTED against a
+    real directory — and the caller assigns from it unconditionally, so there
+    is no branch left to neuter.
+
+    ⭐ SILENCE FROM THE DISK IS NOT A REFUSAL. A directory with no readable
+    `owner.json` is the ordinary pre-owner.json shape and keeps its claim; only
+    a directory that positively names a DIFFERENT research or person loses it.
+
+    ⛔⛔ WHICH IS EXACTLY WHY THE CLAIM MUST BE A NAME FIRST. "Silence keeps the
+    claim" is safe for a run directory and catastrophic for a path: a claim of
+    `<somebody's run>/documents` or `/anywhere/at/all` is silent here because
+    there is no `owner.json` under it, and it was kept. `_run_dir_inside_queues`
+    is asked before the record is read, so both questions are asked of the same
+    directory and that directory is always one of ours.
+    """
+    claimed = str(claimed_run_id or "").strip()
+    rid = str(research_id or "").strip()
+    if not claimed:
+        return claimed
+    run_dir = _run_dir_inside_queues(claimed)
+    if run_dir is None:
+        log(f"Resume: run id {claimed[:60]!r} is not the name of a run "
+            f"directory on this computer — ignoring the claim", "WARN")
+        return ""
+    if not rid:
+        return claimed
+    try:
+        owner = json.loads((run_dir / "owner.json").read_text(encoding="utf-8"))
+    except Exception:
+        return claimed
+    owns = str((owner or {}).get("researchId") or "").strip()
+    if owns and owns != rid:
+        log(f"Resume: run {claimed} was named for {rid[:8]}… but that run "
+            f"belongs to {owns[:8]}… — ignoring the claim", "WARN")
+        return ""
+    if not _owner_record_admits(owner, uid):
+        log(f"Resume: run {claimed} was named for {rid[:8]}… but it belongs to "
+            f"another person on this computer — ignoring the claim", "WARN")
+        return ""
+    return claimed
+
+
+def _resume_run_id(data, uid: str, research_id: str) -> "tuple[str, dict | None]":
+    """Which run directory a Resume queue doc may act on: (run id, research doc).
+
+    Both places a run id can come from are the SENDER'S claims, and both are
+    corroborated against the disk for the person the doc names:
+      · the payload's `backendRunId`, read off the queue doc on purpose so a
+        synth user who cannot read the research doc still resumes;
+      · the research document's `backendRunId`, read only when the first is
+        absent or refused.
+    Returns ("", doc) when neither survives — the caller then asks the disk,
+    by owner, in `_run_dir_owning_research` — and ("", None) when the research
+    document does not exist. A failed read RAISES; that exit is transient and
+    the caller keeps it silent.
+
+    ⛔⛔ THE DOCUMENT IS A CLAIM TOO, and checking only the payload would have
+    moved the hole rather than closed it. The document sits in the sender's own
+    tree, which the rules let them create with any id and any field — so a
+    refused payload claim followed by an unchecked document field is the same
+    attack with one more write.
+
+    ⭐ ONE FUNCTION, ASSIGNED UNCONDITIONALLY, so the resume branch has no
+    condition of its own left to neuter and a test can hand this a queue doc
+    naming somebody else and read the answer.
+    """
+    claimed = _corroborated_run_id((data or {}).get("backendRunId"), research_id, uid)
+    if claimed:
+        return claimed, {}
+    snap = (_firebase_db.collection("users").document(uid)
+            .collection("researches").document(research_id).get())
+    if not snap.exists:
+        return "", None
+    rd = snap.to_dict() or {}
+    return _corroborated_run_id(rd.get("backendRunId"), research_id, uid), rd
+
+
 def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
     """(tree uid, pinned writer) when a queue START doc's two identities
     disagree, else None.
@@ -2551,12 +3144,231 @@ def _start_doc_identity_conflict(data) -> "tuple[str, str] | None":
     return None
 
 
+# ── A Resume we cannot take has to say so ──────────────────────────────────
+# ⛔⛔ MEASURED 2026-09-21. The resume handler has exactly ONE Firestore write
+# and it is on the success path. NINE other exits delete the queue entry and
+# write nothing, so the research document keeps whatever status put the Resume
+# banner on screen — which the web reads as a run that is paused but NOT over.
+# The web side closes the loop the wrong way round: `resumePipelineFromCheckpoint`
+# is a bare addDoc with no listener and no timeout, and the chat used to clear
+# its card the moment that write resolved. Four seconds later there was no
+# banner, no error and no button, on a request this process had already thrown
+# away.
+#
+# ⭐ ONLY THREE OF THE NINE GET A WRITE-BACK, and the line between them is
+# whether the person can do anything. The zombie and claim-error exits leave the
+# banner up with the artifacts intact and replay on the next restart — telling
+# somebody a run failed when it is about to be retried would be the next false
+# sentence. These three cannot be retried by anyone:
+#   · no backendRunId  — there is no run directory to point at;
+#   · queue_dir gone   — the 7-day sweep took the artifacts;
+#   · .stop present    — the run was terminally stopped.
+#
+# ⭐⭐ AND `paused_backend_restart_failed` COSTS NOTHING HERE, which is why this
+# needed no owner decision. That status is absent from `_safe_enqueue`'s
+# whitelist, so writing it permanently closes auto-resume for the run — a real
+# cost on a recoverable run, and none at all on these three, where every
+# re-enqueue path is already blocked: `.stop` is that funnel's FIRST gate, and
+# the other two have no artifacts to resume from. Blocking a resume that cannot
+# work is not a loss.
+RESUME_DROP_NO_RUN_ID = (
+    "This run has no saved checkpoint on the computer, so there is nothing to "
+    "pick up from. Start it again to run it fresh."
+)
+RESUME_DROP_ARTIFACTS_GONE = (
+    "The saved files for this run have been cleared from the computer, so it "
+    "can't be picked up from where it stopped. Start it again to run it fresh."
+)
+RESUME_DROP_TERMINALLY_STOPPED = (
+    "This run was stopped for good, so it can't be resumed. Start it again to "
+    "run it fresh."
+)
+
+
+RESUME_DROP_WENT_STALE = (
+    "Your earlier Resume sat waiting for more than 12 hours because Super "
+    "Research wasn't running on the computer, so it was dropped. The run's "
+    "files are still there — start the app and tap Resume again."
+)
+
+
+# The statuses that mean the run is OVER. Read by `_research_is_terminal` AND
+# by the start listener's pre-claim gate — which used to keep its own copy of
+# these five words — and mirrors the web's `TERMINAL_RUN_STATUSES`; a run in
+# this set may gain a sentence but must never be moved out of it.
+TERMINAL_RESEARCH_STATUSES = (
+    "stopped", "completed", "archived",
+    "terminated_by_user_discard", "stopped_by_watchdog",
+)
+
+
+def _resume_drop_writeback(uid: str, research_id: str, reason: str,
+                           status: "str | None" = "paused_backend_restart_failed") -> bool:
+    """Record that a Resume was received and cannot be honoured.
+
+    ⛔⛔ AND IT NEVER MOVES A RUN OUT OF A TERMINAL STATUS. Cross-verify caught
+    this before the push and it is the nastiest shape in the wave: the recovery
+    card offers Resume for all four statuses INCLUDING the two terminal ones, so
+    pressing it on a watchdog-stopped or discarded run reaches these branches —
+    and a blind write of `paused_backend_restart_failed` silently demotes a
+    finished run to a non-terminal one. `paused_backend_restart_failed` is
+    deliberately absent from the web's `TERMINAL_RUN_STATUSES`, so the listing
+    page recomputes `isActivePipeline` as true and puts Stop and Pause back on a
+    run that ended hours ago — the exact wave-10.7 defect, reopened for the runs
+    this card serves, and pressing Stop there overwrites the record permanently.
+    A terminal run gets the SENTENCE and keeps its status.
+
+    ⭐ THE STATUS IS THE ONE THE WEB ALREADY DRAWS. `paused_backend_restart_failed`
+    has a card, and as of wave 10.8 that card renders `lastError` in place of its
+    generic line — so the sentence passed here is what the person reads. Nothing
+    new had to be added to the status union, and no surface had to learn a word.
+
+    ⛔⛔ `status=None` MEANS LEAVE IT ALONE, AND ONE CALLER NEEDS THAT. The
+    12-hour abandoned sweep drops a resume request whose artifacts are still on
+    disk — nothing has swept them at twelve hours, the 7-day sweep does that —
+    so the run really is still resumable and stamping the failed status would
+    close auto-resume on a run that can be picked up. That caller writes the
+    sentence and nothing else: the banner stays, still offering Resume, and now
+    says why the last one went nowhere.
+
+    Returns whatever the write returned; the caller deletes the queue entry
+    either way, because a queue document we cannot act on must not be left to
+    be re-read on the next snapshot.
+    """
+    if not uid or not research_id:
+        return False
+    # ⛔⛔ ITS OWN FIELD, AND ROUND TWO OF CROSS-VERIFY IS WHY. Round one found
+    # a stale `lastError` — three writers, no deleter — speaking for statuses it
+    # was never written about, so the card was scoped to read it for one status
+    # only. That scoping collided with the terminal guard above: on the two
+    # TERMINAL recovery statuses the status is deliberately not moved, so the
+    # reason landed in a field the card would not read, the card could not
+    # change, and the chat's 45-second fallback then stamped "your computer
+    # didn't pick this up" over a refusal that can never change — FROZEN there,
+    # beside a Resume that cannot work. Three repairs cancelling each other, and
+    # worse than what they replaced.
+    #
+    # ⭐ A DEDICATED FIELD BREAKS THE KNOT. `resumeDropReason` is written by
+    # exactly one function — this one — and means one thing: "the Resume you
+    # just pressed could not be taken, and here is why." The card prefers it for
+    # EVERY recovery status and never reads `lastError` at all, so the stale
+    # field stops mattering without needing a deleter. `resumeDropAt` is what
+    # lets a reader tell this refusal from an older one.
+    updates: dict = {
+        "lastError": reason,
+        "resumeDropReason": reason,
+        "resumeDropAt": int(time.time() * 1000),
+    }
+    if status and not _research_is_terminal(uid, research_id):
+        updates["status"] = status
+    return _update_research_doc(uid, research_id, updates)
+
+
+def _run_dir_owning_research(research_id: str, uid: str):
+    """The queue directory whose `owner.json` names this research AND this
+    person, if any.
+
+    ⭐ THE DISK IS THE SECOND OPINION. A research document with no
+    `backendRunId` may still have a real run directory — the write-back of that
+    field can fail while the run proceeds — and the difference decides whether
+    a Resume refusal is permanent or merely confused.
+
+    ⛔⛔ AND IT IS ASKED ABOUT A PERSON, NOT ONLY A RESEARCH (wave 10.9). A
+    member could create a research document in their own tree under somebody
+    else's published research id, leave `backendRunId` off it, and press
+    Resume: this lookup found the other person's directory, the caller
+    "repaired" the sender's document with it and resumed it into their tree.
+    A directory naming somebody else is skipped, not refused — the loop goes on
+    looking for one that is this person's.
+    """
+    rid = str(research_id or "").strip()
+    if not rid:
+        return None
+    root = Path(__file__).parent / "queues"
+    try:
+        entries = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return None
+    for d in entries:
+        # ⛔ A LISTING IS A CLAIM TOO, once anything in it is a symlink.
+        # `is_dir()` follows one, so a link in `queues/` pointing anywhere on
+        # the disk would be handed back as a run directory to resume into.
+        if _run_dir_inside_queues(d.name) is None:
+            continue
+        try:
+            owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if (str(owner.get("researchId") or "").strip() == rid
+                and _owner_record_admits(owner, uid)):
+            return d
+    return None
+
+
+def _research_is_terminal(uid: str, research_id: str, *, on_error: bool = True) -> bool:
+    """Is this run already over, according to the document?
+
+    ⛔⛔ THE FAILURE DIRECTION IS THE CALLER'S TO CHOOSE, and round two of
+    cross-verify is why. The first version always failed CLOSED — an unreadable
+    document read as terminal — reasoning that the worst case is a sentence
+    written without a status change. That is true at `_resume_drop_writeback`
+    and INVERTED at `run_pipeline`'s stop exit, where this guard suppresses the
+    ONLY terminal status that exit writes: one failed read there leaves a run
+    the person stopped sitting `ongoing` for ever, with Stop and Pause live on
+    it, and the process calls `os._exit(0)` three seconds later so nothing
+    corrects it. Reachable from the local HTTP /stop endpoint, which closes the
+    browser inline and writes no status of its own.
+
+    ⭐ So: True at the write-back (a sentence without a status change costs
+    little), False at the stop exit (overwriting a status we could not read
+    beats leaving a finished run active).
+    """
+    if not _firebase_db:
+        return on_error
+    try:
+        snap = (_firebase_db.collection("users").document(uid)
+                .collection("researches").document(research_id).get())
+    except Exception as _tr_err:
+        log(f"[terminal-check] read failed for {research_id[:8]}… "
+            f"({_tr_err}) — assuming terminal={on_error}", "DEBUG")
+        return on_error
+    if not snap.exists:
+        return on_error
+    return (snap.to_dict() or {}).get("status") in TERMINAL_RESEARCH_STATUSES
+
+
 def _start_doc_identity_refused(data, where: str) -> bool:
     """True when this START doc must not be claimed. Logs the reason.
 
     ⭐ THE DECISION AND ITS SENTENCE TOGETHER, because the two claim sites had
     begun to carry a copy of each. A refusal whose message is written twice
-    drifts, and the drifted one is always the path nobody exercises."""
+    drifts, and the drifted one is always the path nobody exercises.
+
+    ⛔⛔ A START DOC THAT NAMES A TREE AND NO WRITER IS REFUSED TOO, and the
+    reason is the same one the owner-control gate learned in round two: the
+    disagreement below needs BOTH identity fields, so writing LESS skipped the
+    whole check. On start that buys a paid run inside somebody else's account —
+    their reports, their billing, their tile — and the sentence "a member
+    started it" would be unattributable, because `_resolve_run_submitter` reads
+    exactly the field that was left off.
+
+    ⭐ AN UNNAMED doc is a different shape and still runs. `uid` absent is the
+    legacy/pre-Wave-8 document this listener has always accepted; it ends up
+    `unclaimed`, which is honest. What is refused is naming a person's tree
+    while refusing to say who asked.
+
+    ⭐⭐ COSTS NOTHING TODAY: `devices/{id}/queue` has required
+    `submittedBy == request.auth.uid` on create since the collection was made,
+    and every writer (the web's queue payload and owner-control path, the
+    agent's REST start/resume/cancel) stamps it. This is the half that keeps
+    being true while the rules are stale, which this project has shipped."""
+    if not str((data or {}).get("submittedBy") or "").strip():
+        unsigned = str((data or {}).get("uid") or "").strip()
+        if unsigned:
+            log(f"[{where}] refusing start — it names a tree "
+                f"(uid={unsigned[:8]}…) and no writer at all; every client that "
+                f"may write this queue stamps submittedBy", "WARN")
+            return True
     conflict = _start_doc_identity_conflict(data)
     if conflict is None:
         return False
@@ -2599,7 +3411,8 @@ class _RunLogSink:
             "attempt": self.attempt,
             "pid": os.getpid(),
             "worker": WORKER_ID,
-            "build": _sr_version(),
+            # The code that RAN this research, not the dist-info on disk.
+            "build": _sr_build_label(),
             "platform": sys.platform,
             "startedUtc": self.started_utc,
             # ⭐ WHO FIRED THIS RUN — and, since Wave 8, whose support bundle
@@ -2698,11 +3511,26 @@ _RUN_LOG_TLS = _log_threading.local()
 # device-command listener (a hard reset is why the run died), and the worker
 # watchdog. Silence about why a run ended is the failure this whole capture
 # exists to prevent.
+#
+# ⭐ AND THE OWNER'S LOG GETS THEM TOO, WITH NO MARKING (wave 10.10, on the
+# origin rule of 10.9's last repair). None of the four is a run's work — the
+# server starts the two loops, the SDK's own thread runs the device-command
+# callback, and the watchdog's verdict is written by the worker outside the
+# pipeline's task — so their lines carry no run origin, and
+# `_console_withholds_line` never holds back a line with no origin, even while
+# a private run is armed. They name a run, if at all, by its research-id prefix
+# or its queue folder name, which for a private run is minted without the
+# topic. Held by tests/test_owner_log_lines_1010.py, each loop executed.
 import contextvars as _log_contextvars  # noqa: E402
 import contextlib as _log_contextlib  # noqa: E402
 
 _LOG_SCOPE_MACHINE = "machine"
 _LOG_SCOPE = _log_contextvars.ContextVar("sr_log_scope", default="")
+#: The research a line is written FOR — its origin, not whatever run is armed
+#: when it is written. Set by `run_pipeline_captured` around the pipeline, and
+#: carried by every task and `to_thread` hop the pipeline makes, because a
+#: context goes wherever its work goes. See `_console_withholds_line`.
+_LOG_RUN = _log_contextvars.ContextVar("sr_log_run", default=None)
 
 
 @_log_contextlib.contextmanager
@@ -2803,6 +3631,83 @@ def _run_submitted_by() -> "str | None":
     return getattr(sink, "claimed_by", None) if sink is not None else None
 
 
+def _console_withholds_line() -> bool:
+    """True when the line `log()` is writing belongs to a run that keeps nothing
+    — so it goes to that run's own folder and never to the console.
+
+    ⛔⛔ THE CONSOLE IS `backend.log`, AND IT IS THE MACHINE OWNER'S (wave 10.9
+    repair). Every worker's stdout is appended to it, its tail rides the owner's
+    support bundle, it is never cleaned by a run ending, and on a shared
+    computer it holds every member's runs. Every line a run writes was printed
+    there as well as into the run's folder — and only the folder is removed
+    when a run that keeps nothing ends. Those lines carry the run: the topic
+    words its checks compare against, the feedback a person typed at the brief
+    gate, what the agents' pages said to the CUA. Hunting them one call site at
+    a time would miss the next one somebody writes, so the decision is made
+    once, here.
+
+    ⛔⛔ DECIDED BY THE LINE'S ORIGIN — `_LOG_RUN` — AND NEVER BY WHAT IS ARMED
+    WHEN IT IS WRITTEN (wave 10.9, last repair). The first version asked the
+    armed sink and the pipeline's `_fb_research_id`, i.e. which run was running
+    NOW, and a write-time question has three wrong answers: an ordinary run's
+    late hand-off lines were swallowed because the NEXT run was private; the
+    owner's alarms — the relink notice before the process exits, Reset
+    Backend's record of stopping other members' jobs, the outage notices — went
+    only into a private run's folder, which leaves with it; and a teardown that
+    raised left `_fb_research_id` naming a finished run, silencing the machine
+    for hours. The origin is set where the run's work begins and travels with
+    that work through every task and `to_thread` hop, so a line knows whose it
+    is wherever it lands. A line with no run origin — a loop the server
+    started, an SDK callback, a raw thread — is the machine's, and prints.
+
+    ⭐ The machine scope still wins: a line inside it is never the run's, even
+    when the run's own call stack wrote it.
+
+    ⛔ AN ABSENT ID IS NEVER ASKED ABOUT. This runs for every line the process
+    writes, from inside every exception handler in the file; the predicate is
+    only handed an id that exists, so no answer about "no run" can ever make
+    `log()` itself raise."""
+    about_the_run = _LOG_SCOPE.get() != _LOG_SCOPE_MACHINE
+    origin = _LOG_RUN.get()
+    return about_the_run and bool(origin) and _is_incognito_research(origin)
+
+
+def _line_is_another_runs(sink) -> bool:
+    """True when the line being written came from a run OTHER than the one
+    whose folder is armed — so the folder must not get it.
+
+    ⛔⛔ THE FOLDER WAS STILL DECIDED AT WRITE TIME (wave 10.10). Wave 10.9's
+    last repair taught the console to ask a line's ORIGIN, but the folder copy
+    kept asking only "what is armed now". A private run's work that outlives
+    the run — a `to_thread` worker still inside a fetch, a copied-context
+    thread, a task nobody awaited — then wrote into the NEXT run's folder
+    while it stayed out of `backend.log`, and that folder ships in the next
+    person's support bundle. A verifier measured exactly that.
+
+    The four cases, decided:
+      · SAME origin as the folder's research → the run's own line: kept.
+      · a DIFFERENT origin → somebody else's line: not this folder's.
+      · NO origin → the machine's or the server's (a loop the server started,
+        an SDK callback, a raw thread) → kept, UNCHANGED. The per-run command
+        listener's `Command received: STOP` and the reap after it run on a
+        thread no context reaches, and they are the only account some runs
+        have of how they ended — see the comment above `_LOG_SCOPE`. Those
+        lines print to `backend.log` too; nothing about them is private.
+      · an origin, and a folder whose research is UNKNOWN → not kept. The line
+        is known to be one run's, and a folder that cannot say it is that
+        run's does not get it. A run whose own id is unknown sets no origin
+        (`run_pipeline_captured` sets exactly the id it armed the folder
+        with), so no run ever loses its own lines to this branch.
+
+    ⭐ Compared as stripped strings, the way `_run_folders_for_research_any`
+    matches a folder to a research."""
+    origin = str(_LOG_RUN.get() or "").strip()
+    if not origin:
+        return False
+    armed = str(getattr(sink, "research_id", None) or "").strip()
+    return origin != armed
+
+
 def _log_write_through(line: str, level: str) -> None:
     """Copy one already-formatted `log()` line into the armed run folder.
 
@@ -2810,16 +3715,19 @@ def _log_write_through(line: str, level: str) -> None:
     through `log()`, and a background thread's line must not be silenced just
     because the pipeline thread happens to be mid-write.
 
-    ⭐ THE ONE EXCLUSION IS EXPLICIT. Everything still reaches the armed run
+    ⭐ TWO EXCLUSIONS, BOTH EXPLICIT. Everything still reaches the armed run
     except what a standing machine-concern loop deliberately wrapped — see
     `_machine_log_scope`, and the list of loops that are NOT wrapped, which is
-    the more important half."""
+    the more important half — and a line whose origin is ANOTHER run; see
+    `_line_is_another_runs`."""
     if _LOG_SCOPE.get() == _LOG_SCOPE_MACHINE:
         return
     if getattr(_RUN_LOG_TLS, "busy", False):
         return
     sink = _RUN_LOG_SINKS[-1] if _RUN_LOG_SINKS else None
     if sink is None:
+        return
+    if _line_is_another_runs(sink):
         return
     _RUN_LOG_TLS.busy = True
     try:
@@ -2828,6 +3736,125 @@ def _log_write_through(line: str, level: str) -> None:
         pass
     finally:
         _RUN_LOG_TLS.busy = False
+
+
+CLOUD_HANDOFF_FILENAME = "handoff.log"
+
+
+def _run_folders_for_research_any(research_id, root=None) -> "list[Path]":
+    """Every run-log folder for one research — LIVE ONES INCLUDED.
+
+    ⛔⛔ DELIBERATELY NOT `_run_log_folders_for_research`. That one is the
+    DELETE path's resolver and skips any folder a sink is currently armed on,
+    which is exactly right for a sweep and exactly wrong here: the P4/P5 drive
+    starts while the pipeline is still finishing, so its first line can arrive
+    before the seal. Reusing the sweep's resolver would silently drop that line
+    and leave the harder case — the one we are here to fix — looking fixed.
+
+    Matched on `meta.json`'s researchId, never on the folder name, for the same
+    reason the sweep does: the name is sanitised and two researches can share a
+    prefix.
+    """
+    out: "list[Path]" = []
+    rid = str(research_id or "").strip()
+    if not rid:
+        return out
+    base = Path(root) if root is not None else _runs_log_root()
+    try:
+        folders = [p for p in base.iterdir() if p.is_dir()]
+    except OSError:
+        return out
+    for folder in folders:
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(meta.get("researchId") or "").strip() == rid:
+            out.append(folder)
+    out.sort(key=_safe_mtime)
+    return out
+
+
+def _cloud_catchup_clause(research_id) -> str:
+    """What re-drives a run whose cloud hand-off did not land — one clause, for
+    every outcome sentence this file writes about it.
+
+    ⛔⛔ "OPENING THE CHAT ASKS THE ROUTE AGAIN" IS FALSE FOR A RUN THAT KEEPS
+    NOTHING (wave 10.9, #536-C11). That re-drive needs somebody to REOPEN the
+    research, and an incognito chat is in no list — there is nothing to reopen,
+    so a closed tab is the end of it. This file is the run's own permanent
+    account and it rides the support bundle; a lying diagnostic here is the
+    failure `_note_cloud_handoff` was added to stop — "never reached the cloud"
+    written onto runs that succeeded — arriving one wave later in a new sentence.
+
+    ⛔ IT DESCRIBES THE MACHINE'S SIDE AND PROMISES NOTHING ELSE. What becomes
+    of the record, and by when, is the app's sentence to write in the commit
+    that makes it true (wave 6's rule)."""
+    if _is_incognito_research(research_id):
+        return ("nothing here can ask the route again — a run that keeps nothing "
+                "has no chat to reopen")
+    return "opening the chat asks the route again"
+
+
+def _note_cloud_handoff(research_id, line: str) -> bool:
+    """Put one line about the P4/P5 hand-off into THAT run's own folder.
+
+    ⛔⛔ WHY THIS EXISTS, MEASURED ON A REAL DISK. `log()` copies into
+    `_RUN_LOG_SINKS[-1]` — a module-global stack, read at WRITE time. The drive
+    thread posts to `/api/uploadYouTube` with a 3600s timeout and writes its
+    outcome minutes later, by which point the pipeline's sink has been popped.
+    Across all three run folders on this machine the drive's own outcome strings
+    appear ZERO times, while the synchronous marker line written one second
+    earlier — same run, same function, worker thread — is there. And if the NEXT
+    run has armed a sink by then, the line lands in that run's folder and ships
+    in that person's support bundle.
+
+    ⭐ SO THE FOLDER IS ADDRESSED BY `researchId`, NEVER BY "whatever is armed".
+    Writing into a SEALED folder is already the pattern here twice —
+    `_patch_run_log_status` reaches into a finalized meta, `_pull_cloud_logs`
+    drops `cloud.log` into a finished run — so this is a third use of a shape
+    the collector already walks: `folder.rglob("*")` picks it up with no bundle
+    change at all.
+
+    ⛔ AND IT IS AN APPEND TO ITS OWN FILE, not to `run.log`. `finalize()`
+    closes the capped writer, and `write_line` on a closed writer is a silent
+    no-op — a line written there after the seal would be lost exactly when it
+    matters most.
+    """
+    rid = str(research_id or "").strip()
+    if not rid or not line:
+        return False
+    try:
+        folders = _run_folders_for_research_any(rid)
+    except Exception:
+        return False
+    if not folders:
+        return False
+    stamped = f"[{datetime.now().strftime('%H:%M:%S')}] {line}\n"
+    wrote = False
+    for folder in folders[-1:]:
+        try:
+            # ⛔ NEVER `mkdir` HERE. Clear Logs and the orphan sweep can remove
+            # the folder between the listing above and this write, and
+            # re-creating it would leave a directory holding one line and no
+            # meta — a shape the next sweep cannot identify and the bundle
+            # index cannot describe. `_pull_cloud_logs` takes the same care and
+            # says so.
+            #
+            # ⚠ THE RE-CHECK IS HYGIENE, NOT THE GUARD, and a mutant made me
+            # say so properly: `open(..., "a")` does not create parent
+            # directories, so removing this line changes nothing but a DEBUG
+            # log. The thing that must stay true is the ABSENCE of a mkdir, and
+            # that is what the test pins.
+            if not folder.is_dir():
+                continue
+            with open(folder / CLOUD_HANDOFF_FILENAME, "a", encoding="utf-8") as fh:
+                fh.write(stamped)
+            wrote = True
+        except Exception as _hf_err:
+            log(f"[handoff-log] could not record for {rid[:8]}… (non-fatal): {_hf_err}",
+                "DEBUG")
+    return wrote
 
 
 def _run_log_folder_name(research_id, started_utc, attempt=0) -> str:
@@ -2962,6 +3989,31 @@ def _queue_owner_map(queues_root=None) -> "dict[str, str]":
     return out
 
 
+def _queue_dir_owner_map(queues_root=None) -> "dict[str, str]":
+    """queue directory NAME → uid, from the same `owner.json` as above.
+
+    ⭐ Keyed by the directory, not the research, because that is the form a log
+    line carries it in: `queues/<topic-slug>_<ts>` and `run_id=<topic-slug>_<ts>`.
+    The support bundle's redactor asks one question of it — is this queue the
+    kept person's? — and a directory with no readable owner is NOT, so a swept
+    queue loses its topic slug rather than keeping it on a guess."""
+    out: "dict[str, str]" = {}
+    base = Path(queues_root) if queues_root is not None else (Path(__file__).parent / "queues")
+    try:
+        entries = [d for d in base.iterdir() if d.is_dir()]
+    except OSError:
+        return out
+    for d in entries:
+        try:
+            owner = json.loads((d / "owner.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        uid = str(owner.get("uid") or "").strip() if isinstance(owner, dict) else ""
+        if uid:
+            out[d.name] = uid
+    return out
+
+
 def _render_cloud_log(docs) -> str:
     """Turn the cloud's captured records into one file for the run folder.
 
@@ -3059,6 +4111,171 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
             continue
         out.append(folder)
     return out
+
+
+#: Delivery statuses that mean this machine is finished with a run.
+#:
+#: ⛔⛔ DELIBERATELY NOT "paused" AND NOT A CRASH. Both of those leave a Retry or
+#: a Resume on offer, and both need the on-disk checkpoint to take it. `ongoing`
+#: is a run still executing. Only these two say nobody here is coming back.
+_RUN_DELIVERY_OVER = frozenset({"completed", "stopped"})
+
+
+#: How long after a run last wrote its `delivery.json` the orphan sweep keeps
+#: asking about it on every tick (five minutes) instead of hourly.
+#:
+#: ⛔⛔ A DAY, NOT "ALWAYS", AND NOT "SINCE THIS PROCESS FIRST SAW IT". The hour
+#: exists because the sweep once billed a read per finished folder per tick for
+#: ever — 288 reads a day for one old run. A research is almost always deleted
+#: in the day it ran, while somebody is still looking at it, so that day is
+#: where five minutes is worth paying for; after it the hour comes back. Keyed on
+#: the FILE's time because a process-local "first seen" would start every folder
+#: on the disk over again after each restart and bring the old read bill back.
+_ORPHAN_RECENT_WINDOW_SEC = 24 * 60 * 60
+
+
+def _orphan_recheck_due(last_verified_at, now: float, research_id,
+                        recheck_sec: float, last_write_at=None) -> bool:
+    """Should the orphan sweep ask Firestore about this run directory again?
+
+    ⛔⛔ A DELETED RESEARCH SAT ON THIS DISK FOR UP TO AN HOUR (wave 10.10).
+    The hourly memo below covered every ordinary folder, including the one a
+    person had just deleted in the app — so its queue folder and its logs stayed
+    here for up to about sixty-five minutes. `last_write_at` (the folder's
+    `delivery.json` modified time) now splits the folders in two: one whose run
+    wrote within `_ORPHAN_RECENT_WINDOW_SEC` is asked about on every tick, and
+    one older than that keeps the hour. "Within" counts both ways, so a file
+    stamped ahead by a clock that moved is recent for at most a day and can
+    never be recent for ever. An unknown time (`None`) is the old tier: the read
+    bill is the thing this memo exists to hold down.
+
+    ⛔⛔ THE MEMO WAS WORTH AN HOUR OF LATENCY AND IS NOT WORTH IT HERE. It exists
+    because the sweep billed one read per finished directory every five minutes,
+    for ever — 288 reads a day for one old run, always answering "still there".
+    Its stated cost was a deleted research surviving up to an hour on local disk
+    instead of up to five minutes, "latency on a cleanup path with no
+    user-visible surface". For a run that keeps nothing that sentence stops
+    being true: the surface is a promise the app has already made, and the
+    folder holds the documents, the delivery record and the topic.
+
+    ⭐ THE EXTRA READS ARE BOUNDED BY WHAT THE PURGE REFUSED. A finished
+    incognito run removes its own folders on the way out
+    (`_purge_incognito_run_dirs`), so what still reaches the sweep is the crash,
+    the pause and the machine that died — and each of those is gone the first
+    time the sweep finds its record missing.
+
+    ⛔ EXTRACTED FROM `_orphan_sweep_loop`, a closure inside `run_server` that
+    no test could call — so the CALL SITE is pinned by rebuilding that closure."""
+    if (last_write_at is not None
+            and abs(float(now) - float(last_write_at)) < _ORPHAN_RECENT_WINDOW_SEC):
+        return True
+    if _is_incognito_research(research_id):
+        return True
+    return (float(now) - float(last_verified_at or 0.0)) >= float(recheck_sec)
+
+
+def _queue_dir_research_id(queue_dir) -> str:
+    """Whose research a run FOLDER is, read from the `owner.json` beside its
+    checkpoint — `""` when the folder cannot say.
+
+    ⛔⛔ THE CALLER DOES NOT ALWAYS KNOW (wave 10.9 repair). `superresearch
+    --resume queues/<run>` hands the pipeline a directory and nothing else, so
+    the wrapper's capture key binds no research id at all and every gate that
+    asks "is this a run that keeps nothing?" answers no. The purge then refused
+    at its first line, and a run that ENDED on that resume left its documents,
+    its delivery record and its topic on the computer until the orphan sweep
+    noticed the record was gone.
+
+    ⭐ `owner.json` IS THE ANSWER ALREADY IN USE — by the resume's own ownership
+    check and by `_queue_owner_map` — because it is the one place on this disk
+    where a run folder sits beside the person and the research it belongs to.
+    The folder NAME is never used for this: it is sanitised, and for an
+    incognito run it deliberately carries no topic at all.
+
+    ⛔ NO RECORD, NO CLAIM. An absent or unreadable `owner.json` answers `""`,
+    and a caller must read that as "leave it alone" — removing a directory on a
+    guess is how somebody else's unfinished work disappears."""
+    if not queue_dir:
+        return ""
+    try:
+        owner = json.loads(
+            (Path(queue_dir) / "owner.json").read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str((owner or {}).get("researchId") or "").strip()
+
+
+def _purge_incognito_run_dirs(queue_dir, research_id) -> bool:
+    """Take a finished incognito run's folders off this disk, now.
+
+    ⛔⛔ THE SWEEP IS NOT FAST ENOUGH TO BE THE ANSWER. `_orphan_sweep_loop`
+    removes a queue directory only once its research is GONE from Firestore, and
+    it memoises a research it has seen for an hour — so a run folder holding the
+    documents, the delivery record and the topic could sit here for about
+    sixty-five minutes after the run ended. "Nothing stays once the run ends" is
+    a sentence about this disk too, and it has to be true the moment it is said.
+
+    ⛔ BUT ONLY WHEN NOBODY HERE IS COMING BACK — `_RUN_DELIVERY_OVER`. A crash
+    card offers Retry and a login interrupt offers Resume, and both resume from
+    the checkpoint inside this very directory; deleting it would turn a
+    recoverable paid run into a lost one. Those are left to the sweep, which for
+    an incognito folder now re-checks on every tick instead of hourly.
+
+    ⭐ THE LOG FOLDER GOES TOO, and by `meta.json`'s researchId rather than by
+    name — the same rule the orphan sweep uses, for the same reason: the folder
+    name is sanitised, so a prefix match would either miss it or take somebody
+    else's diagnostics.
+
+    ⭐ AND IT ASKS THE FOLDER WHEN THE CALLER SAID NOTHING — `--resume` names a
+    directory and no research at all. The folder's own `owner.json` answers;
+    a caller that DID name a research is never second-guessed, so a stale record
+    beside an ordinary run cannot turn its folder into an ephemeral one.
+
+    Returns True when anything was removed. Never raises: this runs on the way
+    out of a pipeline, and a cleanup that can end a run is worse than a leftover
+    directory."""
+    queue_dir = Path(queue_dir) if queue_dir else None
+    if not research_id:
+        research_id = _queue_dir_research_id(queue_dir)
+    if not _is_incognito_research(research_id):
+        return False
+    import shutil as _shutil
+    try:
+        status = json.loads(
+            (queue_dir / "delivery.json").read_text(encoding="utf-8")).get("status", "")
+    except Exception:
+        # ⛔ UNREADABLE MEANS LEAVE IT. A missing or broken delivery.json is the
+        # shape a run that died mid-construction has, and that run may still be
+        # recoverable — the orphan sweep's own defensive default, kept here.
+        return False
+    if status not in _RUN_DELIVERY_OVER:
+        return False
+    # ⛔ THE LOG FOLDERS ARE RESOLVED BEFORE THE QUEUE DIRECTORY GOES. If this
+    # process dies between the two removals, a queue dir already deleted leaves
+    # the log folders with no attribution key at all — the orphan sweep makes
+    # the same ordering argument for the same reason.
+    try:
+        log_folders = _run_log_folders_for_research(research_id)
+    except Exception as exc:
+        log(f"[incognito] log-folder lookup failed for {research_id[:8]}…: {exc}", "WARN")
+        log_folders = []
+    removed = False
+    try:
+        if queue_dir is not None and queue_dir.exists():
+            _shutil.rmtree(queue_dir)
+            removed = True
+    except Exception as exc:
+        log(f"[incognito] could not remove {queue_dir}: {exc}", "WARN")
+    for folder in log_folders:
+        try:
+            _shutil.rmtree(folder)
+            removed = True
+        except Exception as exc:
+            log(f"[incognito] could not remove {folder.name}: {exc}", "WARN")
+    if removed:
+        log(f"[incognito] {research_id[:8]}… ended — its run folder and "
+            f"{len(log_folders)} log folder(s) removed from this computer", "INFO")
+    return removed
 
 
 _MAINT_TASKS: "set" = set()
@@ -3398,12 +4615,13 @@ class _RunLogCapture:
                 f"attempt={self.attempt} "
                 f"parentResearchId={parent.research_id if parent is not None else None}")
             sink.writer.write_line(
-                f"build={_sr_version()} pid={os.getpid()} worker={WORKER_ID} "
+                f"build={_sr_build_label()} pid={os.getpid()} worker={WORKER_ID} "
                 f"python={sys.version.split()[0]} platform={sys.platform}")
             _RUN_LOG_SINKS.append(sink)
             self.sink = sink
             tm.tm_emit(tm.Ev.RUN_STARTED,
-                       research_id=self.research_id, worker=WORKER_ID)
+                       research_id=_tm_research_id(self.research_id),
+                       worker=WORKER_ID)
         except Exception as exc:
             self.sink = None
             log(f"[run-log] capture unavailable for this run: {exc}", "WARN")
@@ -3436,7 +4654,7 @@ class _RunLogCapture:
             # EVERY run's terminal state, including the ones that die by
             # exception, and it already has the id and the duration.
             tm.tm_emit(tm.Ev.RUN_FINISHED,
-                       research_id=sink.research_id,
+                       research_id=_tm_research_id(sink.research_id),
                        outcome={"complete": tm.RunOutcome.COMPLETE,
                                 "errored": tm.RunOutcome.ERRORED,
                                 "cancelled": tm.RunOutcome.STOPPED,
@@ -3598,7 +4816,7 @@ def _install_session_tee(command: str):
             keep=RUN_LOG_OVERFLOW_KEEP)
         writer.write_line(f"=== super research session: {command} ===")
         writer.write_line(
-            f"startedUtc={started} build={_sr_version()} pid={os.getpid()} "
+            f"startedUtc={started} build={_sr_build_label()} pid={os.getpid()} "
             f"python={sys.version.split()[0]} platform={sys.platform}")
         for name in ("stdout", "stderr"):
             stream = getattr(sys, name, None)
@@ -4080,7 +5298,11 @@ def _ask_yes_no_sync(
         a.strip().lower() for a in no_aliases if str(a).strip())) if w not in yes)
 
     for attempt in range(1, max(1, int(tries)) + 1):
-        raw = input(prompt)
+        # ⛔ The console is held for the read — a background thread printing
+        # over the question is what made it unreadable. See
+        # `_console_quiet_for_prompt`; withheld lines replay right after.
+        with _console_quiet_for_prompt():
+            raw = input(prompt)
         ans = (raw or "").strip().lower()
         if ans == "":
             return default
@@ -4505,14 +5727,35 @@ def _serve_boot_preview(port: int) -> None:
 # section. This used to be six `log("  GET  /api/runs …")` calls inside the
 # serve boot path, which put a static reference through the timestamped logger
 # on every start. A reference belongs on the reference surface.
+#
+# ⛔⛔ TWO OF THESE ROWS DESCRIBED ROUTES DELETED ON 2026-04-29 — `GET
+# /api/runs/{id}/events` and `WS /ws/{run_id}` — and `--help` went on
+# advertising them for five months. Nothing could notice: the only test asked
+# whether each row appeared in the rendered output, which is a question about
+# the renderer, not about the API. `test_help_advertises_no_route_that_was_deleted`
+# now asks the source, so a deleted route takes its reference row with it.
 _LOCAL_API_ROUTES: "tuple[tuple[str, str], ...]" = (
     ("GET  /api/runs",                      "List all runs"),
     ("POST /api/runs",                      "Start a new run {topic, email}"),
     ("GET  /api/runs/{id}",                 "Run details + meta"),
     ("GET  /api/runs/{id}/documents/{type}", "Document content (brief/chatgpt/gemini/claude)"),
-    ("GET  /api/runs/{id}/events",          "Progress events"),
-    ("WS   /ws/{run_id}",                   "Real-time event stream"),
+    ("GET  /api/runs/{id}/audio/{filename}", "Podcast audio for a finished run"),
+    ("POST /api/runs/{id}/stop",            "Stop a run (terminal) and exit the backend"),
+    ("POST /api/runs/{id}/pause",           "Pause at the next checkpoint (resumable)"),
+    ("POST /api/runs/{id}/resume",          "Resume a paused run"),
+    ("POST /api/runs/{id}/feedback",        "Save feedback for a phase and pause to redo it"),
+    ("POST /api/runs/{id}/add_context",     "Add context mid-run (Phase 1 only)"),
+    ("PATCH /api/runs/{id}/config",         "Update pipeline config mid-run"),
+    ("DELETE /api/runs/{id}",               "Delete a run's queue dir (destructive)"),
+    ("GET  /api/queue",                     "Queue status: running + pending count"),
+    ("GET  /api/health",                    "Liveness + heartbeat counters (no token needed)"),
 )
+# ⛔⛔ AND IT IS CHECKED IN BOTH DIRECTIONS, because one direction is how the
+# phantom rows survived. `test_help_advertises_no_route_that_was_deleted` asks
+# that every row here still exists; `test_help_advertises_every_route_that_does`
+# asks that every route is listed. Without the second, a fifteenth route is
+# gated by the middleware and invisible on the only surface that describes the
+# API — and DELETE, the one route that destroys data, was exactly that.
 
 
 def _setup_step(n: int, total: int, title: str):
@@ -4804,27 +6047,6 @@ def _render_context_strip(items: list[tuple[str, str]]):
         print(f"  {_c(_DIM, (lab + ':').ljust(label_width + 2))}  {val}")
 
 
-def _fetch_paired_email(paired_uid: str | None) -> str:
-    """Best-effort lookup of the user's email for display. Returns empty
-    string if Firestore is unreachable or the uid is unknown — callers
-    fall back to showing '(not paired)' or the truncated uid.
-
-    Post-Track-D: reads from the device doc's `ownerEmail` field (set
-    by the claim Cloud Function from claimerRecord.email), NOT the
-    legacy `users/{uid}.email` path which the synth user can't read
-    per the user-tree rule."""
-    if not _firebase_db:
-        return ""
-    device_id = load_device_id()
-    if not device_id:
-        return ""
-    try:
-        snap = _firebase_db.collection("devices").document(device_id).get()
-        if snap.exists:
-            return (snap.to_dict() or {}).get("ownerEmail", "") or ""
-    except Exception:
-        pass
-    return ""
 
 
 def _fetch_device_meta() -> dict:
@@ -5043,6 +6265,183 @@ def safe_name(topic, max_len=50):
     # leaked into queue dir names (e.g. multi-line Flow C topics like
     # "Research\n\nLinks to..."), which Windows rejects with WinError 123.
     return re.sub(r'[^\w-]+', '_', topic).strip('_')[:max_len]
+
+
+# ── A research that keeps nothing ────────────────────────────────────────────
+# ⛔⛔ THE ID IS THE SIGNAL, AND IT IS THE ONLY ONE (wave 10.9, #536). An
+# incognito research runs like any other paid run and leaves nothing in Super
+# Research once it ends. Four parties have to agree about which runs those are,
+# and only one of them could read a field: `firestore.rules` and `storage.rules`
+# see the PATH — the document id — before they see any data, and they are the
+# only thing that can refuse a write from a wheel shipped before this wave. A
+# `set(…, merge=True)` that resurrects a purged record carries only its merged
+# fields, so a flag ON the record is absent from the one write the promise most
+# needs refused. The id is in the path of every one of them.
+#
+# ⛔ THE SHAPE IS DUPLICATED IN THE WEB REPO — `src/lib/incognito.ts`,
+# `firestore.rules` and `storage.rules` all carry `incog_[0-9]{13}_[0-9]{1,6}`,
+# because rules cannot import and neither can this file. Change one and the four
+# stop agreeing about which runs the product refuses to keep.
+#
+# ⭐ ANCHORED AT BOTH ENDS, for the reason the web's copy gives: a bare
+# `startswith("incog_")` would call somebody's hand-made `incog_notes` record
+# ephemeral and hang a 48-hour fuse on an ordinary research.
+#
+# ⛔ AND ASKED WITH `fullmatch`, NEVER `match`. Python's `$` also matches just
+# before a final newline, so `match` said yes to `incog_…_1\n` while the app's
+# `RegExp.test` and both rules files say no — the four copies agreed in spelling
+# and disagreed in meaning. The pattern text stays as the web spells it, because
+# the parity pin compares the text.
+_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}$")
+
+
+def _is_incognito_research(research_id) -> bool:
+    """True when this research id names a run that must keep nothing.
+
+    ⛔ IT TAKES THE ID, NEVER THE ACTIVE-RUN GLOBAL. This process runs one
+    pipeline at a time, but its start listener, its sweeps and its boot recovery
+    all touch OTHER people's records in the same process — a helper that read
+    `_fb_research_id` would answer about the wrong run at every one of those
+    sites. Callers that mean the running pipeline pass `_fb_research_id`
+    themselves, and they are the minority."""
+    return isinstance(research_id, str) and bool(_INCOGNITO_ID_RE.fullmatch(research_id))
+
+
+def _mint_run_id(topic, research_id=None, now=None) -> str:
+    """The name of this run's queue directory, and the `backendRunId` the app
+    reads back.
+
+    ⛔⛔ AN ORDINARY RUN ID CARRIES THE TOPIC — `safe_name(topic)_YYYYMMDD_HHMMSS`
+    — deliberately, so an operator reading `queues/` can see what each folder is.
+    An incognito run cannot have that. This name reaches the device document's
+    `workers.{n}.runId`, which the machine's OWNER reads; the record's
+    `backendRunId`; every log line that names the job; and the folder on disk.
+    For somebody running on a computer they do not own, that is their research
+    subject written across another person's machine and another person's app —
+    while the owner is deliberately told only that a run happened.
+
+    ⭐ SAME SHAPE, so everything that parses a run id keeps working: the stamp
+    still ENDS the name (`_RUN_ID_STAMP_RE`, `_BUNDLE_QUEUE_NAME_RE`), and the
+    slug is still the part that identifies the run.
+
+    ⭐ UNIQUENESS COMES FROM THE RESEARCH ID, NOT FROM A RANDOM SOURCE. Dropping
+    the topic collapses every incognito run of the same second onto one folder
+    name, and two members of a shared computer claiming at the same second would
+    then share a queue directory — each writing the other's documents. The id's
+    own `<ms>_<counter>` tail is already unique per record, so the mint stays a
+    pure function of its arguments and can be pinned without seeding a clock."""
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    if _is_incognito_research(research_id):
+        return f"incognito_{research_id.removeprefix('incog_')}_{stamp}"
+    return f"{safe_name(topic)}_{stamp}"
+
+
+#: How far ahead an incognito run's own writes are fused, in hours.
+#:
+#: ⛔⛔ EVERY WRITE CARRIES ITS OWN FUSE, because the purge that normally removes
+#: them is exactly what fails in the cases the promise has to survive: the tab
+#: was closed and the cloud hand-off never landed, or this machine died. Firestore
+#: TTL is then the only thing left, and it acts only on a timestamp-typed value
+#: that is already in the past.
+#:
+#: ⛔ 48 HOURS IS THE RULES' CEILING, NOT THIS NUMBER. `ephemeralExpiryOk()`
+#: refuses anything further out, and the gap between 24 and 48 is the room a long
+#: run has to renew its record. A wheel that stamped the ceiling would leave a
+#: run with no room at all.
+#:
+#: ⭐ AND THE WORDING SAYS "WITHIN TWO DAYS", not "in a day": Firestore removes
+#: an expired document within about 24 hours of its expiry, so 24 + 24 is what
+#: can honestly be promised.
+_INCOGNITO_EXPIRE_HOURS = 24
+
+
+def _incognito_expire_at(research_id, now=None):
+    """The `expireAt` this write must carry, or None for an ordinary run.
+
+    ⛔ TIMEZONE-AWARE, AND THAT IS THE LOAD-BEARING HALF. Firestore stores a
+    naive datetime by guessing, and the rules test `is timestamp` precisely
+    because a value that merely looks like a time expires nothing, for ever —
+    the web's own stripper turned a Timestamp into `{seconds, nanoseconds}` and
+    it sat in the field looking correct until this wave.
+
+    Returns None rather than a far-future date for an ordinary run, so a caller
+    that spreads it writes no key at all and every existing document keeps the
+    expiry policy it already has."""
+    if not _is_incognito_research(research_id):
+        return None
+    from datetime import timedelta, timezone
+    base = now if now is not None else datetime.now(timezone.utc)
+    return base + timedelta(hours=_INCOGNITO_EXPIRE_HOURS)
+
+
+def _with_incognito_renewal(payload: dict, research_id, now=None) -> dict:
+    """`payload` with the record's fuse pushed a day out in front of it — or
+    `payload` itself, untouched, for an ordinary run.
+
+    ⛔⛔ THE RECORD WAS FUSED ONCE AND NEVER RENEWED (wave 10.9 repair). The app
+    stamps `expireAt` when it creates an incognito record, and until now no
+    write from this machine moved it. A run still alive a day later — parked at
+    a sign-in prompt, or waiting behind somebody else's run — lost its record to
+    Firestore's own sweep while it ran: every later write here failed, the
+    reports piled up under a parent that was gone, and phase 5 found no record
+    to deliver. With the tab closed this machine is the only writer, so every
+    write it makes to the record is proof the run is alive and carries the fuse
+    forward. When the writes stop, so does the renewal — which is exactly when
+    the fuse should burn.
+
+    ⭐ THE SAME OBJECT BACK FOR AN ORDINARY RUN, not a copy that happens to be
+    equal: an ordinary record has no fuse and must be written exactly as it was
+    before this existed.
+
+    ⛔ THE VALUE IS `_incognito_expire_at`'s, so it is timezone-aware and a day
+    out against the rules' 48-hour ceiling — and `ephemeralExpiryOk()` checks
+    the MERGED document, which after this write holds this value."""
+    at = _incognito_expire_at(research_id, now)
+    if at is None:
+        return payload
+    return {**payload, "expireAt": at}
+
+
+def _loggable_topic(topic, research_id=None, limit=40) -> str:
+    """What a log line may say this run is about.
+
+    ⛔ `backend.log` IS THE MACHINE'S, NOT ONE PERSON'S — `_log_job_ref` makes
+    the whole argument. Its tail ships in the owner's support bundle, and on a
+    shared computer every member's runs land in it. An ordinary run's topic is
+    allowed there: the owner can already see it in the queue folder name and the
+    app. An incognito run's is the one thing that must not be.
+
+    ⭐ THE MARK IS THE BUNDLE REDACTOR'S OWN, on purpose. `<topic removed>` is
+    already this product's word for "a research subject is not here", it is what
+    `_BUNDLE_TOPIC_BARE_RE` writes over the keyed shapes, and re-marking an
+    already-marked value is a no-op — so a redacted bundle and a live log read
+    the same, and there is one vocabulary instead of two.
+
+    Byte-identical to the old expression for every non-incognito run, which is
+    what keeps this off the ordinary path."""
+    if _is_incognito_research(research_id):
+        return _BUNDLE_TOPIC_MARK
+    return str(topic or "")[:limit]
+
+
+def _print_pipeline_traceback(research_id) -> None:
+    """The traceback of a pipeline that died — to stderr as always, or, for a
+    run that keeps nothing, into that run's own folder only.
+
+    ⛔ STDERR IS `backend.err.log`, THE MACHINE'S OTHER HALF (wave 10.9 repair).
+    `_console_withholds_line` keeps the run's `log()` lines out of the owner's
+    log, but a raw `print_exc` bypasses `log()` altogether — and the exception
+    it prints is the same text `Fatal: {e}` carries: a source's file name, a URL
+    the page was on, whatever the failing call was holding. Routed through
+    `log()` it lands in the run's folder beside that line and leaves with it.
+
+    ⭐ An ordinary run's traceback goes exactly where it always went."""
+    import traceback
+    if _is_incognito_research(research_id):
+        for line in traceback.format_exc().rstrip().splitlines():
+            log(line, "ERROR")
+        return
+    traceback.print_exc()
 
 
 # ── Run-name reference ───────────────────────────────────────────────────────
@@ -5523,28 +6922,31 @@ _QUEUE_STATE = {
     "running": False, "current_job": None, "queue_ref": None, "recompute_fn": None,
     # 2026-05-15: persist_fn exposes the run_server closure
     # `_persist_pending_queue` to the module-scope device-cmd listener
-    # (research.py:1766) so hard_reset can flush a clean snapshot to disk
-    # before os._exit. _hard_reset_lock makes the gate-state clear+persist
-    # atomic w.r.t. the worker's `finally` writes — without it, a worker
-    # finishing between the device-cmd's clear (memory) and persist (disk)
-    # would resurrect the wedged values to disk. Both initialised inside
-    # run_server (research.py:24049-24051) before the device-cmd listener
-    # starts at research.py:24898.
+    # (`_start_device_command_listener`) so hard_reset can flush a clean snapshot to disk
+    # before os._exit. _hard_reset_lock serializes that persist with the
+    # worker's `finally` writes — without it, a worker finishing inside the
+    # exit window could write a job back into the snapshot hard_reset just
+    # cleaned. (It also covered a prior-run gate-state clear until wave 10.9
+    # removed that state — see below.) Both initialised inside
+    # run_server before it starts the device-cmd listener.
     "persist_fn": None, "_hard_reset_lock": None,
-    # 2026-05-11: prior-run tracking for the FE-completion queue gate
-    # (BE_PHASES_TIMEOUT_SEC). The worker's finally{} block records the
-    # just-completed run's uid+rid+timestamp here so the NEXT dequeue can
-    # poll its Firestore status until FE-P5 flips it to "completed" (or
-    # the 4200s fallback fires). last_be_done_at=0 on error/timeout paths
-    # short-circuits the gate so a watchdog-stopped run doesn't wedge the
-    # queue for 70 min.
-    "last_completed_uid": None, "last_completed_rid": None, "last_be_done_at": 0,
+    # ⛔⛔ THE PRIOR-RUN POINTER IS GONE (wave 10.9, N8). Three keys lived here
+    # — last_completed_uid / last_completed_rid / last_be_done_at — so the next
+    # dequeue could hold itself behind the PREVIOUS run's cloud tail until that
+    # run's status reached "completed" or a 4200-second fallback fired. It
+    # serialized nothing: phases 4 and 5 run on Cloud Run, not on this computer,
+    # so the "resource contention" it was written for is contention with a
+    # machine that is idle. What it did instead was hold the next person's run
+    # on a shared computer for as long as somebody else's cloud tail took, and
+    # its disk snapshot brought the wait back across a restart. The browser lock
+    # it was paired with is deleted (D-1) and the YouTube ceiling is a daily
+    # count, not a concurrency limit, so there is nothing left for it to protect.
     # 2026-05-22: listener-replay dual-claim gate.
     # Firestore on_snapshot delivers ADDED changes synchronously in a
     # callback thread; the actual asyncio.Queue.put happens via
     # `loop.call_soon_threadsafe(...)`, which is asynchronous. Between
     # the listener's claim+schedule of doc A and its next iteration
-    # processing doc B, the gate at research.py:4106 reads
+    # processing doc B, the busy gate in the start listener's on_snapshot reads
     # `job_queue.qsize()` — but A's put hasn't landed on the event loop
     # yet, so qsize() is still 0. Gate passes, B is also claimed,
     # dual-spawn for back-to-back submissions (the 2026-05-22 St Bernard
@@ -5561,7 +6963,7 @@ _QUEUE_STATE = {
 def _pending_enq_inc():
     """Listener-thread increment. Idempotent on first-call when the
     `_pending_enq_lock` hasn't been initialised yet (run_server
-    initialises it during startup at research.py:~26686). The pre-init
+    initialises it during startup). The pre-init
     case only matters in tests; in prod the lock is always set before
     the listener attaches."""
     lock = _QUEUE_STATE.get("_pending_enq_lock")
@@ -5612,7 +7014,7 @@ def _sweep_stuck_research_docs_for_device(
     would be invisible to a Reset).
 
     Firestore rules path: synth-device-user reads/writes user-tree
-    research docs via `deviceMemberOf(userId)` (firestore.rules:45-49),
+    research docs via `deviceMemberOf(userId)` in firestore.rules,
     which checks `deviceOwnership(deviceId, userId)` — true when this
     device's `ownerUid == userId` OR `userId in sharedWith`. So the
     sweep can iterate any uid the device's sharedWith[] lists, same
@@ -5782,7 +7184,7 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
         # phase events) that the user should see in their listing as
         # "Stopped" — not silently disappear. The FE's chat-close
         # cascade-delete fires only on cancelled=true (see
-        # ChatContainer.tsx cancelledRef cleanup ~line 596), so
+        # the `cancelledRef` cleanup in ChatContainer.tsx), so
         # leaving cancelled unset preserves these runs in the
         # listing as historical Stopped entries.
         if status == "queued":
@@ -5864,7 +7266,7 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
         `device.currentRunTitle`" — that field is no longer written or
         mapped either, for the same reason.
 
-    Filter rules mirror the existing FIFO pre-query at research.py:4226:
+    Filter rules mirror the FIFO pre-query in the start listener's on_snapshot:
       - skip `processed: true` (already-claimed-and-finished)
       - skip `assignedWorker: <not me>` (sibling has it)
       - include `assignedWorker == self` (post-claim-pre-delete window
@@ -5959,7 +7361,7 @@ def _phase_estimate_ms(phase: int) -> int:
     keyed by phase int; convert to ms here.
 
     Forward-reference safe — `_phase_averages` is defined at module
-    line ~4001 (post-helper-definition) but Python resolves globals
+    scope further down (after this helper) but Python resolves globals
     at call time so this works as long as `load_analytics()` has run
     before any `_estimate_queue_eta_ms` call (it runs in server
     startup, well before listeners fire)."""
@@ -6198,7 +7600,7 @@ def _read_eta_inputs_and_compute(position: int) -> "tuple[int, int]":
 # fresh when it started.
 #
 # 2026-05-25 P0 fix: local `import threading` here — the module-level
-# `import threading as _threading` at line ~4050 is AFTER this code,
+# `import threading as _threading` further down the module is AFTER this code,
 # so the original `_threading.Lock()` raised NameError at module load
 # (worker crashed on startup, daemon-loop respawned tightly = 67+
 # restarts in <5min on the affected E2E). stdlib `threading` is
@@ -6272,7 +7674,7 @@ def _recompute_deferred_queue_positions() -> None:
     skip rather than queue. See lock's defining comment for rationale.
 
     Why this exists separately from `_recompute_queue_positions`:
-      - `_recompute_queue_positions` (run_server closure, ~line 27030)
+      - `_recompute_queue_positions` (a run_server closure)
         reads only `_job_queue._queue` — the LOCAL asyncio deque of
         jobs that have already been claimed (queue doc deleted, status
         flipped to ongoing/queued). It cannot see Firestore-deferred
@@ -6552,13 +7954,10 @@ def _pending_enq_reset():
     with lock:
         _QUEUE_STATE["_pending_listener_enqueues"] = 0
 
-# 2026-05-11: queue gate fallback — wait at most this many seconds for the
-# prior run's FE-P5 to flip status="completed" before force-dequeueing the
-# next job. Hoisted to module scope (2026-05-12) so the Firestore start
-# listener (module-level) can reference the same constant when predicting
-# whether the gate will block at queue-banner time; the worker's existing
-# in-server reference resolves via normal global lookup.
-BE_PHASES_TIMEOUT_SEC = 4200
+# ⛔ BE_PHASES_TIMEOUT_SEC (4200) STOOD HERE AND IS GONE (wave 10.9, N8). It
+# was the queue gate's fallback: how long the next dequeue would wait for the
+# PREVIOUS run's cloud tail to flip its status to "completed". Nothing waits
+# on another run's tail any more, so the constant has no reader.
 
 
 def _try_claim_queue_doc(doc_ref, worker_id: int, log_prefix: str = "[claim]",
@@ -7026,8 +8425,8 @@ _GRPC_HEAL_STRUCTURAL_AFTER = 3
 _grpc_heal_last_ts = 0.0
 _grpc_heal_consec_fail = 0
 _grpc_heal_structural = False
-# The module-level `import threading as _threading` lives further down (~line
-# 4633); import here too so this lock resolves at import time (re-import is a
+# The module-level `import threading as _threading` lives further down the
+# module; import here too so this lock resolves at import time (re-import is a
 # harmless rebind of the same module object).
 import threading as _threading  # noqa: E402
 _grpc_heal_lock = _threading.Lock()
@@ -7219,7 +8618,8 @@ def _grpc_write_with_heal(op, *, what: str):
         # user-tree write the freshly-minted/cached synth token lags the
         # deviceId-claim propagation (most often the `queued→ongoing` flip's
         # transactional READ racing deviceMemberOf on a fresh doc; see
-        # firestore.rules:175-203 #723), the force-refresh re-mints, and the
+        # the #723 deviceId read fast-path on /researches in firestore.rules), the
+        # force-refresh re-mints, and the
         # retry below succeeds. Logging it at WARN every time was misleading
         # noise (it reads as a problem when it self-heals). Log the heal ATTEMPT
         # at INFO; a genuinely UNHEALED denial still surfaces — the retry-failed
@@ -7362,6 +8762,8 @@ def _atomic_write_text(path: Path, text: str, create_parents: bool = True) -> No
     import tempfile
     if create_parents:
         path.parent.mkdir(parents=True, exist_ok=True)
+    # ⛔ mkstemp's 0600 is LOAD-BEARING: `_write_owner_only_text` relies on it to
+    # keep the API-keys file unreadable by other accounts. Never widen the temp.
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -7373,6 +8775,38 @@ def _atomic_write_text(path: Path, text: str, create_parents: bool = True) -> No
         except OSError:
             pass
         raise
+
+
+def _write_owner_only_text(path, text: str) -> None:
+    """Atomically replace `path` with `text`, readable by this OS account only.
+
+    ⛔⛔ #538. `mkstemp` (inside `_atomic_write_text`) opens the temp O_EXCL at
+    0600 whatever the umask, and `os.replace` carries THAT inode onto the target
+    — so the bytes are never readable by another account, not even for the
+    instant before the rename, and a leftover 0644 `.tmp` from an older build is
+    never reused. No parent is created: the API-keys file sits beside the code,
+    which exists. Raises on failure, with the temp already removed."""
+    _atomic_write_text(Path(path), text, create_parents=False)
+
+
+def _owner_only(path) -> None:
+    """Take group and other access off ONE existing file or directory — 0644 →
+    0600, 0755 → 0700 — leaving the owner's own bits exactly as they were.
+
+    ⛔ NEVER FOLLOWS A SYMLINK. `_harden_owner_only_paths` walks whole trees, and
+    a link in one points at something that is not ours to re-permission. An
+    absent path, a link and a refused chmod are all silent: this runs on every
+    boot and must never be the reason a command fails."""
+    import stat as _stat
+    try:
+        st = os.lstat(path)
+        if _stat.S_ISLNK(st.st_mode):
+            return
+        mode = _stat.S_IMODE(st.st_mode)
+        if mode & 0o077:
+            os.chmod(path, mode & ~0o077)
+    except OSError:
+        pass
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -8428,9 +9862,11 @@ async def _firebase_reconnect_loop():
                     # in the worker's `finally`, which is BEFORE the two POSTs
                     # that hand this run to the web app have returned — the phase
                     # notice, and the P4/P5 trigger that carries the rest of the
-                    # run. Neither has a replay path behind it, and killing the
-                    # second one aborts the request, SIGTERMs ffmpeg and
-                    # terminalises the research as stopped.
+                    # run. Neither has a replay path behind it, and the second
+                    # one IS the rest of the run: the route runs P4 and P5 inside
+                    # that request, so killing it abandons work nothing else is
+                    # driving. (It no longer stops the run outright — the route's
+                    # abort handler went on 2026-09-19; see _FE_DRIVE_WAIT_SEC.)
                     #
                     # ⭐ Only the RESPAWN can do that. The in-place rebind that a
                     # foreground serve takes is non-destructive — it swaps two
@@ -8644,7 +10080,8 @@ async def _revoked_recovery_loop():
     expired) so a stuck recovery doesn't spin.
 
     2026-05-22: wall-clock cap at MAX_RECOVERY_WALLCLOCK_SEC (1hr). After
-    the device doc TTL-deletes at 15 min (reset-pair-code/route.ts:269),
+    the device doc TTL-deletes at 15 min (the web reset-pair-code route's
+    `expireAt`, RESET_TTL_MS),
     the pending subdoc path becomes unreachable — polling forever wastes
     CPU + log volume. At the cap we log + os._exit(0) so the supervisor
     sees a clean exit code (and stops respawning a worker that will just
@@ -8773,7 +10210,7 @@ async def _revoked_recovery_loop():
                 #   target) → every Storage/Firestore cross-tree call 403s
                 #   → audio upload broken, source download broken, queue
                 #   writes rejected by the FE-side `isDeviceMember` rule.
-                # cmd_pair_v2 Stage 1 (research.py:~26931) does this eager
+                # `cmd_pair_v2`'s Stage 1 does this eager
                 # patch already; the recovery path was missed when Track D
                 # shipped. _pair_patch_device uses REST PATCH so it works
                 # with just the freshly-minted ID token (no gRPC client
@@ -9633,8 +11070,6 @@ def _parse_bundle_run_names(data: dict) -> "list[str] | None":
     return out
 
 
-def _log_bundle_doc_path(owner_uid: str, code: str) -> str:
-    return f"users/{owner_uid}/logBundles/{code}"
 
 
 def _open_log_bundle_row(owner_uid: str, code: str, device_id: str,
@@ -9687,19 +11122,68 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
         body.setdefault("createdAt", datetime.now(timezone.utc))
         body.setdefault("expireAt",
                         datetime.now(timezone.utc) + timedelta(days=BUNDLE_MAX_AGE_DAYS))
-        body.setdefault("buildId", _sr_version())
+        # The build whose logs are in the bundle, not whatever is installed now.
+        body.setdefault("buildId", _sr_build_label())
     try:
         ref = (_firebase_db.collection("users").document(owner_uid)
                .collection("logBundles").document(code))
-        payload = _be_payload(body)
-        _grpc_write_with_heal(
-            (lambda: ref.set(payload)) if create else (lambda: ref.update(payload)),
-            what="log_bundle_status")
+
+        def _write(fields: dict) -> None:
+            payload = _be_payload(fields)
+            _grpc_write_with_heal(
+                (lambda: ref.set(payload)) if create else (lambda: ref.update(payload)),
+                what="log_bundle_status")
+
+        try:
+            _write(body)
+        except Exception as denied:
+            # ⛔⛔ THE LEFT-OUT COUNTS ARE THE ONE PART OF THIS ROW THE RULES MAY
+            # NOT KNOW YET (wave 10.9). `hasOnly` refuses the WHOLE write on an
+            # unknown key, and rules deploy separately from this code — so
+            # against an older ruleset the `done` write would lose its
+            # `objectPath` too, and the row would sit at 'uploading' naming
+            # nothing: the pathless row Clear logs has to hold back. The counts
+            # are worth less than the path, so a DENIAL of a write carrying them
+            # is tried once more without them. A network failure is not retried
+            # here — the heal ladder has already done that.
+            # ⛔ ONE more attempt, inline, never a recursive call: a write with
+            # nothing to strip re-raises at once instead of retrying itself.
+            bare = {k: v for k, v in body.items() if k not in _LOG_BUNDLE_LEFT_OUT_KEYS}
+            if len(bare) == len(body) or not _is_synth_permission_denied(denied):
+                raise
+            log("[send-logs] the row refused the left-out counts — the deployed "
+                "rules predate them; writing it without them", "WARN")
+            _write(bare)
         return True
     except Exception as exc:
         log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "
             f"continues; the row will look stale", "WARN")
         return False
+
+
+# ⭐ WHAT A BUNDLE LEFT OUT, as the row carries it (wave 10.9). The builder has
+# always counted these; they reached its own log line and the terminal, and
+# never the screen of the person who pressed Send.
+_LOG_BUNDLE_LEFT_OUT_KEYS = ("droppedForSize", "runsNotAttributed", "runsOtherMembers")
+
+
+def _log_bundle_left_out(summary: dict) -> dict:
+    """The three counts of what a bundle left out, for its `done` row.
+
+    ⛔ COUNTS, NEVER NAMES. `droppedForSize` is a list of folder and file names
+    in the builder's summary, and a run folder's name is a research id — the
+    row is read by a person whose bundle may have left out somebody else's run.
+    So only its length leaves this function.
+
+    ⭐ READ FROM THE BUILDER'S SUMMARY, on `maxRunsApplied`'s provenance rule:
+    what the archive was actually cut with, never what the caller asked for.
+    `runsNotAttributed` exists only on a selection; absent reads as zero, which
+    is what it means there."""
+    return {
+        "droppedForSize": len(summary.get("droppedForSize") or []),
+        "runsNotAttributed": int(summary.get("runsNotAttributed") or 0),
+        "runsOtherMembers": int(summary.get("runsOtherMembers") or 0),
+    }
 
 
 def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
@@ -10101,11 +11585,15 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
             # because it is everything the machine has ever done for everyone who
             # uses it. Same reasoning as the sink-side consent check: a flag the
             # app sets is a flag a future caller can set differently.
+            # ⛔ `keep_uid` IS THE DEVICE'S OWNER, whoever pressed: support may
+            # see the owner's identity in the machine's own material and nobody
+            # else's (#539). A sharer's scoped bundle keeps its requester anyway.
             summary = _build_log_bundle(
                 dest, support_code=code, max_runs=runs,
                 only_runs=only_runs,
                 requester_uid=(submitted_by if selected else None),
-                include_machine=machine_wanted)
+                include_machine=machine_wanted,
+                keep_uid=owner_uid)
             # ⛔⛔ THE MACHINE'S OWN LOG SAID "received" AND "bundle uploaded (N
             # bytes)" AND NOTHING ELSE. Eleven facts went to Firestore and one
             # reached the log — so the artefact a support engineer opens FIRST,
@@ -10149,6 +11637,8 @@ def _handle_send_logs_command(data: dict, device_id: str, limited: bool = False,
                     "sessionCount": int(summary["sessionCount"]),
                     "sizeBytes": int(summary["sizeBytes"]),
                     "runsApplied": int(summary["maxRunsApplied"]),
+                    # On `done` only: what the person is shown beside "Sent".
+                    **_log_bundle_left_out(summary),
                 })
             else:
                 _write_log_bundle_status(row_uid, code, {
@@ -10437,7 +11927,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
     col_ref = _firebase_db.collection("devices").document(device_id) \
         .collection("commands")
 
-    # Startup sweep — same rationale as _start_command_listener (line ~2127).
+    # Startup sweep — same rationale as `_start_command_listener`'s startup sweep.
     try:
         for d in _fs_where(col_ref, "processed", "==", True).stream():
             try:
@@ -10496,7 +11986,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             log(f"[device-cmds] received action={action!r} doc={doc.id}")
 
             # 2026-05-26: HARD_RESET defers the cmd-doc DELETE until AFTER
-            # the sweep completes. The route at reset-pair-code/route.ts:140
+            # the sweep completes. The web's reset-pair-code route
             # polls for cmd-doc deletion as the ack signal, then proceeds
             # to clear sharedWith[] on the device doc (step 5). Pre-fix the
             # early-delete acked the route IMMEDIATELY, and route step 5
@@ -10512,7 +12002,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             # Mark processed=true upfront so SDK-reconnect mid-handler
             # re-fires skip via the processed check at the top of on_snap.
             # The actual delete happens at the END of the hard_reset
-            # branch (just before the `continue` at line ~4017), so the
+            # branch (just before that branch's final `continue`), so the
             # route's ack lands only after sharedWith-dependent writes are
             # done. Other actions keep the original tail-delete-first
             # semantics.
@@ -10571,7 +12061,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 #   1. Touch the active run's .stop sentinel so the new
                 #      --serve doesn't auto-resume it after respawn
                 #      (matches how the research-scoped stop action
-                #      writes the sentinel at line ~2278). Best-effort:
+                #      in `_start_command_listener` writes the sentinel).
+                #      Best-effort:
                 #      if no run is active, skip silently.
                 #   2. Wait up to 5s for any in-flight Storage upload
                 #      to drain — see _wait_for_uploads_to_settle.
@@ -10579,16 +12070,12 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 #      blob.upload_from_filename leaves a half-written
                 #      blob whose Firestore audios/{id} doc already
                 #      points at it.
-                #   3. Clear the queue-gate state (last_completed_*) so
-                #      daemon-loop's respawn rehydrates a clean slate.
-                #      Without this, the next --serve picks up the same
-                #      stale prior-run pointer and re-engages the wedge
-                #      that prompted the reset in the first place.
+                #   3. Flush a clean queue snapshot to disk so the
+                #      daemon-loop's respawn starts from an empty slate.
                 #      Race-guarded by _QUEUE_STATE["_hard_reset_lock"]:
-                #      the worker `finally` acquires the same lock
-                #      around its gate-state writes + persist call so
-                #      a worker finishing within our exit window can't
-                #      interleave between our clear and our persist.
+                #      the worker `finally` acquires the same lock so a
+                #      worker finishing within our exit window can't write
+                #      a job back into the snapshot we just cleaned.
                 #   4. Schedule os._exit via _schedule_server_exit with
                 #      a 1.5s grace (shorter than the 3s default for
                 #      research stop because we have less to ack —
@@ -10679,40 +12166,33 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                         log("[device-cmds] HARD_RESET: uploads drained")
                 except Exception as _ue:
                     log(f"[device-cmds] HARD_RESET: upload-settle check failed: {_ue}", "WARN")
-                # 2026-05-15: clear queue-gate state + persist clean
-                # snapshot under the hard-reset lock so the worker
-                # `finally` block (research.py:~24400) can't race
-                # between our clear and our persist. _persist_pending_queue
+                # 2026-05-15: flush a clean snapshot to disk under the
+                # hard-reset lock so the worker's `finally` block can't
+                # race us and write a job back into it. _persist_pending_queue
                 # is a closure inside run_server, so we look it up via
-                # _QUEUE_STATE["persist_fn"] (set at the function-def
-                # tail, research.py:~24153). The atomic .tmp + os.replace
+                # _QUEUE_STATE["persist_fn"] (set in run_server right after
+                # the closure's def). The atomic .tmp + os.replace
                 # write inside that helper means a mid-write os._exit
                 # can't corrupt _pending_queue.json — either the OLD file
                 # (replace not committed) or NEW (clean) survives.
+                # ⛔ The prior-run pointer this block also used to clear is gone
+                # with the queue gate (wave 10.9, N8); Reset Backend no longer
+                # has a wedge to escape from.
                 try:
                     _hr_lock = _QUEUE_STATE.get("_hard_reset_lock")
                     _persist_fn = _QUEUE_STATE.get("persist_fn")
                     if _hr_lock is None or _persist_fn is None:
                         # Pre-run_server-init hard_reset (boot-time race).
                         # No worker yet → no race risk → no lock needed
-                        # AND no in-memory gate state to clear yet, so the
-                        # disk snapshot (if any) lives on. Best-effort log.
-                        log("[device-cmds] HARD_RESET: pre-init — gate clear skipped (no run_server yet)", "WARN")
+                        # AND nothing in memory to flush, so the disk
+                        # snapshot (if any) lives on. Best-effort log.
+                        log("[device-cmds] HARD_RESET: pre-init — snapshot flush skipped (no run_server yet)", "WARN")
                     else:
                         with _hr_lock:
-                            _QUEUE_STATE["last_completed_uid"] = None
-                            _QUEUE_STATE["last_completed_rid"] = None
-                            _QUEUE_STATE["last_be_done_at"] = 0
-                            # Also clear gate_pending_job so any worker
-                            # currently sitting in _wait_for_prior_fe_
-                            # completion immediately falls through on
-                            # its next is_stop() check (we set request
-                            # _stop below in the foreground branch).
-                            _QUEUE_STATE.pop("gate_pending_job", None)
                             _persist_fn(current_job=None)
-                        log("[device-cmds] HARD_RESET: cleared queue-gate state and persisted clean snapshot")
+                        log("[device-cmds] HARD_RESET: persisted clean queue snapshot")
                 except Exception as _ge:
-                    log(f"[device-cmds] HARD_RESET: gate clear/persist failed: {_ge}", "WARN")
+                    log(f"[device-cmds] HARD_RESET: snapshot flush failed: {_ge}", "WARN")
 
                 # Drain queued jobs — Reset Backend means "stop everything
                 # on this device, not just the active run". Without this,
@@ -10739,15 +12219,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     # the listener thread can ValueError "called too many
                     # times". The deque popleft is thread-safe in CPython
                     # (single C-level operation), matches how the queue-
-                    # position recompute at research.py:24700 already
+                    # position recompute (`_recompute_queue_positions`) already
                     # snapshots `_job_queue._queue`, and bypasses the
                     # counter entirely. The drained jobs are about to be
                     # cancelled anyway, so the counter mismatch doesn't
                     # matter — the process will exit + respawn fresh.
                     _drained_jobs: list[dict] = []
                     # 2026-05-26 FIX: reach the in-memory queue via
-                    # _QUEUE_STATE["queue_ref"] (set in --serve at
-                    # research.py:~28894). The bare name `_job_queue` is a
+                    # _QUEUE_STATE["queue_ref"] (set in run_server right
+                    # after `_job_queue` is created). The bare name `_job_queue` is a
                     # LOCAL of the serve function — NOT in scope in this
                     # Firestore-listener callback thread — so referencing it
                     # raised NameError on every reset ("name '_job_queue' is
@@ -10906,10 +12386,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # session and never finished writing a terminal status
                 # (process crash, kill -9, BE-restart-without-finally, etc).
                 # Pre-fix, those zombie docs kept the FE chat tile showing
-                # "Ongoing" forever and the queue gate (which keys on the
-                # most recent beDone marker) would refuse to advance into
-                # the NEXT user's queued run until the user manually went
-                # tile-by-tile in Settings → Manage devices to delete them.
+                # "Ongoing" forever until the user manually went tile-by-tile
+                # in Settings → Manage devices to delete them.
                 #
                 # Filter: by deviceId so other devices' in-flight work
                 # isn't accidentally killed. The research doc's deviceId
@@ -11575,6 +13053,8 @@ def _scan_run_folders(root=None) -> "list[dict]":
 # identifier: it is the one thing in the row that names a PERSON rather than a
 # run, and the archive already travels to us with the owner's consent for the
 # machine, not with every submitter's consent for their identity.
+# ⛔ This covers index.json ONLY. The files beside it are held to the same rule
+# by `_split_other_members_runs` and `_BundleRedactor` (#539).
 _INDEX_PRIVATE_KEYS = ("dir", "submitterUid", "submitterSource")
 
 
@@ -11634,11 +13114,25 @@ def _run_index_by_submitter(rows) -> "dict[str, dict]":
     ⛔ Newest first and then truncated, so what a bound removes is the oldest —
     the opposite direction was measured wrong once already in this file, on the
     source cap, and the comment there is explicit that truncation DIRECTION
-    matters as much as the number."""
+    matters as much as the number.
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING IS NOT OFFERED (wave 10.9, #536). This document
+    is the Send Logs picker's whole source of truth — the app cannot know what is
+    on that disk — so a row here is a run the person can name and send to
+    support. An incognito run has no row in any list by design, and the folder it
+    names is removed when the run ends; offering it would put a run the app
+    deliberately does not show back in front of the person, in a picker, by id.
+
+    ⭐ DROPPED HERE RATHER THAN IN `_scan_run_folders`, because that scan also
+    feeds the support bundle's own selection, and a machine's owner asking for
+    their whole machine still gets their own diagnostics. This is the APP-facing
+    list, and it is the only one that has to be silent."""
     grouped: "dict[str, list]" = {}
     for row in rows:
         uid = row.get("submitterUid")
         if not uid:
+            continue
+        if _is_incognito_research(row.get("researchId")):
             continue
         grouped.setdefault(str(uid), []).append(row)
     out = {}
@@ -12195,8 +13689,9 @@ def _clear_local_logs(root=None, telemetry_root=None) -> dict:
 
     ⭐ THE COLLECTOR'S SOURCES ARE NOT A GUESS, and that is the whole reason this
     lives beside the collector instead of next to the command that calls it.
-    `_build_log_bundle` reads exactly three places — the `runs/` folders,
-    `_select_bundle_sessions()` and `_system_log_tails()` — so clearing those
+    `_build_log_bundle` collects from exactly three places — the `runs/` folders,
+    `_select_bundle_sessions()` and `_system_log_tails()` (it also READS each
+    queue's `owner.json`, to redact, and ships none of it) — so clearing those
     three IS "there is nothing left here to send", and the test proves it by
     BUILDING a bundle afterwards rather than by re-reading this list. A clear
     defined by its own inventory drifts the moment the collector grows a fourth
@@ -12392,11 +13887,333 @@ def _pick_selected_runs(rows, only_runs, requester_uid=None,
     }
 
 
+# ─── Other members' identities, in a bundle that is not theirs (#539) ──
+# ⛔⛔ `_INDEX_PRIVATE_KEYS` KEPT THE UID OUT OF index.json AND NOTHING ELSE DID.
+# MEASURED 2026-09-21 in three real owner bundles: the same archive carried a
+# second member's uid in their run's `meta.json` and `run.log`, and uids and
+# topics in the sessions and raw tails as `users/<uid>/`, `audio/<uid>/`,
+# `o/logs%2F<uid>%2F…`, `ownerUid='<uid>'`, `submittedBy=<prefix>`, `topic='…'`,
+# and `queues/<topic-slug>_<ts>` / `run_id=<topic-slug>_<ts>`. The owner agreed
+# to send their machine; nobody else agreed to send who they are.
+#
+# ⚠ WHAT THIS DOES NOT REMOVE, said once: a run's own narration still names its
+# subject in places no pattern can know (a source title, an agent's answer). The
+# tails are owner-only for that reason already; what goes here is the link from
+# that content to a PERSON, and the topic in the fields that exist to carry one.
+
+#: A Firebase Auth uid: 28 letters and digits, mixing upper and lower case —
+#: which keeps hex digests and long single-case words out. `%2F` counts as a
+#: boundary because Storage URLs encode the object path.
+#:
+#: ⛔ THIS RULE ALSO REQUIRED A DIGIT, AND ABOUT ONE UID IN A HUNDRED AND FIFTY
+#: HAS NONE. A member whose run folders and queues have aged out is known to
+#: this redactor by shape and by nothing else, so theirs shipped verbatim in the
+#: tails — measured on `audio/<uid>/` and on a `sharedWith` list. The digit was
+#: never what kept a digest out; the two cases are, because a digest is one
+#: case, and they still do.
+_BUNDLE_UID_SHAPE_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))"
+    r"(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])"
+    r"[A-Za-z0-9]{28}(?![A-Za-z0-9])")
+#: `users/<uid>` — a Firestore path, whatever the uid looks like.
+_BUNDLE_USERS_PATH_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))(users(?:/|\\|%2F|%2f))([A-Za-z0-9_-]+)")
+#: A key that names a person: anything ending in uid/Uid/UID (never `uuid`), the
+#: command's `submittedBy`, and the `*_owner` keys the ownership checks print.
+#: The value may be a whole uid or the `uid[:8]` prefix the logs usually print.
+_BUNDLE_UID_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"([A-Za-z_]*?(?:(?<![Uu])(?:uid|Uid|UID)|_owner|submittedBy|submitted_by))"
+    r"([\"']?\s*[=:]\s*[\"']?)([A-Za-z0-9_-]+)")
+#: A key that carries somebody's research subject, with a quoted value: the
+#: `topic='…'` / `topic "…"` reprs the logs print, JSON's `"topic": "…"`, a
+#: Python dict repr's `{'topic': '…'}`.
+#:
+#: ⛔ IT KNEW `topic=` AND `topic '…'` AND NOTHING ELSE. An unattributed run.log
+#: — which is every fleet run until the attributing wheel ships — holds the JSON
+#: and repr forms too, and those went to support verbatim.
+#:
+#: ⛔⛔ THE BARE `topic` ALTERNATIVE MUST BE FOLLOWED BY A SPACE. Without the
+#: lookahead it read the apostrophe in the English possessive `topic's` as an
+#: opening quote and deleted the line from there to the next apostrophe —
+#: measured on the off-topic diagnostics, which say "none of the topic's
+#: distinctive terms (…)" and lost ninety characters of the sentence a support
+#: engineer opened the archive for. Whether a line survived depended only on
+#: whether a second apostrophe happened to sit on it.
+_BUNDLE_TOPIC_QUOTED_RE = re.compile(
+    r"(?<![\w\-/])([\"']?topic[\"']?[ \t]*[=:]|topic(?=[ \t]))([ \t]*)"
+    r"('(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\")", re.IGNORECASE)
+#: The keys a bare topic value ends at. A quoted value is left to the rule
+#: above, which is the one that keeps the quotes on.
+#:
+#: ⛔⛔ IT WAS ANY `word=`, AND A SUBJECT CAN CONTAIN ONE. `topic=why E=mc2
+#: changed physics run_id=…` ended the value at `E=`, so `mc2 changed physics`
+#: shipped. These are the keys this program actually prints beside a topic, so
+#: an equals sign inside the subject is no longer a place the value can end —
+#: and an unknown key after one now costs that key, which is the safe direction.
+_BUNDLE_TOPIC_END_KEYS = "run_id|resume_dir|submittedBy|submitted_by|uid|rid"
+#: The same key with an unquoted value — `topic=…`, `topic: …`, the CLI's
+#: `Topic: …` — up to one of those keys or the end of the line.
+_BUNDLE_TOPIC_BARE_RE = re.compile(
+    r"(?<![\w\-/])(topic[ \t]*[=:])(?![ \t]*['\"])[^\n]*?"
+    r"(?=[ \t]+(?:" + _BUNDLE_TOPIC_END_KEYS + r")=|\n|$)",
+    re.MULTILINE | re.IGNORECASE)
+#: Lines this program itself wrote into the machine log with a research subject
+#: in them and NO key to find it by — the queued-job pickup, the idle-rescan
+#: orphan claim, the two NotebookLM rename lines, Gemini's sidebar-adoption
+#: recovery, the title-refresh refusal and the off-topic diagnostics.
+#:
+#: ⛔⛔ THE SOURCE LINES NO LONGER CARRY A TOPIC (`_log_job_ref` and the call
+#: sites around it), and this rule exists anyway because a tail is fourteen days
+#: deep: every bundle sent before those lines age out still ships them, and no
+#: `topic=` pattern can see them — the subject sits after a colon or inside
+#: brackets with no key at all. ⭐ The replacement lines are deliberately NOT of
+#: these shapes, so the research id they carry instead survives this rule.
+#:
+#: ⛔⛔ THE FIRST PASS KNEW FOUR SHAPES AND THERE WERE NINE. Measured on this
+#: owner's live `backend.log`: another member's chat title survived in
+#: `opening owned sidebar chat '…'`, their generated title in `REFUSING the
+#: generated title '…'` and their topic's own distinctive words in
+#: `distinctive terms (…)` — 148 characters of research subject in the tail that
+#: ships. The off-topic diagnostics looked redacted only because the possessive
+#: in "the topic's" was being misread as a quote; fixing that took the accident
+#: away, so they are named here on purpose instead.
+#:
+#: ⛔ THE QUOTED TITLES ARE NOT ESCAPED. These values are interpolated straight
+#: into an f-string, so a title with an apostrophe in it closes the value early
+#: for any `[^']*` rule and ships its tail. An apostrophe followed by a LETTER
+#: is part of the value here, which covers `Bob's …`; the list keeps its own
+#: bracket to the last `]` on the line for the same reason. ⚠ A title whose
+#: apostrophe is followed by a SPACE (`Bobs' divorce`) still ends the value
+#: there and the rest of that title survives — nothing on the line tells the
+#: closing quote from that one. The sources no longer write these lines at all,
+#: so what is left is the fourteen days of them already on disk.
+_BUNDLE_TOPIC_LINE_RE = re.compile(
+    r"(?<![\w-])(?:"
+    r"(?P<head>(?:Starting queued job:|Renaming notebook to|"
+    r"DOM rename OK \(read-back verified\):)[ \t]*)[^\n]*"
+    r"|"
+    r"(?P<orphan>picking up orphan[ \t]+[^\s(\n]*[ \t]*\()[^)\n]*(?P<close>\))"
+    r"|"
+    r"(?P<terms>distinctive[ \t]+(?:terms|word\(s\))[ \t]*\()[^)\n]*"
+    r"(?P<terms_close>\))"
+    r"|"
+    r"(?P<chats>top recent sidebar chats[ \t]*\[)[^\n]*(?P<chats_close>\])"
+    r"|"
+    r"(?P<named>(?:generated title|opening owned sidebar chat|sidebar entry)"
+    r"[ \t]*)(?P<quote>['\"])"
+    r"(?:(?!(?P=quote))[^\n]|(?P=quote)(?=[A-Za-z]))*(?P=quote)"
+    r")")
+#: The bracketing groups of every alternative above but `head`, which runs to the
+#: end of its line. Read by `_topic_line`, so an alternative added to the rule
+#: without a row here would be a crash, not a silent pass-through.
+_BUNDLE_TOPIC_LINE_PAIRS = (("orphan", "close"), ("terms", "terms_close"),
+                            ("chats", "chats_close"))
+#: A queue directory name, `safe_name(topic)_YYYYMMDD_HHMMSS`, wherever it appears.
+_BUNDLE_QUEUE_NAME_RE = re.compile(r"(?<![\w-])[\w-]+_(\d{8}_\d{6})(?![\w-])")
+#: Values a person-key carries that are not a person.
+_BUNDLE_UID_NON_VALUES = frozenset(
+    {"None", "none", "null", "True", "False", "true", "false", "unknown"})
+_BUNDLE_TOPIC_MARK = "<topic removed>"
+#: How much text one redaction pass rewrites at a time, in characters.
+_BUNDLE_REDACT_CHUNK = 1 << 20
+
+
+def _bundle_line_chunks(s: str, size: int = _BUNDLE_REDACT_CHUNK) -> "list[str]":
+    """`s` cut into pieces of roughly `size` characters, always after a newline.
+
+    ⛔⛔ THE CUT IS ON A LINE BOUNDARY AND THAT IS THE WHOLE ARGUMENT FOR CUTTING
+    AT ALL: no redaction rule spans a newline — every quoted value and every
+    character class excludes it, and the bare-topic rule ends at one — so a piece
+    that ends after a `\\n` is rewritten exactly as the whole string would be.
+    Cut anywhere else and a uid split in half ships in two halves.
+    """
+    if len(s) <= size:
+        return [s]
+    out, start, n = [], 0, len(s)
+    while start < n:
+        cut = s.find("\n", start + size)
+        end = n if cut < 0 else cut + 1
+        out.append(s[start:end])
+        start = end
+    return out
+
+
+class _BundleRedactor:
+    """One per bundle: every member that is not provably the kept person's own
+    goes through `data()`, so the aliases agree across files.
+
+    ⭐ PSEUDONYMS, NOT DELETION. `member-1` is the same person in every file of
+    this archive, so a reader can still follow one person's request from the
+    listener to the pipeline — and the numbering is per-archive, so it can never
+    be joined against another bundle or hashed back to an account.
+
+    ⛔ `keep_uid=None` KEEPS NOBODY. An unpaired machine has no owner to spare,
+    and resolving that doubt toward collecting less is this collector's rule."""
+
+    def __init__(self, keep_uid=None, known_uids=(), owned_queues=()):
+        keep = keep_uid.strip() if isinstance(keep_uid, str) else ""
+        self.keep = keep or None
+        self.owned_queues = frozenset(owned_queues)
+        self.aliases: "dict[str, str]" = {}
+        self._alias_names: "set[str]" = set()
+        self._known = sorted({str(u).strip() for u in known_uids
+                              if u and str(u).strip() and str(u).strip() != self.keep},
+                             key=len, reverse=True)
+        self._known_re = re.compile(
+            r"(?:(?<![A-Za-z0-9])|(?<=%2F)|(?<=%2f))(?:"
+            + "|".join(re.escape(u) for u in self._known)
+            + r")(?![A-Za-z0-9])") if self._known else None
+
+    def _is_kept(self, value: str) -> bool:
+        # The logs print `uid[:8]`, so a long enough prefix of the kept uid is
+        # the kept person too.
+        return self.keep is not None and (
+            value == self.keep or (len(value) >= 6 and self.keep.startswith(value)))
+
+    def swap(self, value: str) -> str:
+        """The kept person's id unchanged; anyone else's as `member-N`."""
+        if self._is_kept(value) or value in self._alias_names:
+            return value
+        key = value
+        if len(value) >= 6:
+            key = next((u for u in self._known if u.startswith(value)), value)
+        alias = self.aliases.get(key)
+        if alias is None:
+            alias = f"member-{len(self.aliases) + 1}"
+            self.aliases[key] = alias
+            self._alias_names.add(alias)
+        return alias
+
+    def _queue(self, m) -> str:
+        return m.group(0) if m.group(0) in self.owned_queues else m.group(1)
+
+    def _keyed(self, m) -> str:
+        value = m.group(3)
+        if value in _BUNDLE_UID_NON_VALUES:
+            return m.group(0)
+        return m.group(1) + m.group(2) + self.swap(value)
+
+    @staticmethod
+    def _topic_quoted(m) -> str:
+        # ⭐ THE QUOTES STAY ON. A run.log line and a meta.json are read as JSON
+        # or as a Python repr, and a bare `<topic removed>` where a string was
+        # leaves the reader of the archive holding a file that no longer parses.
+        quote = m.group(3)[0]
+        return m.group(1) + m.group(2) + quote + _BUNDLE_TOPIC_MARK + quote
+
+    @staticmethod
+    def _topic_line(m) -> str:
+        head = m.group("head")
+        if head is not None:
+            return head + _BUNDLE_TOPIC_MARK
+        for open_name, close_name in _BUNDLE_TOPIC_LINE_PAIRS:
+            opener = m.group(open_name)
+            if opener is not None:
+                return opener + _BUNDLE_TOPIC_MARK + m.group(close_name)
+        # ⭐ THE QUOTES STAY ON, for the reason `_topic_quoted` gives: these
+        # lines are read back as text, and a bare mark where a quoted title was
+        # reads as the line having been truncated.
+        quote = m.group("quote")
+        return m.group("named") + quote + _BUNDLE_TOPIC_MARK + quote
+
+    def _shaped(self, m) -> str:
+        return self.swap(m.group(0))
+
+    def _users_path(self, m) -> str:
+        return m.group(1) + self.swap(m.group(2))
+
+    def _passes(self) -> list:
+        """The rewrite rules, in the order they run.
+
+        ⛔ ORDER IS OUTPUT. `member-N` is handed out on first appearance, so
+        moving a pass renames people; and the quoted-topic rule has to see a
+        value before the bare one does, or the quotes come off."""
+        out = [
+            lambda t: _BUNDLE_QUEUE_NAME_RE.sub(self._queue, t),
+            lambda t: _BUNDLE_TOPIC_LINE_RE.sub(self._topic_line, t),
+            lambda t: _BUNDLE_TOPIC_QUOTED_RE.sub(self._topic_quoted, t),
+            lambda t: _BUNDLE_TOPIC_BARE_RE.sub(r"\1" + _BUNDLE_TOPIC_MARK, t),
+            lambda t: _BUNDLE_USERS_PATH_RE.sub(self._users_path, t),
+            lambda t: _BUNDLE_UID_KEY_RE.sub(self._keyed, t),
+        ]
+        if self._known_re is not None:
+            out.append(lambda t: self._known_re.sub(self._shaped, t))
+        out.append(lambda t: _BUNDLE_UID_SHAPE_RE.sub(self._shaped, t))
+        return out
+
+    def text(self, s: str) -> str:
+        """Every rule, over the whole text — a line-sized bite at a time.
+
+        ⛔⛔ EVERY PASS GOES OVER EVERY PIECE BEFORE THE NEXT PASS STARTS: pass
+        first, piece second. `member-N` is first-appearance order, so finishing
+        piece 1 before starting piece 2 would number the same two people
+        differently and the chunking would stop being invisible.
+
+        ⛔ WHY IT IS CHUNKED AT ALL. A worker's bundle builds on a daemon thread
+        inside the `--serve` process, beside the asyncio loop driving a live
+        pipeline. One `re.sub` over a capped 32 MB run.log holds the GIL for its
+        whole run — measured at up to 8.5 s per pass on a loaded machine, and
+        there are eight passes — so every other thread stops. A bite at a time
+        the interpreter can switch away between calls, and only one piece of the
+        rewritten copy is alive at once."""
+        pieces = _bundle_line_chunks(s, _BUNDLE_REDACT_CHUNK)
+        for run in self._passes():
+            for i, piece in enumerate(pieces):
+                pieces[i] = run(piece)
+        return "".join(pieces)
+
+    def data(self, raw: bytes) -> bytes:
+        # surrogateescape round-trips any byte that is not UTF-8, so a file the
+        # rules find nothing in comes back byte-identical.
+        return self.text(raw.decode("utf-8", "surrogateescape")).encode(
+            "utf-8", "surrogateescape")
+
+
+def _split_other_members_runs(rows, keep_uid) -> "tuple[list, int]":
+    """The run rows a bundle for `keep_uid` may carry, and how many it may not.
+
+    ⛔⛔ ATTRIBUTED TO SOMEBODY ELSE MEANS LEFT OUT, and only counted. The old
+    argument for shipping every folder — the owner already holds these files —
+    covers the owner, not support: a folder is a person's uid (meta.json, the
+    run.log header) and their topic (the queue path) in one piece. A member sends
+    their own runs through the selected action.
+
+    ⭐ UNATTRIBUTED RUNS STAY — that is every fleet run until the wheel carrying
+    `submitterUid` is published — and they go through the redactor instead,
+    because nothing proves they are the kept person's. `keep_uid=None` keeps no
+    attributed run at all."""
+    keep = keep_uid.strip() if isinstance(keep_uid, str) else ""
+    kept, others = [], 0
+    for row in rows:
+        uid = row.get("submitterUid")
+        if uid and uid != keep:
+            others += 1
+            continue
+        kept.append(row)
+    return kept, others
+
+
+def _open_private_bundle(dest):
+    """The archive's file, created 0600 — and re-chmodded, because `O_CREAT`'s
+    mode does nothing to a file that already exists.
+
+    ⛔ It was `-rw-r--r--` in a 0755 `logs/outgoing`: every other account on the
+    computer could read a whole-machine bundle."""
+    fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.chmod(str(dest), 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, "wb")
+
+
 def _build_log_bundle(dest_path, support_code=None, now=None,
                       max_runs=BUNDLE_MAX_RUNS, max_age_days=BUNDLE_MAX_AGE_DAYS,
                       max_bytes=BUNDLE_MAX_BYTES,
                       only_runs=None, requester_uid=None,
-                      include_machine=True) -> dict:
+                      include_machine=True, keep_uid=None,
+                      queues_root=None) -> dict:
     """Write the support bundle to `dest_path`. Returns a summary dict.
 
     Order inside the archive is the order a reader needs it: the manifest and
@@ -12410,10 +14227,16 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     terminal and every pre-Wave-8 caller still get.
 
     ⭐ `requester_uid` — scope the selection to runs attributed to this person.
-    `None` means "no attribution filter", which is the OWNER AT THE MACHINE: they
-    already hold every one of these files on their own disk, so filtering grants
-    nothing and would only hide the unattributed runs from the one person who
-    can act on them.
+    `None` means the selection is not scoped to a requester — the owner's
+    bundle — and then `keep_uid` decides whose runs and identity it carries.
+
+    ⛔⛔ `keep_uid` — the machine owner (#539). The owner holds every file on
+    this disk, but the archive goes to SUPPORT, and that argument covers the
+    owner, not support. So an owner's bundle leaves out runs attributed to
+    anybody else (counted as `runsOtherMembers`, never named), and every member
+    that is not provably the kept person's own — unattributed runs, sessions,
+    the raw tails — goes through ONE `_BundleRedactor`. `None` keeps nobody.
+    A scoped bundle keeps its requester instead: every run in it is theirs.
 
     ⛔⛔ `include_machine=False` is what makes a sharer's bundle honest. MEASURED
     on this machine: `backend.log` carries 18 distinct research ids and 15 topics
@@ -12430,15 +14253,34 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     rows = _scan_run_folders()
+    # ⛔⛔ WHOSE IDENTITY MAY STAY IN THIS ARCHIVE, decided once. A scoped bundle
+    # is its requester's; any other is the machine owner's.
+    own_uid = requester_uid if requester_uid is not None else keep_uid
     if only_runs is None:
-        selected = _select_bundle_runs(rows, max_runs=max_runs,
+        # Other members' runs leave BEFORE the count bound, so the owner still
+        # gets up to N runs of their own rather than N minus everyone else's.
+        candidates, other_members = _split_other_members_runs(rows, own_uid)
+        selected = _select_bundle_runs(candidates, max_runs=max_runs,
                                        max_age_days=max_age_days, now=now)
         selection_report = {}
     else:
         selected, selection_report = _pick_selected_runs(
             rows, only_runs, requester_uid=requester_uid, max_runs=max_runs)
+        # AFTER the pick, so a ticked foreign run is counted here and never
+        # named in `runsNotOnDisk`. A no-op on a scoped pick, which has already
+        # refused everything not attributed to its requester.
+        selected, other_members = _split_other_members_runs(selected, own_uid)
     sessions = (_select_bundle_sessions(max_age_days=max_age_days, now=now)
                 if include_machine else [])
+    # ⭐ The owner.json map is read, never archived: it answers "whose queue is
+    # this" and "which uids exist here", and neither answer ships.
+    queue_owners = _queue_dir_owner_map(queues_root)
+    redactor = _BundleRedactor(
+        own_uid,
+        known_uids=[r.get("submitterUid") for r in rows] + list(queue_owners.values()),
+        owned_queues=[name for name, uid in queue_owners.items()
+                      if own_uid and uid == own_uid])
+    redacted: "list[str]" = []
 
     written = 0
     dropped_runs: "list[str]" = []
@@ -12451,25 +14293,45 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
     # and the only honest place for it is beside the bytes it explains.
     tail_stats: "dict[str, dict]" = {}
 
-    def _add_file(zf, source, arcname) -> bool:
+    def _add_file(zf, source, arcname, redact) -> bool:
         """Allowlist, then write, then account. ⛔ There is deliberately NO
         per-file size check here: the cap decides per RUN and per SESSION GROUP
         above, and a second per-file check was proved unreachable by mutation —
-        dead code that reads as protection is worse than none."""
+        dead code that reads as protection is worse than none.
+
+        ⛔ `redact` IS REQUIRED, NOT DEFAULTED, so every call site has to say
+        whether this member is provably the kept person's own. A default of
+        "no" is how a new source would ship unredacted without anyone deciding."""
         nonlocal written
         src = Path(source)
         if not _bundle_source_is_allowed(src):
             refused.append(str(src))
             return False
+        if not redact:
+            try:
+                size = src.stat().st_size
+            except OSError:
+                return False
+            try:
+                zf.write(str(src), arcname)
+            except OSError:
+                return False
+            written += size
+            return True
         try:
-            size = src.stat().st_size
+            raw = src.read_bytes()
+            # from_file keeps the member's own mtime, as `zf.write` would.
+            info = _zipfile.ZipInfo.from_file(str(src), arcname)
         except OSError:
             return False
-        try:
-            zf.write(str(src), arcname)
-        except OSError:
-            return False
-        written += size
+        # The archive's own setting, not a second copy of it: one place decides
+        # whether a bundle is compressed, whichever writer a member goes through.
+        info.compress_type = zf.compression
+        data = redactor.data(raw)
+        if data != raw:
+            redacted.append(arcname)
+        zf.writestr(info, data)
+        written += len(data)
         return True
 
     def _add_bytes(zf, data, arcname) -> None:
@@ -12477,14 +14339,17 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         zf.writestr(arcname, data)
         written += len(data)
 
-    with _zipfile.ZipFile(dest, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
+    with _open_private_bundle(dest) as fh, \
+            _zipfile.ZipFile(fh, "w", compression=_zipfile.ZIP_DEFLATED) as zf:
         index = [{k: v for k, v in row.items() if k not in _INDEX_PRIVATE_KEYS}
                  for row in selected]
         _add_bytes(zf, json.dumps({
             "schema": 1,
             "createdUtc": _utc_iso(),
             "supportCode": support_code,
-            "build": _sr_version(),
+            # ⛔ THE FIELD THAT LIED. A support bundle that names the wrong
+            # revision sends whoever reads it to the wrong source.
+            "build": _sr_build_label(),
             "platform": sys.platform,
             "installUuid": _install_uuid_best_effort(),
             "bounds": {"maxRuns": int(max_runs), "maxAgeDays": int(max_age_days),
@@ -12522,10 +14387,13 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             if not newest and written + folder_bytes > int(max_bytes):
                 dropped_runs.append(row["name"])
                 continue
+            # ⭐ Verbatim only when the folder is attributed to the kept person —
+            # an unattributed one could be anybody's, so it is redacted.
+            redact_run = not (own_uid and row.get("submitterUid") == own_uid)
             added_any = False
             for member in members:
                 arc = f"runs/{row['name']}/{member.relative_to(folder).as_posix()}"
-                if _add_file(zf, member, arc):
+                if _add_file(zf, member, arc, redact_run):
                     added_any = True
             (included_runs if added_any else dropped_runs).append(row["name"])
 
@@ -12544,7 +14412,8 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
                 continue
             added_any = False
             for member in members:
-                if _add_file(zf, member, f"sessions/{member.name}"):
+                # A session is the machine's, never provably one person's.
+                if _add_file(zf, member, f"sessions/{member.name}", True):
                     added_any = True
             if added_any:
                 session_count += 1
@@ -12566,6 +14435,12 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             data = _tail_bytes(path, stats=stats)
             if not data:
                 continue
+            # Everyone who uses the machine is in these, so every tail is
+            # redacted — before the size check, which must see what ships.
+            clean = redactor.data(data)
+            if clean != data:
+                redacted.append(f"system/{path.name}")
+            data = clean
             # ⛔ SAY IT IN THE FILE, not only in the manifest. A reader who opens
             # `system/backend.log` and finds no health probes in five megabytes
             # would conclude the probes stopped — which is a diagnosis, and a
@@ -12587,6 +14462,11 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
             "systemTailFilter": tail_stats,
             "uncompressedBytes": written,
             "machineIncluded": bool(include_machine),
+            # ⛔ A COUNT, NEVER NAMES — a folder name is a research id. And the
+            # members a redactor rewrote are named, so a reader who meets
+            # `member-2` or `<topic removed>` knows it was done on purpose.
+            "runsOtherMembers": other_members,
+            "filesRedacted": redacted,
             # Empty when no selection was made. Present and specific when one
             # was, because "you ticked six and got four" is a fact the person
             # is owed and only this function knows.
@@ -12610,6 +14490,12 @@ def _build_log_bundle(dest_path, support_code=None, now=None,
         "requesterScoped": requester_uid is not None,
         "machineIncluded": bool(include_machine),
         **selection_report,
+        # ⭐ ON THE ROW SINCE WAVE 10.9, as a count, beside `droppedForSize` and
+        # `runsNotAttributed` — see `_log_bundle_left_out`. The rules' `hasOnly`
+        # refuses an unknown key and refuses the WHOLE write, so those rules
+        # deploy first, and `_write_log_bundle_status` retries a denied write
+        # without the three counts rather than lose the `done` write over them.
+        "runsOtherMembers": other_members,
         "sizeBytes": dest.stat().st_size if dest.exists() else 0,
         "uncompressedBytes": written,
         "runCount": len(included_runs),
@@ -13099,6 +14985,158 @@ def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_u
         log(f"Failed to sync audio to Firestore: {e}", "WARN")
 
 
+async def _p3_publish_audio(audio_path, research_id) -> str:
+    """Put phase 3's podcast where every consumer looks for it, and answer with
+    the Storage URL — `""` when there is nothing there.
+
+    Three writes, and all three outlive the run: the mp3 in a Storage bucket
+    that has no TTL and no purge, the `audios` row the Podcasts page lists from,
+    and `links.audio_file` on the record — which is what FE-P4's video gate, the
+    /shared/podcast player and the in-chat Play button all read.
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING PUBLISHES NO PODCAST (wave 10.9, #536). The
+    rules refuse the `audios` row on every wheel and `storage.rules` refuses the
+    object, so this gate is the second net rather than the first — but a run
+    that spends minutes on an upload it is about to be denied has still spent
+    them, and leaves a 403 nobody can explain.
+
+    ⭐ PHASE 3 IS OFF FOR AN INCOGNITO RUN ANYWAY, decided beside the owner's
+    "video off": nothing is left on the computer owner's NotebookLM account and
+    nothing is produced that the person cannot receive by mail. This gate is
+    what holds when that configuration does not arrive — a resume whose
+    config.json predates the flip, or a caller that drops the key.
+
+    ⛔ EXTRACTED FROM `run_phase3_audio` SO A TEST CAN RUN IT. Its caller is a
+    six-hundred-line browser coroutine, and the decision below was reachable
+    only by driving NotebookLM. Called unconditionally there — a guard at the
+    call site would put half of this decision back out of reach.
+
+    Best-effort throughout: the pipeline continues whatever happens here, which
+    is why every failure answers `""` rather than raising."""
+    if _is_incognito_research(research_id):
+        log("[Phase3] a run that keeps nothing publishes no podcast — no Storage "
+            "object, no audios row, no audio_file link", "INFO")
+        return ""
+    if not (audio_path and audio_path.exists()):
+        return ""
+    try:
+        # B2 (2026-05-01): to_thread so the asyncio event loop (and
+        # _heartbeat_loop on it) keeps ticking — a blocking probe ate
+        # 1/6 of the 30s offline threshold. 2026-07-12: probing goes
+        # through _audio_duration_sec (tinytag primary — pure Python,
+        # pip-installed, works on a clean machine with no ffmpeg;
+        # ffprobe fallback). durationSec: 0 froze the FE player's
+        # progress bar (seek clamps to 0), so a failed probe WARNs.
+        dur_sec = await asyncio.to_thread(_audio_duration_sec, audio_path)
+        if dur_sec <= 0:
+            log("[Phase3] audio duration probe failed (tinytag + ffprobe) "
+                "— writing durationSec=0; FE will self-heal from media "
+                "metadata", "WARN")
+        # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
+        # biggest single blocker — easily blew past the 30s offline window.
+        audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
+        # Use the filename stem as doc id so re-runs upsert in place
+        # instead of stacking duplicates. Display name = research
+        # title from Firestore (set by FE's /api/title early in P1)
+        # so the Podcasts page shows one human-readable title instead
+        # of the auto-generated underscore .m4a filename. If the
+        # Firestore title isn't set (rare P3-before-P1-write race),
+        # smart_title falls back to a stem-derived topic with
+        # underscores swapped for spaces — still readable.
+        display_name = smart_title(audio_path.stem.replace("_", " "))
+        # B2: sync Firestore .set() — small payload but on slow links
+        # still worth offloading.
+        await asyncio.to_thread(save_audio_to_firestore,
+                                audio_path.stem, display_name, dur_sec, audio_url)
+        # FE-P4 cutover (2026-05-10): also pin the Storage URL into
+        # research.links.audio_file so the FE-P4 trigger
+        # (readResearchForP4 → /api/uploadYouTube) can fetch the
+        # downloadable audio without query-walking the audios
+        # subcollection. links.audio stays as the NLM share URL
+        # (page, not a media file) — the Doc still renders that as
+        # "Audio Overview"; links.audio_file is purely for the FE
+        # YouTube upload step.
+        if audio_url:
+            update_link_in_firestore("audio_file", audio_url,
+                                     label="Podcast Audio (Storage)", phase=3,
+                                     verified=True)
+            # ⛔⛔ RETURNED, NOT JUST WRITTEN. Until 2026-08-28 this URL was
+            # written to Firestore and then dropped on the floor — the phase's
+            # return carried only `audio_path`, so its own completion gate could
+            # not see whether the bytes had actually reached Storage. A local
+            # file with a failed upload emitted a green phase_complete:3 and a
+            # "Podcast ready" notice, while FE-P4 read `links.audio_file`, found
+            # nothing, and silently skipped the video. Completion and delivery
+            # disagreed about the same run.
+            return audio_url
+        # Storage upload is best-effort — local playback still works via
+        # the backend, and Phase 5 can still upload to YouTube from the
+        # local file. Warn (not error) if it failed.
+        log("[Phase3] Firebase Storage upload failed — audio still saved locally", "WARN")
+    except Exception as e:
+        log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
+    return ""
+
+
+#: What phase 3 tells the person when it ends holding no podcast for a run that
+#: keeps nothing — the tile's line and the notice's line.
+#:
+#: ⛔⛔ PROSE, NOT A SLUG, AND THAT IS LOAD-BEARING. The app enumerates the skip
+#: reasons it knows and de-underscores any other one into "Skipped — a slug like
+#: this"; a reason carrying a capital or a space is a sentence somebody wrote and
+#: is returned untouched. So these arrive as written, with nothing to ship beside
+#: them — and a new slug would have arrived as a slug.
+#:
+#: ⭐ AND PROSE RAISES NO NOTICE, which is the right answer here rather than a
+#: happy accident: `isAutomaticSkip` classifies a prose reason as not-automatic,
+#: so no bell entry is minted — and a bell entry for a run that keeps nothing
+#: names a research the person can no longer open. An ordinary run's two slugs
+#: still notify.
+_P3_KEEPS_NOTHING_REASON = "No podcast — this research keeps nothing"
+_P3_KEEPS_NOTHING_DETAIL = (
+    "A research that keeps nothing leaves no podcast: nothing is published, and "
+    "anything made on the research computer goes when the run ends.")
+
+
+def _p3_no_podcast_report(audio_path, research_id) -> "tuple[str, str]":
+    """`(reason, detail)` for the `phase_skipped` event phase 3 emits when it
+    ends with no podcast anybody can play.
+
+    ⛔⛔ A REFUSAL IS NOT A FAILURE (wave 10.9, #536). Phase 3 is off for a run
+    that keeps nothing, and `_p3_publish_audio` is the net for when that
+    configuration does not arrive — a resume whose config.json predates the
+    flip, or a caller that drops the key. On that path the podcast IS made and
+    publication IS declined, so a gate reading only the artefact saw a file with
+    no Storage URL and called it `audio_generated_but_upload_failed`: "The
+    podcast was generated but couldn't be uploaded — it's still on your research
+    computer." Nothing failed, and the file is not still anywhere —
+    `_purge_incognito_run_dirs` takes that folder minutes later. The person is
+    running on somebody else's computer, and this told them their private
+    research was sitting on it.
+
+    ⭐ ONE ANSWER FOR THAT RUN, whether or not the audio was made. "We made one
+    and kept nothing" and "we never made one" differ only in a repair that
+    neither has here: there is nothing to fetch and nothing to retry, and a
+    sentence naming a podcast would be a claim about a file nobody can reach.
+
+    ⭐ AND THE ORDINARY RUN KEEPS BOTH OF ITS ANSWERS. "No podcast" and "a
+    podcast we could not upload" are different states with different repairs,
+    and in the second one the file really is on that computer — saying so was
+    the whole point of the branch this came out of.
+
+    ⛔ EXTRACTED SO A TEST CAN RUN IT, exactly as `_p3_publish_audio` was: this
+    decision sits inside a six-hundred-line browser coroutine and was otherwise
+    reachable only by driving NotebookLM. Called unconditionally there."""
+    if _is_incognito_research(research_id):
+        return (_P3_KEEPS_NOTHING_REASON, _P3_KEEPS_NOTHING_DETAIL)
+    if audio_path:
+        return ("audio_generated_but_upload_failed",
+                "NotebookLM notebook created. The podcast was generated but "
+                "couldn't be uploaded — it's still on your research computer.")
+    return ("no_audio_generated",
+            "NotebookLM notebook created. No audio overview was produced.")
+
+
 def save_document_to_firestore(doc_type: str, content: str, name: str | None = None) -> bool:
     """Upsert a research document (brief/chatgpt/gemini/claude/consolidated)
     into the user's Firestore documents subcollection so the Documents page
@@ -13114,11 +15152,19 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
     Firestore client, blank content, or API error). Callers gate the
     `link_extracted` emit on this so an unsynced doc never gets a "Read
     report" button that would open an empty modal.
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING FUSES ITS REPORTS (wave 10.9, #536). These
+    documents are the whole content of the research and the body of the mail,
+    and they are what is left behind in exactly the cases the purge cannot
+    reach: the tab closed and the hand-off lost, or this machine dead. The rule
+    on `documents` REFUSES an incognito create without `expireAt`, so an old
+    wheel — which stamps none — cannot write a report it would then keep.
     """
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return False
     if not content or not content.strip():
         return False
+    _expire_at = _incognito_expire_at(_fb_research_id)
     try:
         _grpc_write_with_heal(
             lambda: _firebase_db.collection("users").document(_fb_uid)
@@ -13131,8 +15177,19 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
                     "content": content,
                     "size": f"{len(content) / 1024:.0f} KB",
                     "createdAt": int(time.time() * 1000),
+                    # ⭐ Absent for an ordinary run, so every document already in
+                    # the database keeps the policy it has (there is none) and
+                    # nothing about a normal research changes.
+                    **({"expireAt": _expire_at} if _expire_at else {}),
                 })),
             what=f"document {doc_type}")
+        if _expire_at:
+            # ⛔ SO THE LEASE CAN CARRY THIS REPORT'S FUSE FORWARD TOO — see
+            # `_renew_incognito_leases`. Remembered only once it landed, and
+            # only for a run that keeps nothing: an ordinary report has no
+            # fuse and must never be handed one.
+            _INCOGNITO_DOCS_WRITTEN.setdefault(
+                (_fb_uid, _fb_research_id), set()).add(doc_type)
         return True
     except Exception as e:
         # F5 (2026-05-13): include exception class + gRPC/HTTP status code
@@ -13253,7 +15310,7 @@ def start_firestore_start_listener(job_queue, loop):
             #                  fall through to normal claim path
             # Missing-timestamp legacy docs (no _ts and no _ca) fall
             # through, preserving the original code's bug-compatible
-            # behavior. The FIFO pre-query at line 3901 already filters
+            # behavior. The FIFO pre-query further down this handler already filters
             # docs with assignedWorker set, so a claimed-doc passing
             # through the elif chain is harmless either way.
             ZOMBIE_GRACE_MS = 30_000
@@ -13269,7 +15326,7 @@ def start_firestore_start_listener(job_queue, loop):
                 if _age_since_claim > ZOMBIE_GRACE_MS:
                     log(
                         f"Queue: stale-skip ZOMBIE {(data.get('researchId') or '')[:8]}… "
-                        f"topic={(data.get('topic') or '')[:40]!r} "
+                        f"topic={_loggable_topic(data.get('topic'), data.get('researchId'))!r} "
                         f"submittedBy={(data.get('submittedBy') or '?')[:8]} "
                         f"assignedWorker={_aw} claimedAt={_ca} "
                         f"age_since_claim={_age_since_claim // 1000}s — deleting",
@@ -13302,7 +15359,18 @@ def start_firestore_start_listener(job_queue, loop):
                 # (incl. an owner-initiated Stop/Cancel) with no feedback.
                 # Processing a stale cancel is a cheap idempotent no-op
                 # (the target run is long terminal), so let it through.
-                # (resume docs keep their prior behavior — out of scope.)
+                #
+                # ⛔⛔ 2026-09-21 (wave 10.8): "resume docs keep their prior
+                # behavior — out of scope" was the note here, and the prior
+                # behaviour is a SILENT DELETE. The banner's own copy is "Start
+                # Super Research on your PC, then tap Resume" — so tapping
+                # before booting is the order the product asks for, and a
+                # person who does that overnight had their request dropped at
+                # twelve hours with nothing said anywhere. The artifacts are
+                # untouched at this point (the 7-day sweep is what removes
+                # them), so the run is still resumable and the STATUS must not
+                # move — this writes the sentence alone, leaving the banner up
+                # and still offering Resume.
                 #
                 # #904 review catch (wake-before-boot hole): the keepalive
                 # re-stamps restDeferredAt only while the BE is ALIVE. Park
@@ -13343,11 +15411,26 @@ def start_firestore_start_listener(job_queue, loop):
                         continue
                 log(
                     f"Queue: stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… "
-                    f"topic={(data.get('topic') or '')[:40]!r} "
+                    f"topic={_loggable_topic(data.get('topic'), data.get('researchId'))!r} "
                     f"submittedBy={(data.get('submittedBy') or '?')[:8]} "
                     f"age={_age_ms // 1000}s — deleting",
                     "INFO",
                 )
+                # ⛔⛔ AND THIS WRITE IS SIXTY LINES ABOVE THE LINE THAT READS
+                # `action`, so it reached a named person's research document
+                # before either owner-control layer was consulted — the one path
+                # where the machine's guard and the Firestore rule are not two
+                # layers but one. In the window the rule's own docstring exists
+                # for (rules deploy in a command, a machine upgrades when its
+                # owner chooses), a resume doc naming somebody else's tree put
+                # `lastError`, `resumeDropReason` and its stamp into their
+                # document — and this wave taught the card to prefer that reason
+                # for every recovery status.
+                if (data.get("action") == "resume"
+                        and not _owner_control_refused(data, "stale-sweep")):
+                    _resume_drop_writeback(
+                        data.get("uid") or "", data.get("researchId") or "",
+                        RESUME_DROP_WENT_STALE, status=None)
                 try:
                     doc.reference.delete()
                 except Exception:
@@ -13364,8 +15447,8 @@ def start_firestore_start_listener(job_queue, loop):
             # so cancel/skip-action docs (rare but valid path for
             # orchestrator cleanups) are unaffected. Adds one Firestore
             # read per legacy doc, zero overhead for modern (timestamped)
-            # docs. Sync .get() mirrors the existing existence check at
-            # research.py:4647 — same listener thread, same pattern.
+            # docs. Sync .get() mirrors the ABANDONED branch's research-doc
+            # read above — same listener thread, same pattern.
             elif _age_ms == 0 and _aw is None and data.get("action", "start") == "start":
                 try:
                     _rid_legacy = data.get("researchId") or ""
@@ -13393,7 +15476,7 @@ def start_firestore_start_listener(job_queue, loop):
                                 log(
                                     f"Queue: stale-skip ABANDONED-BY-RESEARCH "
                                     f"{_rid_legacy[:24]}… "
-                                    f"topic={(data.get('topic') or '')[:40]!r} "
+                                    f"topic={_loggable_topic(data.get('topic'), _rid_legacy)!r} "
                                     f"research_age={_rd_age_ms // 1000}s — deleting",
                                     "INFO",
                                 )
@@ -13417,6 +15500,8 @@ def start_firestore_start_listener(job_queue, loop):
             # actively-running job is handled by its own per-run command
             # listener, not here.
             if action == "cancel":
+                if _refuse_owner_control(doc, data, "start-listener"):
+                    continue
                 target_rid = data.get("researchId", "")
                 target_uid = data.get("uid", "")
                 # 2026-05-28: owner-initiated stop/cancel of a SHARER's run
@@ -13446,31 +15531,35 @@ def start_firestore_start_listener(job_queue, loop):
                 # actually cancels now, so no "couldn't cancel" message
                 # path is needed.)
                 current = _QUEUE_STATE.get("current_job") or {}
-                # 2026-05-12: also check the gate-pending job. Worker pops
-                # from job_queue then awaits _wait_for_prior_fe_completion
-                # BEFORE setting current_job — so a cancel that arrives
-                # while the worker is in the gate wait sees neither
-                # current_job nor a queue entry and silently no-ops. The
-                # gate_pending_job marker closes this gap.
-                gate_pending = _QUEUE_STATE.get("gate_pending_job") or {}
-                if gate_pending.get("research_id") == target_rid:
-                    _log_about_the_armed_run(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status{' (owner '+_oc+')' if _oc else ''}")
-                    loop.call_soon_threadsafe(_controls.request_stop)
-                    if _firebase_db:
-                        from google.cloud.firestore import DELETE_FIELD as _DF
-                        _update_research_doc(target_uid, target_rid, _owner_control_patch(_oc, running=False) or {
-                            "status": "stopped",
-                            "summary": "Cancelled while queued",
-                            "cancelled": True,
-                            "queuePosition": _DF,
-                            "queuedBehindRunId": _DF,
-                            "queuedBehindTitle": _DF,
-                        })
-                    try:
-                        doc.reference.delete()
-                    except Exception:
-                        pass
+                # ⛔⛔ AND THE RUN HAS TO BE THE ONE THEY NAMED, which neither
+                # the rule nor the identity guard can tell. Both of those ask
+                # whether `uid` disagrees with `submittedBy`; a member of a
+                # shared computer signs honestly as themselves and puts
+                # SOMEBODY ELSE'S researchId in the doc, and every match below
+                # keys on `research_id` alone. That stopped the victim's run,
+                # left a permanent `.stop` behind it, and wrote the status into
+                # the sender's own tree so the victim was never told. Their
+                # researchId is on the device document every member may read.
+                #
+                # ⭐ ASKED ONCE, BEFORE ANYTHING IS STOPPED OR WRITTEN, over
+                # every job this process holds.
+                # ⛔⛔ AND IT CANNOT SEE A DEFERRED RUN, which this comment used
+                # to say it covered. Nobody holds a deferred run, so this gate
+                # passes it, and a sibling worker reaches the deferred scan even
+                # when the holder refuses. That scan checks the START doc's own
+                # uid — see `_deferred_start_doc_id` in `_do_cancel` below.
+                _local_jobs = _jobs_held_locally(job_queue)
+                if _refuse_foreign_run(doc, _local_jobs, target_rid, target_uid,
+                                       "start-listener"):
                     continue
+                # ⛔ THE GATE-WAIT BRANCH RETIRED WITH THE GATE (wave 10.9, N8).
+                # A worker used to pop from job_queue and then await the
+                # previous run's cloud tail BEFORE setting current_job, so for
+                # the length of that wait a dequeued job was in neither
+                # current_job nor the queue and a cancel silently no-opped. The
+                # wait is gone: `current_job` is now set in the same breath as
+                # the dequeue, so the two branches below cover every job this
+                # process holds.
                 if current.get("research_id") == target_rid:
                     _log_about_the_armed_run(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit{' (owner '+_oc+')' if _oc else ''}")
                     loop.call_soon_threadsafe(_controls.request_stop)
@@ -13510,29 +15599,6 @@ def start_firestore_start_listener(job_queue, loop):
                     continue
                 def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference, oc=_oc):
                     try:
-                        # 2026-05-12: also re-check gate_pending_job. The
-                        # listener-thread initial check above could miss a
-                        # job that JUST entered the gate wait. Same fix as
-                        # the sync path.
-                        gate_pending_now = _QUEUE_STATE.get("gate_pending_job") or {}
-                        if gate_pending_now.get("research_id") == rid:
-                            _log_about_the_armed_run(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop{' (owner '+oc+')' if oc else ''}")
-                            _controls.request_stop()
-                            if _firebase_db:
-                                from google.cloud.firestore import DELETE_FIELD as _DF
-                                _update_research_doc(u, rid, _owner_control_patch(oc, running=False) or {
-                                    "status": "stopped",
-                                    "summary": "Cancelled while queued",
-                                    "cancelled": True,
-                                    "queuePosition": _DF,
-                                    "queuedBehindRunId": _DF,
-                                    "queuedBehindTitle": _DF,
-                                })
-                            try:
-                                dref.delete()
-                            except Exception:
-                                pass
-                            return
                         # Race-safe re-check: between the listener's initial
                         # current_job read (above) and this callback running on
                         # the asyncio loop, the worker may have completed its
@@ -13541,8 +15607,19 @@ def start_firestore_start_listener(job_queue, loop):
                         # job would be missing (already popped) → no-op → the
                         # pipeline would start despite the cancel. Re-checking
                         # current_job here closes that window.
+                        #
+                        # ⛔ THE RACE RE-CHECK RE-ASKS THE OWNERSHIP QUESTION
+                        # TOO. The listener-thread gate ran before this callback
+                        # was scheduled, and the whole reason this branch exists
+                        # is that a job can arrive in the window between.
+                        #
+                        # ⛔ A SIBLING BRANCH FOR `gate_pending_job` STOOD HERE
+                        # and retired with the queue gate (wave 10.9, N8): there
+                        # is no longer a state in which a dequeued job is held by
+                        # this process and is not `current_job`.
                         current_now = _QUEUE_STATE.get("current_job") or {}
-                        if current_now.get("research_id") == rid:
+                        if (current_now.get("research_id") == rid
+                                and not _job_is_another_persons(current_now, u)):
                             _log_about_the_armed_run(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit{' (owner '+oc+')' if oc else ''}")
                             _controls.request_stop()
                             run_id_now = current_now.get("run_id") or ""
@@ -13568,11 +15645,23 @@ def start_firestore_start_listener(job_queue, loop):
                             _schedule_server_exit("token-cancel-current-late")
                             return
                         dq = job_queue._queue  # deque
-                        kept = [j for j in dq if j.get("research_id") != rid]
-                        removed = any(j.get("research_id") == rid for j in dq)
+                        # ⛔ AND THE DEQUE SCAN DROPS ONLY THIS PERSON'S JOB.
+                        # Matching on research_id alone made "remove the job I
+                        # named" and "remove the job I own" the same sentence,
+                        # which is exactly the confusion this repair is about.
+                        def _cancels(j, _r=rid, _u=u):
+                            return (j.get("research_id") == _r
+                                    and not _job_is_another_persons(j, _u))
+                        kept = [j for j in dq if not _cancels(j)]
+                        removed = any(_cancels(j) for j in dq)
                         dq.clear()
                         for j in kept:
                             dq.append(j)
+                        # ⛔⛔ AND THE SNAPSHOT FORGETS A RUN THAT KEEPS NOTHING
+                        # NOW, not when the run in front of it ends — a leave
+                        # sends this same cancel. See the helper.
+                        if removed and _is_incognito_research(rid):
+                            _shed_from_pending_snapshot(job_queue)
                         # Bug Cancel-Stale (2026-05-22): for deferred jobs
                         # (still in Firestore queue, no worker has claimed
                         # them) the local dq scan misses, removed=False,
@@ -13594,12 +15683,13 @@ def start_firestore_start_listener(job_queue, loop):
                         _start_doc_id = None
                         if not removed and _firebase_db:
                             try:
-                                for _qsnap in col_ref.limit(50).stream():
-                                    _qd = _qsnap.to_dict() or {}
-                                    if (_qd.get("researchId") == rid
-                                            and (_qd.get("action") or "start") == "start"):
-                                        _start_doc_id = _qsnap.id
-                                        break
+                                # ⛔⛔ ONLY THIS PERSON'S START DOC. The scan
+                                # matched on researchId alone, so a member's
+                                # cancel naming somebody else's published id
+                                # deleted that person's queued run. Assigned,
+                                # not branched on — see the helper.
+                                _start_doc_id = _deferred_start_doc_id(
+                                    col_ref.limit(50).stream(), rid, u)
                                 if _start_doc_id is not None:
                                     try:
                                         col_ref.document(_start_doc_id).delete()
@@ -13709,6 +15799,8 @@ def start_firestore_start_listener(job_queue, loop):
             # is a fresh daemon process), so the token-queue is the only path
             # that re-enqueues the job from disk artifacts.
             if action == "resume":
+                if _refuse_owner_control(doc, data, "start-listener"):
+                    continue
                 target_uid = data.get("uid", "")
                 target_rid = data.get("researchId", "")
                 if not target_uid or not target_rid:
@@ -13716,58 +15808,134 @@ def start_firestore_start_listener(job_queue, loop):
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
+                # ⛔⛔ A RUN THIS PROCESS HOLDS FOR SOMEBODY ELSE IS NOT THEIRS
+                # TO RESUME, whatever the disk says. The owner.json checks below
+                # carry the person too, but a directory written before the uid
+                # half existed decides nothing; the job in hand always names its
+                # owner. The cancel branch asks the same question the same way.
+                if _refuse_foreign_run(doc, _jobs_held_locally(job_queue), target_rid,
+                                       target_uid, "start-listener", verb="resume"):
+                    continue
+                # ⛔⛔ AND THE RECORD IS READ BEFORE ANYTHING ELSE IS BELIEVED
+                # (wave 10.10). A Resume that carries its run id used to be taken
+                # on the disk's word alone — `_resume_run_id` reads the document
+                # only when the payload has no usable id — so a research deleted
+                # while its recovery card offered Resume was resumed and EMAILED.
+                # Deleting sends a queue cancel to catch exactly this, but with
+                # the computer offline the two documents arrive in no fixed
+                # order, and the cancel finds nothing to cancel about half the
+                # time. Nothing is written back: there is no record to write to,
+                # or it is archived and put away.
+                _withdrawn, _ = _pickup_withdrawn(target_uid, target_rid, "resume")
+                if _withdrawn:
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
                 # Track D: synth user can't read users/{ownerUid}/researches.
                 # FE now carries backendRunId in the queue payload, so the
                 # research-doc read is a fallback only (legacy Admin-SDK BEs
                 # or installs where the FE somehow forgot to include it).
-                # Initialize `rd` so the topic fallback at line ~2829 is
+                # Initialize `rd` so the topic fallback below (`rd.get("topic")`) is
                 # safe even when we skip the doc-read branch entirely.
                 rd: dict = {}
-                backend_run_id = (data.get("backendRunId") or "").strip()
-                if not backend_run_id:
-                    try:
-                        rs = _firebase_db.collection("users").document(target_uid) \
-                            .collection("researches").document(target_rid).get()
-                    except Exception as ex:
-                        err_str = str(ex)
-                        if (
-                            "403" in err_str
-                            or "PERMISSION_DENIED" in err_str
-                            or "Missing or insufficient permissions" in err_str
-                        ):
-                            log(
-                                "Resume: read denied on research doc + no backendRunId in payload — drop queue entry",
-                                "WARN",
-                            )
-                        else:
-                            log(f"Resume: failed to read research doc: {ex}", "WARN")
-                        try: doc.reference.delete()
-                        except Exception: pass
-                        continue
-                    if not rs.exists:
-                        log(f"Resume: research {target_rid[:8]}... not found", "WARN")
-                        try: doc.reference.delete()
-                        except Exception: pass
-                        continue
-                    rd = rs.to_dict() or {}
-                    backend_run_id = rd.get("backendRunId") or ""
-                if not backend_run_id:
-                    log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
+                # ⛔⛔ AND A CLIENT-SUPPLIED RUN ID IS A CLAIM, NOT A FACT. The
+                # payload's field is read straight off the queue document
+                # precisely so a synth user who cannot read the research doc
+                # still resumes — which means nothing upstream has checked that
+                # the run it names is the research it names, or the person's.
+                # Left unchecked it resumes somebody else's run directory under
+                # this person's research, clears their `.no_auto_retry` and
+                # their `.pause`, and rewrites the artifacts' status. The
+                # document's field is the same kind of claim: it sits in the
+                # sender's own tree. `_resume_run_id` corroborates both against
+                # `owner.json` — research AND person.
+                #
+                # ⛔⛔ ASSIGNED UNCONDITIONALLY, AND A MUTANT IS WHY. Written as
+                # an `if` here, the whole corroboration could be neutered to
+                # `if False and backend_run_id:` with every name the test looked
+                # for still in place — and it survived the harness. There is no
+                # branch to neuter now; the resolution is executed by its own
+                # tests with a queue doc naming somebody else.
+                try:
+                    backend_run_id, rd = _resume_run_id(data, target_uid, target_rid)
+                except Exception as ex:
+                    err_str = str(ex)
+                    if (
+                        "403" in err_str
+                        or "PERMISSION_DENIED" in err_str
+                        or "Missing or insufficient permissions" in err_str
+                    ):
+                        log(
+                            "Resume: read denied on research doc + no usable backendRunId in payload — drop queue entry",
+                            "WARN",
+                        )
+                    else:
+                        log(f"Resume: failed to read research doc: {ex}", "WARN")
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
+                if rd is None:
+                    log(f"Resume: research {target_rid[:8]}... not found", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                if not backend_run_id:
+                    log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
+                    # ⛔ "NO RUN DIRECTORY TO POINT AT" IS TRUE OF THE DOCUMENT,
+                    # NOT OF THE DISK, and cross-verify was right to separate
+                    # them. The start listener writes `backendRunId` back with
+                    # an update and falls back to a merged set precisely because
+                    # that write can fail; when both fail the run proceeds with
+                    # a real `queues/<run_id>` directory while the document
+                    # carries nothing. Closing auto-recovery there is permanent
+                    # — the status is outside both enqueue whitelists — so we
+                    # look on the disk before taking it away.
+                    # ⛔⛔ AND IT USES WHAT IT FOUND. Round two of cross-verify
+                    # caught the first version finding the directory, logging
+                    # it, and then REFUSING anyway with "try Resume once more" —
+                    # a closed loop, because nothing between two presses writes
+                    # `backendRunId` back, so the next press takes the identical
+                    # branch, and the sentence tells the person to keep pressing
+                    # it. The directory's own name IS the missing run id.
+                    # ⛔⛔ ONLY A DIRECTORY THAT IS THIS PERSON'S. Asked about the
+                    # research alone, this found another member's run for a
+                    # research id the sender had minted in their own tree, and
+                    # the arm below "repaired" the sender's document with it.
+                    _orphaned = _run_dir_owning_research(target_rid, target_uid)
+                    if _orphaned is not None:
+                        log(f"Resume: {target_rid[:8]}… has no backendRunId but "
+                            f"{_orphaned.name} on disk claims it — repairing the "
+                            f"document and resuming", "WARN")
+                        backend_run_id = _orphaned.name
+                        _update_research_doc(target_uid, target_rid,
+                                             {"backendRunId": backend_run_id})
+                    else:
+                        _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_NO_RUN_ID)
+                        try: doc.reference.delete()
+                        except Exception: pass
+                        continue
                 queue_dir = Path(__file__).parent / "queues" / backend_run_id
                 if not queue_dir.exists():
                     log(f"Resume: queue_dir missing for {backend_run_id} — disk artifacts gone", "WARN")
+                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_ARTIFACTS_GONE)
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
                 # Block resume of terminal-stopped runs (mirrors HTTP endpoint).
                 if (queue_dir / ".stop").exists():
                     log(f"Resume: run {backend_run_id} marked .stop (terminal) — skipping", "WARN")
+                    _resume_drop_writeback(target_uid, target_rid, RESUME_DROP_TERMINALLY_STOPPED)
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
+                # ⭐ A PERSON ASKED FOR ANOTHER GO, so the automatic-attempts
+                # marker goes. `run_pipeline` writes it when it gives up and
+                # shows the terminal card; `_safe_enqueue` refuses anything
+                # carrying it, which is what stops a supervised boot silently
+                # relaunching a run whose budget is spent. Retry is a decision
+                # to spend a fresh one — and clearing it HERE, on the one path a
+                # human drives, is why that gate needs no list of callers.
+                _clear_no_auto_retry(queue_dir)
                 # Clear .pause signal so the dispatcher / phase loops drain.
                 p = queue_dir / ".pause"
                 if p.exists():
@@ -13826,8 +15994,25 @@ def start_firestore_start_listener(job_queue, loop):
                 # _safe_enqueue's whitelist accepts ongoing). #728: re-stamp
                 # assignedWorker = the worker resuming it (this process), so a
                 # later restart's rehydration keeps the affinity correct.
+                #
+                # ⛔⛔ AND THE REFUSAL GOES WITH IT — THIS IS THE DELETER. Round
+                # one found a stale `lastError` speaking for statuses it was
+                # never written about; the repair was a dedicated field, and
+                # round three found the same defect waiting on the replacement.
+                # `resumeDropReason` had one writer and NO deleter while the
+                # card was widened to prefer it for all four recovery statuses,
+                # so a Resume that succeeded left its old refusal standing:
+                # the run hits the watchdog ceiling hours later and the card
+                # reads "Your earlier Resume sat waiting for more than 12
+                # hours…" under "Run stopped — it hit the time limit",
+                # suppressing "Your PC was fine throughout" — the sentence a
+                # 2026-09-01 measurement exists to protect. A resume that WORKED
+                # is the one moment we know the refusal is spent.
+                from google.cloud.firestore import DELETE_FIELD as _DF_RESUME
                 _update_research_doc(target_uid, target_rid,
-                                     {"status": "ongoing", "assignedWorker": WORKER_ID})
+                                     {"status": "ongoing", "assignedWorker": WORKER_ID,
+                                      "resumeDropReason": _DF_RESUME,
+                                      "resumeDropAt": _DF_RESUME})
                 # Delete the queue doc — Firestore's onSnapshot replays it
                 # otherwise, double-enqueueing on every BE restart.
                 try: doc.reference.delete()
@@ -13869,7 +16054,7 @@ def start_firestore_start_listener(job_queue, loop):
             # links from these in the P3-skip block of run_pipeline.
             user_links = data.get("userLinks") or []
             if not topic or not uid or not research_id:
-                log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={topic[:30]}", "WARN")
+                log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={_loggable_topic(topic, research_id, 30)}", "WARN")
                 try:
                     doc.reference.delete()
                 except Exception:
@@ -13920,18 +16105,20 @@ def start_firestore_start_listener(job_queue, loop):
             # of API calls on work the user already abandoned. Mark the
             # queue doc staleSkipped so it doesn't replay on future
             # listener attaches.
+            # ⭐ THE ONE PICKUP RULE (wave 10.10) — deleted or archived stands
+            # down and takes the queue doc with it; an unreadable record is
+            # taken, as this branch always did ("allowing through"). The record
+            # it read is handed on, so the checks below do not read it again.
+            _withdrawn, _rd_found = _pickup_withdrawn(uid, research_id, "start")
+            if _withdrawn:
+                try:
+                    doc.reference.delete()
+                except Exception:
+                    pass
+                continue
             try:
-                research_doc = _firebase_db.collection("users").document(uid) \
-                    .collection("researches").document(research_id).get()
-                if not research_doc.exists:
-                    log(f"Queue: skipped — research doc {research_id} no longer exists (user deleted chat?)", "INFO")
-                    try:
-                        doc.reference.delete()
-                    except Exception:
-                        pass
-                    continue
                 # 2026-05-22 (cancel-stale fix): cross-worker cancel race
-                # mitigation. The cancel handler at research.py:4090 flips
+                # mitigation. The cancel handler (`_do_cancel`, above) flips
                 # research status="stopped" + cancelled=True, but there's
                 # a window where worker A claimed the queue doc + scheduled
                 # call_soon_threadsafe enqueue BEFORE the cancel arrives —
@@ -13940,12 +16127,17 @@ def start_firestore_start_listener(job_queue, loop):
                 # Pre-claim status re-check catches this: if the research
                 # doc is already in a terminal state, skip + delete the
                 # queue doc so it doesn't replay on listener attach.
-                _rd_data = research_doc.to_dict() or {}
+                # None when the read failed: no status, so nothing below
+                # refuses it — the same "allowing through" as ever.
+                _rd_data = _rd_found or {}
                 _rd_status = _rd_data.get("status")
-                if _rd_status in (
-                    "stopped", "completed", "archived",
-                    "terminated_by_user_discard", "stopped_by_watchdog",
-                ):
+                # ⛔ ONE TUPLE, NOT TWO. This gate carried its own copy of the
+                # terminal statuses and the module constant's comment promised
+                # they mirrored each other — a promise nothing measured, and the
+                # tests for this gate were a third copy in the test file. It
+                # reads the constant now, so the set has one definition and the
+                # tests that drive this branch measure it.
+                if _rd_status in TERMINAL_RESEARCH_STATUSES:
                     log(
                         f"Queue: skipped — research {research_id[:24]}… "
                         f"already status={_rd_status} (cancel landed mid-claim?)",
@@ -13980,7 +16172,16 @@ def start_firestore_start_listener(job_queue, loop):
                 # ongoing (which no-ops on already-ongoing, NOT in the
                 # BAIL_STATUSES set) and worker enters run_pipeline for
                 # an already-running research → dual-spawn.
-                if _rd_status == "ongoing":
+                #
+                # ⛔⛔ AND WHEN THE RECORD COULD NOT BE READ (wave 10.10). A
+                # failed read has no status, so this guard never ran — and since
+                # a failed read now TAKES the job, a duplicate start doc for a run
+                # a sibling is executing went on to run it twice, on two browser
+                # sessions, billed twice. The lock is a local file and needs no
+                # Firestore, so it decides alone: a live sibling running THIS
+                # research makes this doc a duplicate. With no such sibling the
+                # job is taken, exactly as the pickup rule says.
+                if _rd_status == "ongoing" or _rd_found is None:
                     _siblings = _scan_sibling_locks_for_research(
                         research_id, WORKER_ID
                     )
@@ -13998,7 +16199,7 @@ def start_firestore_start_listener(job_queue, loop):
                             pass
                         continue
             except Exception as e:
-                log(f"Queue: research-doc existence check failed (allowing through): {e}", "WARN")
+                log(f"Queue: research-doc status checks failed (allowing through): {e}", "WARN")
 
             # ── Multi-worker claim (2026-05-21) ─────────────────────────────
             # With workerCount>1, every worker's listener fires for this same
@@ -14080,7 +16281,7 @@ def start_firestore_start_listener(job_queue, loop):
                         _defer_reason = "claim-in-flight"
                     log(
                         f"[start-listener] worker {WORKER_ID}: defer {research_id[:8]}… "
-                        f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                        f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
                         f"reason={_defer_reason}",
                         "INFO",
                     )
@@ -14241,7 +16442,7 @@ def start_firestore_start_listener(job_queue, loop):
                             # for cross-account triage.
                             log(
                                 f"[start-listener] worker {WORKER_ID}: FIFO defer {research_id[:8]}… "
-                                f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                                f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
                                 f"(older unclaimed {_head_id[:8]}… is head)",
                                 "INFO",
                             )
@@ -14320,7 +16521,7 @@ def start_firestore_start_listener(job_queue, loop):
                         # silent skip is traceable from log alone.
                         log(
                             f"[start-listener] worker {WORKER_ID}: claim error — skipping {research_id[:8]}… "
-                            f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                            f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
                             f"(idle-rescan will retry)",
                             "WARN",
                         )
@@ -14328,54 +16529,36 @@ def start_firestore_start_listener(job_queue, loop):
                     if _claim_outcome is False:
                         log(
                             f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}… "
-                            f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}",
+                            f"topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]}",
                             "INFO",
                         )
                         continue
-                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}… topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}", "INFO")
+                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}… topic={_loggable_topic(topic, research_id)!r} submittedBy={(data.get('submittedBy') or '?')[:8]}", "INFO")
                     # Synchronously reserve a "pending enqueue" slot
                     # BEFORE call_soon_threadsafe schedules the actual
                     # put. This closes the back-to-back-claim race
                     # exploited by Firestore listener replay (see the
-                    # gate clause at research.py:~4106). Decrement
+                    # busy-gate clause above). Decrement
                     # lands either at the worker's running-flag flip
                     # OR via _enqueue_with_position_refresh on
                     # _safe_enqueue failure (rare cancel-mid-flight).
                     _pending_enq_inc()
 
             # Generate run_id
-            run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
+            run_id = _mint_run_id(topic, research_id)
+            log(f"Firestore start: uid={uid[:8]}... topic={_loggable_topic(topic, research_id)} run_id={run_id}")
             # Decide initial status: "ongoing" if worker is idle AND the gate
             # won't block, else "queued" with position + behind-target so the
             # chat banner + tile badge can tell the user which run must
             # finish first.
             is_busy = bool(_QUEUE_STATE.get("running")) or job_queue.qsize() > 0
-            # 2026-05-12: also predict the queue gate. Even when the worker is
-            # idle and queue empty, `_wait_for_prior_fe_completion` can block
-            # the dequeue for up to BE_PHASES_TIMEOUT_SEC waiting on a prior
-            # run's FE-P5. Without surfacing this, the new run lands as
-            # status="ongoing" but with no phase_start:0 events for the entire
-            # gate window — the FE renders an "ongoing" chat with no Phase 0
-            # tile (the inconsistency the user flagged 2026-05-12). Compute
-            # the same predicate the gate uses so the user sees a queued
-            # banner during the wait instead of empty silence.
-            _gate_will_block = False
-            _gate_prid = _QUEUE_STATE.get("last_completed_rid") or ""
-            _gate_puid = _QUEUE_STATE.get("last_completed_uid") or ""
-            _gate_pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
-            if (
-                not is_busy
-                and _gate_prid and _gate_puid and _gate_pdone > 0
-                # Skip when this rid IS the gate's prior rid (resume path —
-                # the helper at research.py:22457 skips the wait for this
-                # case, so we must NOT show a banner either).
-                and research_id != _gate_prid
-            ):
-                _gate_deadline = _gate_pdone + (BE_PHASES_TIMEOUT_SEC * 1000)
-                if int(time.time() * 1000) < _gate_deadline:
-                    _gate_will_block = True
-            if is_busy or _gate_will_block:
+            # ⛔ THE QUEUE-GATE PREDICTION RETIRED WITH THE GATE (wave 10.9,
+            # N8). A block stood here computing the gate's own predicate, so a
+            # run submitted while the PREVIOUS run's cloud tail was in flight
+            # landed "queued" with a banner naming that other run — on a shared
+            # computer, somebody else's. An idle worker now starts immediately,
+            # so busy-ness is the whole of the question again.
+            if is_busy:
                 # Bug A fix (2026-05-22): position calc via device-wide
                 # FIFO scan instead of per-worker `job_queue.qsize()+1`.
                 # In multi-worker installs the local qsize misses
@@ -14399,30 +16582,17 @@ def start_firestore_start_listener(job_queue, loop):
                     )
                     position = job_queue.qsize() + 1
                     behind_rid = ""
-                # Gate-blocked path special-case: when no behind-doc
-                # found in the global queue (we're head), fill behind
-                # from the prior run whose FE-P5 the gate is waiting
-                # on. Best-effort title read.
-                if not behind_rid and _gate_will_block:
-                    behind_rid = _gate_prid
-                    # ⛔⛔ THE WHOLE READ IS GONE, NOT JUST THE SLICE — 7.7E, found by
-                    # cross-verify after the first pass missed it. `behind_rid` is
-                    # assigned on the line above from `_gate_prid`, so this Firestore
-                    # get existed ONLY to populate `behind_title`: a cross-tree read of
-                    # ANOTHER account's research document (`_gate_puid` is the prior
-                    # run's submitter, not this one), to fetch their topic, for a value
-                    # every consumer now writes as a field delete. One extra read of
-                    # somebody else's private record, per gate-blocked start, for
-                    # nothing.
-                    #
-                    # ⭐ This is the fifth carrier. The other four were found by design
-                    # review; this one survived because the backend guard written for
-                    # them checked only the two spellings those four used. The guard
-                    # now checks the shape.
-                # Falling back to local current_job ONLY if global helper
-                # returned no behind AND we're not in gate-block — happens
-                # when I'm position 1 and worker has a job mid-completion
-                # not yet visible as currentRunId on device doc.
+                # ⛔⛔ THE GATE-BLOCKED SPECIAL CASE IS GONE WITH THE GATE
+                # (wave 10.9, N8). It filled `behind_rid` from the PREVIOUS
+                # run's id — on a shared computer, another person's — and
+                # before 7.7E it also read that person's research document to
+                # fetch their topic for a field every consumer now deletes.
+                # Nothing waits behind a cloud tail any more, so there is no
+                # such "behind" to name.
+                # Falling back to local current_job ONLY if the global helper
+                # returned no behind — happens when I'm position 1 and the
+                # worker has a job mid-completion not yet visible as
+                # currentRunId on the device doc.
                 if not behind_rid:
                     current = _QUEUE_STATE.get("current_job")
                     if current:
@@ -14452,7 +16622,8 @@ def start_firestore_start_listener(job_queue, loop):
                 # On a BE restart, worker-1's rehydration uses this to avoid
                 # auto-resuming a run onto the WRONG worker's profile (the
                 # "worker-1 funnel"). The researches update rule has no field
-                # whitelist (firestore.rules:206 deviceUpdatingFor), so it rides
+                # whitelist (firestore.rules' /researches update rule, via
+                # `deviceUpdatingFor`), so it rides
                 # the same write that already sets backendRunId/status.
                 status_payload = {"backendRunId": run_id, "status": "ongoing",
                                   "assignedWorker": WORKER_ID,
@@ -14461,7 +16632,28 @@ def start_firestore_start_listener(job_queue, loop):
             # `_update_research_doc` returns False on failure (logs WARN);
             # we then attempt a set(merge=True) as a fallback for the
             # "doc doesn't exist yet" race (FE hasn't created it).
+            #
+            # ⛔⛔ EXCEPT THAT A RUN THAT KEEPS NOTHING ABORTS INSTEAD (wave 10.9,
+            # #536). For an ordinary research this fallback covers a race: the
+            # app is still creating the record. For an incognito one it covers
+            # something else — the record was DELETED, by somebody leaving the
+            # chat or by the fuse burning out while the run waited in a queue —
+            # and recreating it is the one thing the promise cannot survive. The
+            # fragment would carry no `createdAt`, so no list, no sweep and no
+            # TTL could ever find it again.
+            #
+            # ⭐ THE QUEUE DOC GOES WITH IT. Left behind, the idle-rescan would
+            # claim it on the next pass and arrive here again, for ever.
             if not _update_research_doc(uid, research_id, status_payload):
+                if _is_incognito_research(research_id):
+                    log(f"[start-listener] {research_id[:8]}… keeps nothing and its "
+                        f"record is gone — abandoning the start rather than "
+                        f"recreating it", "WARN")
+                    try:
+                        doc.reference.delete()
+                    except Exception:
+                        pass
+                    continue
                 _set_research_doc(uid, research_id, status_payload, merge=True)
             # Delete the queue doc (was: mark processed). Queue subcollection
             # accumulated forever before this — every start request a permanent
@@ -14495,7 +16687,10 @@ def start_firestore_start_listener(job_queue, loop):
                          # PINNED writer. Read at the dequeue, not here — the
                          # job dict is the only thing that survives the hop.
                          "submitted_by": sb},
-                        source="start-listener"):
+                        source="start-listener",
+                        # ⛔⛔ THE QUEUE DOC IS ALREADY DELETED (above), so a
+                        # refusal on a failed read would drop the run for good.
+                        take_unreadable=True):
                     _recompute = _QUEUE_STATE.get("recompute_fn")
                     if _recompute is not None:
                         try:
@@ -14534,6 +16729,42 @@ def start_firestore_start_listener(job_queue, loop):
     log(f"Firestore start listener active on {listener_label}")
 
 
+#: What `_log_job_ref` prints when a job carries nothing it may name.
+_LOG_REF_UNKNOWN = "?"
+#: The `YYYYMMDD_HHMMSS` half of a `safe_name(topic)_<stamp>` run id — the same
+#: cut `_BUNDLE_QUEUE_NAME_RE` makes, and it has to END the name, so a stamp-like
+#: run of digits inside the slug cannot be mistaken for it.
+_RUN_ID_STAMP_RE = re.compile(r"(?<!\d)(\d{8}_\d{6})(?![\w-])")
+
+
+def _log_job_ref(job) -> str:
+    """How a machine-wide log line names one queued job: its research id, short.
+
+    ⛔⛔ NEVER THE TOPIC. `backend.log` belongs to the MACHINE, not to one
+    person: on a shared computer every member's jobs land in it, and the owner's
+    support bundle ships its tail. The pickup line printed the whole topic, and
+    so did the idle-rescan claim and the two notebook-rename lines — none of
+    them behind a `topic=` key any redactor could find, which is how they
+    outlived a redactor written for the keyed shapes. A research id ties the
+    line to the run folder, the queue and the Firestore doc, which is what a
+    reader of these logs follows anyway.
+
+    ⛔ `run_id` AND `resume_dir` ARE NOT SAFE WHOLE. Both are
+    `safe_name(topic)_YYYYMMDD_HHMMSS`, so only the stamp may be printed — the
+    same cut the bundle redactor makes on a queue directory name.
+    """
+    if not isinstance(job, dict):
+        return _LOG_REF_UNKNOWN
+    research_id = str(job.get("research_id") or "").strip()
+    if research_id:
+        return research_id[:8] + "…"
+    for key in ("run_id", "resume_dir"):
+        stamp = _RUN_ID_STAMP_RE.search(str(job.get(key) or ""))
+        if stamp:
+            return "queue " + stamp.group(1)
+    return _LOG_REF_UNKNOWN
+
+
 def setup_firestore_run(uid, research_id, loop=None, run_id=None):
     """Set per-run Firestore context. Call at pipeline start."""
     global _fb_uid, _fb_research_id, _fb_seq, _fb_listener
@@ -14561,14 +16792,21 @@ def setup_firestore_run(uid, research_id, loop=None, run_id=None):
 
 
 def teardown_firestore_run():
-    """Clean up per-run Firestore state."""
+    """Clean up per-run Firestore state.
+
+    ⛔ THE RUN'S IDS ARE CLEARED EVEN WHEN THE UNSUBSCRIBE RAISES (wave 10.9,
+    last repair). `run_pipeline`'s finally survives that raise on purpose, and
+    the ids used to stay behind it — naming a run that had ended, to every
+    global-target writer, until the next run's setup hours later."""
     global _fb_uid, _fb_research_id, _fb_seq, _fb_listener
-    if _fb_listener:
-        _fb_listener.unsubscribe()
-        _fb_listener = None
-    _fb_uid = None
-    _fb_research_id = None
-    _fb_seq = 0
+    try:
+        if _fb_listener:
+            _fb_listener.unsubscribe()
+            _fb_listener = None
+    finally:
+        _fb_uid = None
+        _fb_research_id = None
+        _fb_seq = 0
 
 
 _exit_scheduled = False
@@ -14587,8 +16825,79 @@ _exit_scheduled = False
 _active_browser_ref = None  # type: Optional["Browser"]
 
 
+# ── A research the person took back is never picked up ─────────────────────
+#: The one status, beside the record being gone, that withdraws a research from
+#: every pickup. ⛔ NOT the whole terminal set: a Resume is offered for a
+#: watchdog-stopped or discarded run, so "over" cannot mean "withdrawn" here.
+#: "archived" can — the old archive wrote it over a QUEUED run, and that record
+#: must never be started by a machine coming back online.
+_PICKUP_WITHDRAWN_STATUS = "archived"
+
+
+def _log_pickup_stand_down(where: str, research_id, reason: str) -> None:
+    """The line every stand-down writes: the machine's, and never the topic.
+
+    ⭐ THE MACHINE'S, because the job is not running — nothing about it belongs
+    in whatever run happens to be armed, which on a shared computer is somebody
+    else's. The research id says which job; the topic is the person's."""
+    with _machine_log_scope():
+        log(f"[pickup:{where}] {str(research_id or '')[:8]}… was {reason} — "
+            f"standing down, nothing is picked up", "INFO")
+
+
+def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict | None]":
+    """Read the research record before a job is taken: (why it must stand
+    down, the record).
+
+    The reason is "deleted" (the read succeeded and there is no record) or
+    "archived", and None means take the job. The record is the document's data
+    when it could be read and exists, else None — so a caller that needs the
+    status for its own checks does not read it twice.
+
+    ⛔⛔ A READ THAT FAILS TAKES THE JOB — it is never a deletion. Standing
+    down is irreversible and silent: the listener and the rescan delete the
+    queue document and the boot restore sheds the snapshot's entry — the only
+    copy of the request — and nobody is told, while the person watches a tile
+    that says queued. A read fails for
+    reasons that say nothing about the record — a network blip at boot, a token
+    mid-refresh, the fresh-sharer-document race the rules file documents — and
+    all of them happen to runs somebody is waiting for. The opposite mistake is
+    bounded: a job taken on an unreadable record meets a second, independent
+    read at the worker's dequeue, which applies this same rule, so a deleted
+    research runs only if both reads fail.
+
+    ⭐ ONE DEFINITION FOR EVERY PICKUP — start, Resume, the idle rescan, the
+    dequeue, the boot restore, the rehydrate and the dead-worker reconcile. A
+    rule written per path is a rule one path forgets, and a Resume that named
+    its run was that path: it never read the record at all."""
+    rid = str(research_id or "").strip()
+    if not (_firebase_db and uid and rid):
+        return None, None
+    try:
+        snap = (_firebase_db.collection("users").document(uid)
+                .collection("researches").document(rid).get())
+        # Inside the try: a snapshot that cannot say whether it exists is an
+        # unreadable record, not a missing one.
+        exists = bool(snap.exists)
+        record = (snap.to_dict() or {}) if exists else None
+    except Exception as err:
+        with _machine_log_scope():
+            log(f"[pickup:{where}] {rid[:8]}… record unreadable "
+                f"({type(err).__name__}) — taking the job: a read that fails is "
+                f"not a deletion", "WARN")
+        return None, None
+    if not exists:
+        _log_pickup_stand_down(where, rid, "deleted")
+        return "deleted", None
+    if record.get("status") == _PICKUP_WITHDRAWN_STATUS:
+        _log_pickup_stand_down(where, rid, "archived")
+        return "archived", record
+    return None, record
+
+
 def _safe_enqueue(job_queue, job, source: str,
-                  allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart")) -> bool:
+                  allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart"),
+                  *, take_unreadable: bool = False) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -14609,6 +16918,31 @@ def _safe_enqueue(job_queue, job, source: str,
     this also closes the multi-worker double-enqueue: worker-2's per-process
     disk-restore can't re-fire a run worker-1 already parked, even though
     worker-2's local `_rehydrated_rids` set never saw it.
+
+    ⛔⛔ WHAT A READ THAT FAILS DOES IS THE CALLER'S TO SAY — `take_unreadable`
+    (wave 10.10). The funnel refused on any failure that was not a 403, and on
+    no Firestore client at all, and that is right only for a caller who still
+    holds the job somewhere. The start listener and the idle rescan do not: by
+    the time they get here they have DELETED the job's queue document, so a
+    refusal was the end of the request — a paid run gone on a Firestore blip,
+    its record left saying "ongoing" or "queued", and nobody told. Those two
+    pass True and a failed read TAKES the job, the way `_pickup_withdrawn`
+    takes it: the record was read a moment earlier on the way in, and the
+    worker's dequeue reads it again before anything runs — it stands a deleted
+    research down and bails on every terminal status — so a withdrawn run
+    starts only if all three reads fail.
+
+    ⭐ THE DEFAULT STAYS A REFUSAL, for the two callers who keep the job:
+      · the BOOT RESTORE, which leans on it on purpose. Its snapshot is a stale
+        local copy, and this read is the only thing between it and relaunching
+        a run worker 1's rehydration has just parked for its person's Resume
+        (#728) — so it must not act on a status it could not see. It keeps a
+        refused entry for the next boot instead.
+      · the supervised AUTO-RESUME at rehydrate, which falls through to the
+        `paused_backend_restart` mark when refused: the person gets a Resume
+        card, which is a slower run, not a lost one.
+    A read that SUCCEEDED and said no — the record gone, a status outside the
+    whitelist — is an answer, and refuses for every caller.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -14623,7 +16957,8 @@ def _safe_enqueue(job_queue, job, source: str,
     # FE"). Pre-fix, a reconnect-respawn's disk-restore/rehydrate hit that 403
     # fall-through and re-fired a run the user had already stopped (the
     # German-Shepherd resurrection). The resume HTTP/listener paths already
-    # gate on .stop (research.py:~5415); this closes the same hole in the
+    # gate on .stop (the start listener's resume branch and `resume_run`);
+    # this closes the same hole in the
     # enqueue funnel. Derive the run dir from resume_dir (full path) or run_id.
     _rd = (job or {}).get("resume_dir")
     _stop_path = None
@@ -14640,47 +16975,320 @@ def _safe_enqueue(job_queue, job, source: str,
                 return False
         except Exception:
             pass
-    if _firebase_db is None:
-        log(f"[safe_enqueue:{source}] skipped — Firestore unavailable", "WARN")
+    # ── auto-recovery exhausted: refuse, but only the AUTOMATIC callers ──
+    # ⛔⛔ THE CRASH BUDGET DIED WITH ITS CALL. `_crash_retries` is a parameter
+    # of `run_pipeline`, so a supervised boot that re-enqueues a run whose
+    # terminal crash card is on screen starts it over at attempt zero — three
+    # more Chrome launches nobody asked for, and the person watching a card
+    # that says we gave up. The marker makes exhaustion survive the re-enqueue.
+    #
+    # ⭐ THE HUMAN PATH CLEARS IT BEFORE IT GETS HERE, which is why this gate
+    # needs no caller list and cannot drift out of step with one. Pressing
+    # Retry is a decision to spend a fresh budget; a machine rebooting is not.
+    if _stop_path is not None and _no_auto_retry_marked(_stop_path.parent):
+        log(f"[safe_enqueue:{source}] skipped — run {rid[:24]}… exhausted its "
+            f"automatic attempts (a person's Retry clears this)", "INFO")
         return False
-    try:
-        snap = _firebase_db.collection("users").document(uid_v) \
-            .collection("researches").document(rid).get()
-        if not snap.exists:
-            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
+    unreadable = None
+    if _firebase_db is None:
+        unreadable = "Firestore unavailable"
+    else:
+        try:
+            snap = _firebase_db.collection("users").document(uid_v) \
+                .collection("researches").document(rid).get()
+            if not snap.exists:
+                log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
+                return False
+            status = (snap.to_dict() or {}).get("status")
+            if status not in allowed_statuses:
+                log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not in {allowed_statuses})", "INFO")
+                return False
+        except Exception as e:
+            # Track D synth-device-user can't read `users/{ownerUid}/
+            # researches/{rid}` — the rule's `allow read` requires
+            # auth.uid==userId and the synth uid never matches the owner.
+            # Treat 403 as "trust the FE", since the queue-listener entry
+            # we're acting on was authenticated FE-side (the FE rule for
+            # devices/{id}/queue gates create on submittedBy==auth.uid).
+            # Any OTHER exception is the caller's call — see the docstring.
+            err_str = str(e)
+            if (
+                "403" in err_str
+                or "PERMISSION_DENIED" in err_str
+                or "Missing or insufficient permissions" in err_str
+            ):
+                log(
+                    f"[safe_enqueue:{source}] existence check denied (user-mode read "
+                    f"rule blocks synth user) — trusting FE-side queue write",
+                    "DEBUG",
+                )
+            else:
+                unreadable = f"Firestore check failed ({type(e).__name__}: {e})"
+    if unreadable is not None:
+        if not take_unreadable:
+            log(f"[safe_enqueue:{source}] skipped — {unreadable} for {rid[:24]}…", "WARN")
             return False
-        status = (snap.to_dict() or {}).get("status")
-        if status not in allowed_statuses:
-            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not in {allowed_statuses})", "INFO")
-            return False
-    except Exception as e:
-        # Track D synth-device-user can't read `users/{ownerUid}/
-        # researches/{rid}` — the rule's `allow read` requires
-        # auth.uid==userId and the synth uid never matches the owner.
-        # Treat 403 as "trust the FE", since the queue-listener entry
-        # we're acting on was authenticated FE-side (the FE rule for
-        # devices/{id}/queue gates create on submittedBy==auth.uid).
-        # Any OTHER exception still bails defensively.
-        err_str = str(e)
-        if (
-            "403" in err_str
-            or "PERMISSION_DENIED" in err_str
-            or "Missing or insufficient permissions" in err_str
-        ):
-            log(
-                f"[safe_enqueue:{source}] existence check denied (user-mode read "
-                f"rule blocks synth user) — trusting FE-side queue write",
-                "DEBUG",
-            )
-        else:
-            log(f"[safe_enqueue:{source}] skipped — Firestore check failed for {rid[:24]}…: {e}", "WARN")
-            return False
+        log(f"[safe_enqueue:{source}] {unreadable} for {rid[:24]}… — taking the "
+            f"job anyway: its queue document is already gone, and the worker "
+            f"reads the record again before anything runs", "WARN")
     try:
         job_queue.put_nowait(job)
         return True
     except Exception as e:
         log(f"[safe_enqueue:{source}] put_nowait failed: {e}", "WARN")
         return False
+
+
+def _snapshot_job_view(job):
+    """What the queue snapshot on disk may hold about the job a worker is
+    RUNNING right now.
+
+    ⛔⛔ THE CLAIMED JOB WAS WRITTEN OUT WHOLE (wave 10.9, #536) — the topic,
+    the person's email address and their entire brief, in plaintext, at the ROOT
+    of `queues/`, on a computer they may not own. The purge that takes a run
+    that keeps nothing off this disk reaches `queues/<run>/` and the log
+    folders, never this file; "clear local storage" keeps the top-level files on
+    purpose; and on a crash nothing rewrites it — the next boot ends the run,
+    the enqueue funnel refuses a stopped one, and the snapshot sat there with
+    all three until some unrelated later job happened to be claimed. Same class
+    as the run id, the log lines and the log folder name, reached through a file
+    none of those looked at.
+
+    ⭐ WHAT THE BOOT PATH ACTUALLY USES IS THE IDS. `research_id` dedupes
+    against what Firestore rehydration already touched and reads the record's
+    status, `uid` says whose tree that is, and `run_id` is how the `.stop`
+    sentinel is found — the mint already keeps the topic out of that name. None
+    of it is anybody's content, and a run that keeps nothing is never restored
+    from this file anyway, so the work it described was dead weight only a disk
+    could leak.
+
+    ⛔ A JOB STILL WAITING ITS TURN IS LEFT WHOLE, deliberately. The claim
+    DELETES the run's queue document from Firestore, so for a job that has been
+    claimed but not yet started this snapshot is the only description of the
+    work that exists; redacting it would silently lose a run somebody paid for
+    and is watching. Its content lives exactly as long as the wait — the claim
+    replaces it with the view above, and the run's own purge takes the rest."""
+    rid = (job or {}).get("research_id")
+    if not _is_incognito_research(rid):
+        return job
+    return {
+        "uid": (job or {}).get("uid"),
+        "research_id": rid,
+        "run_id": (job or {}).get("run_id"),
+    }
+
+
+def _write_pending_queue_snapshot(path, current_job, pending_jobs) -> None:
+    """THE one writer of `queues/_pending_queue*.json`, so the view above cannot
+    be forgotten by a caller.
+
+    2026-05-11: atomic write — write to tmp, then os.replace (atomic on POSIX
+    and Windows same-volume). Protects against the Q7 watchdog path where
+    `_schedule_server_exit`'s timer can race `os._exit(0)` past a slow
+    in-progress write, leaving the snapshot truncated. On respawn a truncated
+    file fails json.loads and disk-restore silently skips, losing pending
+    in-memory jobs not yet visible in Firestore."""
+    payload = {
+        "ts_ms": int(time.time() * 1000),
+        "current": _snapshot_job_view(current_job),
+        "pending": list(pending_jobs or []),
+        # ⛔ A "gate" SUB-OBJECT LIVED HERE (wave 10.9, N8). It carried the
+        # previous run's uid/rid/finish-time across a restart so the queue gate
+        # could resume waiting on that run's cloud tail — which is how a wait
+        # for somebody else's run survived a reboot. The gate is gone; a
+        # snapshot written by an older build still carries the key and is
+        # simply ignored on read.
+    }
+    tmp_path = Path(path).with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(str(tmp_path), str(path))
+
+
+def _forget_pending_queue_snapshot(path, job_queue, unrestored=()) -> None:
+    """Rewrite the boot snapshot from what is really in the queue now — or take
+    the file away when nothing is left.
+
+    ⛔⛔ THE BOOT PATH USED TO READ THIS FILE AND NEVER WRITE IT, and that is the
+    half that made a crash permanent: the run was ended, its entry could never
+    be enqueued again, and the entry stayed. Called when the snapshot held a run
+    that keeps nothing, so that a crash-then-boot for one of those leaves
+    nothing of it behind — not the entry, and not the file if it was the only
+    thing in it. Jobs that really did restore are in the queue and are written
+    back.
+
+    ⛔⛔ AND SO ARE THE ORDINARY JOBS BOOT COULD NOT RESTORE THIS TIME —
+    `unrestored` (wave 10.9 repair). This rewrite was built from the live queue
+    alone, so an ordinary job the funnel refused went with the private run: and
+    the funnel refuses on a transient Firestore error too, for a job whose queue
+    document the claim had already deleted — this file was the only description
+    of it left, its record stayed "queued", and nothing would ever start it.
+    Before the rewrite existed such a job waited for the next boot or the next
+    worker boundary; it still does. Only a run that keeps nothing is shed from
+    this list, which is the whole reason the rewrite exists.
+
+    Also called by a cancel that takes a waiting run that keeps nothing out of
+    the queue — see `_shed_from_pending_snapshot`.
+
+    ⛔⛔ IT WRITES AROUND WHATEVER IS RUNNING NOW, and does not assert that
+    nothing is. The worker task is created BEFORE boot reaches the disk
+    snapshot, and boot awaits Firestore on the way here, so a job rehydration
+    auto-resumed can be claimed while this is still running. Forcing `current`
+    to None would then erase the only crash record of a run that had just
+    started — a boot tidying one run's leftovers taking the next run's safety
+    net with it."""
+    current = _QUEUE_STATE.get("current_job")
+    try:
+        live = list(job_queue._queue)
+    except Exception:
+        live = []
+    live += [j for j in (unrestored or ())
+             if not _is_incognito_research((j or {}).get("research_id"))]
+    try:
+        if live or current:
+            _write_pending_queue_snapshot(path, current, live)
+        else:
+            Path(path).unlink(missing_ok=True)
+    except Exception as e:
+        log(f"[pending_queue] could not clear the boot snapshot: {e}", "WARN")
+
+
+def _pending_queue_snapshot_path() -> Path:
+    """This worker's queue snapshot. Worker 1 keeps the legacy name, so a
+    single-worker install that never re-paired still finds its file; workers 2+
+    get their own, because two writers sharing one tmp-then-replace race."""
+    root = Path(__file__).parent / "queues"
+    if WORKER_ID == 1:
+        return root / "_pending_queue.json"
+    return root / f"_pending_queue_worker_{WORKER_ID}.json"
+
+
+def _shed_from_pending_snapshot(job_queue) -> None:
+    """Rewrite this worker's snapshot after a cancel took a waiting run that
+    keeps nothing out of the queue.
+
+    ⛔⛔ A CANCEL NEVER TOUCHED THIS FILE (wave 10.9 repair). A job waiting its
+    turn is written whole — it has to be, the claim deleted its queue document
+    and this is the only description of the work left — so a run that keeps
+    nothing, cancelled or left while it waited behind somebody else's run, kept
+    its topic, its delivery address and its brief at the root of `queues/`
+    until that other run ended, hours after the person was told nothing is kept.
+
+    ⭐ UNDER THE SAME LOCK, AND THE SAME RULE, AS THE WORKER'S OWN BOUNDARY:
+    Reset Backend writes this file itself and then drains the queue, and a
+    rewrite from memory landing inside that would put back what it is clearing.
+    Only the job's OWN leaving is handled here — an ordinary cancelled job left
+    in the file is harmless (boot re-offers it and the funnel refuses a stopped
+    run), so an ordinary cancel still writes nothing."""
+    lock = _QUEUE_STATE.get("_hard_reset_lock")
+    with (lock if lock is not None else contextlib.nullcontext()):
+        if _QUEUE_STATE.get("_hard_reset_in_progress"):
+            return
+        _forget_pending_queue_snapshot(_pending_queue_snapshot_path(), job_queue)
+
+
+def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int, int]":
+    """Boot's disk fallback (Phoenix T3): re-offer the jobs a crash left behind.
+
+    Firestore-driven rehydration is the source of truth, but a research that
+    hadn't yet reached `status=queued` (e.g. it crashed in the put_nowait →
+    Firestore-write window) never appears there — the disk snapshot covers that
+    gap. Dedupe by research_id so nothing Firestore already restored is
+    double-enqueued, including ongoing runs that got marked
+    paused_backend_restart and must not silently re-launch from a stale
+    snapshot. Returns (restored, skipped).
+
+    ⛔⛔ A RUN THAT KEEPS NOTHING IS NOT RESTORED FROM HERE, AND ITS ENTRY DOES
+    NOT STAY (wave 10.9, #536). Boot recovery has just ended that run — there is
+    no chat to reopen, no Resume anybody can press, and `_safe_enqueue` refuses
+    a stopped run — so re-offering it could only start a run nobody is waiting
+    for, on the browser profiles of a machine whose owner was told a run
+    happened and nothing more. Its snapshot entry is therefore dropped rather
+    than handed on, and the file is rewritten so the crash leaves nothing.
+
+    ⭐ EXTRACTED FROM `run_server`'s boot block, which is a closure and cannot be
+    called from a test. Everything it touches is a parameter, so the pin runs
+    the real thing against a real file."""
+    path = Path(path)
+    if not path.exists():
+        return (0, 0)
+    snap = json.loads(path.read_text(encoding="utf-8"))
+    # Seed dedupe with anything Firestore-rehydration touched (ongoing-status
+    # only — queued docs are handled by the listener, not rehydration), then
+    # add what is currently in the in-memory queue (auto-resumed supervised
+    # runs).
+    already = set(already_rids or ())
+    try:
+        for q in list(job_queue._queue):
+            rid = (q or {}).get("research_id") or ""
+            if rid:
+                already.add(rid)
+    except Exception:
+        pass
+    cur = snap.get("current") or None
+    cur_rid = (cur or {}).get("research_id") or ""
+    pending = list(snap.get("pending") or [])
+    held_a_run_that_keeps_nothing = bool(_is_incognito_research(cur_rid)) or any(
+        _is_incognito_research((j or {}).get("research_id")) for j in pending)
+    # Restore current_job FIRST if it was mid-flight (so it resumes ahead of
+    # pending). Then the rest of pending in original order.
+    disk_jobs = []
+    if _is_incognito_research(cur_rid):
+        log(f"[pending_queue] {cur_rid[:24]}… keeps nothing — the run this "
+            f"snapshot was executing is ended by boot recovery, not restored",
+            "INFO")
+    elif cur and cur_rid not in already:
+        disk_jobs.append(cur)
+    for j in pending:
+        rid = (j or {}).get("research_id") or ""
+        if rid and rid in already:
+            continue
+        disk_jobs.append(j)
+    # Funnel each disk-restored job through _safe_enqueue (Q7) — it does the
+    # same Firestore existence check the Q1 inline loop did, plus a status
+    # whitelist. Fail-closed posture is preserved (the helper skips on
+    # missing/error/no-firebase rather than re-fire). The skipped-count is
+    # rolled up; per-job reasons are in the helper's own logs.
+    # #728: TIGHTER whitelist for the boot disk-restore — ("queued","ongoing")
+    # EXCLUDING paused_backend_restart. A run worker-1's rehydration just marked
+    # paused_backend_restart is intentionally awaiting a user Resume;
+    # auto-relaunching it from a stale per-worker disk snapshot would
+    # double-handle it (and on a sibling worker whose `_rehydrated_rids` never
+    # saw it, this is the only cross-worker guard). Genuinely-ongoing runs still
+    # restore.
+    restored = 0
+    skipped = 0
+    refused = []
+    withdrew = False
+    for j in disk_jobs:
+        # ⛔⛔ THE PICKUP RULE FIRST, AND ITS ANSWER IS THE ONE THAT SHEDS
+        # (wave 10.10). The funnel below refuses a deleted or archived research
+        # too, but it cannot say WHY — it refuses on a failed read as well, and
+        # a refusal must be kept for the next boot — so nothing ever shed a
+        # deleted research's entry: it was re-offered and refused at every boot
+        # until a worker boundary happened to rewrite the file. Only this
+        # answer removes an entry; an unreadable record is kept.
+        if _pickup_withdrawn((j or {}).get("uid"), (j or {}).get("research_id"),
+                             "disk-restore")[0]:
+            skipped += 1
+            withdrew = True
+            continue
+        if _safe_enqueue(job_queue, j, source="disk-restore",
+                         allowed_statuses=("queued", "ongoing")):
+            restored += 1
+        else:
+            skipped += 1
+            refused.append(j)
+    if restored or skipped:
+        log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
+    else:
+        log("[pending_queue] Disk snapshot empty — nothing to restore")
+    if held_a_run_that_keeps_nothing:
+        _forget_pending_queue_snapshot(path, job_queue, refused)
+    elif withdrew:
+        # The same rewrite, for the same reason: what restored is in the queue
+        # and what the funnel refused is kept; only the withdrawn entry goes.
+        _forget_pending_queue_snapshot(path, job_queue, refused)
+    return (restored, skipped)
 
 
 def _crun_delete_field():
@@ -14762,7 +17370,7 @@ def _clear_current_run_id_best_effort(reason: str) -> None:
         # phase_start emit would overwrite, but in the gap between worker-1
         # picking up the new job and that emit landing, the FE QueuedBanner
         # head-phase line would show the prior run's stale phase. Pair this
-        # with the publish-on-pickup patch in `_job_worker` (~line 29773)
+        # with the publish-on-pickup patch in `_job_worker`
         # which writes phase=0 the moment a new job is claimed.
         _firebase_db.collection("devices").document(_did).update({
             "currentRunId": _CR_DF,
@@ -14959,15 +17567,33 @@ _FE_HANDOFF_WAIT_SEC = 90
 # ⭐⭐ And a far longer one for the P4/P5 drive, because that request is not a
 # notification — it IS the rest of the run.
 #
-# ⛔ The route wires `req.signal` to an abort handler that SIGTERMs the in-flight
-# ffmpeg child and writes `status: "stopped"`. So exiting this process while the
-# drive is connected does not merely lose a message: it kills the video encode
-# and terminalises the user's research as stopped. Ninety seconds would land
-# squarely in the middle of a long encode.
+# ⛔⛔ THE REASON WRITTEN HERE EXPIRED ON 2026-09-19, AND THE NUMBER OUTLIVED
+# IT. It used to say: the route wires `req.signal` to an abort handler that
+# SIGTERMs the in-flight ffmpeg child and writes `status: "stopped"`, so
+# exiting this process while the drive is connected kills the encode and
+# terminalises the run. That was true when it was written and is not true now.
+# `uploadYouTube`'s second pass that day removed it, in its own words — "A
+# CLOSED SOCKET IS NOT A STOP" — and the commit carrying it is on `origin/main`,
+# which IS the production deploy. A hang-up now triggers a Firestore read and
+# cancels only if a terminal status is really recorded.
 #
-# Matched to the route's own Cloud Run ceiling, which is the point past which the
-# request cannot still be alive. Waiting that long costs a worker that does not
-# pick up new jobs meanwhile; not waiting costs the run in progress.
+# ⚠ AND THE HANG-UP IS EVERY RUN. Measured on both of that day's runs: something
+# in front of Cloud Run severs this connection at EXACTLY 300 seconds while the
+# route keeps working (one run's own log shows it finishing at 497 s). So
+# `requests` raises here at ~300 s, the `finally` clears the in-flight flag, and
+# the 3600-second budget is a ceiling practice never reaches.
+#
+# ⭐ WHY IT STAYS ANYWAY, WHICH IS A DIFFERENT REASON FROM THE OLD ONE: the
+# route processes P4 and P5 INLINE inside this request, so while the socket is
+# alive this worker's exit still abandons work that nothing else is driving.
+# Ninety seconds would land mid-encode. The bound is matched to the route's own
+# Cloud Run ceiling because that is the point past which the request cannot
+# still be alive — not because disconnecting is destructive any more.
+#
+# ⛔ DO NOT "TIDY" THIS TO 300 s ON THE STRENGTH OF THE MEASUREMENT ABOVE. What
+# severs at 300 s has not been identified — the owner's E2E carries a line to
+# settle whether it is the edge or the revision — and a bound set to an unknown
+# mechanism's current behaviour is a bound that breaks when it changes.
 _FE_DRIVE_WAIT_SEC = 3600
 
 
@@ -14990,9 +17616,10 @@ def _decide_respawn_hold(pending, wait_until, now, budget, supervised):
                 takes: the in-place rebind swaps two Firestore watches and
                 touches no outbound request, so there is nothing to wait for.
       "hold"    a respawn would land on top of a POST that hands this run to the
-                web app. The P4/P5 one is the dangerous one — the route aborts
-                when its client goes away, SIGTERMs ffmpeg and terminalises the
-                research as stopped.
+                web app. The P4/P5 one is the dangerous one — the route runs P4
+                and P5 inside that request, so a respawn abandons work nothing
+                else is driving. (A disconnect no longer stops the run — the
+                route's abort handler went on 2026-09-19; see _FE_DRIVE_WAIT_SEC.)
       "go_late" the deadline passed with something still in flight. ⛔ BOUNDED ON
                 PURPOSE: one wedged thread must not leave this worker
                 permanently deaf, which is the condition the respawn exists to
@@ -15263,10 +17890,16 @@ def _emit_to_firestore(event):
         new_seq = _fb_seq + 1
     _fb_seq = new_seq
     from datetime import timedelta, timezone
+    # ⛔⛔ A RUN THAT KEEPS NOTHING BURNS IN A DAY, NOT A MONTH (wave 10.9, #536).
+    # Thirty days is right for an ordinary run's timeline; for one whose purge
+    # never ran it is thirty days of that person's phase-by-phase history left
+    # under a record that is already gone — and a late event written after the
+    # purge is an orphan nothing lists and nothing sweeps.
     doc_data = {
         **event,
         "seq": _fb_seq,
-        "expireAt": datetime.now(timezone.utc) + timedelta(days=30),
+        "expireAt": (_incognito_expire_at(_fb_research_id)
+                     or datetime.now(timezone.utc) + timedelta(days=30)),
     }
     try:
         _grpc_write_with_heal(
@@ -15337,10 +17970,14 @@ def update_link_in_firestore(kind: str, url: str, **fields):
         return
     payload = {"url": url, **fields}
     try:
+        # ⛔ NEVER A CREATE FOR A RUN THAT KEEPS NOTHING — `_write_research_doc`.
+        # This is one of the three machine set-merges that could bring a purged
+        # record back as an invisible fragment.
         _grpc_write_with_heal(
-            lambda: _firebase_db.collection("users").document(_fb_uid)
-                .collection("researches").document(_fb_research_id)
-                .set(_be_payload({"links": {kind: payload}}), merge=True),
+            lambda: _write_research_doc(
+                _firebase_db.collection("users").document(_fb_uid)
+                    .collection("researches").document(_fb_research_id),
+                _be_payload({"links": {kind: payload}}), _fb_research_id),
             what=f"link {kind}",
         )
     except Exception as e:
@@ -15374,10 +18011,15 @@ def append_user_source_in_firestore(kind: str, url: str, label: str = "", phase:
             "phase": phase,
             "ts": int(time.time() * 1000),
         }
+        # ⛔ NEVER A CREATE FOR A RUN THAT KEEPS NOTHING — `_write_research_doc`.
+        # `ArrayUnion` is a sentinel, not a map, so the field-path rewrite leaves
+        # it exactly as it is and an update appends the same way a merge did.
         _grpc_write_with_heal(
-            lambda: _firebase_db.collection("users").document(_fb_uid)
-                .collection("researches").document(_fb_research_id)
-                .set(_be_payload({"userSources": _gcfs.ArrayUnion([entry])}), merge=True),
+            lambda: _write_research_doc(
+                _firebase_db.collection("users").document(_fb_uid)
+                    .collection("researches").document(_fb_research_id),
+                _be_payload({"userSources": _gcfs.ArrayUnion([entry])}),
+                _fb_research_id),
             what=f"userSource {entry['kind']}",
         )
     except Exception as e:
@@ -15512,14 +18154,20 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
     `deviceUpdatingFor` rule passes; in legacy mode it's a no-op.
 
     Returns True on success, False on failure (logged WARN; never raises).
-    Sync — async callers wrap with `asyncio.to_thread`."""
+    Sync — async callers wrap with `asyncio.to_thread`.
+
+    ⛔⛔ AND IT RENEWS A RUN THAT KEEPS NOTHING (wave 10.9 repair) — see
+    `_with_incognito_renewal`. This is the seam every status, phase, agent and
+    decision write goes through; it never reached `_write_research_doc`, so a
+    renewal placed there alone would have ridden only on the rare link and
+    source writes and missed nearly every write a run makes."""
     if not _firebase_db or not uid or not research_id:
         return False
     try:
         _grpc_write_with_heal(
             lambda: _firebase_db.collection("users").document(uid)
                 .collection("researches").document(research_id)
-                .update(_be_payload(updates)),
+                .update(_be_payload(_with_incognito_renewal(updates, research_id))),
             what=f"update research {research_id[:8]}…",
         )
         return True
@@ -15532,19 +18180,113 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
         return False
 
 
+#: A field name safe to put on the left of a dot in a Firestore field path.
+#: Anything else (a dot, a backtick, a space) has to be back-quoted, and rather
+#: than build that quoting the write falls back to a whole-map replace.
+#:
+#: ⛔⛔ THE CLIENT'S OWN GRAMMAR, NOT A GUESS AT IT. `parse_field_path` in
+#: google.cloud.firestore accepts an unquoted segment of `[A-Za-z_][A-Za-z0-9_]*`
+#: and RAISES on anything else: this pattern used to admit `-` and a leading
+#: digit, so a link kind like `audio-file` would have gone in as
+#: `links.audio-file` and the client would have thrown `Path … not consumed`
+#: INSIDE the write — swallowed by the caller's except as a WARN, so the write
+#: an ordinary run lands with a set-merge would simply not happen for a run that
+#: keeps nothing. Narrow, and such a key takes the whole-map path below instead.
+_FIELD_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _merge_field_paths(payload: dict) -> dict:
+    """`{"agents": {"claude": {"status": …}}}` as `{"agents.claude.status": …}`.
+
+    ⛔⛔ AN `update()` WITH A NESTED MAP AS ONE VALUE REPLACES THAT MAP, deleting
+    every key the new one omits — the exact trap `apply_firestore_update` in the
+    test conftest documents, and the one that erased `needsRestart` when
+    `updateStatus` was written whole. A dotted path merges instead. So a payload
+    that was written as `set(…, merge=True)` keeps meaning the same thing when
+    it is written as an update: `agents.chatgpt` leaves `agents.gemini` alone.
+
+    ⛔⛔ AND IT GOES ALL THE WAY DOWN, because that trap is not a property of the
+    first level (wave 10.9 repair). Stopping after one, `{"agents": {"claude":
+    {"status": "complete"}}}` became `update({"agents.claude": {…}})` — a map as
+    one value again, one step lower — so the write that says an agent FINISHED
+    deleted that agent's sources, sourceUrls, findings, progressHistory and
+    completionTimeSec, and the card in the chat went blank on everything it had
+    just spent twenty minutes collecting. `set(…, merge=True)` merges at every
+    depth; only a rewrite at every depth means the same thing.
+
+    ⭐ ONLY FOR PLAIN MAPS OF SIMPLE NAMES, AT EVERY LEVEL. A sentinel
+    (`DELETE_FIELD`, `ArrayUnion`) is not a dict and rides its path untouched, so
+    an append still appends; a key this code cannot spell in a field path stops
+    the descent at the level above it — a replace of that sub-map, never a write
+    to a different field; and an EMPTY map stops it too, because expanding `{}`
+    into zero paths is a write that says nothing, silently."""
+    out: dict = {}
+
+    def _expand(path: str, value) -> None:
+        if (type(value) is dict and value
+                and all(isinstance(k, str) and _FIELD_PATH_SEGMENT_RE.match(k)
+                        for k in value)):
+            for inner, inner_value in value.items():
+                _expand(f"{path}.{inner}", inner_value)
+        else:
+            out[path] = value
+
+    for key, value in (payload or {}).items():
+        if _FIELD_PATH_SEGMENT_RE.match(str(key)):
+            _expand(str(key), value)
+        else:
+            out[key] = value
+    return out
+
+
+def _write_research_doc(doc_ref, payload: dict, research_id, *, merge: bool = True):
+    """Put `payload` on a research document — and never bring one back.
+
+    ⛔⛔ A `set(…, merge=True)` TO A MISSING DOCUMENT IS A CREATE (wave 10.9,
+    #536). Three writers on this machine and `saveResearch` in the app all
+    set-merge, so a research that was purged — by somebody leaving the chat, by
+    the P5 chain, or by its own fuse — comes back on the next write as a
+    fragment carrying only the merged fields. It has no `createdAt`, and every
+    list in the app orders by `createdAt`, so the fragment is invisible to every
+    screen, every sweep and the TTL itself: a permanent orphan holding whatever
+    that write carried.
+
+    ⭐ THE RULES REFUSE IT TOO, for every wheel ever shipped, because R1 demands
+    `expireAt` on an incognito record and a merge that recreates one carries
+    none. This is the same answer reached a second way, on the machine that can
+    still say something useful about the failure in its own log.
+
+    ⛔ AND IT IS NOT THE ANSWER FOR AN ORDINARY RUN. The set-merge is
+    load-bearing there: the machine writes `backendRunId` on first arrival,
+    sometimes before the app has finished creating the record, and an update
+    would lose that race every time.
+
+    ⭐ THE UPDATE CARRIES THE FUSE FORWARD (`_with_incognito_renewal`), and only
+    the update: a record that is still there is a run that is still alive, and
+    one that is gone stays gone — the update fails rather than recreating it."""
+    if not _is_incognito_research(research_id):
+        return doc_ref.set(payload, merge=merge)
+    return doc_ref.update(_merge_field_paths(_with_incognito_renewal(payload, research_id)))
+
+
 def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = True) -> bool:
     """Centralized `set(..., merge=True)` of `users/{uid}/researches/{rid}`
     — the "doc may not exist yet" sibling of `_update_research_doc`. Used
     when writing `backendRunId` on first arrival (before the FE has
     created the doc) and on error-rescue paths where the doc state is
-    uncertain. Same Track D PR-D5a seam as `_update_research_doc`."""
+    uncertain. Same Track D PR-D5a seam as `_update_research_doc`.
+
+    ⛔ EXCEPT FOR A RUN THAT KEEPS NOTHING, which is never created anew — see
+    `_write_research_doc`. `merge` is then moot: the write is an update, which
+    merges by definition and fails rather than resurrecting."""
     if not _firebase_db or not uid or not research_id:
         return False
     try:
         _grpc_write_with_heal(
-            lambda: _firebase_db.collection("users").document(uid)
-                .collection("researches").document(research_id)
-                .set(_be_payload(data), merge=merge),
+            lambda: _write_research_doc(
+                _firebase_db.collection("users").document(uid)
+                    .collection("researches").document(research_id),
+                _be_payload(data), research_id, merge=merge),
             what=f"set research {research_id[:8]}…",
         )
         return True
@@ -15555,6 +18297,273 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
             "WARN",
         )
         return False
+
+
+# ── The lease: what keeps a WAITING run that keeps nothing alive ─────────────
+#
+# ⛔⛔ RENEWING ON WRITES DOES NOT COVER A WAIT, BECAUSE A WAIT WRITES NOTHING.
+# Measured on this file (wave 10.9 repair): a run parked at a sign-in prompt sits
+# in `wait_if_paused` or `await_phase_decision`, and both only sleep — one logs a
+# line every ten minutes to the local log, neither touches the record, and both
+# give up after 24 hours, which is the fuse's own length. The fuse was last
+# pushed by the write BEFORE the wait began, so it always burns first. A run
+# claimed into this worker's own queue behind another is the same: its record is
+# written when the queue moves and not otherwise, and a queue does not move while
+# the run ahead of it is itself waiting on a person. The agents' 60-second
+# `heartbeat` goes to `pipeline_events`, which renews nothing above it.
+#
+# So the renewal needs a beat of its own, and this is it: once an hour, every
+# worker re-lights the fuse on each incognito run it HOLDS — the one it is
+# running and the ones it has claimed into its own queue — and on the reports
+# it has written for them.
+#
+# ⭐ HELD, AND ONLY HELD. A job still waiting in the DEVICE queue is not this
+# worker's: its queue document carries a fuse nobody may move (the rules allow a
+# claimed job to change three fields, none of them `expireAt`), so the app's
+# design lets the job and its record burn down TOGETHER. Renewing that record
+# from here would leave a record with no job behind it. Once a worker claims the
+# job it deletes the queue document, and from then on the record's fuse is the
+# only one — so from then on, this renews it.
+#
+# ⭐ AND IT STOPS WHEN THE RUN STOPS BEING HELD. A machine that dies takes its
+# lease with it and the fuse burns a day later, which is the promise for exactly
+# that case.
+
+#: How often a worker renews the fuse of every incognito run it holds, seconds.
+#: ⛔ Well inside the 24-hour fuse, so a renewal lost to a network blip or a slow
+#: tick still leaves most of a day of headroom.
+_INCOGNITO_LEASE_INTERVAL_SEC = 3600
+
+#: The reports this process has written for each incognito run, as
+#: {(uid, research id): {document id, …}}.
+#:
+#: ⛔⛔ THE RECORD IS NOT THE WHOLE RUN. `documents` carry fuses of their own —
+#: Firestore's TTL takes the document it is declared on and never its children —
+#: so on a run past a day the brief written in the first hour burns under a live
+#: record, and phase 5 builds the email without it. They have to be renewed with
+#: the record.
+#:
+#: ⭐ REMEMBERED, NOT LISTED. The rules let a shared machine WRITE a sharer's
+#: reports and not READ them (`documents` read is owner-machine only, 7.7E), so a
+#: lease that listed the subcollection would renew nothing on exactly the
+#: machines that run other people's research.
+_INCOGNITO_DOCS_WRITTEN: "dict[tuple, set]" = {}
+
+
+def _incognito_runs_held() -> "list[tuple[str, str]]":
+    """(uid, research id) of every incognito run this worker holds right now:
+    the one it is running, then the ones claimed into its own queue, in order,
+    each once. Ordinary runs are never in it."""
+    jobs = [_QUEUE_STATE.get("current_job")]
+    queue = _QUEUE_STATE.get("queue_ref")
+    if queue is not None:
+        try:
+            jobs.extend(list(queue._queue))
+        except Exception:
+            pass
+    held: "list[tuple[str, str]]" = []
+    for job in jobs:
+        uid = str((job or {}).get("uid") or "").strip()
+        rid = (job or {}).get("research_id")
+        if uid and _is_incognito_research(rid) and (uid, rid) not in held:
+            held.append((uid, rid))
+    return held
+
+
+#: Incognito runs this worker still holds whose record the lease found GONE, as
+#: {(uid, research id)} — asked about once, and not again while they are held.
+_INCOGNITO_LEASE_GONE: "set[tuple]" = set()
+
+
+def _lease_renew_record(uid, rid) -> str:
+    """One lease write on a held run's record: "renewed", "gone" or "failed".
+
+    ⭐ THE SAME WRITE `_update_research_doc` MAKES — an update carrying only
+    the fuse, through the same heal — kept apart only so the caller can tell a
+    record the web DELETED from one it could not reach. A network failure must
+    be retried next hour; a deleted record never comes back."""
+    try:
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(uid)
+                .collection("researches").document(rid)
+                .update(_be_payload(_with_incognito_renewal({}, rid))),
+            what=f"update research {rid[:8]}…",
+        )
+        return "renewed"
+    except Exception as e:
+        try:
+            import google.api_core.exceptions as _gax_exc
+            if isinstance(e, _gax_exc.NotFound):
+                return "gone"
+        except Exception:
+            pass
+        log(f"research doc update failed "
+            f"(uid={uid[:8]}.., rid={rid[:8]}..): {e}", "WARN")
+        return "failed"
+
+
+def _drop_gone_incognito_job(uid, rid) -> int:
+    """Take a held incognito job whose record the web deleted out of this
+    worker's own queue, and out of the queue snapshot on disk. Returns how many
+    waiting jobs were removed (the running one is never touched here).
+
+    ⛔⛔ LEFT THERE, IT WOULD RUN (wave 10.10). A job waiting in this worker's
+    queue has no queue document any more — the claim deleted it — so a cancel
+    that never arrived (the tab was closed) leaves it here. When its turn came
+    the flip would find no record, say "proceeding, as before", and spend a
+    whole paid run writing into nothing; until then the lease warned about it
+    every hour. `deque.remove` one job at a time, never clear-and-refill, so a
+    worker taking its next job at the same moment loses nothing else."""
+    queue = _QUEUE_STATE.get("queue_ref")
+    if queue is None:
+        return 0
+    removed = 0
+    try:
+        for job in [j for j in list(queue._queue)
+                    if str((j or {}).get("uid") or "").strip() == uid
+                    and (j or {}).get("research_id") == rid]:
+            try:
+                queue._queue.remove(job)
+                removed += 1
+            except ValueError:
+                pass
+    except Exception:
+        return removed
+    if removed:
+        try:
+            _shed_from_pending_snapshot(queue)
+        except Exception:
+            pass
+    return removed
+
+
+def _renew_incognito_leases() -> dict:
+    """Carry the fuse forward on every incognito run this worker holds.
+
+    Returns counts: `renewed` records, `documents` renewed under them, and
+    `failed` writes (a record that is gone counts once and its reports are left
+    alone).
+
+    ⛔⛔ A RECORD THE WEB DELETED IS ASKED ABOUT ONCE (wave 10.10). It was asked
+    again every hour, with a WARN each time, for as long as the run was held —
+    and a cancelled run waiting in this worker's queue stays held until its
+    turn. Now a not-found record is said once, its waiting job leaves the queue
+    (`_drop_gone_incognito_job`), and a running one is remembered in
+    `_INCOGNITO_LEASE_GONE` so it is not written to again."""
+    out = {"renewed": 0, "documents": 0, "failed": 0}
+    if not _firebase_db:
+        return out
+    held = _incognito_runs_held()
+    # A run this worker no longer holds has nothing left to renew here.
+    for key in list(_INCOGNITO_DOCS_WRITTEN):
+        if key not in held:
+            _INCOGNITO_DOCS_WRITTEN.pop(key, None)
+    for key in list(_INCOGNITO_LEASE_GONE):
+        if key not in held:
+            _INCOGNITO_LEASE_GONE.discard(key)
+    for uid, rid in held:
+        if (uid, rid) in _INCOGNITO_LEASE_GONE:
+            continue
+        # ⭐ AN EMPTY PATCH, ON PURPOSE: the same fuse-stamping update every
+        # record write makes, carrying nothing else. An update, so a record
+        # that was purged stays purged.
+        verdict = _lease_renew_record(uid, rid)
+        if verdict != "renewed":
+            # ⛔ THE RECORD IS GONE OR UNREACHABLE, SO ITS REPORTS ARE NOT
+            # RENEWED. Carrying their fuse forward under a parent that no longer
+            # exists would keep the content of a research that was taken away.
+            if verdict == "gone":
+                _INCOGNITO_LEASE_GONE.add((uid, rid))
+                _dropped = _drop_gone_incognito_job(uid, rid)
+                log(f"[incognito-lease] a held run's record is gone from the web — "
+                    f"no longer renewing it; {_dropped} waiting job(s) left this "
+                    f"worker's queue", "INFO")
+            out["failed"] += 1
+            continue
+        out["renewed"] += 1
+        for doc_id in sorted(_INCOGNITO_DOCS_WRITTEN.get((uid, rid), ())):
+            try:
+                _grpc_write_with_heal(
+                    lambda doc_id=doc_id, uid=uid, rid=rid: _firebase_db
+                        .collection("users").document(uid)
+                        .collection("researches").document(rid)
+                        .collection("documents").document(doc_id)
+                        .update(_be_payload({"expireAt": _incognito_expire_at(rid)})),
+                    what=f"incognito lease document {doc_id}")
+                out["documents"] += 1
+            except Exception as e:
+                out["failed"] += 1
+                log(f"[incognito-lease] a report's fuse was not renewed: "
+                    f"{type(e).__name__}", "DEBUG")
+    return out
+
+
+def _incognito_lease_report(res) -> "str | None":
+    """One machine-log line for a tick that did something, or nothing.
+
+    ⛔ COUNTS ONLY. The runs it names are other people's, and some are waiting
+    behind the run this line would otherwise have landed in."""
+    if not isinstance(res, dict) or not (res.get("renewed") or res.get("failed")):
+        return None
+    line = (f"[incognito-lease] renewed the fuse on {res.get('renewed', 0)} run(s) "
+            f"and {res.get('documents', 0)} report(s) this worker holds")
+    if res.get("failed"):
+        line += f" · {res['failed']} write(s) did not land"
+    return line
+
+
+@_machine_logged
+async def _incognito_lease_loop():
+    """The beat that keeps a held incognito run's fuse ahead of it while it
+    waits. Armed on EVERY worker, because each worker holds its own runs; idle
+    whenever this worker holds none, and whenever Firestore is down."""
+    try:
+        while True:
+            await asyncio.sleep(_INCOGNITO_LEASE_INTERVAL_SEC)
+            try:
+                res = await asyncio.to_thread(_renew_incognito_leases)
+            except Exception as err:
+                log(f"[incognito-lease] tick skipped ({type(err).__name__})", "DEBUG")
+                continue
+            line = _incognito_lease_report(res)
+            if line:
+                log(line, "INFO")
+    except asyncio.CancelledError:
+        return
+
+
+def _restart_recovery_patch(research_id) -> dict:
+    """What the machine writes over a run it found abandoned by a restart.
+
+    ⛔⛔ AN INCOGNITO RUN IS ENDED, NOT PARKED (wave 10.9, #536).
+    `paused_backend_restart` is an OFFER: it puts a Resume card in the chat and
+    leaves the run non-terminal until somebody takes it. An incognito chat is in
+    no list and cannot be reopened, so there is no chat for the card to appear
+    in and nobody who can press it — the run would simply sit there, holding its
+    documents and its folder, until its fuse burned out. `stopped` is the
+    terminal status the app already draws, and it is the truth about a run this
+    machine will never pick up again.
+
+    ⛔ THE SENTENCE SAYS WHAT HAPPENED AND PROMISES NOTHING. What is kept, and
+    for how long, is said by the app in the commit that makes it true (wave 6's
+    rule); a machine-written summary that got there first would be the promise
+    arriving before the behaviour.
+
+    ⭐ ONE PATCH FOR BOTH RECOVERY PATHS — boot rehydration and worker-1's
+    dead-worker reconcile. They wrote the same two fields in two places, and a
+    branch added to one of them is a run recovered differently depending on how
+    its worker died."""
+    if _is_incognito_research(research_id):
+        return {
+            "status": "stopped",
+            "summary": "The research computer restarted. This run could not be "
+                       "picked up again, so it ended here.",
+        }
+    return {
+        "status": "paused_backend_restart",
+        "summary": "Backend restarted mid-run — hit Resume to pick up from the "
+                   "last checkpoint.",
+    }
 
 
 def _owner_control_patch(oc: str, *, running: bool) -> dict:
@@ -15616,40 +18625,43 @@ def _owner_control_patch(oc: str, *, running: bool) -> dict:
 # ════════════════════════════════════════════════════════════════════
 
 
-def _mint_fe_id_token(uid):
-    """Always returns None — the BE has no path to mint a Firebase ID
-    token for an arbitrary uid (the synth-device-user's refresh-token
-    credentials only authorize itself, and Admin custom-token mint
-    requires the service account that's no longer on disk). Returning
-    None triggers `_fire_fe_p4_trigger`'s `needsFeTrigger` fallback;
-    the FE catch-up hook re-fires P4/P5 on next chat-open."""
-    del uid  # unused — kept for caller signature compatibility
-    log("FE trigger: ID token mint unavailable — fallback to needsFeTrigger marker", "INFO")
-    return None
-
-
 def _fire_fe_p4_trigger(uid, research_id):
-    """Write a `needsFeTrigger` marker on the research doc so the FE
-    catch-up hook re-fires the autonomous P4 + P5 chain on next
-    chat-open. Without an Admin SDK service account, the BE can no
-    longer mint user ID tokens or enqueue Cloud Tasks directly — the
-    FE-side catch-up is the canonical trigger.
+    """Write a `needsFeTrigger` marker on the research doc so a chat opening on
+    this run asks the cloud route to run phases 4 and 5. It is the backstop
+    behind the machine's own kick, and the marker a reopened chat reads.
 
-    Returns False (no successful enqueue ever happens from this BE).
-    The caller doesn't actually distinguish True/False besides log
-    formatting; the FE catch-up always handles it."""
+    Returns True when the marker is on the document, False otherwise.
+
+    ⛔⛔ IT USED TO SAY "marker written" WHATEVER HAPPENED (wave 10.9, 542-S4).
+    The write went through `_update_firestore_research`, which returns None on
+    every path — including the one where it declines because the module globals
+    are unset, and including a `_update_research_doc` that logged its own
+    failure and returned False. Nothing raised, so the success line printed
+    over a marker that was not there. That line is the FIRST of the two a stuck
+    run's report is read from; saying it unconditionally is what made those
+    reports unanswerable.
+
+    ⭐ AND THE TARGET IS NAMED, NOT INHERITED. `_update_research_doc(uid, rid)`
+    takes the run this call is about, so the same function is safe from the boot
+    rehydrate and the resume path — where the pipeline globals belong to another
+    run, or to none."""
     if not uid or not research_id:
         log(f"FE trigger: skip (uid={bool(uid)} rid={bool(research_id)})", "WARN")
         return False
     try:
-        _update_firestore_research({
+        written = _update_research_doc(uid, research_id, {
             "needsFeTrigger": True,
             "needsFeTriggerAt": int(time.time() * 1000),
         })
-        log(f"FE trigger: needsFeTrigger marker written rid={research_id[:8]}…")
     except Exception as e:
-        log(f"FE trigger: marker write failed: {e}", "WARN")
-    return False
+        log(f"FE trigger: marker write raised: {e}", "WARN")
+        return False
+    if written:
+        log(f"FE trigger: needsFeTrigger marker written rid={research_id[:8]}…")
+    else:
+        log(f"FE trigger: needsFeTrigger marker NOT written rid={research_id[:8]}… "
+            f"— a chat opening on this run has no marker to catch up from", "WARN")
+    return bool(written)
 
 
 def _summarize_notify_reply(body_text) -> str:
@@ -15720,6 +18732,21 @@ def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
     the web app answered. Best-effort; never raises.
     """
     if not uid or not research_id:
+        return False
+    # ⛔⛔ A RUN THAT KEEPS NOTHING ASKS FOR NO NOTICE (wave 10.9, #536). The
+    # route this posts to writes a notification into the person's inbox, and an
+    # inbox entry is a row in the app that outlives the run — it survives the
+    # purge, and its `/research/{id}` link points at a chat that will not exist.
+    # The person is watching the run in the chat it is running in; the whole
+    # reason this call exists is the tab that is CLOSED, and a closed incognito
+    # tab cannot be reopened.
+    #
+    # ⭐ The app also drops an incognito notice on read (`isEphemeralNoticeHref`),
+    # because the SERVER writes notices this call never touches. That is the
+    # reader's net; this is not asking in the first place.
+    if _is_incognito_research(research_id):
+        log(f"phase-notify: {research_id[:8]}… keeps nothing — no notice asked for",
+            "INFO")
         return False
     id_token = _fresh_user_mode_id_token()
     if not id_token:
@@ -15802,72 +18829,465 @@ def _post_fe_phase_notice(uid, research_id, phase, event_type, seq):
     return True
 
 
+# ⭐ How long a connection must have been open before we treat it as having
+# REACHED the cloud. A request that dies inside a couple of seconds never left
+# — DNS, a refused connection, no route. One that dies later was received, and
+# the measured 300-second severance lands far past this.
+_DRIVE_SENT_AFTER_SEC = 10
+
+
+def _dispatch_never_left(exc: BaseException, elapsed_sec: float) -> bool:
+    """Did the P4/P5 POST fail before the cloud ever had it?
+
+    ⛔⛔ EXTRACTED SO IT CAN BE EXECUTED, and a mutant is why. Inline, the
+    classification could be neutered to `False and isinstance(...)` and every
+    assertion about it stayed green — they were reading the parse tree for the
+    NAMES, which survive. A decision worth making is a decision worth running.
+
+    ⛔ THE CLASS DECIDES ONLY WHERE THE CLASS IS UNAMBIGUOUS. A black-holed SYN
+    does not fail instantly — it fails at the OS connect timeout, tens of
+    seconds, past any threshold — so a clock-only rule filed a request that
+    never left as one the cloud received. `requests` names that case precisely:
+    ConnectTimeout, and ProxyError for a proxy that would not open the tunnel.
+
+    ⛔⛔ BUT A BARE `ConnectionError` NAMES BOTH SIDES OF THE LINE, and round
+    three of cross-verify induced the real exception to prove it. This route's
+    defining failure — something in front of Cloud Run severing the socket at
+    EXACTLY 300 seconds while the request keeps being served, one measured run
+    finishing at 497 s — arrives as ConnectionError(ProtocolError('Connection
+    aborted.', ConnectionResetError)), because urllib3 wraps a mid-flight reset
+    in the same class it uses for a connection that never opened. Sending every
+    ConnectionError to "never left" therefore re-broke the majority path round
+    one had fixed, and wrote "never reached the cloud" into the permanent
+    support-bundle record of runs the cloud received and finished.
+
+    ⭐ SO THE CLOCK KEEPS THIS ONE. A ConnectionError inside a couple of
+    seconds never left; one at five minutes was a severance. ReadTimeout cannot
+    arbitrate it — with a 3600 s read timeout it does not fire for an hour.
+    """
+    try:
+        import requests as _rq
+    except Exception:
+        return elapsed_sec < _DRIVE_SENT_AFTER_SEC
+    exc_mod = _rq.exceptions
+    if isinstance(exc, (exc_mod.ReadTimeout, exc_mod.ChunkedEncodingError)):
+        return False
+    if isinstance(exc, (exc_mod.ConnectTimeout, exc_mod.ProxyError)):
+        return True
+    return elapsed_sec < _DRIVE_SENT_AFTER_SEC
+
+
+#: The pauses between cloud-kick attempts, in seconds. One more attempt than
+#: there are pauses.
+#:
+#: ⭐ SIZED FOR A DRIVE, NOT FOR A NOTICE. `_post_fe_phase_notice` retries three
+#: times two seconds apart, which is right for it: it announces a phase that has
+#: already finished, and arriving a few seconds late is the whole point. This
+#: request IS the rest of the run. The web's own route already spends ~2.5 s of
+#: ladder on its Firestore read and says in a comment that anything outstanding
+#: longer than that is the MACHINE's to come back for — so a six-second budget
+#: here would close almost none of the window it was written to close. Just under
+#: two minutes covers a route restart, a rolling deploy and a brief network drop,
+#: and is still far inside the time the person would otherwise wait for nothing.
+_DRIVE_BACKOFF_SEC = (5, 15, 30, 60)
+
+
+def _answered_without_phase_5(body_text) -> bool:
+    """Did the route answer phase 4 and stop, without running phase 5?
+
+    ⛔⛔ THE ROUTE SAYS SO IN ITS OWN WORDS, and the machine was not listening.
+    `casRouteP4`'s already-completed short-circuit returns 200 with the video
+    link and NO `p5` key, and its comment names the contract: "the browser reads
+    exactly that as 'ask for phase 5 alone'". The GCS-link branch answers the
+    same way. So a kick that lands on a run whose phase 4 is already done — the
+    boot re-kick and the Resume re-kick are exactly that shape — got a 200, and
+    this side called the chain finished while phase 5 had never run: no Super
+    Research, no Doc, no email, on a machine with no tab open to notice. #542's
+    symptom, reached through the fix for it.
+
+    ⭐ THE SAME RULE AS `cloudKickOutcome`, and no more of it. An answer that
+    cannot be parsed is NOT a missing phase 5 — the browser reads that as a
+    transport failure and does not follow up either, and guessing here would ask
+    for a phase 5 that may be mid-flight. The route streams keep-alive spaces
+    before its JSON, which `json.loads` skips; an answer of spaces alone parses
+    to nothing and reads as unparseable."""
+    try:
+        parsed = json.loads(body_text or "")
+    except Exception:
+        return False
+    return isinstance(parsed, dict) and "p5" not in parsed
+
+
+def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0) -> str:
+    """What one attempt at the cloud kick means. One of:
+
+      "ran"     — the route ran the chain and answered (HTTP 2xx).
+      "claimed" — HTTP 202: ANOTHER caller holds the claim. The work is
+                  somebody's; it is not this call's, and it is not a failure.
+      "cut"     — the connection died AFTER the cloud had the request. The route
+                  does not stop when a socket closes, so this machine has simply
+                  stopped being able to watch. Asking again would only take a 202.
+      "retry"   — nothing ran and asking again could change it: a 5xx, or a
+                  request that never left this machine.
+      "refused" — the route declined on the merits and repeating it changes
+                  nothing except the load.
+
+    ⛔⛔ EXTRACTED SO IT CAN BE EXECUTED, for the same reason `_dispatch_never_left`
+    was: a retry ladder whose classification is inline can be neutered to
+    `if False` while every name a test reads for survives.
+
+    ⛔ 401 AND 403 ARE RETRIED, and they are the only 4xx that are. A 401 means
+    the ID token this attempt minted was not accepted — a fresh mint is exactly
+    what the next attempt does. A 403 is `authorizeSynthForResearch` refusing
+    the device→research binding, which is the shape that loses a
+    claim-propagation race right after a run is claimed. Both can clear on their
+    own; a 400 or a 404 cannot.
+
+    ⭐ AND THE RETRYABLE SIDE IS THE DEFAULT, so a status nobody anticipated is
+    asked again rather than written off — the direction where the cost is one
+    more request instead of a run that never finishes."""
+    if exc is not None:
+        return "retry" if _dispatch_never_left(exc, elapsed_sec) else "cut"
+    if status_code == 202:
+        return "claimed"
+    if isinstance(status_code, int) and 200 <= status_code < 300:
+        return "ran"
+    if status_code in (401, 403):
+        return "retry"
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        return "refused"
+    return "retry"
+
+
+def _record_cloud_kick_refusal(uid, research_id, reason: str) -> bool:
+    """Put a refused hand-off somewhere the chat can see it: phase 4's own
+    entry on the research document, errored, carrying the reason.
+
+    ⛔⛔ DELIBERATELY NOT `feP4State: "failed"`, and the route's own source says
+    why. `cloudKickDecision` reads `feP4State`, and any terminal value there
+    means "phase 4 has been TRIED": the next hand-off then asks the route for
+    phase 5 ALONE, and the Doc and the email go out with no video for an upload
+    that never ran. That is 542-S2 through a different door, and it would be a
+    fix that reroutes somebody's run rather than reporting on it.
+
+    ⭐ `phases[4].status` IS THE SURFACE THAT WORKS. `cloudPhaseRecorded` reads
+    it first, so the phase-4 tile goes red on an open chat, on a reopened one and
+    on the researches-list card alike — while `cloudKickDecision`, which never
+    looks at `phases`, still re-drives BOTH phases when a chat opens. The record
+    is visible and the run stays recoverable, which is the pair this needs.
+
+    ⚠ `reason` rides along as the document's durable account. It is the phases
+    entry's existing field — `reopenedPhaseSkip` reads it only for a SKIPPED
+    entry, so an errored one cannot be mistaken for a skip — and no surface
+    renders it today. The tile is what a person sees; this is what the support
+    bundle and the next reader of the document get.
+
+    ⚠ THE RACE, NAMED: this is a read-modify-write on `phases`, and so is the
+    route's. It only runs where the kick did NOT reach the route, so there is
+    normally nothing on the other side — the exception is a 403 arriving while a
+    BROWSER's kick has the route running, where this could put a stale "errored"
+    over the claim's "running" until the route's next `phases` write corrects
+    it. That window is narrow and self-healing; recording nothing at all is
+    #542's symptom, which is not.
+
+    Explicit uid/rid: this runs on a detached thread minutes after the POST, by
+    which time the pipeline globals may belong to the NEXT run."""
+    if not _firebase_db or not uid or not research_id:
+        return False
+    ref = _firebase_db.collection("users").document(uid) \
+        .collection("researches").document(research_id)
+
+    def _op():
+        snap = ref.get()
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        phases = list(data.get("phases") or [])
+        entry = None
+        for row in phases:
+            if isinstance(row, dict) and row.get("phase") == 4:
+                entry = row
+                break
+        if entry is None:
+            entry = {"phase": 4, "label": "Phase 4",
+                     "startedAt": int(time.time() * 1000)}
+            phases.append(entry)
+        entry["status"] = "errored"
+        entry["reason"] = reason
+        ref.update(_be_payload({"phases": phases}))
+
+    try:
+        _grpc_write_with_heal(_op, what=f"cloud-kick refusal rid={research_id[:8]}…")
+        return True
+    except Exception as e:
+        log(f"FE trigger: could not record the refusal on the document: {e}", "WARN")
+        return False
+
+
+def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
+                        record_failure) -> str:
+    """Ask the cloud to run phases 4 and 5 until it answers, refuses, or the
+    attempts run out. Returns the verdict the drive ended on.
+
+    ⛔⛔ IT USED TO BE ONE POST (wave 10.9, 542-5). No token, a POST that never
+    left the machine, or a 5xx left the `needsFeTrigger` marker and nothing
+    else: no video, no Super Research, no Doc, no email, and a run reading
+    "ongoing" until somebody happened to open its chat. On a machine whose owner
+    is asleep, that is for ever — and the marker is only ever read BY a chat
+    opening, so the backstop and the failure need the same thing to happen.
+
+    ⭐ EFFECTS ARE ARGUMENTS so the ladder, the classification and the record
+    are all executed by tests rather than read as source.
+    `post(id_token, p5_only)` returns `(status_code, text)` or raises;
+    `mint_token()` returns the synth device user's fresh ID token or None;
+    `note(line)` files a sentence in this run's own folder;
+    `record_failure(reason)` is what the chat ends up seeing.
+
+    ⭐ AND IT FOLLOWS THE ROUTE'S "ANSWERED WITHOUT PHASE 5" CONTRACT, which
+    the machine did not (`_answered_without_phase_5`). A 200 carrying no `p5`
+    means phase 4 is over and phase 5 never ran; the drive asks again for phase
+    5 alone, with a budget of its own.
+
+    ⛔ A CONNECTION CUT AFTER THE CLOUD HAD THE REQUEST IS NOT RETRIED. That is
+    this route's defining failure — something in front of Cloud Run severs the
+    socket at exactly 300 seconds while the route keeps working, one measured
+    run finishing at 497 s — so the chain is running and asking again would at
+    best take a 202 off its own claim.
+
+    ⭐ ITS LINES ARE MACHINE LINES (wave 10.10): they reach `backend.log`
+    whatever run is armed, and never the next run's folder (see
+    `_post_fe_p4p5_trigger`). That is why the reply is cut from `why` itself
+    for a run that keeps nothing (`_quote_reply`) — every line below, logged
+    or noted, carries only the status for such a run."""
+    attempts = len(_DRIVE_BACKOFF_SEC) + 1
+    verdict = "retry"
+    why = "never attempted"
+    # ⭐ "ANSWERED WITHOUT PHASE 5" IS ASKED FOR AGAIN, exactly as the browser
+    # does. `p5_only` flips once, and the second pass gets a budget of its own:
+    # phase 5 is the rest of the run, not a postscript to the attempts phase 4
+    # happened to use up.
+    _p5_only = False
+    _attempt = 0
+    # ⛔⛔ THE ROUTE'S REPLY IS NOT QUOTED FOR A RUN THAT KEEPS NOTHING (wave
+    # 10.9, last repair). `why` is logged and filed after the run has ended,
+    # and the reply of a chain that sends the report by email can carry the
+    # mail error — which names the person's address. The status says what
+    # happened; the text is theirs.
+    _quote_reply = not _is_incognito_research(research_id)
+    while _attempt < attempts:
+        _attempt += 1
+        _elapsed = 0
+        id_token = mint_token()
+        if not id_token:
+            verdict, why = "retry", "no synth id-token (creds revoked?)"
+            _text = ""
+        else:
+            _t0 = time.monotonic()
+            try:
+                _status, _text = post(id_token, _p5_only)
+                verdict = _dispatch_verdict(status_code=_status)
+                why = f"HTTP {_status}" + (f" ({str(_text)[:160]})"
+                                           if _text and _quote_reply else "")
+            except Exception as _e:
+                _elapsed = int(time.monotonic() - _t0)
+                verdict = _dispatch_verdict(exc=_e, elapsed_sec=_elapsed)
+                why = f"{_e}"
+                _text = ""
+        if verdict == "ran":
+            if not _p5_only and _answered_without_phase_5(_text):
+                # ⛔⛔ NOT A FINISHED CHAIN. `casRouteP4`'s already-completed
+                # short-circuit and the GCS-link branch both answer phase 4 and
+                # stop, carrying no `p5` — and the route's own comment names
+                # this as the caller's cue to ask for phase 5 alone. The machine
+                # used to call it done here, which on a boot or Resume re-kick
+                # (the two that land on a finished phase 4) meant no Super
+                # Research, no Doc and no email, with nobody awake to notice.
+                note(f"P4/P5: the route answered phase 4 and stopped ({why}) — "
+                     f"asking it for phase 5 alone.")
+                log(f"FE trigger: BE-driven P4/P5 — the route answered phase 4 "
+                    f"without running phase 5 ({why}) — asking for phase 5 alone "
+                    f"rid={research_id[:8]}…")
+                _p5_only = True
+                _attempt = 0
+                continue
+            note(f"P4/P5 dispatched to the cloud and the route ran it ✓ ({why})")
+            log(f"FE trigger: BE-driven P4/P5 — the cloud ran the chain ✓ ({why}) "
+                f"rid={research_id[:8]}…")
+            return verdict
+        if verdict == "claimed":
+            # ⛔⛔ LOGGED AS "dispatched ✓" UNTIL WAVE 10.9 (542-S4). A 202 means
+            # somebody ELSE holds the claim — an open tab, or an earlier kick
+            # still running — so this call did nothing, and the tick said it
+            # had. On a run that then stalled, the one line the report rested on
+            # named the wrong party.
+            note("P4/P5 was already claimed by another caller (HTTP 202) — "
+                 "the cloud is running it, and this machine's kick did nothing.")
+            log(f"FE trigger: BE-driven P4/P5 already claimed by another caller "
+                f"(HTTP 202) — nothing dispatched rid={research_id[:8]}…")
+            return verdict
+        if verdict == "cut":
+            note(f"P4/P5 connection cut after {_elapsed}s ({why}). The cloud "
+                 f"received the request and may be finishing it; this machine "
+                 f"stopped being able to watch. If it did not finish, the run "
+                 f"stays on phase 3 and "
+                 f"{_cloud_catchup_clause(research_id)}.")
+            log(f"FE trigger: BE-driven P4/P5 connection cut after {_elapsed}s "
+                f"({why}) — the cloud has the request rid={research_id[:8]}…", "WARN")
+            return verdict
+        if verdict == "refused":
+            # ⭐⭐ THE REFUSAL CASE, AND THE WEB SAYS IN ITS OWN WORDS THAT THIS
+            # HALF IS OURS. `uploadYouTube` leaves a marker on every post-auth
+            # exit and deliberately NOT on the 401/403 ones: a 401 has no
+            # verified identity and a 403 has one that failed its check, so
+            # writing from there would mean writing under a caller's CLAIMED
+            # ownerUid — the exact relay hole the check closes. It also drops
+            # its own captured lines for those two exits. So on a refusal
+            # NOTHING was written anywhere, by anyone. We know who we are; we
+            # write it here.
+            break
+        # "retry" — nothing ran, and asking again can change it.
+        if _attempt >= attempts:
+            break
+        _delay = _DRIVE_BACKOFF_SEC[_attempt - 1]
+        log(f"FE trigger: BE-driven P4/P5 attempt {_attempt} did not land ({why}) "
+            f"— retrying in {_delay}s rid={research_id[:8]}…", "WARN")
+        sleep(_delay)
+    # ⛔ THE PHASE IT GAVE UP ON, NAMED. A drive that had already flipped to
+    # `p5_only` failed on PHASE 5, and saying "P4/P5" there would send the next
+    # reader looking for an upload that succeeded.
+    _leg = "P5" if _p5_only else "P4/P5"
+    # ⛔ AND WHAT RE-DRIVES IT IS NOT THE SAME FOR EVERY RUN — see
+    # `_cloud_catchup_clause`. A run that keeps nothing has no chat to reopen,
+    # so this file must not tell its reader to open one.
+    _catchup = _cloud_catchup_clause(research_id)
+    _sentence = (
+        f"{_leg} was refused by the cloud — {why}. Nothing ran, and nothing was "
+        f"recorded on the cloud side. Phase 4 is marked errored on this run so "
+        f"the chat can show it; {_catchup}."
+        if verdict == "refused" else
+        f"{_leg} never reached the cloud after {_attempt} attempt(s) — {why}. "
+        f"Phase 4 is marked errored on this run so the chat can show it; "
+        f"{_catchup}."
+    )
+    note(_sentence)
+    # ⛔ `_attempt`, NOT `attempts` (542-S4). A refusal stops on the FIRST ask,
+    # and reporting the whole budget there claims a persistence the drive did
+    # not have — the same class of overstatement as the 202 logged as a dispatch.
+    log(f"FE trigger: BE-driven {_leg} gave up after {_attempt} attempt(s) "
+        f"({verdict}: {why}) rid={research_id[:8]}… — recording the failure on "
+        f"the run", "WARN")
+    try:
+        record_failure(_sentence)
+    except Exception as _re:
+        log(f"FE trigger: recording the refusal failed ({_re})", "WARN")
+    return verdict
+
+
 def _post_fe_p4p5_trigger(uid, research_id):
     """Option C (#742): drive P4 (YouTube) + P5 (Doc/email) autonomously so a
     run completes even when the chat app is never opened.
 
     Two cooperating parts:
       1) Write the `needsFeTrigger` marker synchronously (via
-         _fire_fe_p4_trigger) — the long-standing FE catch-up backstop AND the
-         safe fallback if the autonomous POST below can't run. This uses the
-         worker's module-global Firestore context, so it MUST run here in the
-         worker thread, never the background thread.
-      2) Additionally POST {FE_BASE_URL}/api/uploadYouTube authenticated with
-         the synth-device user's OWN fresh ID token; the route authorizes the
-         device->research binding (authorizeSynthForResearch) and runs P4 then
+         _fire_fe_p4_trigger) — the backstop a chat opening on this run reads,
+         and the record that the hand-off happened at all.
+      2) POST {FE_BASE_URL}/api/uploadYouTube authenticated with the synth
+         device user's OWN fresh ID token; the route authorizes the
+         device→research binding (authorizeSynthForResearch) and runs P4, then
          chains P5 server-side on Cloud Run. We hit ONLY uploadYouTube (it owns
-         the P5 chain) to avoid a double P5. casRouteP4 dedups this against the
-         FE catch-up, so the two triggers coexist safely.
+         the P5 chain) to avoid a double P5. `casRouteP4` dedups this against a
+         browser's kick, so the two coexist safely — a repeated kick is safe by
+         design, and answers 202 while a claim is fresh.
 
     The POST runs in a detached daemon thread with a long timeout: the encode +
     resumable upload can take minutes and the route processes inline while the
-    connection is open, so we must neither block the worker (it has a queue to
-    drain) nor disconnect early (a client-disconnect can abort the route
-    mid-encode). On any POST failure the marker — already written — ensures the
-    FE catch-up still runs on next chat-open. Best-effort; never raises."""
-    # (1) marker backstop — synchronous, worker context (module globals valid).
+    connection is open, so we must not block the worker (it has a queue to
+    drain). A disconnect no longer aborts the route — its abort handler was
+    removed on 09-19 — but the route is still working inside this request, so
+    the worker holds its respawn for it (`_FE_DRIVE_WAIT_SEC`). Best-effort;
+    never raises.
+
+    ⭐ THE TOKEN IS MINTED PER ATTEMPT, INSIDE THE THREAD (wave 10.9, 542-5). It
+    used to be minted once here, in the worker, and a `None` returned early with
+    the marker as the only trace — so a machine whose token refresh blipped
+    delivered nothing and said so only in a log line. `_drive_cloud_phases`
+    retries the mint like any other attempt, and records the outcome on the run
+    when the attempts run out.
+
+    ⭐ SAFE TO CALL FOR A RUN THAT IS NOT THE ONE IN THE PIPELINE GLOBALS. Every
+    write underneath names `uid`/`research_id` explicitly, which is what lets
+    the boot rehydrate and the resume path re-fire a kick for a run this worker
+    is not executing."""
+    # (1) marker backstop.
     _fire_fe_p4_trigger(uid, research_id)
     if not uid or not research_id:
         return False
-    # (2) autonomous server-to-server trigger.
-    id_token = _fresh_user_mode_id_token()
-    if not id_token:
-        log("FE trigger: no synth id-token (creds revoked?) — needsFeTrigger marker only", "INFO")
-        return False
 
+    def _post(id_token, p5_only=False):
+        """One POST. Returns (status_code, text); raises what `requests` raises.
+
+        ⭐ `p5_only` IS THE ROUTE'S OWN FLAG, not a second endpoint. It is
+        handled immediately after the synth auth — before the phase-4 scope read
+        — so the same body and the same credentials ask for phase 5 alone."""
+        import requests as _requests
+        from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+        _body = {"research_id": research_id, "ownerUid": uid}
+        if p5_only:
+            _body["p5_only"] = True
+        _resp = _requests.post(
+            f"{_FE_BASE_URL}/api/uploadYouTube",
+            headers={"Authorization": f"Bearer {id_token}"},
+            json=_body,
+            # ⛔ A PAIR, NOT A SCALAR. A scalar sets the CONNECT timeout to
+            # 3600 as well, so a black-holed SYN — firewall drop, no route,
+            # VPN down — does not fail fast; it fails tens of seconds later,
+            # past `_DRIVE_SENT_AFTER_SEC`, and the record then says the cloud
+            # received a request that never left the machine. Ten seconds
+            # bounds the connect; the read stays matched to the route's
+            # Cloud Run maxDuration (long podcast encode + upload).
+            timeout=(10, 3600),
+        )
+        return _resp.status_code, _resp.text
+
+    # ⛔⛔ MACHINE LINES, WHATEVER RUN IS ARMED WHEN THEY ARE WRITTEN (wave
+    # 10.10). `log()` copies each line into the run armed AT WRITE TIME, and
+    # this thread writes its outcome minutes after this run's own sink has
+    # been popped. Wave 10.9 removed the wait that held the next run's start
+    # behind this delivery, so the next run — often somebody else's, on a
+    # shared computer — is now routinely armed by then, and it collected this
+    # run's research id and up to 160 characters of the route's answer in its
+    # own run.log and support bundle. The removed wait had been preventing that
+    # by accident. This run's own account is `note()` → `_note_cloud_handoff`,
+    # addressed by researchId, and it is unchanged.
+    @_machine_logged
     def _drive():
         # ⭐⭐ Counted as an in-flight DRIVE, not a brief handoff. This request is
-        # not a notification — it is the rest of the run, and the route wires
-        # `req.signal` to an abort handler that SIGTERMs the in-flight ffmpeg
-        # child and writes `status: "stopped"`. Exiting this process while it is
-        # connected kills the encode and terminalises the user's research. See
+        # not a notification — it is the rest of the run: the route runs phases
+        # 4 and 5 INLINE while this socket is open, so a worker that exits
+        # mid-request abandons work nothing else is driving. (A hang-up alone no
+        # longer stops the route — its abort handler was removed on 09-19 — so
+        # the reason is the abandoned work, not a destructive disconnect.) See
         # `_FE_DRIVE_WAIT_SEC`.
         _fe_handoff_begin(drive=True)
         try:
-            _drive_once()
+            # ⛔⛔ EVERY LINE THE DRIVE WRITES USED TO LAND NOWHERE. By the time
+            # this thread finishes, this run's sink has been popped, so its
+            # outcome reached no run folder — measured: zero occurrences across
+            # every run folder on this disk. `note()` addresses the run's OWN
+            # folder by researchId. ⚠ It never stopped the drive's `log()`
+            # lines reaching the NEXT run's folder; the marking on this function
+            # does that.
+            _drive_cloud_phases(
+                uid, research_id,
+                post=_post,
+                mint_token=_fresh_user_mode_id_token,
+                sleep=time.sleep,
+                note=lambda _line: _note_cloud_handoff(research_id, _line),
+                record_failure=lambda _reason: _record_cloud_kick_refusal(
+                    uid, research_id, _reason),
+            )
+        except Exception as _e:
+            log(f"FE trigger: BE-driven P4/P5 drive raised ({_e})", "WARN")
         finally:
             _fe_handoff_end(drive=True)
-
-    def _drive_once():
-        try:
-            import requests as _requests
-            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
-            _resp = _requests.post(
-                f"{_FE_BASE_URL}/api/uploadYouTube",
-                headers={"Authorization": f"Bearer {id_token}"},
-                json={"research_id": research_id, "ownerUid": uid},
-                timeout=3600,  # match the route's Cloud Run maxDuration (long podcast encode + upload)
-            )
-            if _resp.status_code in (200, 202):
-                log(f"FE trigger: BE-driven P4/P5 dispatched ✓ (HTTP {_resp.status_code}) rid={research_id[:8]}…")
-            else:
-                log(
-                    f"FE trigger: BE-driven P4/P5 HTTP {_resp.status_code} "
-                    f"({_resp.text[:160]}) — FE catch-up covers via marker",
-                    "WARN",
-                )
-        except Exception as _e:
-            log(f"FE trigger: BE-driven P4/P5 dispatch failed ({_e}) — FE catch-up covers via marker", "WARN")
 
     try:
         import threading as _threading
@@ -15899,6 +19319,19 @@ _phase_status_by_rid: dict = {}
 # → status strings); 64 recent runs is far more than any worker holds live.
 _STATUS_BY_RID_CAP = 64
 
+# ⛔⛔ ONE MACHINE WRITER OF THE PHASE LIST AT A TIME (wave 10.10). "Ordering no
+# longer matters" above is true of the STATUS, and it is not true of the rest of
+# a row. `_do_phase_terminal_status_write` is a read-modify-write on a daemon
+# thread, fired by `phase_complete`: it reads the array, and if a whole-array
+# write lands between its read and its write — the save that closes phase 2, the
+# hand-off that closes phase 3 — it writes back the array it READ, and the row's
+# end and duration are gone. That is the row the web's timeline measured on
+# every run that finished normally: phase 3 "complete", a "Phase 3" label, no
+# end and no duration. Held across each writer's read and write, the later
+# writer always reads what the earlier one wrote. Re-entrant, and never held
+# while `_grpc_heal_lock` is: `_grpc_write_with_heal` never calls its op under it.
+_phases_write_lock = threading.RLock()
+
 
 def _record_terminal_status(store: dict, rid: str, key, status: str) -> None:
     """Synchronously record a terminal status under store[rid][key], evicting
@@ -15916,7 +19349,7 @@ def _do_agent_terminal_status_write(agent_key: str, status: str,
                                     reason: str = "", detail: str = ""):
     """Inner sync write — kept separate so the public _write_*
     helpers can fire-and-forget on a daemon thread, avoiding the
-    event-loop blocking that B2 (research.py:1046) called out for
+    event-loop blocking that B2 (`_heartbeat_loop`) called out for
     sync Firestore I/O on the main asyncio loop."""
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
@@ -15970,7 +19403,7 @@ def _write_agent_terminal_status(agent_key: str, status: str, force: bool = Fals
 
     Fire-and-forget on a daemon thread so the sync Firestore round-trip
     doesn't block the asyncio event loop (heartbeat, command listener,
-    narration ticker). Same lesson as B2 (research.py:1046) — any
+    narration ticker). Same lesson as B2 (`_heartbeat_loop`) — any
     multi-second sync I/O on the main loop starves heartbeat and trips
     the FE 30s offline threshold.
 
@@ -16059,20 +19492,23 @@ def _do_phase_terminal_status_write(phase_num: int, status: str):
         # the READ too — wrap the whole read+upsert+update so the heal's force-
         # refresh re-runs both. _be_payload the update (deviceUpdatingFor's
         # payload clause REQUIRES deviceId; a raw dict 403s even fresh).
-        snap = ref.get()
-        data = (snap.to_dict() or {}) if snap.exists else {}
-        phases = list(data.get("phases") or [])
-        # Upsert by phase number
-        found = False
-        for entry in phases:
-            if isinstance(entry, dict) and entry.get("phase") == phase_num:
-                entry["status"] = status
-                found = True
-                break
-        if not found:
-            phases.append({"phase": phase_num, "label": f"Phase {phase_num}",
-                           "startedAt": int(time.time() * 1000), "status": status})
-        ref.update(_be_payload({"phases": phases}))
+        # ⛔⛔ Under `_phases_write_lock`, read AND write (wave 10.10): this is the
+        # write that used to land the array it read over a row's end.
+        with _phases_write_lock:
+            snap = ref.get()
+            data = (snap.to_dict() or {}) if snap.exists else {}
+            phases = list(data.get("phases") or [])
+            # Upsert by phase number
+            found = False
+            for entry in phases:
+                if isinstance(entry, dict) and entry.get("phase") == phase_num:
+                    entry["status"] = status
+                    found = True
+                    break
+            if not found:
+                phases.append({"phase": phase_num, "label": f"Phase {phase_num}",
+                               "startedAt": int(time.time() * 1000), "status": status})
+            ref.update(_be_payload({"phases": phases}))
 
     try:
         _grpc_write_with_heal(_op, what=f"phase-status phase={phase_num}")
@@ -16322,7 +19758,7 @@ def _start_command_listener(uid, research_id, loop):
             if action == "stop":
                 # Mark processed BEFORE scheduling the 3s exit timer so the
                 # flag lands even if the Firestore Admin SDK buffers the
-                # tail-end mark-processed write (at line ~1455) and
+                # tail-end mark-processed write (at the bottom of this handler) and
                 # os._exit(0) kills the buffer before flush. Without this,
                 # an ungraceful exit leaves the stop doc unprocessed and
                 # the next serve replays it the moment the listener
@@ -16443,7 +19879,7 @@ def _start_command_listener(uid, research_id, loop):
                     # a delayed onSnapshot delivery can leave the chat
                     # icon row out of sync with the tile that just sent
                     # this command. Mirrors the HTTP /api/runs/{id}/config
-                    # PATCH path (line ~18347) which already emits.
+                    # PATCH path (`update_config`) which already emits.
                     try:
                         emit_event("config_updated", config=cfg)
                     except Exception:
@@ -16490,10 +19926,10 @@ def _start_command_listener(uid, research_id, loop):
                     # #777 parity: retract any durable "Hit a snag" pendingDecision
                     # mirror the instant the user clicks Skip. A launch-failed agent
                     # (fail_agent → skipped_agents but NOT in `pending`) never emits
-                    # agent_skipped, so the central clear seam (~11606) never fires and
+                    # agent_skipped, so the central clear seam in `emit_event` never fires and
                     # the fail_agent mirror lingered → the FE AgentAlertPanel fallback
                     # (decisionToCard) re-rendered the snag card even after the agent
-                    # was skipped. Symmetric to the retry_agent clear at ~7787/7805;
+                    # was skipped. Symmetric to the retry_agent clear below (#777);
                     # idempotent DELETE_FIELD; one chokepoint covers every skip_agent
                     # site (P2 fail_agent Skip + P3/P4 verify-gate Skip). Agent-scoped
                     # (pass _ag) so skipping ONE agent's card can't retract a DIFFERENT
@@ -16603,9 +20039,9 @@ def _start_command_listener(uid, research_id, loop):
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
                     # Auto-resume the FE across ALL surfaces on Retry. A fail_agent
-                    # card FE-auto-pauses the run locally (usePipeline:3063) with no
+                    # card FE-auto-pauses the run locally (usePipeline.ts) with no
                     # BE pause, and this intake otherwise emits NO resume (see the
-                    # 8692 note) — so a second tab / phone / cold reopen stayed stuck
+                    # #777 note below) — so a second tab / phone / cold reopen stayed stuck
                     # "Paused MM:SS" (the user's "still paused after retry" report).
                     # The acting tab clears optimistically FE-side; this covers the
                     # rest. Scheduled on the loop thread (emit does Firestore I/O);
@@ -16620,7 +20056,7 @@ def _start_command_listener(uid, research_id, loop):
                     # the instant the user clicks Retry. The agent-retry path resolves
                     # the decision via request_retry_agent_hard + request_resume +
                     # await_agent_decision()=="retry" — it emits NO pipeline_resumed /
-                    # phase_restart event, so the central clear seam (~11387) never
+                    # phase_restart event, so the central clear seam in `emit_event` never
                     # fired and the snag card lingered until the run advanced PAST the
                     # phase (FE staleness guard nulled it on docPhase>pd.phase). This
                     # ONE chokepoint covers EVERY Phase-2 fail_agent→retry site
@@ -16762,7 +20198,8 @@ def _start_cli_command_reader(loop):
             if cmd in ("r", "resume"):
                 # At a Phase 0 pro_required pause, a bare resume falls through
                 # to the post-pause "no explicit choice → Free-acknowledged"
-                # branch (line ~18877) — even if the user just upgraded to Pro
+                # branch (Phase 0's pro_required pause in `run_pipeline`) — even if
+                # the user just upgraded to Pro
                 # in the browser. The web frontend's Retry button on the
                 # pro_required banner sets retry_phase(0); CLI 'r' must do the
                 # same so Phase 0 actually re-verifies ChatGPT/Gemini/Claude
@@ -16773,7 +20210,7 @@ def _start_cli_command_reader(loop):
                 #
                 # DGOPS-7710 (F6, 2026-05-18): claude_chat_mode pause needs a
                 # DIFFERENT consume path — Phase 2B's `await_agent_decision`
-                # (line 4274) polls consume_continue_anyway / skipped_agents,
+                # polls consume_continue_anyway / skipped_agents,
                 # NOT phase-level flags. Plain `request_resume` releases
                 # wait_if_paused but await_agent_decision then hangs for the
                 # 3h timeout. CLI `r` here means [Continue in chat mode] (the
@@ -16800,7 +20237,7 @@ def _start_cli_command_reader(loop):
                     log("[CMD] resume → retry agent (link_failed alert)")
                     loop.call_soon_threadsafe(_controls.set_agent_decision, "retry")
                 # human_verification_required `r` falls through to plain
-                # resume — the poll loop at line ~18430 already detects
+                # resume — the poll loop in `wait_for_verification_clearance` already detects
                 # is_pause()==False and re-checks the browser. No special
                 # flag needed; behavior preserved.
                 else:
@@ -16849,7 +20286,7 @@ def _start_cli_command_reader(loop):
                     loop.call_soon_threadsafe(_controls.request_resume)
                 elif pr == "cua_unavailable":
                     # #705: cua_unavailable is a fail-closed INFRA gate — the P0
-                    # probe loop (research.py:28426) re-probes and ignores
+                    # probe loop in `run_pipeline` re-probes and ignores
                     # skip_init_verify, so `s` would silently re-card forever.
                     # Don't pretend to skip; tell the user the real recovery.
                     log("[CMD] skip unavailable at cua_unavailable — vision/CUA is required infra. "
@@ -16875,7 +20312,7 @@ def _start_cli_command_reader(loop):
                 # pro_required banner button. Only meaningful at a
                 # pro_required pause; gated to avoid leaking the
                 # continue_anyway flag into later phases that also
-                # consume it (Phase 1 Pro selector backstop @ 14220,
+                # consume it (the Phase 1 Pro selector backstop,
                 # etc.). To stop the pipeline, use Ctrl+C.
                 pr = getattr(_controls, "pause_reason", "") or ""
                 if pr == "pro_required":
@@ -17095,8 +20532,8 @@ class PipelineControls:
         """Called from command listener when user chooses retry/skip/stop
         for an agent_link_failed prompt. Whitelist-guards the value; only
         retry/skip/stop are written. NOTE: does NOT release the pause —
-        callers must invoke `request_resume()` separately (the dispatcher
-        at research.py:3819-3854 does this explicitly for both `r` and `s`
+        callers must invoke `request_resume()` separately (the CLI dispatcher
+        in `_start_cli_command_reader` does this explicitly for both `r` and `s`
         branches at agent_link_failed pauses).
 
         #955 Phase 5: `agent` scopes the decision so the NON-blocking Claude
@@ -17191,7 +20628,7 @@ class PipelineControls:
                 actions = f"  r) resume (re-check verification)   s) skip {target or 'agent'}"
             elif reason == "cua_unavailable":
                 header = "[PAUSE] cua_unavailable — fix Anthropic key/cap, then:"
-                # #705: NO skip option. The P0 probe loop (research.py:28426)
+                # #705: NO skip option. The P0 probe loop in `run_pipeline`
                 # is fail-closed and ignores skip_init_verify — vision/CUA is
                 # required infra, not a login the user can wave past. Advertising
                 # `s` here only re-cards forever (Stop was the sole real exit).
@@ -17472,8 +20909,18 @@ class PipelineControls:
         never-die contract: the user being AFK shouldn't terminate
         their run. The FE watchdog T3 catches genuinely-dead runs via
         silence detection; this timeout is now effectively a no-op
-        backstop. BE keeps heartbeating in the await loop so the
-        watchdog stays alive while paused for user decision."""
+        backstop.
+
+        ⛔ THIS LOOP WRITES NOTHING — it only polls in-memory events and
+        sleeps. It used to say the backend "keeps heartbeating in the await
+        loop so the watchdog stays alive"; there is no such heartbeat here,
+        and believing there was is what hid that an incognito record could
+        expire under a run parked at this very wait (its fuse is 24h, the
+        same as this timeout, and started at the last write BEFORE the wait).
+        What keeps a waiting run's record alive is the hourly incognito
+        lease (`_incognito_lease_loop`, started in `run_server`), not this
+        loop. What keeps the worker-watchdog
+        from calling the wait "stuck" is `_awaiting_user`, set below."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         # Fix D (2026-05-27): mark "blocked on a user decision" so the outer
@@ -17799,8 +21246,8 @@ class PipelineRuntime:
         self.agent_modes: dict = {}
         # 2026-05-03: per-agent live progress snapshot keyed by lowercase
         # platform name. Polling loop writes into this on every emit cycle
-        # (research.py:~12091) so the P2 completion emit at
-        # extract_and_record_agent (research.py:~10705) can pull the latest
+        # (in `poll_all_agents_round_robin`) so the P2 completion emit in
+        # `extract_and_record_agent` can pull the latest
         # rich fields (source_urls / sections / steps / searches /
         # observed_sources) into the `complete` agent_progress payload.
         # Without this, the completion emit only shipped partialTextLen +
@@ -17841,10 +21288,24 @@ class PipelineRuntime:
         # Phoenix-resumed run skip events the FE already saw, instead of
         # replaying them and producing dup phase transitions in chat.
         self.last_event_id: str = ""
-        # True when run_pipeline is invoked with resume_dir set (auto-retry
-        # from checkpoint OR user-resume from paused). Currently used only
-        # for non-browser-crash recovery decisions; browser crashes are
-        # always-auto regardless of this flag (see last_failure_kind).
+        # ⛔⛔ DEAD, AND TWO COMMENTS ELSEWHERE STILL SEND READERS TO IT.
+        # Declared here, assigned in exactly one place (`run_pipeline`'s resume
+        # branch) and READ NOWHERE — `grep -n "is_retry_attempt"` returns three
+        # hits and not one of them is a read. The description below is what it
+        # was FOR; nothing has consulted it since the #725 crash-retry rework
+        # moved that decision into `_plan_pipeline_auto_retry`, which takes
+        # `resume_dir` and `failure_kind` as arguments and never touches
+        # `_runtime`.
+        #
+        # ⭐ KEPT RATHER THAN DELETED, deliberately and in line with how this
+        # file treats the other unreachable branch it has chosen to hold: the
+        # wave that found it was a comment sweep, and removing a field from a
+        # class that several long functions close over is not a comment change.
+        # What was actually harmful was the two comments asserting a branch
+        # that does not exist; those are corrected. Filed for deletion.
+        #
+        # (was: True when run_pipeline is invoked with resume_dir set —
+        # auto-retry from checkpoint OR user-resume from paused.)
         self.is_retry_attempt: bool = False
         # Tag for the most recent failure that bubbled out of a phase.
         # Set at fail-detection sites (browser-crash, agent timeout, etc.)
@@ -18419,7 +21880,7 @@ async def _probe_cua_available(cua_client) -> None:
     """
     if cua_client is None:
         # No client == no key resolved. run_pipeline returns early on an empty
-        # key (:27272) so this is belt-and-suspenders, but treat it as a hard
+        # key, so this is belt-and-suspenders, but treat it as a hard
         # unavailable rather than silently degrading.
         raise CuaUnavailableError("No Anthropic client (API key did not resolve)")
     try:
@@ -18438,7 +21899,8 @@ async def _probe_cua_available(cua_client) -> None:
         kind = _anthropic_err_kind(err)
         # Only the unambiguously-structural classes block the run: a bad/capped
         # key (401 / workspace cap) or a rate-limit (429) the user must clear.
-        # These are exactly the classes verify_login_cua raises on (:8503).
+        # These are exactly the classes verify_login_cua raises on (via
+        # `_cua_login_call`).
         if kind in ("rate_limit", "key"):
             log(f"[probe_cua] Anthropic unavailable ({kind}) — fail-closed at P0: {err[:160]}", "ERROR")
             raise CuaUnavailableError(err) from e
@@ -18934,10 +22396,42 @@ _CHATGPT_MODEL_TRIGGER_JS = r"""(P) => {
     const vis = el => el.getClientRects().length > 0 || !!el.offsetParent;
     const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
     const avoid = (P.avoid || '').toLowerCase();
+    // ⛔⛔ 2026-09-19 — READ THE LABEL THE WAY IT IS RENDERED, NOT THE WAY IT IS
+    // CONCATENATED. This was `norm(el.textContent)`, and on the live pill the
+    // tier is TWO adjacent inline spans — "6" and "Pro" — separated by CSS and
+    // by nothing else. `textContent` glues them into "6Pro", and the tier test
+    // is word-boundary aware, so `has_term("6Pro", ["pro"])` is False: the
+    // left-hand neighbour of "pro" is the alphanumeric "6".
+    //
+    // The cost was the whole slider rung. The 2026-09-19 run drove the thumb
+    // onto the Pro stop correctly and then failed its own confirm twice —
+    // "unverified … slider on tier; pill still '6Pro'" — and handed the job to
+    // CUA anyway, which is the exact expense the rung was built to remove.
+    //
+    // ⚠ NOT `innerText`, which was the obvious candidate and is WRONG. It is
+    // line-aware, not gap-aware: for two inline siblings it concatenates
+    // exactly as textContent does, in the shim and in a real browser alike.
+    // The space a human sees there is CSS. So the boundary has to be supplied
+    // here, by walking the tree and separating ELEMENTS — which is also what
+    // makes this honest, because a word boundary in the rendering is a word
+    // boundary in the reading.
+    const spaced = el => {
+        let out = '';
+        const walk = n => {
+            for (const c of n.childNodes || []) {
+                if (c.nodeType === 3) out += c.nodeValue || '';
+                else if (c.nodeType === 1) { out += ' '; walk(c); out += ' '; }
+            }
+        };
+        walk(el);
+        // Fall back to textContent for a node the walk cannot read — a glued
+        // label still beats no label, and every caller tolerates a miss.
+        return norm(out) || norm(el.textContent);
+    };
     for (const g of (P.groups || [])) {
         for (const el of document.querySelectorAll(g.sel)) {
             if (!vis(el) || inOverlay(el)) continue;
-            const t = norm(el.textContent);
+            const t = spaced(el);
             // A trigger is a short chip. The cap also keeps a wrapper whose
             // textContent concatenates the whole composer from posing as one.
             if (!t || t.length > 40) continue;
@@ -19641,6 +23135,317 @@ async def _chatgpt_open_effort_submenu(page, *, tag, trace=None) -> str:
     return ""
 
 
+# ⭐⭐ 2026-09-19 — THE TIER IS A SLIDER NOW. Read it, and name its stops, from
+# ARIA only.
+#
+# The 2026-08-17 walk looks for a ROW naming the tier. The live picker has none:
+# one row carries `role="slider"` with `aria-valuemin="0" aria-valuemax="4"`, and
+# its five stops ARE the old rows (Instant / Medium / High / Extra High / Pro).
+# So the walk correctly reports "no row names 'pro'", correctly declines to call
+# that a no-subscription verdict, and hands every single run to CUA — which then
+# does the job, slowly and at cost, on an account that has Pro.
+#
+# ⛔ WHY NOT JUST DRIVE IT TO THE MAXIMUM. Because "the top stop" and "the tier
+# the policy asks for" are two different claims, and only one of them is this
+# function's to make. A top stop that is not Pro is precisely the free-account
+# case the caller's `no_target` verdict exists to report; driving blind to
+# `aria-valuemax` would report a successful Pro pick on an account that has none.
+# So each stop is NAMED and checked, and the drive stops at the named one.
+#
+# ⛔ AND NOT BY CLICKING. A slider track sets its value from WHERE it is clicked,
+# so the marking-and-real-click machinery every other control here uses is, on
+# this one, a way to land on an arbitrary tier. The row advertises its own
+# contract — `aria-keyshortcuts="ArrowLeft ArrowRight"`, `tabindex="0"` — and
+# that is what gets used: focus the row, press ArrowRight, re-read the value.
+#
+# The stop's NAME comes from the row's `aria-describedby`, which points at the two
+# live labels ("6 Pro" and "Pro, 5 of 5. Use Left and Right arrow keys to adjust
+# power"). That is the platform stating the stop's name in the one vocabulary it
+# is contractually obliged to keep accurate. The class names in the same capture
+# (`d1BZWq_SliderTopRowMotion`, `_9wXMRW_ThumbInput`) are build-hashed and will
+# not survive a deploy; none of them is used here.
+_CHATGPT_SLIDER_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const low = s => norm(s).toLowerCase();
+    const vis = el => el.getClientRects().length > 0;
+    const OVERLAY = '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]';
+    const ROW = '[role="menuitem"], [role="menuitemradio"], [role="group"]';
+    // Tokens, never a RegExp built per word — see the row filter's note on the
+    // lone `\b` that became a literal backspace in an interpolated string.
+    const toks = s => low(s).split(/[^a-z0-9+]+/).filter(Boolean);
+    const anyOf = (s, words) => {
+        const t = toks(s);
+        return (words || []).some(w => t.indexOf(String(w).toLowerCase()) !== -1);
+    };
+    for (const el of document.querySelectorAll('[' + P.attr + '="' + P.value + '"]')) {
+        el.removeAttribute(P.attr);
+    }
+
+    // ── the control ───────────────────────────────────────────────────────
+    // Scoped to a VISIBLE overlay. The composer has no other slider today, but
+    // "no other one today" is the assumption that let the left sidebar absorb a
+    // menu-row click on 2026-08-05 and navigate the tab mid-run.
+    const found = [];
+    for (const el of document.querySelectorAll('[role="slider"][aria-valuemax]')) {
+        const menu = el.closest(OVERLAY);
+        if (!menu || !vis(menu)) continue;
+        found.push({ el: el, menu: menu });
+    }
+    if (!found.length) return { found: false, reason: 'no_slider' };
+    let pick = null, named = false;
+    if (found.length === 1) {
+        pick = found[0];
+    } else {
+        // More than one knob in the picker: take only the one the policy names,
+        // and refuse rather than guess. Driving the wrong slider to maximum is
+        // not a failed pick — it is a silent change to a setting nobody asked
+        // about, on the user's own account.
+        for (const c of found) {
+            const row = c.el.closest(ROW);
+            if (row && anyOf(row.getAttribute('aria-label') || '', P.rowWords)) {
+                pick = c; named = true; break;
+            }
+        }
+        if (!pick) return { found: false, reason: 'ambiguous_slider', count: found.length };
+    }
+    const sl = pick.el, menu = pick.menu;
+    const row = sl.closest(ROW);
+    const nnum = a => {
+        const v = parseInt(sl.getAttribute(a) || '', 10);
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    };
+    const now = nnum('aria-valuenow'), lo = nnum('aria-valuemin'), hi = nnum('aria-valuemax');
+    if (now === null || hi === null) return { found: false, reason: 'no_value' };
+
+    // ── what THIS stop is called ─────────────────────────────────────────
+    const names = [];
+    const push = s => { s = norm(s); if (s && names.indexOf(s) === -1) names.push(s); };
+    push(sl.getAttribute('aria-valuetext'));
+    if (row) {
+        for (const id of (row.getAttribute('aria-describedby') || '').split(/\s+/)) {
+            if (!id) continue;
+            const n = document.getElementById(id);
+            if (n) push(n.textContent);
+        }
+        push(row.textContent);
+    }
+
+    // Stops the plan does not offer. CORROBORATION ONLY: it turns "the thumb
+    // will not move" from an unexplained stall into a plan limit, and it is
+    // never on its own enough to claim one.
+    let locked = 0, stops = 0;
+    for (const t of menu.querySelectorAll('[data-locked]')) {
+        stops++;
+        if (t.getAttribute('data-locked') === 'true') locked++;
+    }
+
+    // The FOCUS target is the row, not the thumb: the thumb is `aria-hidden`
+    // with `tabindex="-1"`, so it is the element that holds the value and not
+    // the one that takes the keys.
+    if (row) row.setAttribute(P.attr, P.value);
+    return { found: true, now: now, min: (lo === null ? 0 : lo), max: hi,
+             names: names.slice(0, 4), named: named, marked: !!row,
+             locked: locked, stops: stops,
+             keys: row ? norm(row.getAttribute('aria-keyshortcuts')) : '' };
+}"""
+
+
+async def _chatgpt_drive_effort_slider(page, *, tag, tiers, verbs, trace=None) -> str:
+    """Drive the open picker's tier SLIDER onto the policy tier.
+
+    Returns one of:
+      * ``""``          — there is no slider here. Not a failure: it is how every
+                          older layout opts out, and the caller's row walk runs
+                          exactly as it does today.
+      * ``"already"``   — a stop naming the tier was ALREADY selected.
+      * ``"moved"``     — the thumb was driven onto a stop naming the tier.
+      * ``"no_target"`` — every stop was visited and none names the tier, or the
+                          thumb will not pass a LOCKED stop. Both are the honest
+                          "this account does not offer that tier" signal.
+      * ``"unsure"``    — a slider is there and could not be read or driven.
+
+    ⛔ `already` and `moved` are NOT success. They say what this function did; the
+    caller still closes the picker and re-reads the pill, because the pill is the
+    only thing that proves the app took the change. Step 3 of this block's rule —
+    verify the OUTCOME, never the action — is not suspended for a keystroke.
+
+    Never raises.
+    """
+    tr = trace if trace is not None else {}
+    params = {"attr": _SR_CLICK_MARK, "value": "effort-slider",
+              "rowWords": p1_words("chatgpt", "slider_row_words")}
+
+    def _on_tier(names) -> bool:
+        """A stop is the target when one of its names carries a tier word and is
+        not a sales prompt. Same two-part rule as the row picker's, deliberately:
+        a slider whose top stop reads "Upgrade to Pro" is the free account's
+        upsell, not the tier."""
+        for n in names or []:
+            s = str(n or "")
+            if verbs and has_term(s, verbs):
+                continue
+            if has_term(s, tiers):
+                return True
+        return False
+
+    try:
+        st = await page.evaluate(_CHATGPT_SLIDER_JS, params) or {}
+    except Exception as e:
+        log(f"{tag} slider read failed ({e})", "INFO")
+        return ""
+    if not isinstance(st, dict) or not st.get("found"):
+        # ⚠ `(st or {}).get(...)` is NOT enough: a truthy non-dict — a string,
+        # a list — passes the `or` and then has no `.get`, which raises out of a
+        # function whose whole contract is that it never does.
+        reason = str(st.get("reason") or "unreadable") if isinstance(st, dict) else "unreadable"
+        # ⛔⛔ AN ALLOW-LIST, NOT A NEGATION, AND THE DIFFERENCE IS A REGRESSION I
+        # SHIPPED AND CAUGHT. This read `if reason != "no_slider": return "unsure"`,
+        # so ANY answer it did not recognise — an empty dict, a transport that gave
+        # back something else, a future build of this JS with a new reason string —
+        # was treated as "a slider is here and I cannot work it", and that verdict
+        # SHORT-CIRCUITS the row walk. Two existing `no_target` tests went to
+        # `unsure` on the spot: a real tier list with no Pro row stopped reporting
+        # the lapsed subscription, which is the one thing that path exists to say.
+        #
+        # Only a POSITIVE report of an unusable slider may stop the row walk. Not
+        # knowing is not a finding, and it must degrade to "carry on as before".
+        if reason not in ("ambiguous_slider", "no_value"):
+            if reason != "no_slider":
+                log(f"{tag} the slider read answered {reason!r}, which says nothing "
+                    f"about whether a slider is there — carrying on to the rows",
+                    "DEBUG")
+            return ""
+        # A slider IS there and this function cannot work it. Say so and stop —
+        # do not fall through to the row walk, which would spend real clicks on a
+        # live page hunting tier rows that a slider layout does not have.
+        log(f"{tag} the picker holds a tier slider this pass cannot use "
+            f"(reason={reason}, count={(st or {}).get('count')}) — leaving it to "
+            f"the next rung", "WARN")
+        tr["detail"] = f"slider unusable: {reason}"
+        return "unsure"
+
+    try:
+        now, lo, hi = int(st.get("now")), int(st.get("min") or 0), int(st.get("max"))
+    except (TypeError, ValueError):
+        # `found` without a usable range. The JS cannot produce this, but a page
+        # can answer anything and this function promises never to raise.
+        log(f"{tag} the slider reported itself found with no usable range "
+            f"({st.get('now')!r}..{st.get('max')!r})", "WARN")
+        return ""
+    names = list(st.get("names") or [])
+    log(f"{tag} the tier control is a SLIDER at stop {now} of {lo}..{hi} "
+        f"(keys={st.get('keys') or '-'}, locked {st.get('locked')}/{st.get('stops')}"
+        f"{', policy-named' if st.get('named') else ''}) reading "
+        f"{json.dumps([str(n)[:44] for n in names[:2]], ensure_ascii=False)}")
+    tr["via"] = f"{tr.get('via') or ''}/slider".lstrip("/")
+
+    if not names:
+        # ⛔ Never drive a control whose stops cannot be identified. Without a
+        # name, the only rule left is "go to the maximum", and the whole reason
+        # this path names its stops is that the maximum is not always the tier.
+        log(f"{tag} the slider names none of its stops — not driving a control "
+            f"whose positions cannot be identified", "WARN")
+        tr["detail"] = f"slider {now}/{hi}, no stop name"
+        return "unsure"
+    if _on_tier(names):
+        log(f"{tag} the slider already sits on the {tiers[0]!r} stop "
+            f"({now}/{hi}, {str(names[0])[:44]!r})")
+        tr["detail"] = f"slider already at {now}/{hi}"
+        return "already"
+    if now >= hi:
+        log(f"{tag} the slider is at its TOP stop ({now}/{hi}) and it reads "
+            f"{str(names[0])[:44]!r}, which does not name {tiers[0]!r} — this "
+            f"account does not offer that tier", "WARN")
+        tr["detail"] = f"slider topped out at {str(names[0])[:24]!r}"
+        return "no_target"
+    if not st.get("marked"):
+        log(f"{tag} the slider has no row to aim keys at (the thumb itself is "
+            f"aria-hidden and untabbable) — leaving it to the next rung", "WARN")
+        tr["detail"] = "slider has no focusable row"
+        return "unsure"
+
+    sel = f'[{_SR_CLICK_MARK}="effort-slider"]'
+    try:
+        # ⛔ focus(), NOT click(). See the block comment: a click on a slider sets
+        # the value from the pointer's position along the track.
+        await page.focus(sel, timeout=4000)
+    except Exception as e:
+        log(f"{tag} could not focus the slider row ({type(e).__name__}) — leaving "
+            f"it to the next rung", "INFO")
+        try:
+            await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+        except Exception:
+            pass
+        tr["detail"] = "slider row would not take focus"
+        return "unsure"
+
+    start, last, verdict = now, now, "unsure"
+    try:
+        # Bounded by the control's OWN range, so a slider that reports a value it
+        # never reaches cannot turn this into an unbounded keypress loop on a live
+        # page. One press per stop, re-reading in between — the same
+        # never-trust-the-action discipline as the click paths.
+        for _ in range(max(0, hi - start)):
+            try:
+                await page.keyboard.press("ArrowRight")
+            except Exception as e:
+                log(f"{tag} ArrowRight failed ({type(e).__name__})", "INFO")
+                break
+            await asyncio.sleep(0.3)
+            try:
+                st = await page.evaluate(_CHATGPT_SLIDER_JS, params) or {}
+            except Exception as e:
+                log(f"{tag} slider re-read failed mid-drive ({e})", "INFO")
+                break
+            if not (isinstance(st, dict) and st.get("found")):
+                log(f"{tag} the slider went away mid-drive "
+                    f"(reason={st.get('reason') if isinstance(st, dict) else st!r})",
+                    "WARN")
+                break
+            cur = int(st.get("now"))
+            names = list(st.get("names") or [])
+            if cur == last:
+                # One press that does not move the thumb IS the diagnosis. A
+                # locked stop ahead says the plan stops here, which is a tier
+                # fact; anything else is a fact about our keyboard, which is not.
+                if int(st.get("locked") or 0) > 0:
+                    log(f"{tag} the slider will not advance past stop {cur}/{hi} "
+                        f"and {st.get('locked')} of {st.get('stops')} stops are "
+                        f"locked — this account does not offer the {tiers[0]!r} "
+                        f"tier", "WARN")
+                    tr["detail"] = f"slider locked at {cur}/{hi}"
+                    verdict = "no_target"
+                else:
+                    log(f"{tag} ArrowRight did not move the slider off stop "
+                        f"{cur}/{hi} — the keys are not reaching it; leaving it "
+                        f"to the next rung", "WARN")
+                    tr["detail"] = f"slider stuck at {cur}/{hi}"
+                    verdict = "unsure"
+                break
+            last = cur
+            if _on_tier(names):
+                log(f"{tag} drove the slider {start} → {cur} of {hi}; the stop "
+                    f"reads {str(names[0])[:44]!r} ✓")
+                tr["detail"] = f"slider {start}→{cur}/{hi} = {str(names[0])[:24]!r}"
+                verdict = "moved"
+                break
+        else:
+            # Ran the full range without a stop naming the tier. Every stop was
+            # visited and named, which is the strong form of the no-tier signal.
+            log(f"{tag} drove the slider {start} → {last} (its top) and no stop "
+                f"names {tiers[0]!r} — last stop reads "
+                f"{str((names or ['?'])[0])[:44]!r}; this account does not offer "
+                f"that tier", "WARN")
+            tr["detail"] = f"slider swept {start}→{last}/{hi}, no {tiers[0]!r} stop"
+            verdict = "no_target"
+    finally:
+        try:
+            await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+        except Exception:
+            pass
+    return verdict
+
+
 async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
                                     _trace=None) -> str:
     """The `builtin` rung of `chatgpt.select_model` — pick the policy EFFORT TIER
@@ -19776,6 +23581,38 @@ async def _chatgpt_pick_effort_tier(page, *, label="ChatGPT", phase=1,
     if (snap or {}).get("census_ignored"):
         log(f"{tag} the pre-open census matched every candidate, so it was ignored "
             f"for this read — the conversation-link exclusion still applies", "WARN")
+    # ⭐⭐ THE SLIDER RUNG, before anything is ranked or clicked. On a layout that
+    # has no slider this is one `evaluate` that returns `no_slider`, and every
+    # line below runs exactly as it did — which is the whole reason it sits here
+    # rather than replacing the row walk. On today's layout it is the only rung
+    # that can answer at all: the tiers are slider stops, so there is no row to
+    # rank and the walk below can only ever reach `unsure`, which is precisely
+    # what the 2026-09-19 E2E logged before handing the job to CUA.
+    #
+    # It runs BEFORE the `not rows` bail-out on purpose: a picker that mounts a
+    # slider and no text rows at all is still a picker this can drive, and
+    # reporting "no rows mounted" for it would be true and useless.
+    _slider = await _chatgpt_drive_effort_slider(page, tag=tag, tiers=tiers,
+                                                 verbs=verbs, trace=tr)
+    if _slider in ("already", "moved"):
+        # Settle, close, and ask the PILL — never the slider we just wrote to.
+        # A control reporting the value we put into it is not evidence the app
+        # accepted it; the trigger's own label is the app's answer.
+        await asyncio.sleep(1.0 if _slider == "moved" else 0.25)
+        await _escape()
+        post = await _chatgpt_read_effort_tier(page)
+        if post.get("on_target"):
+            log(f"{tag} the pill now reads {post.get('text')!r} ✓")
+            return "already" if _slider == "already" else "selected"
+        log(f"{tag} the slider reports the {tiers[0]!r} stop but the pill still "
+            f"reads {post.get('text')!r} — NOT claiming the tier was selected", "WARN")
+        tr["detail"] = (f"slider on tier; pill still "
+                        f"{str(post.get('text'))[:32]!r}")
+        return "unverified"
+    if _slider in ("no_target", "unsure"):
+        await _escape()
+        return _slider
+
     if not rows:
         # Say what was there. "No rows" alone cannot tell a rotated hook from a
         # menu that never opened, and the corpus has exactly one occurrence of
@@ -20297,8 +24134,8 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
             return "free"
         # #724 item 2: an ambiguous LIGHT-model verdict gets one escalated
         # re-read on the heavy model (Opus 4.8) before we fall back to fail-open
-        # "unsure" — mirrors verify_login_cua's attempts>=2 rule (research.py
-        # ~9040). A fresh screenshot after a short settle covers the common
+        # "unsure" — mirrors verify_login_cua's attempts>=2 rule. A fresh
+        # screenshot after a short settle covers the common
         # case where the Pro/Free chrome simply hadn't finished rendering when
         # the first shot was taken. heavy=True passes don't recurse (guard is
         # `not heavy`), so this is at most ONE extra screenshot + Opus call,
@@ -22255,7 +26092,7 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=1)
     # this function — five call sites, one recording point.
     #
     # ⛔ FIRST PASTE ONLY, NEVER OVERWRITTEN. This function also pastes MID-RUN
-    # FOLLOW-UPS (the dispatcher at :19801). Letting a follow-up replace the
+    # FOLLOW-UPS (via `paste_followup`). Letting a follow-up replace the
     # fingerprint would re-identify the conversation by the newest thing typed
     # into it, so a resume-with-added-input would make the run stop recognising
     # its own tab.
@@ -22552,7 +26389,7 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # OVERWRITES a prior "errored" — important when user picks Retry on
     # a fail_phase alert and the retry succeeds. ALL agent_skipped emits
     # now carry a `reason` (config-skips emit "Disabled in pipeline
-    # config" — research.py:19402, runtime skips emit "user_skip…") and
+    # config" at Phase 2's start in run_pipeline, runtime skips emit "user_skip…") and
     # all persist to root doc as dual-source defense-in-depth: the
     # FE-side pipelineConfig snapshot can be missing on legacy docs or
     # overwritten by the Settings cascade mid-run, so we want the icon
@@ -22566,7 +26403,7 @@ def emit_event(event_type, phase=None, agent=None, **data):
             # "complete" for it anyway, on a daemon thread, while the call site
             # wrote "skipped" or "errored" on another — two non-transactional
             # read-modify-writes on the same `phases` array, and the last one
-            # home won. P1's post-error skip (research.py ~59482) has had that
+            # home won. P1's post-error skip in `run_pipeline` has had that
             # race since it was written; P2's wipeout verdict inherited it, and I
             # claimed in the same change that passing the marker made this one
             # writer. It did not. This is what makes that true.
@@ -22798,7 +26635,7 @@ def emit_event(event_type, phase=None, agent=None, **data):
         # currentRunPhaseStartedAt to the device doc so queued-doc ETA
         # computations + the FE banner's "Current run is in Phase X"
         # line have live source of truth. Worker-1 only (mirrors
-        # currentRunId/Title/StartedAt convention at research.py:~29193;
+        # currentRunId/Title/StartedAt convention in `_job_worker`;
         # multi-worker per-worker tracking is a future schema bump).
         # Fire-and-forget — never block emit_event on a Firestore write.
         try:
@@ -22868,8 +26705,8 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # was reverted because completed/stopped runs MUST preserve their full
     # event timeline for replay/post-mortem. Cleanup happens only when the
     # user explicitly deletes a research — see deleteResearch cascade in
-    # firestore.ts and the BE orphan-sweep in startup. The FE seq filter at
-    # firestore.ts:925 (where("seq", ">", lastSeq) + localStorage) keeps
+    # firestore.ts and the BE orphan-sweep in startup. The FE seq filter in
+    # firestore.ts (where("seq", ">", lastSeq) + localStorage) keeps
     # cold-start reads bounded regardless of subcollection size.
 
 
@@ -24189,7 +28026,7 @@ def _alert_actions_for(intent: str, phase, agent=None):
                         "command": {"action": "stop"}})
         elif token == "skip_login":
             # #955 Phase 5: login_required Skip is destination-aware — byte-exact
-            # to the FE loginDecisionAlert (pipeline-decision.ts:96-103). At a
+            # to the FE `loginDecisionAlert` in pipeline-decision.ts. At a
             # phase-time work-tab pause (phase >= 1, single platform) Skip drops
             # THIS platform (skip_agent); at the P0 init walk / env-check (phase
             # 0) it bypasses the sign-in verification (skip_init_verify). The FE
@@ -24205,18 +28042,18 @@ def _alert_actions_for(intent: str, phase, agent=None):
                             "command": {"action": "skip_init_verify"}})
         elif token == "resume":
             # #955 Phase 5: solvable-HV Resume → resume (byte-exact to FE
-            # humanVerifyAlert non-Cloudflare branch, pipeline-decision.ts:164).
+            # humanVerifyAlert's non-Cloudflare branch in pipeline-decision.ts).
             out.append({"id": "resume", "label": "Resume", "style": "primary",
                         "command": {"action": "resume"}})
         elif token == "retry_link":
             # #955 Phase 5: agent_link_failed Retry → agent_decision(retry)
-            # (byte-exact to FE agentLinkFailedAlert, pipeline-decision.ts:183).
+            # (byte-exact to FE `agentLinkFailedAlert` in pipeline-decision.ts).
             out.append({"id": "retry", "label": "Retry", "style": "primary",
                         "command": {"action": "agent_decision", "agent": agent,
                                     "decision": "retry"}})
         elif token == "skip_link":
             # #955 Phase 5: agent_link_failed Skip → agent_decision(skip)
-            # (byte-exact to FE agentLinkFailedAlert, pipeline-decision.ts:184).
+            # (byte-exact to FE `agentLinkFailedAlert`'s Skip in pipeline-decision.ts).
             out.append({"id": "skip", "label": f"Skip {_agent_display_name(agent)}",
                         "style": "default",
                         "command": {"action": "agent_decision", "agent": agent,
@@ -24346,18 +28183,37 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
     emit_event(event_name, phase=phase, agent=agent, **_data)
     if mirror is not None:
         _persist_pending_decision(mirror)
-    # #955 Phase 3: best-effort async AI copy sharpen for the vague cards. Fully
-    # gated — env off by default (DG_ALERT_AI_COPY), only `ai_upgrade` intents,
-    # only inside a running loop. The template just emitted is the guaranteed
-    # fallback; the upgrade re-emits the SAME alert_id+decision_id in place iff
-    # still live. The re-emit passes _ai_upgraded=True so it never respawns.
-    if (intent is not None and not _ai_upgraded
-            and ALERT_INTENTS.get(intent, {}).get("ai_upgrade")
-            and _alert_ai_copy_enabled()):
-        _spawn_alert_copy_upgrade(
-            decision_id=decision_id, alert_id=alert_id, intent=intent,
-            phase=phase, agent=agent, base_title=title, base_details=details,
-            facts=facts, actions=actions)
+    # #955 Phase 3: best-effort async AI copy sharpen for the vague cards. ON
+    # unless DG_ALERT_AI_COPY turns it off (see `_alert_ai_copy_enabled`); only
+    # `ai_upgrade` intents; only inside a running loop. The plain card has
+    # ALREADY been emitted above, so it reaches the person whatever happens
+    # next; the upgrade re-emits the SAME alert_id+decision_id in place iff still
+    # live, and passes _ai_upgraded=True so it never respawns.
+    # ⛔ Only a card that still carries its intent's OWN class. A caller that
+    # forces `recoverability="blocker"` onto agent_failed is one of the four
+    # Anthropic cards (key rate-limited, key over its cap, key rejected, service
+    # overloaded): its copy already says exactly what to do, the drafter is
+    # forbidden to mention API keys, and the re-emit re-derives the class from
+    # the catalog — so a rewrite could only drop the instruction AND demote a
+    # must-act blocker to a recoverable card.
+    # ⛔ Guarded whole: nothing in a best-effort nicety may raise into the
+    # phase that raised the card.
+    try:
+        if (intent is not None and not _ai_upgraded
+                and ALERT_INTENTS.get(intent, {}).get("ai_upgrade")
+                and recoverability == ALERT_INTENTS[intent]["class"]
+                and _alert_ai_copy_enabled()):
+            _spawn_alert_copy_upgrade(
+                decision_id=decision_id, alert_id=alert_id, intent=intent,
+                phase=phase, agent=agent, base_title=title, base_details=details,
+                facts=facts, actions=actions,
+                auto_skip_deadline=auto_skip_deadline, arm_registry=arm_registry)
+    except Exception as _copy_e:
+        try:
+            log(f"[alert-copy] rewrite not started ({type(_copy_e).__name__}) — "
+                "the plain card stands", "WARN")
+        except Exception:
+            pass
     return decision_id
 
 
@@ -24366,11 +28222,42 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
 # async LLM rewrite that re-emits the SAME alert_id + decision_id in place. The
 # deterministic template (already emitted) is the GUARANTEED fallback — any
 # failure, timeout, rejected draft, resolved card, or disabled flag keeps it.
-# Actions and the recoverability class are NEVER AI — only the two copy strings.
-# Default OFF: prod enables via the launcher env (DG_NARRATOR_USE_GEMINI
-# pattern); every test keeps it off (tests/conftest.py) so alert copy stays the
-# template the byte-parity tests assert.
+# Actions and the recoverability class are NEVER AI, and neither is the TITLE
+# (the web's headline rules read it — see `_upgrade_alert_copy`): only the body.
+#
+# ⭐ ON BY DEFAULT since 2026-09-23 (the owner's call: clearer wording for
+# everyone). Until then this comment said production switched it on "via the
+# launcher env" — no launcher, plist, scheduled task or env example ever set
+# DG_ALERT_AI_COPY, so the feature was built, tested and off everywhere.
+# `DG_ALERT_AI_COPY=0` (or false / no / off) in .dg-supervisor.env turns it
+# off; see `_alert_ai_copy_enabled`. The test suite still pins it OFF
+# (tests/conftest.py) so every OTHER test sees the template the byte-parity
+# tests assert; tests/test_alert_ai_copy_955.py clears that pin to measure the
+# real default.
+#
+# The cost and failure side — every row ends with the plain card still up:
+#   • no AI key            → `_call_text_narrator` makes no request at all.
+#   • the call fails / 429 → the draft is None, nothing is re-emitted.
+#   • empty, over-long or unsafe rewrite → `_parse_and_validate_alert_copy`
+#     refuses it (the caps are 90 / 280 chars; a rewrite LONGER than a vague
+#     original but inside the caps is the point, so it is allowed).
+#   • slow call            → the draft runs on its own daemon thread, never the
+#     loop's shared executor, and is abandoned after _ALERT_COPY_DEADLINE_S.
+#   • a burst of cards     → at most _ALERT_COPY_MAX_PER_MIN rewrites start in
+#     any rolling minute; the rest keep their plain copy and cost nothing.
 _alert_copy_tasks: set = set()   # strong refs so detached tasks aren't GC'd
+
+# A rewrite that has not come back by now is abandoned: the person has read the
+# plain card already, and swapping its words under them much later is worse
+# than keeping them. Above the narrator's own HTTP budget (14 s default), so a
+# healthy fallback to Haiku still lands.
+_ALERT_COPY_DEADLINE_S = 20.0
+# Rewrites started in any rolling 60 s, per process. Sized to one whole Phase 2
+# failing at once (up to six agents); a runaway loop of failure cards past that
+# spends nothing more.
+_ALERT_COPY_MAX_PER_MIN = 6
+_alert_copy_starts: "collections.deque" = collections.deque()
+_alert_copy_starts_lock = threading.Lock()
 
 # Credential-bait an upgraded card must never solicit (a hijacked page could try
 # to steer the LLM into a phishing string). Word-boundaried regex, not a bare
@@ -24393,10 +28280,47 @@ _ALERT_COPY_KNOWN_LABELS = {
 }
 
 
+_ALERT_AI_COPY_OFF_WORDS = frozenset({"0", "false", "no", "off", "disable", "disabled"})
+_ALERT_AI_COPY_ON_WORDS = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
+_alert_ai_copy_warned = {"value": None}   # the last unreadable value we logged
+
+
 def _alert_ai_copy_enabled() -> bool:
-    """True when the launcher armed the async alert-copy sharpen. Read at call
-    time (not import) so a fresh BE process / a test env pin is honored."""
-    return (os.environ.get("DG_ALERT_AI_COPY") or "").strip().lower() in ("1", "true", "yes")
+    """Is the async alert-copy sharpen on? ON unless DG_ALERT_AI_COPY says off.
+
+    Unset or empty → ON (the default). 0 / false / no / off / disable(d) → OFF.
+    Any other value keeps the default and says so ONCE per distinct value in
+    the log: a typo must neither silently cancel the owner's decision nor
+    fail an alert, and the line names the value that does turn it off.
+    Read at call time (not import) because `.dg-supervisor.env` is loaded by
+    `main()`, long after this module binds its constants."""
+    val = (os.environ.get("DG_ALERT_AI_COPY") or "").strip().lower()
+    if val in _ALERT_AI_COPY_OFF_WORDS:
+        return False
+    if val and val not in _ALERT_AI_COPY_ON_WORDS and _alert_ai_copy_warned["value"] != val:
+        _alert_ai_copy_warned["value"] = val
+        try:
+            log(f"[alert-copy] DG_ALERT_AI_COPY={val!r} is not an on/off value — "
+                "keeping the default (ON); set it to 0 to turn the clearer "
+                "alert wording off", "WARN")
+        except Exception:
+            pass
+    return True
+
+
+def _alert_copy_take_slot(now: "float | None" = None) -> bool:
+    """Claim one of the _ALERT_COPY_MAX_PER_MIN rewrites allowed in any rolling
+    minute. False → this card keeps its plain copy and no call is made. Locked
+    so the prune-check-append stays atomic if two loop threads ever raise cards
+    at once; `now` is a monotonic clock reading, injectable for tests."""
+    now = time.monotonic() if now is None else now
+    with _alert_copy_starts_lock:
+        while _alert_copy_starts and now - _alert_copy_starts[0] >= 60.0:
+            _alert_copy_starts.popleft()
+        if len(_alert_copy_starts) >= _ALERT_COPY_MAX_PER_MIN:
+            return False
+        _alert_copy_starts.append(now)
+        return True
 
 
 def _parse_and_validate_alert_copy(text, allowed_labels):
@@ -24483,7 +28407,9 @@ def _draft_alert_copy(intent, base_title, base_details, facts, actions):
             "You rewrite ONE status/alert card shown to a person watching an "
             "automated multi-agent research pipeline. Given the CURRENT card "
             "copy plus raw context, return a SHARPER, calmer, more specific "
-            "version with the SAME meaning and the SAME facts.\n\n"
+            "version with the SAME meaning and the SAME facts.\n"
+            "The TITLE is always shown exactly as it is: copy it into \"title\" "
+            "unchanged and rewrite only \"details\".\n\n"
             "OUTPUT: a single minified JSON object and nothing else — "
             '{"title": "...", "details": "..."}\n\n'
             "HARD RULES (your text ships verbatim to the user, zero editing):\n"
@@ -24515,53 +28441,137 @@ def _draft_alert_copy(intent, base_title, base_details, facts, actions):
         return None
 
 
-async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
-                              base_title, base_details, facts, actions):
-    """(async best-effort.) Draft sharper copy off the loop thread, then — iff
-    the card is STILL live — re-emit it in place under the same alert_id +
-    decision_id. The liveness check and the re-emit run with NO await between
-    them (both sync on the loop), so a Retry/Skip landing mid-draft is never
-    overwritten and a resolved card is never resurrected."""
+def _alert_copy_note(intent, agent, outcome):
+    """One INFO line per vague card saying what became of its rewrite — the
+    line an end-to-end run greps for (`[alert-copy]`). Names the intent and the
+    agent only, never the copy: the draft is built partly from untrusted page
+    text, and this log's tail ships in the owner's support bundle."""
     try:
-        drafted = await asyncio.to_thread(
-            _draft_alert_copy, intent, base_title, base_details, facts, actions)
+        log(f"[alert-copy] {intent} card for {agent or 'the run'}: {outcome}", "INFO")
     except Exception:
+        pass
+
+
+def _draft_alert_copy_off_loop(intent, base_title, base_details, facts, actions):
+    """Run `_draft_alert_copy` on its OWN daemon thread; return a loop future
+    that settles with its result (None on any failure).
+
+    ⛔ NOT `asyncio.to_thread`. That borrows the loop's default executor — the
+    same few workers every `await asyncio.to_thread(...)` in the pipeline queues
+    on — so a burst of slow drafts would stall a phase's own work behind them,
+    and `asyncio.run()` waits for that executor at exit, so a hung draft would
+    hold a finished run open for as long as the HTTP call took. A daemon thread
+    holds neither. The context is copied so the draft's log lines go where the
+    card's would (what `to_thread` did for free)."""
+    import contextvars
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+
+    def _settle(result):
+        if not fut.done():      # abandoned at the deadline → nobody is waiting
+            fut.set_result(result)
+
+    def _work():
+        try:
+            result = _draft_alert_copy(intent, base_title, base_details, facts, actions)
+        except Exception:
+            result = None
+        try:
+            loop.call_soon_threadsafe(_settle, result)
+        except RuntimeError:
+            pass                # the loop closed while we drafted — drop it quietly
+
+    ctx = contextvars.copy_context()
+    threading.Thread(target=ctx.run, args=(_work,), name="dg-alert-copy",
+                     daemon=True).start()
+    return fut
+
+
+async def _upgrade_alert_copy(*, decision_id, alert_id, intent, phase, agent,
+                              base_title, base_details, facts, actions,
+                              auto_skip_deadline=None, arm_registry=True):
+    """(async best-effort.) Draft sharper copy off the loop, then — iff the card
+    is STILL live — re-emit it in place under the same alert_id + decision_id.
+    The liveness check and the re-emit run with NO await between them (both
+    sync on the loop), so a Retry/Skip landing mid-draft is never overwritten
+    and a resolved card is never resurrected. A draft slower than
+    _ALERT_COPY_DEADLINE_S is abandoned and the plain card stays."""
+    try:
+        drafted = await asyncio.wait_for(
+            _draft_alert_copy_off_loop(intent, base_title, base_details, facts, actions),
+            timeout=_ALERT_COPY_DEADLINE_S)
+    except asyncio.TimeoutError:
+        _alert_copy_note(intent, agent, "kept the plain wording — no answer within "
+                                        f"{_ALERT_COPY_DEADLINE_S:g} s")
         return
+    except Exception:
+        return  # failed to start → the plain card stays
     if not drafted:
+        _alert_copy_note(intent, agent, "kept the plain wording — no usable rewrite "
+                                        "(no AI key, the call failed, or the draft "
+                                        "was refused)")
         return  # brain down / draft rejected → the template stays
-    new_title, new_details = drafted
+    # ⛔⛔ THE TITLE IS NEVER REWRITTEN — only the body. The web picks a card's
+    # headline FROM its title: quiet-infra words ("overloaded", "rate limit", …)
+    # turn it into a "retrying automatically, no action needed" banner
+    # (`isQuietInfraCard`), and `humanizeError` passes only the
+    # "<Agent> stopped: <evidence>" shape through verbatim, replacing anything
+    # else with "Hit a snag … retrying". The plain titles are written to survive
+    # both (`_alert_title_safe`); a rephrased title was held to neither, so a
+    # parked agent read as auto-retrying and the evidence headline was swapped
+    # for a false "retrying". The web shows the body verbatim, so it is the one
+    # string a clearer wording can safely change.
+    _drafted_title_unused, new_details = drafted
     # ── atomic on the loop from here: no await until emit_decision returns ──
     if decision_id not in _active_decisions:
+        _alert_copy_note(intent, agent, "kept the plain wording — the card was "
+                                        "answered or replaced first")
         return  # resolved (Retry / Skip / auto-skip) while drafting — do NOT resurrect
-    # Re-derive the deadline from the LIVE registry: a poke/wait-longer/growth
-    # disarm may have dropped it, and the spawn-time value would re-arm a
-    # cancelled deadline. (A disarm also retires the id from _active_decisions,
-    # so we'd have bailed above — this is belt-and-suspenders.)
-    live_deadline = _pending_decisions.get(decision_id, {}).get("deadline")
+    if arm_registry:
+        # Re-derive the deadline from the LIVE registry: a poke/wait-longer/growth
+        # disarm may have dropped it, and the spawn-time value would re-arm a
+        # cancelled deadline. (A disarm also retires the id from _active_decisions,
+        # so we'd have bailed above — this is belt-and-suspenders.)
+        live_deadline = _pending_decisions.get(decision_id, {}).get("deadline")
+    else:
+        # ⛔ A card whose OWN wait is the firer (`arm_registry=False` — the parked
+        # agent_error card, which is exactly the vague card this rewrites) never
+        # had a registry entry, so the lookup above always answers None: the
+        # rewrite would erase the countdown from the card while the park still
+        # skips the agent on time. Its deadline is the one stamped at emit, and a
+        # resolve retires the id, which the liveness check above already read.
+        live_deadline = auto_skip_deadline
     # Refresh the durable mirror in place ONLY if this card still owns the single
     # slot; if a sibling's card took it, suppress so we don't clobber the sibling.
     owns_mirror = bool(_pending_decision_active and _pending_decision_did == decision_id)
     try:
         emit_decision(
             phase=phase, agent=agent, intent=intent,
-            facts={"title": new_title, "details": new_details},
+            facts={"title": base_title, "details": new_details},
             alert_id=alert_id, decision_id=decision_id,
-            auto_skip_deadline=live_deadline,
+            auto_skip_deadline=live_deadline, arm_registry=arm_registry,
             suppress_generic_mirror=(not owns_mirror),
             _ai_upgraded=True)
     except Exception:
         return
+    _alert_copy_note(intent, agent, "rewritten in plain words")
 
 
 def _spawn_alert_copy_upgrade(**kw):
     """Schedule _upgrade_alert_copy as a detached task IFF a loop is running
-    (sync / test callers have none → the template just stays). Never raises into
-    the caller; keeps a strong ref so the task isn't GC'd mid-flight, and
-    retrieves the task's exception in a done-callback so a late failure doesn't
-    log 'Task exception was never retrieved'."""
+    (sync / test callers have none → the template just stays) and the rolling
+    per-minute budget has room (a burst past it keeps its plain copy). Never
+    raises into the caller; keeps a strong ref so the task isn't GC'd
+    mid-flight, and retrieves the task's exception in a done-callback so a late
+    failure doesn't log 'Task exception was never retrieved'."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        return
+    if not _alert_copy_take_slot():
+        _alert_copy_note(kw.get("intent"), kw.get("agent"),
+                         f"kept the plain wording — {_ALERT_COPY_MAX_PER_MIN} "
+                         "rewrites already started this minute")
         return
     try:
         task = loop.create_task(_upgrade_alert_copy(**kw))
@@ -24605,9 +28615,8 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     NotebookLM starts — pre-fix, the FE rendered NLM with a red
     error badge while the pipeline was still at Phase 0 Init, which
     falsely implied NLM itself had failed. With this flag, the
-    pipeline_error banner + Retry/Skip actions still fire, and the
-    queue-gate "_errored" flag is still set; only the icon-state
-    write is skipped."""
+    pipeline_error banner + Retry/Skip actions still fire; only the
+    icon-state write is skipped."""
     if title == "" and error:
         title = error
     if details == "" and reason:
@@ -24662,7 +28671,7 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # 2026-05-21: when mark_phase_errored=False (preflight aborts), also
     # flag the event payload as quiet=True so the FE listing-page tile
     # doesn't paint the target phase's node red via the volatile
-    # pipeline.phaseAlerts fallback (researches/page.tsx:786-792 unions
+    # pipeline.phaseAlerts fallback (researches/page.tsx unions
     # alerts into erroredPhases only when !quiet). Pre-fix, the persistent
     # write was suppressed but the tile still went red on the Flow B
     # preflight abort because the alert side-channel was unconditional.
@@ -24691,17 +28700,11 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # Skipped for preflight aborts — see docstring.
     if mark_phase_errored:
         _write_phase_terminal_status(phase, "errored")
-    # 2026-05-12: flag the queue gate so the next dequeue short-circuits.
-    # Without this, run_pipeline returning cleanly after fail_phase leaves
-    # the worker's `finally` block setting `last_be_done_at = now` (the
-    # same as a successful run) — wedging the next queued run for the
-    # full 4200s fallback. The `except` path at research.py:22589 already
-    # sets this for raised exceptions; fail_phase covers the
-    # clean-return-after-fail path that the except never sees.
-    try:
-        _QUEUE_STATE["_errored"] = True
-    except Exception:
-        pass
+    # ⛔ A `_QUEUE_STATE["_errored"]` FLAG WAS RAISED HERE AND IS GONE (wave
+    # 10.9, N8). Its only reader was the queue gate: the worker's `finally`
+    # recorded a zero finish-time for a failed run so the NEXT dequeue would not
+    # sit waiting for a cloud tail that was never going to come. No dequeue
+    # waits on another run any more, so there is nothing to tell.
 
 
 _PRO_TIER_DETAILS_BY_KEY = {
@@ -24936,7 +28939,24 @@ async def _platform_auth_cookie_present(browser, agent_key: str) -> bool:
     try:
         cookies = await browser.context.cookies()
     except Exception as e:
-        log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
+        # ⛔ 2026-09-20 — THIS PROBE SAW THE BROWSER DIE AND WHISPERED IT.
+        # In bundle 8D9CWHZJ this line fired at 00:34:43 with "BrowserContext
+        # .cookies: Target page, context or browser has been closed" — one
+        # second before Phase 3 tried `new_page()` on the same dead context and
+        # reported a NotebookLM upload failure. It was the earliest honest
+        # signal in the whole run and it went out at DEBUG, which the console
+        # does not show by default.
+        #
+        # ⚠ It still does NOT raise, and that is deliberate: this is a
+        # fast-path asking "can I skip the full verify?", and every other way
+        # it can fail is a reason to fall back rather than to unwind. The
+        # callers that own the unwind now classify it themselves. All this has
+        # to do is stop burying the one failure that means something.
+        if _is_browser_close_error(e):
+            log(f"[gate] cookie probe failed because the BROWSER IS GONE ({e}) "
+                f"— the caller's browser-death handling will pick this up", "WARN")
+        else:
+            log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
         return False
     return _auth_cookie_present_in(cookies, agent_key)
 
@@ -25340,10 +29360,18 @@ def _park_chat_mode_decision(platform_l: str, label: str, *, why: str) -> None:
         f"{'none (auto-skip off — waiting for you)' if window_sec <= 0 else f'{window_sec}s'} "
         f"deadline_ms={deadline_ms}", "WARN")
 
-
 def _emit_claude_chat_mode_alert():
-    """Back-compat shim — #709 generalized this into _emit_chat_mode_alert."""
+    """Back-compat shim — #709 generalized this into _emit_chat_mode_alert.
+
+    ⛔ NOT DEAD, AND A 2026-09-20 cleanup sweep nearly deleted it. It has no
+    production caller, which is exactly what a back-compat shim looks like —
+    and `tests/test_chat_mode_gate.py` PINS its existence by name ("the Claude
+    alert name must remain as a back-compat shim (#709)"). Test-only reach is a
+    deliberate seam here, not an absence of one."""
     _emit_chat_mode_alert("claude")
+
+
+
 
 
 def _emit_model_drift_alert(platform_l: str, message: str, details: str = ""):
@@ -25442,8 +29470,15 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None, *,
 
     Use this on the FIRST attempt (initial run, not a resume_dir retry).
     On a retry attempt the auto-retry guard won't fire again, so callers
-    must use fail_phase/fail_agent instead — see the `_runtime.is_retry_attempt`
-    branch at each browser-crash site."""
+    must use fail_phase/fail_agent instead.
+
+    ⛔ THIS USED TO SAY "see the `_runtime.is_retry_attempt` branch at each
+    browser-crash site". THERE IS NO SUCH BRANCH, and there is no site that
+    reads that flag at all — it is assigned once and never consulted. The
+    decision it describes lives in `_plan_pipeline_auto_retry`, which is given
+    `resume_dir` and `failure_kind` and never touches `_runtime`. A pointer to
+    a branch that does not exist costs the next reader a search of an
+    85,000-line file for something that was never there."""
     # #907: a --login in flight killed this Chrome ON PURPOSE. No auto-retry
     # happens (the planner stands down), so a "tab crashed — auto-retrying"
     # banner would be both wrong and alarming; run_pipeline's failure path
@@ -25560,7 +29595,8 @@ def _wrong_conversation_copy(platform: str) -> "tuple[str, str]":
 
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
                phase: "int | None" = None, auto_skip_deadline: "float | None" = None,
-               recoverability: "str | None" = None, arm_registry: bool = True):
+               recoverability: "str | None" = None, arm_registry: bool = True,
+               raw_err: str = ""):
     """Template B: per-agent error alert (Phase 2 in the common case). Emits
     pipeline_error scoped to one agent with [Retry, Skip]. NO Stop. #955: the
     single "Retry" restarts the agent (close tab + re-run setup) — the only
@@ -25569,7 +29605,7 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     defaults a mode-less retry_agent to that restart.
 
     `phase` defaults to the LIVE run phase (`_runtime.phase`) so a P1-context
-    relaunch failure (research.py:~11201) is honestly tagged phase 1 instead of
+    relaunch failure (one raised while Phase 1 runs) is honestly tagged phase 1 instead of
     the old hardcoded phase 2 — which mislabeled a P1 ChatGPT failure as a P2
     agent card and leaked it into the P2 dropdown. Pass an explicit phase only
     to override the live value.
@@ -25604,7 +29640,7 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
         pass
     # Dismiss button removed 2026-04-28 — the alert's corner ✕ already
     # records the alertId in dismissedAlertIds and clears the visible
-    # alert (PhaseDropdown.tsx:2062-2069), so an in-action Dismiss button
+    # alert (PhaseDropdown.tsx's `dismissedAlertIds`), so an in-action Dismiss button
     # was a duplicate path that just added noise.
     _eff_phase = phase if isinstance(phase, int) and phase >= 0 else (
         _runtime.phase if isinstance(_runtime.phase, int) and _runtime.phase >= 0 else 2)
@@ -25634,7 +29670,18 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # exactly this case — the parked-decision resolver owns its timeout.
     emit_decision(phase=_eff_phase, agent=agent_key,
                   intent=("agent_failed_handsoff" if skip_only else "agent_failed"),
-                  facts={"title": title, "details": details, "agent": agent_key},
+                  # ⭐⭐ `raw_err` — THE EVIDENCE SLOT, FINALLY WRITTEN. It has
+                  # been READ at `_draft_alert_copy` since that drafter was
+                  # written, and no caller anywhere in the repo ever set it, so
+                  # the drafter's one source of real evidence has always been
+                  # empty and it fell back to `details` — the same constant
+                  # sentence the template already showed. This is the owner's
+                  # "both surfaces work from the same facts": `facts` is now the
+                  # one dict carrying what was actually on screen, filled by the
+                  # emitter that has it, and CUA and Vision reach it through the
+                  # same channel (they already share one reply string).
+                  facts={"title": title, "details": details, "agent": agent_key,
+                         "raw_err": raw_err},
                   alert_id=_agent_error_alert_id(agent_key, _eff_phase),
                   auto_skip_deadline=(None if skip_only else auto_skip_deadline),
                   recoverability=recoverability, arm_registry=arm_registry)
@@ -25737,12 +29784,12 @@ def _narrator_cadence_for_phase(phase: int) -> float:
 
 # Chat-thread chrome that leaks via DOM scrape into events. Strip from
 # narrator inputs ONLY (scrape outputs untouched — chip/step count still
-# read those raw). Patterns mirror the FE filter at
-# PhaseDropdown.tsx:2034-2041 plus 'brief.md' and the partial form
+# read those raw). Patterns mirror the FE filter `isNoiseLabel` in
+# PhaseDropdown.tsx plus 'brief.md' and the partial form
 # without trailing colon. Compiled once at module load.
 _NARR_NOISE_PREFIX_RE = re.compile(
     # Optional leading verb-prefix (e.g. "Building: ", "Searching: ") allows
-    # the JS-prepended composites at research.py:7102 to be cleaned —
+    # the JS-prepended composites from `scrape_progress_claude` to be cleaned —
     # "Building: Claude responded: I'll start by..." → "I'll start by..."
     r"^\s*(?:\w+:\s*)?(?:you|chatgpt|gemini|claude|notebooklm|gpt)\s+(?:said|responded)\b\s*[:.]?\s*",
     re.IGNORECASE,
@@ -26383,6 +30430,13 @@ async def brief_topic_gate(brief_text: str, topic: str, *,
 
     anchors = topic_anchors(topic)
     retries_left = max(0, max_retries - retry_count)
+    # ⭐ THE WORDS STAY HERE and are taken out of the BUNDLE instead. They are
+    # the topic's own distinctive words, so they are a research subject, and
+    # `backend.log` is the machine's — but an operator cannot review a rejection
+    # that does not say what was looked for (`test_the_rejection_names_the_terms
+    # _it_looked_for`), and the owner already holds this file. The line that
+    # goes to SUPPORT loses them: `_BUNDLE_TOPIC_LINE_RE` knows the
+    # `distinctive terms (…)` shape. Keep the shape if this wording changes.
     log(f"Phase 1: the brief ({_len} chars) mentions NONE of the topic's "
         f"distinctive terms ({', '.join(anchors[:6])}) — this is not a brief "
         f"for this run's research", "ERROR")
@@ -26473,6 +30527,7 @@ def reject_off_topic_text(text: str, queue_dir, label: str, agent_key: str,
     if not topic or not text_is_off_topic(text, topic):
         return text
     anchors = topic_anchors(topic)
+    # ⭐ THE WORDS STAY, THE BUNDLE LOSES THEM — see the Phase 1 gate above.
     log(f"[{label}] OFF-TOPIC text REJECTED at {op}: {len(text)} chars mention "
         f"none of the topic's distinctive terms ({', '.join(anchors[:6])}) — "
         f"this is not this run's research. Not saving it.", "ERROR")
@@ -26501,6 +30556,7 @@ def _second_opinion_on_agent(text: str, topic: str, agent_key: str,
     verdict = report_second_opinion(text, topic, mid_run_witness_text(agent_key))
     _anchors = topic_anchors(topic)
     if verdict == "drift_corroborated":
+        # ⭐ THE WORDS STAY, THE BUNDLE LOSES THEM — see the Phase 1 gate above.
         log(f"[{label}] SECOND OPINION — the report ({len(text)} chars) mentions "
             f"none of the topic's distinctive terms ({', '.join(_anchors[:6])}), "
             f"AND neither did anything the agent's own panel said while it "
@@ -26551,7 +30607,8 @@ def apply_off_topic_sweep(results: dict, queue_dir) -> "list[str]":
     Four things happen to a rejected entry, and all four are load-bearing:
 
       * `text` is cleared, which is what keeps it out of `documents/<agent>.md`,
-        the Firestore documents subcollection, `consolidated.md` and `save_meta`.
+        the Firestore documents subcollection, the merged corpus the run's
+        one-line summary and its title refresh are built from, and `save_meta`.
         Every one of those reads this field.
       * `verified` is cleared, so the agent cannot be bucketed as `linked` and
         offered to the user as "Read <agent> report" pointing at a file we refused
@@ -26576,6 +30633,9 @@ def apply_off_topic_sweep(results: dict, queue_dir) -> "list[str]":
     _t = _run_topic_for_guard(queue_dir)
     _a = topic_anchors(_t)
     if len(_a) < _TOPIC_GUARD_MIN_ANCHORS:
+        # ⭐ THE WORDS STAY, THE BUNDLE LOSES THEM — see the Phase 1 gate above;
+        # the topic itself sits behind its `topic '…'` key, which the bundle
+        # redactor finds, and the word list behind `distinctive word(s) (…)`.
         log(f"[Phase 2] off-topic sweep is INERT this run: topic {_t[:60]!r} yields "
             f"{len(_a)} distinctive word(s) ({', '.join(_a) or 'none'}), below the "
             f"{_TOPIC_GUARD_MIN_ANCHORS} needed to judge anything", "WARN")
@@ -26687,7 +30747,7 @@ def _extract_top_hosts(events: list, limit: int = 2) -> list:
 # fallback when both Tier-2 (Haiku/Flash on real events) AND Tier-3
 # (LLM with hardcoded timeline) refuse or fail. Three phrasings per
 # (akey, phase) so consecutive emits don't collide on the dedupe
-# equality guard at line ~7131/~7207 (silent-emit trap).
+# equality guard in `_narrator_loop` (silent-emit trap).
 AGENT_TIER4_VARIANTS = {
     ("chatgpt", 1): [
         "ChatGPT is reasoning through the brief with its latest thinking model.",
@@ -30625,7 +34685,7 @@ async def scrape_progress_gemini(page):
             // ANIMATION NAME. Both misses are real. What is NOT measured is
             // Gemini's DOM while it DRAFTS THE PLAN — and `isActive` feeds
             // `status`, which the 2D plan-wait reads as its streaming clock
-            // (research.py ~51055): a status of 'generating' resets the clock and
+            // (in `run_phase2`): a status of 'generating' resets the clock and
             // can flip `_streaming_handoff`, which SKIPS the CUA recovery ladder
             // for a genuinely dead plan. So making this tier see more, off a
             // capture taken while research was already running, would change
@@ -30872,8 +34932,8 @@ async def scrape_progress_claude(page):
             // research-panel scope. The .font-claude-message + .contents
             // selectors used to be here (2026-04-30 removed) but they
             // grabbed conversation-thread chrome ("# You said:", "# Claude
-            // responded:") which got prepended with "Building: " at line
-            // 7102 and contaminated r.steps[] / r.progress, then leaked
+            // responded:") which got prepended with "Building: " further
+            // down this scraper and contaminated r.steps[] / r.progress, then leaked
             // into narrator inputs as parroted "Claude responded: I'll
             // start by..." narration. Belt-and-suspenders chrome filter
             // on the .filter() line defends against any future selector
@@ -31445,7 +35505,7 @@ async def detect_completion_claude(page):
             // "stop_btn_present" on a genuinely-done report and completion fell to
             // the slow 5-min CUA fallback (stuck-despite-complete, live E2E
             // 2026-07-10). This is the exact guard verify_claude_generating
-            // adopted 2026-05-14 (research.py:19872) but never back-ported here.
+            // adopted 2026-05-14 but never back-ported here.
             if (!hasStop) {
                 for (const el of document.querySelectorAll(
                     '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], .streaming'
@@ -33900,7 +37960,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // sidebar nav / model-switcher rows and bled UI chrome into
         // out.steps[]. Min length raised 4→12 to drop "OK"/"Done"
         // single-word noise. Activity-verb gate mirrors Claude's panel
-        // walker at research.py:7052 — without it the walker grabs any
+        // walker in `scrape_progress_claude` — without it the walker grabs any
         // 4-240-char text inside a panel-shaped div.
         const STEP_SELS = [
             'li', '[role="listitem"]',
@@ -34361,6 +38421,17 @@ async def scrape_chatgpt_activity_panel_tracking(page):
 
 # ── Browser ────────────────────────────────────────────────────────────────────
 
+# How long `Browser.close()` lets the context close before it kills our
+# profile's Chrome instead. A healthy close takes a second or two; the bound is
+# generous because a kill can drop a sign-in Chrome has not flushed yet (#898b).
+_BROWSER_CLOSE_TIMEOUT_SEC = 30.0
+# How long the same fallback then lets the node DRIVER shut down. Short, because
+# by then our Chrome has already been killed and a driver with no browser left
+# to wait for exits in well under a second — anything longer is the driver
+# itself wedged, and we are throwing the handle away either way.
+_BROWSER_STOP_TIMEOUT_SEC = 10.0
+
+
 class Browser:
     """Playwright persistent Chrome context — proven from original research.py."""
 
@@ -34781,8 +38852,7 @@ class Browser:
             # racing the dialog, EPIPE from the Patchright Node driver
             # during HV recovery, etc.) escalated the whole BE process
             # to exit code 0xFFFFFFFF and the daemon-loop respawned —
-            # losing the in-flight pipeline and leaving the queue-gate
-            # wedged on a stale prior-run pointer. The page is gone; we
+            # losing the in-flight pipeline. The page is gone; we
             # have nothing useful to do with the file. Drop a WARN and
             # let the caller's own retry / timeout path handle it.
             try:
@@ -34800,9 +38870,6 @@ class Browser:
         """Set the file for the next file dialog (replaces any queued files)."""
         self._upload_queue = [str(path)]
 
-    def queue_upload_file(self, path):
-        """Add a file to the upload queue (for sequential file dialogs like video + thumbnail)."""
-        self._upload_queue.append(str(path))
 
     def clear_upload_file(self):
         self._upload_queue = []
@@ -34875,7 +38942,7 @@ class Browser:
         # Self-heal if self.page was closed out from under us. Common
         # trigger: a throwaway tab opened via new_tab() (which reassigns
         # self.page) and then close()'d by the caller — e.g. the verify-
-        # at-phase-time flow at :7718 / :7851. Pre-fix, run_phase1's
+        # at-phase-time flow (`_phase_verify_gate`). Pre-fix, run_phase1's
         # first navigate hit TargetClosedError on the stale self.page
         # because nothing restored it post-verify. context.new_page()
         # gives us a live page on the same persistent profile (logins
@@ -34938,8 +39005,8 @@ class Browser:
         verify/probe tabs the caller will close in a finally. Critical
         because new_tab() reassigns self.page — closing the returned
         page would leave self.page pointing at a dead page and break
-        the next Browser-level navigate. See verify_at_phase_time
-        (:7718) — pre-fix, that flow used new_tab + tab.close() and
+        the next Browser-level navigate. See `_phase_verify_gate`
+        — pre-fix, that flow used new_tab + tab.close() and
         crashed P1's first navigate with TargetClosedError every time
         skipInitVerify was on."""
         page = await self.context.new_page()
@@ -34963,11 +39030,21 @@ class Browser:
 
     async def close(self):
         try:
-            if self.context: await self.context.close()
+            # ⛔⛔ BOUNDED (wave 10.9). The driver closes a persistent context by
+            # sending Chrome `Browser.close` and then waiting, with no timeout,
+            # for the process to exit. A HUNG Chrome never exits, so an unbounded
+            # close froze `run_pipeline`'s finally — the very unwind a hung
+            # browser is sent down — before the relaunch or any card could run.
+            # A timeout lands in the arm below, which kills our profile's Chrome;
+            # nothing else will, because `start()`'s orphan sweep spares any
+            # Chrome younger than this process, and the hung one is.
+            if self.context:
+                await asyncio.wait_for(self.context.close(),
+                                       timeout=_BROWSER_CLOSE_TIMEOUT_SEC)
             if self.playwright: await self.playwright.stop()
             log("Browser closed")
         except Exception as e:
-            log(f"Browser close error: {e}", "WARN")
+            log(f"Browser close error: {str(e) or type(e).__name__}", "WARN")
             # Kill only OUR profile's chromium — never nuke all chrome.exe
             try:
                 import psutil
@@ -34982,6 +39059,30 @@ class Browser:
                         pass
             except Exception:
                 pass
+            # ⛔⛔ AND THE DRIVER OUTLIVES THE KILL UNLESS WE STOP IT (wave 10.9,
+            # repair round). `playwright.stop()` lives on the success path only,
+            # so every close that ended here — a hung Chrome now, an erroring
+            # close before that — left the node driver process and its open pipe
+            # running for the life of `--serve`, and the relaunch above started
+            # another one. Days of crash retries meant a driver apiece.
+            #
+            # ⭐ AFTER the kill, on purpose: stopping the driver first means
+            # waiting on a node process that is itself waiting for a Chrome that
+            # never exits. Bounded, in its own try, for the reason the close is —
+            # this arm is the run's way out, and nothing in it may block it.
+            if self.playwright:
+                try:
+                    await asyncio.wait_for(self.playwright.stop(),
+                                           timeout=_BROWSER_STOP_TIMEOUT_SEC)
+                except Exception as _stop_err:
+                    log(f"Playwright stop error: "
+                        f"{str(_stop_err) or type(_stop_err).__name__}", "WARN")
+            # Neither handle is usable now, and a second close() must not repeat
+            # the bounded wait and the kill on handles we have already given up
+            # on (`pause_and_close_browser` and run_pipeline's finally both call
+            # close() on the same Browser). `start()` installs fresh ones.
+            self.context = None
+            self.playwright = None
 
 
 # ── Action Executor ────────────────────────────────────────────────────────────
@@ -35558,7 +39659,7 @@ async def _verify_chatgpt_generating_diag(page) -> str:
     in the real verify too).
 
     NOTE: kept in sync MANUALLY with verify_chatgpt_generating's host_hit
-    block (research.py:~14495-14597). If you touch one, touch the other.
+    block. If you touch one, touch the other.
     Drift only affects diagnostic accuracy — the real verify path is
     unaffected and the safety-net CUA escalation still works."""
     try:
@@ -36741,6 +40842,158 @@ _CUA_STOP_LINE = _verdict_line_re("stop[_ -]?button", "yes", "no", "unsure")
 _CUA_CONCLUSION_LINE = _verdict_line_re(
     "conclusion", "generating", "done", "needs_click", "error")
 
+# ⭐⭐ THE ONE FREE-TEXT FIELD THE CONTRACT ALREADY ASKS FOR, AND NOBODY READ.
+#
+# `_CUA_CONTRACT_BLOCK` has demanded "EVIDENCE: <one short line naming what you
+# actually saw>" since it was written, and no code in this repo has ever parsed
+# it. On 2026-09-19 Claude stopped because the ACCOUNT hit its usage limit; the
+# model read "Usage limit reached · Resets Sep 20 at 1:00 AM" off the screen and
+# wrote it down, and the user's alert said "Hit a snag at the research step with
+# Claude — retrying." Nothing was retrying and nothing named the limit. The one
+# sentence that would have explained the whole thing had been collected and
+# dropped.
+#
+# ⛔ This cannot use `_verdict_line_re`: that builds a reader for a CLOSED value
+# set, which is exactly right for a decision and exactly wrong for a sentence.
+# Same three properties, though — start-of-line anchored (so an echoed
+# instruction mid-prose is not the answer), horizontal whitespace only, and
+# case-insensitive — for the same reasons written there.
+_CUA_EVIDENCE_LINE = re.compile(
+    r"^[^\S\n]*evidence[^\S\n]*[:=][^\S\n]*(.+)$", re.I | re.M)
+#: The contract's other keywords. A "last non-empty line" fallback must not
+#: hand back the machine-readable lines as if they were prose.
+_CUA_FIELD_LINE = re.compile(
+    r"^[^\S\n]*(?:verdict|stop[_ -]?button|conclusion|evidence)[^\S\n]*[:=]",
+    re.I)
+_EVIDENCE_MAX = 200
+
+
+def _web_swallows_title(text: str) -> bool:
+    """Would the WEB classify this title as transient infrastructure?
+
+    `isAnthropicRuntimeError` in `src/lib/pipeline-errors.ts` decides this, and
+    `isQuietInfraCard` renders anything it flags as a passive banner with NO
+    Retry and NO Skip. So a title this returns True for is a title that loses
+    the user their two controls.
+
+    ⛔⛔ THIS IS A MIRROR OF FRONTEND LOGIC AND IT HAD ALREADY DRIFTED — within
+    hours of being written, in the same commit that introduced it. It was a
+    flat word tuple:
+
+        ("rate-limit", "rate_limit", "ratelimit", "overloaded", "529")
+
+    which is a SUBSET of what the web actually matches. The web also swallows
+    `429` together with `rate` or `limit`, and `anthropic` together with
+    `overload`, `busy` or `server`. So an evidence line the model might really
+    write — "429 rate limit exceeded", "Anthropic servers are busy" — passed
+    this check, went into a title, and was then swallowed by the web into
+    exactly the shrug this guard exists to prevent.
+
+    ⚠ DUPLICATED ON PURPOSE, MIRRORED EXACTLY. The two repos ship separately, so
+    a shared constant would be a lie about coupling — but a LOOSE mirror is
+    worse than no mirror, because it reads as a guard while leaving the hole
+    open. The predicate below is the web's, clause for clause and in the same
+    order, so the two can be compared by eye. `_ALERT_MIRROR_CORPUS` beneath it
+    is the shared example set, and `tests/test_alert_evidence_0919.py` asserts
+    this function's verdict on every one; `pipelineErrors.test.ts` asserts the
+    web's on the same strings. That pair is what makes the duplication safe.
+    """
+    low = str(text or "").lower()
+    if not low:
+        return False
+    return bool(
+        "overloaded" in low
+        or "529" in low
+        or ("429" in low and ("rate" in low or "limit" in low))
+        or "rate_limit" in low
+        or "rate-limit" in low
+        or ("anthropic" in low
+            and ("overload" in low or "busy" in low or "server" in low))
+    )
+
+
+#: The shared example set. Every entry is a string a CUA evidence line could
+#: plausibly contain, paired with whether the WEB swallows it. Both repos assert
+#: against this corpus, so a change to either predicate that is not mirrored
+#: fails on the side that did not change.
+_ALERT_MIRROR_CORPUS = (
+    # (text, web_swallows_it)
+    ("Usage limit reached · Resets Sep 20 at 1:00 AM", False),
+    ("The composer is disabled and no Stop button is present", False),
+    ("Claude is unavailable in your region", False),
+    ("A red banner reads: something went wrong", False),
+    ("Anthropic is overloaded (529)", True),
+    ("overloaded", True),
+    ("529 from the API", True),
+    ("429 rate limit exceeded", True),          # ⛔ the one the flat list missed
+    ("HTTP 429 — too many requests, limit hit", True),
+    ("rate_limit_error", True),
+    ("rate-limit reached", True),
+    ("Anthropic servers are busy", True),       # ⛔ and this one
+    ("Anthropic had a server error", True),
+    ("Anthropic overload detected", True),
+    # ⚠ Near-misses that must NOT be swallowed — a bare 429 with no rate/limit
+    # word, and "anthropic" with no infra word, are ordinary text.
+    ("Error 4290 on the page", False),
+    ("Anthropic Console is open in another tab", False),
+)
+
+
+def _cua_error_evidence(cua_text: str) -> str:
+    """The one short sentence naming what the model actually saw, or ``""``.
+
+    Two rungs, in order:
+      1. the contract's own `EVIDENCE:` line — the channel we already ask for;
+      2. failing that, the last non-empty line that is not one of the contract's
+         machine-readable fields. A model that ignored the format still usually
+         ends with its observation.
+
+    ⛔ THE RESULT IS UNTRUSTED PAGE TEXT and it is about to become user-facing
+    copy, so it is flattened to one line, whitespace-collapsed and length-capped
+    here rather than at each use. Callers still decide whether it may be a
+    TITLE — see `_alert_title_safe`.
+
+    Pure and total: never raises, returns "" on anything it cannot read.
+    """
+    try:
+        t = str(cua_text or "")
+        hits = _CUA_EVIDENCE_LINE.findall(t)
+        # LAST, for the reason `_last_verdict` takes the last: a reply that
+        # quotes its own instructions names the field before it answers it.
+        raw = hits[-1] if hits else ""
+        if not raw:
+            for line in reversed(t.splitlines()):
+                s = line.strip()
+                if not s or _CUA_FIELD_LINE.match(line):
+                    continue
+                # A whole paragraph is not "one short line naming what you saw".
+                if len(s) > _EVIDENCE_MAX * 2:
+                    continue
+                raw = s
+                break
+        out = re.sub(r"\s+", " ", str(raw)).strip().strip("`*_\"' ")
+        # A placeholder echoed back from the contract is not evidence.
+        if out.startswith("<") and out.endswith(">"):
+            return ""
+        return out[:_EVIDENCE_MAX]
+    except Exception:
+        return ""
+
+
+def _alert_title_safe(evidence: str) -> bool:
+    """May this evidence go in an alert TITLE?
+
+    ⛔⛔ THE FRONTEND SWALLOWS SOME TITLES. A card whose title carries
+    "overloaded", "529" or a spelling of "rate limit" is classified as transient
+    infrastructure and rendered as a passive banner with NO Retry and NO Skip
+    button. So a faithful quote of an overload banner would make the alert
+    honest and simultaneously take away the two controls the user needs — worse
+    than the vague sentence it replaced. Such evidence still goes in the BODY,
+    where nothing filters it; only the headline falls back.
+    """
+    low = str(evidence or "").lower()
+    return bool(low) and not _web_swallows_title(low)
+
 
 def _cua_completion_report(cua_text: str) -> dict:
     """Read a vision completion answer. Returns {verdict, stop_seen, source}.
@@ -36793,7 +41046,11 @@ def _cua_completion_report(cua_text: str) -> dict:
 
     if stop_seen and verdict != "generating":
         verdict = "generating"
-    return {"verdict": verdict, "stop_seen": stop_seen, "source": source}
+    # ⭐ `evidence` is the fourth key, and it is inert for every existing caller
+    # — they index by name. It is here so the channel the contract has always
+    # demanded finally has a reader.
+    return {"verdict": verdict, "stop_seen": stop_seen, "source": source,
+            "evidence": _cua_error_evidence(t)}
 
 
 # The page-side half of the badge read, as a probe rather than a predicate: it
@@ -36970,6 +41227,61 @@ async def _page_is_dead(page):
     return None
 
 
+def _watched_for_a_hung_browser(what):
+    """Run one of the run's long browser waits with somebody watching the
+    browser from OUTSIDE it. `what` names the wait, for the log and the unwind.
+
+    ⛔⛔ THE GUARDS ALL LIVE BETWEEN THE AWAITS, AND A HUNG CHROME PARKS US IN
+    ONE (wave 10.9, repair round). Phase 2's tick awaits
+    `browser.switch_to_page(page)` → `page.bring_to_front()` and
+    `page.evaluate(...)`, neither of which the driver bounds, and it consults
+    `_browser_context_is_dead` only after a tab reports CLOSED — which a hung
+    Chrome's tabs never do. The phase ceiling above only warns, so the run sat
+    frozen until the worker's five-hour ceiling (#547). A tick that overran
+    cannot report its own overrun either: the overrun IS an await that never
+    returns, so there is no line after it to check the clock on.
+
+    ⛔⛔ AND #547 IS THREE WAITS, NOT ONE (wave 10.9, repair round 2). The first
+    repair wrapped phase 2 alone, so the identical freeze stayed live in phase
+    1's poll and the phase-3 audio wait: both carry the same unbounded page
+    calls, both are ceilinged with `soft_warn_only=True`, and that banner is
+    BUTTONLESS — there is no Retry or Skip to consume, so the loop warns once
+    and keeps polling for ever. Every one of the three is decorated now; the
+    phase-3 UPLOAD was already hard-capped and asks the context itself.
+
+    ⭐ ON THE DEFINITION, NOT AT THE CALL, so no caller can be written that
+    forgets it — and because nothing in the suite can execute these waits
+    themselves, the mark below is the only thing a test can hold each wiring by.
+    `_run_watching_for_a_hung_browser` holds the decision; this only ties it to
+    the coroutines that need it.
+
+    ⚠ The browser is found BY NAME in the wrapped call, because the three
+    signatures put it in three different places (`poll_until_done` takes it as a
+    keyword). A wait handed no browser is watched by nobody — the probe has
+    nothing to ask — which is what the unwatched code already did.
+    """
+    import functools
+    import inspect
+
+    def _decorate(wait_fn):
+        signature = inspect.signature(wait_fn)
+
+        @functools.wraps(wait_fn)
+        async def _watched(*args, **kwargs):
+            try:
+                browser = signature.bind_partial(*args, **kwargs).arguments.get("browser")
+            except TypeError:
+                browser = None   # a call the wait itself will reject
+            return await _run_watching_for_a_hung_browser(
+                browser, wait_fn(*args, **kwargs), what)
+
+        _watched.watches_for_a_hung_browser = what
+        return _watched
+
+    return _decorate
+
+
+@_watched_for_a_hung_browser("phase 1's poll")
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -36982,7 +41294,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     # Mirrors the per-agent dict P2 round-robin uses, scoped to this single
     # poll call. Flips _panel_open_done True on first verified open. DOM
     # misses count both "found:false" AND "clicked but verify:false". CUA
-    # tier-3 capped at 1/call. The same robust helper (research.py:5048)
+    # tier-3 capped at 1/call. The same robust helper (`_open_chatgpt_activity_panel`)
     # works regardless of phase — Pro+ET in P1 produces the same React-
     # rendered styled <div> strip that DR in P2 does.
     _panel_open_done = False
@@ -37669,7 +41981,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         sources=progress.get("sources", 0),
                         sourceUrls=progress.get("source_urls", []),
                         # 2026-07-20: emit the titled {url,title} items too, at
-                        # parity with the P2 round-robin emit (~27303). The P1
+                        # parity with the P2 round-robin emit in
+                        # `poll_all_agents_round_robin`. The P1
                         # panel walk above builds progress["source_items"] but
                         # this emit only ever sent bare sourceUrls, so the
                         # raw-activity popup could show hostnames but never the
@@ -38560,8 +42873,8 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # Extract real cited-source findings from the markdown so the FE
             # GraphAnalysis Findings tab can render rich
             # {url, snippet, sourceTitle} cards instead of just section
-            # headings. Persisted by save_meta's agents map writer
-            # (research.py:~17686). Source URLs come from the in-memory
+            # headings. Persisted by save_meta's agents map writer.
+            # Source URLs come from the in-memory
             # progress snapshot (already deduped).
             #
             # ⛔⛔ WAVE 10 — THIS RUNS BEFORE THE WRITE NOW, and the order is the
@@ -38573,14 +42886,16 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # report, and the numbering is then built from those same findings.
             _findings = []
             try:
-                _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}).get("source_urls", []) or [])
+                _snap_p = getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}) or {}
+                _src_urls = list(_snap_p.get("source_urls", []) or [])
+                _src_items = list(_snap_p.get("source_items", []) or [])
                 # ⛔ NO LONGER GATED ON THE PANEL LIST. `if _src_urls:` meant a
                 # report full of citations produced no findings whenever the
                 # panel scrape came back empty — which is most Claude runs. The
                 # report is the other input now, so the only thing that can
                 # make findings impossible is having no report.
                 if md_content:
-                    _findings = _extract_findings(md_content, _src_urls) or []
+                    _findings = _extract_findings(md_content, _src_urls, _src_items) or []
                     if _findings:
                         _runtime.agent_findings[agent_key] = _findings
                         _from_panel = sum(
@@ -38687,9 +43002,16 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                                "verified": True, "primary": True}])
         except Exception:
             pass
+        # ⭐ Wave 10.9 — the same fact, durably, for a crash retry. Here and
+        # nowhere else: this is the one branch that has proved the report is
+        # whole, on disk and reachable. See `_p2_mark_agent_done`.
+        _p2_mark_agent_done(queue_dir, agent_key, True, elapsed_sec=elapsed_sec,
+                            findings=getattr(_runtime, "agent_findings", {}).get(agent_key),
+                            progress=_snap,
+                            history=getattr(_runtime, "agent_progress_history", {}).get(agent_key))
         # F4 (2026-05-06): persist agent terminal status to root doc on
         # the individual complete-emit instead of waiting for the bulk
-        # phase_complete write at :19641. On chat reopen mid-Phase-2,
+        # phase_complete write at the end of Phase 2. On chat reopen mid-Phase-2,
         # an agent that finished early (e.g. ChatGPT done while Claude
         # is still researching) should already show as 100% complete in
         # research.agents[k].status — pre-fix, only the message bucket
@@ -38922,8 +43244,8 @@ async def _claude_asking_clarification(page):
 async def _claude_send_clarification_reply(page, label):
     """Type the defer-to-Claude reply into the chat input, then submit.
 
-    Submit strategy: try the Send button first (matches paste_followup at
-    research.py:5170), fall back to Enter if no enabled button is found.
+    Submit strategy: try the Send button first (matches `paste_followup`'s
+    send step), fall back to Enter if no enabled button is found.
     Send-button-first protects against future Claude composer A/B tests
     that might bind Enter to newline (Shift+Enter→Enter swap pattern).
 
@@ -38947,7 +43269,7 @@ async def _claude_send_clarification_reply(page, label):
     if typed_into is None:
         log(f"[{label}] No composer found for clarification reply", "WARN")
         return False
-    # Send-button-first (mirror paste_followup pattern at research.py:5170).
+    # Send-button-first (mirror `paste_followup`'s send step).
     for sel in (
         'button[data-testid="send-button"]',
         'button[aria-label="Send prompt"]',
@@ -39087,7 +43409,7 @@ async def _claude_skip_question_cards(page, label, max_skips=6) -> int:
 # previously unblocked these stalls by typing "Done?" which produced
 # the same "I'm on it" → card-appears sequence).
 #
-# Mirrors the Claude clarification block above (research.py:16179):
+# Mirrors the Claude clarification block above (`_CLAUDE_CLARIFICATION_SIGNOFF_RE`):
 # regex + lightweight DOM probe + one-shot nudge + state reset.
 
 # ACK patterns Gemini emits after "Start research" — confirm Gemini
@@ -39108,7 +43430,7 @@ _GEMINI_KICKOFF_ACK_RE = re.compile(
 #   - "Researching websites..." (no number — Salaar Part 2 run 2026-05-24)
 #   - "Researching N searches..." / "Researching N sites..." (variants)
 # Match any of these to suppress the nudge once kickoff succeeded.
-# Mirrors the noun list in scrape_progress_gemini at research.py:~12054
+# Mirrors the noun list in scrape_progress_gemini
 # (`websites?|sources?|searches?|sites?`).
 _GEMINI_RESEARCH_CARD_RE = re.compile(
     r"researching\s+(?:\d+\s+)?(?:websites?|sources?|searches?|sites?)",
@@ -40825,7 +45147,8 @@ async def _gemini_send_kickoff_nudge(page, label, attempt_idx=0):
 
     Reuses paste_followup so the nudge picks up _PASTE_SELECTORS["gemini"]
     composer selectors + the unified Send-button fallback chain — same
-    machinery as the existing user-poke follow-up at research.py:~17498.
+    machinery as the existing user-poke follow-up (the `consume_poke_agent`
+    branch of `poll_all_agents_round_robin`).
     Returns True on send, False if the composer was unreachable."""
     idx = max(0, min(attempt_idx, len(_GEMINI_KICKOFF_NUDGES) - 1))
     nudge = _GEMINI_KICKOFF_NUDGES[idx]
@@ -40853,7 +45176,7 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
     always `continue`s the round-robin afterwards, so every path here just
     mutates `p` / finalizes into `results` and returns 'continue'."""
     # Gap #1 belt-and-braces (HV never-touch): several resolver branches
-    # interact with the tab (session_expiry reload @~24336, switch_to_page in
+    # interact with the tab (the session_expiry reload, switch_to_page in
     # the extract branches) and are NOT individually hv_blocked-guarded. A
     # verification-walled agent must never reach them — today that state is
     # unreachable (an agent is non-hv_blocked when it parks, and hv_blocked is
@@ -41210,6 +45533,7 @@ async def _sweep_foreign_chatgpt_tabs(pending: dict, results: dict, *,
     return dropped
 
 
+@_watched_for_a_hung_browser("phase 2")
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -41609,6 +45933,41 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _runtime.last_failure_kind = "login_interrupt"
                     raise RuntimeError(
                         "research browser closed by the login command (login interrupt)")
+                # ⛔⛔ 2026-09-20 — ONE TAB, OR THE WHOLE BROWSER? THIS SWEEP
+                # COULD NOT TELL, AND THAT COST A NINE-HOUR DEAD RUN.
+                #
+                # Support bundle 8D9CWHZJ: Chrome's BROWSER process took a
+                # SIGSEGV at 00:33:59 (macOS wrote the report —
+                # `Google Chrome-2026-09-20-003359.ips`, EXC_BAD_ACCESS,
+                # faulting thread CrBrowserMain, pid parented by the patchright
+                # driver). The whole context went. This sweep then read
+                # `page.is_closed()` per agent, saw two closed pages, and did
+                # what it does for a tab crash: failed each agent and dropped
+                # it from `pending`. `pending` emptied, Phase 2 reported
+                # "COMPLETE: 1/3", and Phase 3 walked into a dead context and
+                # parked a decision the user found nine hours later.
+                #
+                # The comment right below this one has always claimed the
+                # "outer run_pipeline.finally rebuilds the browser session and
+                # resumes from checkpoint" — and that machinery is real
+                # (`_plan_pipeline_auto_retry`, BROWSER_CRASH_MAX_RETRIES=2,
+                # silent relaunch + resume). It was simply never reached,
+                # because setting `last_failure_kind` does not unwind anything.
+                # The `--login` branch twenty lines above gets this right: it
+                # sets the flag AND raises. Phase 3's audio poll gets it right
+                # too (research.py, "Browser closed mid-audio-poll"). Phase 2,
+                # the longest phase and the one most likely to be running when
+                # Chrome dies, was the only one that did not.
+                #
+                # ⚠ A SINGLE dead tab is still a per-agent failure and still
+                # falls through to the existing path — that distinction is the
+                # whole point of probing the CONTEXT rather than the page.
+                if await _browser_context_is_dead(browser):
+                    log(f"[{_crash_name}] the whole browser is gone, not just this tab "
+                        f"— unwinding for checkpoint recovery", "WARN")
+                    _runtime.last_failure_kind = "browser_crash"
+                    raise RuntimeError(
+                        "research browser died during phase 2 (browser crash)")
                 log(f"[{_crash_name}] Browser tab crashed — failing agent", "WARN")
                 # Always-auto: passive banner, outer run_pipeline.finally
                 # rebuilds the browser session and resumes from checkpoint.
@@ -42141,7 +46500,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
             log(f"[{_agent_name}] Hard retry #{_hard_count} — closing tab, re-running setup", "WARN")
             # Resolve the brief from runtime state (populated before Phase 2 kicks
-            # off at line ~10050: `_runtime.original_inputs = {..., 'brief': ...}`).
+            # off, in run_pipeline: `_runtime.original_inputs = {..., 'brief': ...}`).
             _brief_text_hr = _runtime.original_inputs.get("brief") or ""
             _brief_path_hr = None
             if _tracks_dir:
@@ -42149,7 +46508,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if _bp.exists():
                     _brief_path_hr = str(_bp)
             # #953: original_inputs carries 'brief' only on the brief-provided
-            # start path (research.py:~39749); the full-pipeline path (~39230)
+            # start path in run_pipeline; the full-pipeline path
             # stores topic+pdf_paths and P1 WRITES the brief to disk later. The
             # 2026-07-13 hard retry pasted a 0-char brief into Gemini ("Paste
             # verify: 1/0 chars") and manufactured a "couldn't send the brief"
@@ -42210,6 +46569,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _brief_text_hr, _brief_path_hr, verbose,
                     reuse_page=_reuse_page)
             except Exception as _e:
+                # ⛔⛔ A DEAD BROWSER IS NOT A FAILED AGENT, HERE EITHER
+                # (2026-09-20). This catch fails one agent and deletes it from
+                # `pending` on ANY exception, which is exactly what the crash
+                # sweep used to do — so a browser that dies while the last
+                # agents are in hard retry empties the set one agent at a time
+                # and Phase 2 reports COMPLETE on a browser that is gone. The
+                # sweep learned to ask the context; this path had not, and it
+                # is the one path that can drain `pending` without the sweep
+                # ever running.
+                if await _browser_context_is_dead(browser):
+                    _runtime.last_failure_kind = "browser_crash"
+                    log(f"[{_agent_name}] the browser died during hard retry — unwinding "
+                        f"for checkpoint recovery rather than failing one agent", "WARN")
+                    raise RuntimeError(
+                        "research browser died during a phase 2 hard retry (browser crash)")
                 log(f"[{_agent_name}] Hard retry setup crashed: {_e}", "ERROR")
                 fail_agent(_agent_key, f"{_agent_name} couldn't restart", f"{_agent_name} hit an error while restarting. Retry to try again, or Skip it.")
                 del pending[_agent_name]
@@ -42745,8 +47119,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         # rendered as <aside> and exceeds any reasonable
                         # bbox lower bound, so a bare-aside check would
                         # always match and the no-panel gate would never
-                        # be true. Tightened gate ports _PANEL_GATE_JS at
-                        # research.py:10639 — must be right-half-of-
+                        # be true. Tightened gate ports _PANEL_GATE_JS (in
+                        # `_read_claude_artifact_panel`) — must be right-half-of-
                         # viewport, ≥400px wide, and innerText must not
                         # read like nav chrome (≥2 nav markers).
                         try:
@@ -42803,8 +47177,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 if sent:
                                     # Reset all wall-clock / growth baselines
                                     # so neither the wall-clock nor the no-
-                                    # growth watchdog (research.py:~14987,
-                                    # requires elapsed>1200 AND no_growth>1200)
+                                    # growth watchdog (gated on STUCK_MIN_ELAPSED_SEC
+                                    # AND STUCK_NO_GROWTH_SEC)
                                     # fires a false-positive snag while Claude
                                     # composes the new response. Without
                                     # last_growth_time reset, no_growth_secs
@@ -42834,7 +47208,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #   - Nudge 2 (yes/no check-in)        at ~225s (180s spacing)
             #   - Nudge 3 (terse, "Done?")         at ~405s (180s spacing)
             # All three fit inside the 600s outer cap, well before the
-            # 20-min general no-growth watchdog at research.py:~17441
+            # general no-growth watchdog (STUCK_NO_GROWTH_SEC, 15 min by default)
             # takes over.
             #
             # Gates (all must hold):
@@ -43892,7 +48266,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # #929: also honor the scraper's separate `phase` field — but ONLY
             # for "planning". Gemini's scraper never returns status="planning"
             # (its plan states read status='generating' with the planning
-            # signal in `phase` — scrape_progress_gemini ~16663), so the
+            # signal in `phase` — scrape_progress_gemini), so the
             # status-only gate never protected a legitimately long plan draft
             # (2026-07-09 false alarm: healthy 10-min plan → stuck card →
             # auto-skip). `phase` values OTHER than planning must NOT gate:
@@ -43935,7 +48309,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 log(f"[{name}] Auto-skip — {_as_why} (elapsed {int(elapsed/60)}m). "
                     "Salvaging partial output, closing tab, continuing other agents.", "WARN")
                 _as_partial = ""
-                # #929 hands-off parity with the user-skip consumer (22555):
+                # #929 hands-off parity with the user-skip consumer:
                 # never run the extraction ladder (DOM walks + CUA fallback)
                 # against a verification-walled tab — those touches are
                 # exactly what the 2026-07-06 Cloudflare directive forbids,
@@ -44256,7 +48630,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # source delta get suppressed and starve the watchdog.
                 "progress_label": (_progress_val or "")[:80],
                 "tool_uses_len": len(progress.get("tool_uses", []) or []),
-                # Same gap as P1 (research.py:~10515) — without these
+                # Same gap as P1 (`poll_until_done`) — without these
                 # entries, a search-only or sectionsDone-only delta is
                 # suppressed and the FE graph series flat-lines through
                 # whole search bursts. Required for real-curve rendering.
@@ -44334,6 +48708,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 try:
                     _runtime.agent_progress_snapshots[agent_key] = {
                         "source_urls": list(progress.get("source_urls", []) or [])[:_SOURCE_LIST_CAP],
+                        # ⭐ THE PANEL'S TITLES, which used to die right here.
+                        # `source_items` is `[{url, title}]` scraped off the
+                        # platform's own source panel — the only place a real
+                        # page title is ever captured — and the snapshot took
+                        # the urls and left the titles behind, so the findings
+                        # extractor downstream had no title to use and fell back
+                        # to a heading from our own markdown.
+                        "source_items": list(progress.get("source_items", []) or [])[:_SOURCE_LIST_CAP],
                         "sections":    list(progress.get("sections", []) or [])[:20],
                         "steps":       list(progress.get("steps", []) or [])[:15],
                         "searches":    int(progress.get("searches", 0) or 0),
@@ -44376,7 +48758,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # panel is scrolled, so the cheap DOM detector below kept returning
                 # not-done on a genuinely-complete report and the run limped along
                 # on the slow 5-min CUA fallback (live E2E 2026-07-10: ~50m flat at
-                # "5 URLs, 15 steps", only CUA — which scrolls first, :24444 — ever
+                # "5 URLs, 15 steps", only CUA — which scrolls first — ever
                 # caught it). Scroll the panel + window to the bottom first so the
                 # marker + full sources render into the DOM before we read them.
                 # Claude-scoped: ChatGPT/Gemini detectors weren't affected and we
@@ -44803,8 +49185,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # once, drop the agent from rotation.
             if is_error:
                 agent_key_err = normalize_agent_key(name)
-                log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state. "
-                    f"Salvaging partial output and dropping from rotation.", "WARN")
+                # ⭐⭐ WHAT IT ACTUALLY SAW. `diag_text_raw` has held the model's
+                # own account of the screen since this loop was written and had
+                # exactly one consumer: the `.lower()` on the next line, on the
+                # way to a four-value enum. It was never even LOGGED, so when
+                # Claude stopped on 2026-09-19 because the account hit its usage
+                # limit — the model read "Usage limit reached · Resets Sep 20 at
+                # 1:00 AM" and wrote it down — the log said "CUA reported
+                # CONCLUSION: ERROR", the card said "Claude reported an error",
+                # and the user was told "retrying" by a UI where nothing was
+                # retrying. The whole thing had to be diagnosed from a
+                # screenshot.
+                _evidence = _cua_error_evidence(diag_text_raw)
+                log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state"
+                    + (f": {_evidence}" if _evidence else " (it named no evidence)")
+                    + ". Salvaging partial output and dropping from rotation.", "WARN")
                 _err_text = ""
                 try:
                     _err_text = await extract_fns[name](
@@ -44965,7 +49360,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # The deadline is stamped on the card with `arm_registry=False`:
                 # the FE renders a countdown to the same epoch the park will
                 # expire at, but no registry entry is created — _fire_due_autoskips
-                # deliberately skips parked agents (line ~26141), so an armed
+                # deliberately skips parked agents, so an armed
                 # entry would be dead weight that could still fire if the park
                 # were ever cleared without disarming. One timer, one actor.
                 #
@@ -44995,10 +49390,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # so the phase stays open and the card stays answerable.
                 _ae_window = unacted_window_sec(_runtime.auto_skip_stuck)
                 if not p.get("failed_alert_emitted"):
-                    fail_agent(agent_key_err,
-                               f"{name} reported an error",
-                               (f"{name} showed a 'research failed' error and we kept "
-                                "what little it produced. Retry to run it fresh, or Skip it."),
+                    # ⛔ THE HEADLINE AND THE BODY TAKE THE EVIDENCE DIFFERENTLY,
+                    # and the asymmetry is the frontend's, not a preference. A
+                    # title carrying "overloaded", "529" or a spelling of "rate
+                    # limit" is classed as transient infrastructure by the web
+                    # and rendered as a passive banner with NO Retry and NO Skip
+                    # — so quoting an overload banner into the title would make
+                    # the card honest and simultaneously remove the two controls
+                    # the user needs. The body is not filtered, so the evidence
+                    # always goes THERE; only the headline falls back.
+                    _err_title = (f"{name} stopped: {_evidence}"[:90]
+                                  if _alert_title_safe(_evidence)
+                                  else f"{name} reported an error")
+                    _err_details = (
+                        f"{name} showed: {_evidence} — we kept what little it "
+                        "produced. Retry to run it fresh, or Skip it."
+                        if _evidence else
+                        f"{name} showed a 'research failed' error and we kept "
+                        "what little it produced. Retry to run it fresh, or Skip it.")
+                    fail_agent(agent_key_err, _err_title, _err_details,
+                               # The model's whole reply, for `_draft_alert_copy`
+                               # and for anything else that later wants to reason
+                               # about the failure rather than re-describe it.
+                               raw_err=diag_text_raw[:500],
                                **({"auto_skip_deadline": (time.time() + _ae_window) * 1000,
                                    "arm_registry": False} if _ae_window else {}))
                     p["failed_alert_emitted"] = True
@@ -45583,6 +49997,18 @@ _DOC_IMG_DOC_BUDGET_SEC = 120.0
 # (or at the document's deadline, if sooner). `_DOC_IMG_TIMEOUT` bounds one socket
 # receive only; see `_DocImgDeadline`.
 _DOC_IMG_PER_IMAGE_SEC = 30.0
+# ⛔⛔ A NAME LOOKUP IS NOT A CONNECT, AND THIS IS NOT `_DOC_IMG_TIMEOUT[0]`
+# (wave 10.9, repair round 2). The bound exists so a resolver that is DOWN cannot
+# hold the rehost thread past the image's deadline — not to say how long a
+# WORKING resolver may take. A stub resolver's own first attempt times out at 5 s
+# and then retries, so bounding the lookup at the 5 s connect timeout made one
+# lost UDP query — ordinary on congested wifi or a VPN — a "failed" image with 25
+# of its 30 s and 115 of the document's 120 s unspent; and that verdict was
+# remembered for the whole research, so every later document captioned the same
+# chart without retrying. Above one resolver retry, well under the per-image
+# budget. ⭐ A lookup that times out anyway is not remembered either; see the
+# cache write in `_doc_img_resolve_src`.
+_DOC_IMG_LOOKUP_TIMEOUT = 10.0
 # ⛔ How many of the addresses an image host resolves to one connection tries
 # (`_doc_img_connect`). Each try gets min(connect timeout, time left).
 _DOC_IMG_CONNECT_ADDRS = 4
@@ -45625,10 +50051,13 @@ _DOC_IMG_MD_RE = re.compile(
 # ⭐ The title may sit on the NEXT line (CommonMark allows it); matched only when
 # nothing else follows it on that line, so a quoted sentence under a definition
 # stays prose. Before this, removing a used definition left the title behind.
+# ⛔ `\r?` at both line ends (wave 10.9): a CRLF document — Gemini's in-page
+# clipboard read on Windows — matched no definition at all, so every reference
+# image kept `![c][1]` and its definition kept the platform URL.
 _DOC_IMG_DEF_RE = re.compile(
     r"^[ ]{0,3}\[(?P<label>[^\[\]\n]{1,999})\]:[ \t]*"
     r"(?:<(?P<adest>[^<>\n]*)>|(?P<dest>\S+))"
-    r"(?:(?:[ \t]+|[ \t]*\n[ \t]*)(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\n|\Z)", re.M)
+    r"(?:(?:[ \t]+|[ \t]*\r?\n[ \t]*)(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*(?:\r?\n|\Z)", re.M)
 # Any `[text]`, `[text][label]` or `[text][]` — which of them is a LINK reference
 # (not an image, not an inline link) is decided by `_doc_img_link_ref_labels`.
 _DOC_IMG_BRACKET_RE = re.compile(
@@ -45672,12 +50101,18 @@ class _DocImageRefused(Exception):
     "refused" (a URL or address rule), "dropped" (too small) or "failed".
     "linked" — the destination answered a web page — carries `fallback`: the bucket
     it lands in when its markup is not a citation (`_doc_img_citation_shaped`).
-    ⛔ Carries no URL — its message is only ever the bucket name."""
+    ⛔ Carries no URL — its message is only ever the bucket name.
 
-    def __init__(self, kind: str, fallback: str = ""):
+    ⛔⛔ `timed_out` is THE CLOCK, not the image: a name lookup that ran out of time
+    says nothing about the host, so the verdict is not remembered for the research
+    (`_doc_img_resolve_src`) and the next document tries it again. Set only where a
+    bound this code chose ran out — never for a refusal the answer earned."""
+
+    def __init__(self, kind: str, fallback: str = "", timed_out: bool = False):
         super().__init__(kind)
         self.kind = kind
         self.fallback = fallback or kind
+        self.timed_out = timed_out
 
 
 class _DocImageRun:
@@ -45903,13 +50338,51 @@ def _doc_img_address_is_public(addr) -> bool:
     return all(c.is_global and not c.is_multicast for c in candidates)
 
 
-def _doc_img_resolve_host(host: str, port: int) -> "list[str]":
-    return [info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+def _doc_img_lookup(host: str, port: int, deadline: float, family: int = 0) -> list:
+    """`socket.getaddrinfo` for one image, bounded by min(`_DOC_IMG_LOOKUP_TIMEOUT`,
+    time left before `deadline`). Out of time — before it starts or while it waits
+    — is a `TimeoutError`, an OSError, so every caller's failure path takes it; any
+    other error the lookup raised is raised here.
+
+    ⛔⛔ WHY A THREAD (wave 10.9). getaddrinfo takes no timeout, and a resolver that
+    never answered held the rehost thread OUTSIDE the image's deadline: the URL check
+    runs before any socket exists for `_DocImgDeadline` to shut, and the connect's
+    own lookup started after its deadline check. So the lookup runs on a thread of
+    its own and this one stops waiting at the bound. A lookup that never returns
+    keeps only that thread, until the resolver gives up; it is a daemon, so it never
+    holds the process's exit (a pool's threads are joined at exit).
+    ⭐ Started from a rehost thread, it inherits that thread's blocked signals."""
+    left = min(_DOC_IMG_LOOKUP_TIMEOUT, deadline - time.monotonic())
+    if left <= 0:
+        raise TimeoutError("lookup")
+    box: dict = {}
+
+    def _resolve():
+        try:
+            box["infos"] = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+        except BaseException as exc:  # noqa: BLE001 — raised again in the waiting thread
+            box["error"] = exc
+
+    th = _threading.Thread(target=_resolve, name="doc-images-lookup", daemon=True)
+    th.start()
+    th.join(left)
+    if th.is_alive():
+        raise TimeoutError("lookup")
+    if "error" in box:
+        raise box["error"]
+    return box["infos"]
 
 
-def _doc_img_check_url(url: str) -> None:
+def _doc_img_resolve_host(host: str, port: int, deadline: float) -> "list[str]":
+    return [info[4][0] for info in _doc_img_lookup(host, port, deadline)]
+
+
+def _doc_img_check_url(url: str, deadline: float) -> None:
     """Refuse unless the URL is https on the default port, carries no credentials,
-    and EVERY address its host resolves to is public."""
+    and EVERY address its host resolves to is public. The lookup ends at the
+    image's `deadline` or `_DOC_IMG_LOOKUP_TIMEOUT`, whichever is sooner
+    (`_doc_img_lookup`); a lookup that does not answer by then is "failed", and
+    "failed BY THE CLOCK" — nothing about this host was learned."""
     if len(url) > _DOC_IMG_MAX_URL_CHARS or _DOC_IMG_URL_BAD_CHARS_RE.search(url):
         raise _DocImageRefused("refused")
     try:
@@ -45924,9 +50397,9 @@ def _doc_img_check_url(url: str) -> None:
     if port not in (None, 443):
         raise _DocImageRefused("refused")
     try:
-        addrs = _doc_img_resolve_host(parts.hostname, 443)
-    except OSError:
-        raise _DocImageRefused("failed") from None
+        addrs = _doc_img_resolve_host(parts.hostname, 443, deadline)
+    except OSError as exc:
+        raise _DocImageRefused("failed", timed_out=isinstance(exc, TimeoutError)) from None
     if not addrs or not all(_doc_img_address_is_public(a) for a in addrs):
         raise _DocImageRefused("refused")
 
@@ -45954,13 +50427,14 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     socket `_DocImgDeadline` could watch: a host with thirty addresses that drop
     packets held the worker about 150 s — past the per-image limit, the document
     budget and the hard stop — and the timer had nothing to shut.
-    So: no connect is started once `deadline` has passed; one lookup; at most
-    `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets min(connect timeout, time left).
+    So: no lookup and no connect is started once `deadline` has passed; one lookup,
+    bounded by `_DOC_IMG_LOOKUP_TIMEOUT` (`_doc_img_lookup`, wave 10.9 — it was not
+    bounded at all); at most `_DOC_IMG_CONNECT_ADDRS` addresses; each try gets
+    min(connect timeout, time left).
     ⛔⛔ An address that is not public is skipped BEFORE its socket is made: the URL
     check resolved the name once, this lookup is a second answer, and a rebinding
     name would otherwise get a TCP handshake with a LAN host before
     `_doc_img_check_peer` (kept, the second guard) closed it.
-    ⚠ The name lookup itself is not bounded (recorded).
     Only non-public addresses, nothing tried and time still left → a "refused"
     refusal (what the peer check said before). Every other failure is "failed": the
     image is not kept, nothing more.
@@ -45970,15 +50444,15 @@ def _doc_img_connect(host: str, port: int, deadline: float, socket_options=None)
     research, so an image the CLOCK ran out on was a caption in every later
     document. `out_of_time` keeps the two apart: the clock raises "failed", which
     `_doc_img_resolve_src` lets out of the cache when the document's budget is
-    spent, and the next document tries it again."""
+    spent — or, for a lookup that ran out (`timed_out`), whatever is left of it —
+    and the next document tries it again."""
     from urllib3.util.connection import allowed_gai_family
-    if time.monotonic() >= deadline:
-        raise _DocImageRefused("failed")
     try:
-        infos = socket.getaddrinfo(host.strip("[]"), port, allowed_gai_family(),
-                                   socket.SOCK_STREAM)[:_DOC_IMG_CONNECT_ADDRS]
-    except OSError:
-        raise _DocImageRefused("failed") from None
+        # ⭐ The deadline is checked inside, before the lookup starts.
+        infos = _doc_img_lookup(host.strip("[]"), port, deadline,
+                                allowed_gai_family())[:_DOC_IMG_CONNECT_ADDRS]
+    except OSError as exc:
+        raise _DocImageRefused("failed", timed_out=isinstance(exc, TimeoutError)) from None
     skipped = tried = out_of_time = False
     for af, socktype, proto, _canon, addr in infos:
         if not _doc_img_address_is_public(addr[0]):
@@ -46231,7 +50705,7 @@ def _doc_img_fetch(url: str, deadline: float) -> bytes:
     guard.start()
     try:
         for _hop in range(_DOC_IMG_MAX_REDIRECTS + 1):
-            _doc_img_check_url(url)
+            _doc_img_check_url(url, deadline)
             if time.monotonic() >= deadline:
                 raise _DocImageRefused("failed")
             resp = session.get(url, stream=True, allow_redirects=False,
@@ -46478,9 +50952,17 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
     # document. ⭐ Still remembered: the per-image limit (it ends BEFORE the
     # document's deadline), every verdict that is not "failed" (refused, login,
     # dropped, a page), and anything decided after the bytes were read.
+    # ⛔⛔ AND THE SAME FOR A NAME LOOKUP THAT RAN OUT (`timed_out`, repair round
+    # 2), whatever the document has left. The lookup's bound is this code's, not
+    # the document's, and it is spent per lookup — a resolver answering one retry
+    # late failed the image with 115 of the document's 120 s unused, so the
+    # deadline test below could never excuse it and the whole research captioned
+    # that chart. A timed-out lookup learned NOTHING about the host; the next
+    # document asks again.
     # Ends: with this call. Read by: the cache write below only.
     reading = True
     cut_off = False
+    timed_out = False
     try:
         data = (_doc_img_decode_data_uri(src) if is_data else
                 _doc_img_fetch(src, min(run.deadline, time.monotonic() + _DOC_IMG_PER_IMAGE_SEC)))
@@ -46501,10 +50983,11 @@ def _doc_img_resolve_src(src: str, run: "_DocImageRun", may_link: bool = False):
                 ref = _DOC_IMG_LINKED
         run.stats["linked" if ref is _DOC_IMG_LINKED else refusal.fallback] += 1
         cut_off = reading and refusal.kind == "failed"
+        timed_out = refusal.timed_out
     except Exception:
         run.stats["failed"] += 1
         cut_off = reading
-    if cut_off and time.monotonic() >= run.deadline:
+    if cut_off and (timed_out or time.monotonic() >= run.deadline):
         return ref
     # ⛔ An abandoned rehost remembers nothing: the next document reads this cache.
     if run.stopped:
@@ -46715,12 +51198,14 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
     return unmask(_DOC_IMG_DEF_RE.sub(_definition, text))
 
 
-# A link around an image: `[![alt](src)](href "title")`. The text may hold more than
-# the image, and brackets three deep (an alt with `[1]` inside a link's text).
-_DOC_IMG_WRAP_RE = re.compile(
-    r"(?<![\\!])\[(?P<text>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\])*+\]){0,4000}+)\]"
+# An inline link, `[text](href "title")`. The text may hold an image and brackets
+# three deep (an alt with `[1]` inside a link's text).
+_DOC_LINK_INLINE = (
+    r"\[(?P<text>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*+\])*+\]){0,4000}+)\]"
     r"\([ \t\n]*(?:<(?P<ahref>[^<>\n]*)>|(?P<href>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*+\))*+))"
     r"(?:[ \t\n]+(?:\"(?:[^\"\\]|\\.)*+\"|'(?:[^'\\]|\\.)*+'|\((?:[^()\\]|\\.)*+\)))?[ \t\n]*\)")
+# A link around an image: `[![alt](src)](href "title")`.
+_DOC_IMG_WRAP_RE = re.compile(r"(?<![\\!])" + _DOC_LINK_INLINE)
 
 
 def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
@@ -46736,7 +51221,9 @@ def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
     chart came from) stays, and so does the same address cited elsewhere.
     ⛔ Which images sit inside a link is read from their SLOTS (`slots[i]` = what the
     image became, its source), never guessed from the link's text: a removed image
-    leaves none, and `[![](<S>) View full size](S)` kept S once the words remained."""
+    leaves none, and `[![](<S>) View full size](S)` kept S once the words remained.
+    ⭐ Every other private link — around no image, or in a document with no image
+    at all — is `_doc_scrub_private_links`'s (wave 10.9)."""
     if not slots:
         return text
 
@@ -46758,6 +51245,135 @@ def _doc_img_unwrap_self_links(text: str, slot_re, slots: list) -> str:
         return m.group(0)
 
     return _DOC_IMG_WRAP_RE.sub(_link, text)
+
+
+# ── Private links (wave 10.9) ────────────────────────────────────────────────
+#
+# ⛔⛔ WHY. Only a link AROUND an image was ever checked (above), and a document
+# with no image never entered the funnel at all. So a report's own
+# `[the file](https://files.oaiusercontent.com/…?sig=…)`, `[csv](sandbox:/mnt/…)`,
+# the agent's conversation `https://chatgpt.com/c/…` or a `[1]: <googleusercontent>`
+# definition was saved as written — into the document, the NotebookLM upload and
+# every frozen share, where an https one is a live link to the owner's private
+# file or session.
+# ⭐ ONLY THE PRIVATE SHAPES: an address only the writer's browser can open, a
+# file or image on the platforms' user-content hosts, and a conversation or
+# notebook PATH. ⛔ NEVER the platform host list as a whole (`_is_platform_host`):
+# it names help.openai.com and support.anthropic.com, real sources for a research
+# about those products. (gstatic.com, in the image veto, serves no private file.)
+_DOC_PRIVATE_LINK_SCHEMES = ("data:", "blob:", "sandbox:")
+_DOC_PRIVATE_LINK_HOSTS = ("oaiusercontent.com", "googleusercontent.com", "ggpht.com")
+# (host, the path that is a conversation or a notebook). ChatGPT's also under a GPT
+# or a project (`/g/<id>/c/…`); Gemini's also under an account index (`/u/1/app/…`).
+_DOC_PRIVATE_LINK_PATHS = (
+    ("chatgpt.com", re.compile(r"/(?:g/[^/]+/)?c/")),
+    ("chat.openai.com", re.compile(r"/(?:g/[^/]+/)?c/")),
+    ("claude.ai", re.compile(r"/chat/")),
+    ("gemini.google.com", re.compile(r"/(?:u/\d+/)?app/")),
+    ("notebooklm.google.com", re.compile(r"/notebook/")),
+)
+# An inline link that is not an image: `\![t](…)` IS a link — a citation after "!"
+# the image pass escaped (`_DOC_IMG_LINKED`).
+_DOC_PRIVATE_INLINE_RE = re.compile(r"(?<!\\)(?<!(?<!\\)!)" + _DOC_LINK_INLINE)
+# An address written as text — bare, or an autolink in angle brackets — with the
+# one space before it. Candidates only: `_doc_link_is_private` decides.
+_DOC_PRIVATE_BARE_RE = re.compile(
+    r"[ \t]?(?P<lt><)?(?<![A-Za-z0-9])"
+    r"(?P<url>(?:https?://|www\.|sandbox:|blob:|data:[a-z]+/)[^\s<>()\[\]\"'`]++)(?(lt)>)", re.I)
+# What is left of a line whose only content was a private address: nothing, or a
+# bare list or quote marker. ⛔ Dropped whole — `-` left under a paragraph is a
+# setext underline, and the paragraph above it would render as a heading.
+_DOC_EMPTIED_LINE_RE = re.compile(r"[ \t>]*(?:[-*+]|\d{1,9}[.)])?[ \t\r]*\Z")
+
+
+def _doc_link_is_private(dest: str) -> bool:
+    """Is this destination one only its writer can open, or a platform's record of
+    the conversation? See `_DOC_PRIVATE_LINK_SCHEMES`."""
+    dest = (dest or "").strip()
+    low = dest.lower()
+    if low.startswith(_DOC_PRIVATE_LINK_SCHEMES):
+        return True
+    if low.startswith("www."):
+        dest = "https://" + dest
+    try:
+        parts = urlsplit(dest)
+    except ValueError:
+        return False
+    host = parts.hostname or ""
+
+    def _on(name: str) -> bool:
+        return host == name or host.endswith("." + name)
+
+    if any(_on(h) for h in _DOC_PRIVATE_LINK_HOSTS):
+        return True
+    return any(_on(h) and rx.match(parts.path) for h, rx in _DOC_PRIVATE_LINK_PATHS)
+
+
+def _doc_scrub_private_links(text: str) -> str:
+    """`text` with every PRIVATE destination dropped (`_doc_link_is_private`). An
+    inline link or a link reference keeps its TEXT; a definition goes, line and
+    all; an autolink or a bare address goes. Ordinary links, image markup and code
+    are untouched. `text` itself when nothing changed.
+
+    ⭐ A label whose FIRST definition is private — the one a renderer uses — loses
+    every definition and every reference; a later private duplicate goes alone.
+    ⛔ No network, and no image rewritten: runs AFTER the image pass on every path
+    (`_rehost_document_images`), so what reaches it is a reference or a caption. If
+    that pass is skipped, a private address inside image markup still goes — by
+    the address rule, leaving `![alt]()`."""
+    if not text:
+        return text
+    masked, unmask = _doc_img_mask_code(text)
+    private: set = set()
+    seen: set = set()
+    for m in _DOC_IMG_DEF_RE.finditer(masked):
+        key = _doc_img_label_key(m.group("label"))
+        if key not in seen:
+            seen.add(key)
+            dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
+            if _doc_link_is_private(dest):
+                private.add(key)
+
+    def _definition(m):
+        dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
+        if _doc_img_label_key(m.group("label")) in private or _doc_link_is_private(dest):
+            return ""
+        return m.group(0)
+
+    def _inline(m):
+        href = m.group("ahref") if m.group("ahref") is not None else m.group("href")
+        return m.group("text") if _doc_link_is_private(href) else m.group(0)
+
+    def _reference(m):
+        s, i = m.string, m.start()
+        # Not an escaped bracket, not an image's, not an inline link's text.
+        if s[i - 1:i] == "\\" or (s[i - 1:i] == "!" and s[i - 2:i - 1] != "\\"):
+            return m.group(0)
+        if m.group("label") is None and s.startswith("(", m.end()):
+            return m.group(0)
+        key = _doc_img_label_key(m.group("label") or m.group("text"))
+        return m.group("text") if key in private else m.group(0)
+
+    def _bare(m):
+        url, tail = m.group("url"), ""
+        if m.group("lt") is None:
+            # Trailing punctuation ends the sentence, not the address — as the
+            # renderer's autolink reads it.
+            core = url.rstrip(".,:;!?*_~")
+            url, tail = core, url[len(core):]
+        return tail if _doc_link_is_private(url) else m.group(0)
+
+    out = _DOC_IMG_DEF_RE.sub(_definition, masked)
+    out = _DOC_PRIVATE_INLINE_RE.sub(_inline, out)
+    if private:
+        out = _DOC_IMG_BRACKET_RE.sub(_reference, out)
+    lines = []
+    for line in out.split("\n"):
+        new = _DOC_PRIVATE_BARE_RE.sub(_bare, line)
+        if new == line or not _DOC_EMPTIED_LINE_RE.match(new):
+            lines.append(new)
+    out = "\n".join(lines)
+    return text if out == masked else unmask(out)
 
 
 def _doc_img_leftover_close(text: str, start: int) -> int:
@@ -46840,9 +51456,9 @@ def _doc_img_executor():
     `to_thread`, and a fetch cut off by the hard stop keeps its thread until its
     own deadline ends it. ⛔ And not one pool for the process: idle threads that
     never end are threads every process-wide signal can land on.
-    Ends: `_rehost_document_images` shuts it down (no wait) when the document is
+    Ends: `_doc_images_rehost` shuts it down (no wait) when the document is
     done; a thread still inside a fetch ends at that image's deadline.
-    Read by: `_rehost_document_images` only."""
+    Read by: `_doc_images_rehost` only."""
     import concurrent.futures
     return concurrent.futures.ThreadPoolExecutor(
         max_workers=_DOC_IMG_WORKERS, thread_name_prefix="doc-images",
@@ -46876,7 +51492,7 @@ def _doc_img_exit_coming() -> bool:
     process; `run_server` resets it on entry). ⚠ A signal's first press is a
     graceful uvicorn shutdown that cancels the pipeline task — that ends the
     rehost as a cancelled task, not through here.
-    Ends: with the process. Read by: `_rehost_document_images` (before the worker
+    Ends: with the process. Read by: `_doc_images_rehost` (before the worker
     starts) and `_doc_img_until_stop` (every poll)."""
     return bool(_exit_scheduled)
 
@@ -46891,7 +51507,7 @@ async def _doc_img_until_stop(work):
     itself, and a caption can never become an image again — the source address is
     gone from the text. See `_doc_img_exit_coming`.
     Ends: when the worker answers, when the exit is seen, or when the caller's hard
-    stop cancels this wait. Read by: `_rehost_document_images` only.
+    stop cancels this wait. Read by: `_doc_images_rehost` only.
     ⚠ On the way out the waiting future is cancelled, as `wait_for` did, so a worker
     that fails later leaves no "exception never retrieved"."""
     try:
@@ -46907,12 +51523,29 @@ async def _doc_img_until_stop(work):
 
 
 async def _rehost_document_images(text: str, label: str = "document") -> str:
-    """Every image in an extracted document, rehosted — THE funnel.
+    """THE funnel — called before a document is written anywhere, so the local .md,
+    the Firestore document and whatever is built from the text later (the
+    consolidated report) all carry what it hands back. Two halves:
+      · `_doc_images_rehost` — every image fetched, stored by the web and
+        referenced: the network half;
+      · `_doc_scrub_private_links` — every private link dropped: no network.
 
-    Called before a document is written anywhere, so the local .md, the Firestore
-    document and whatever is built from the text later (the consolidated report)
-    all carry references. Idempotent: a reference to this research is left alone,
-    so a second pass over rewritten text costs no fetch.
+    ⛔⛔ THE SEAM (wave 10.9). The scrub runs on whatever the image half hands back,
+    on every path of it — a document with no image, the offline pass, a rewrite
+    that raised and handed its input back. Anything that skips the images
+    (incognito uploads nothing) skips `_doc_images_rehost` and NEVER this call: a
+    skipped scrub writes the agents' signed file links and conversation URLs into
+    the saved text and everything built from it.
+    ⭐ AFTER the images, not before: a definition an image resolves through is the
+    image half's to consume, and a `data:` or platform image is stored, not
+    dropped — scrubbed first, its source would be gone before it could be fetched."""
+    return _doc_scrub_private_links(await _doc_images_rehost(text, label))
+
+
+async def _doc_images_rehost(text: str, label: str = "document") -> str:
+    """Every image in an extracted document, rehosted — the image half of THE
+    funnel (`_rehost_document_images`). Idempotent: a reference to this research is
+    left alone, so a second pass over rewritten text costs no fetch.
 
     ⭐ The fetches run off the event loop, so other tasks keep ticking. ⛔ But the
     CALLER waits: `extract_and_record_agent` awaits this, and the round-robin loop
@@ -46934,6 +51567,25 @@ async def _rehost_document_images(text: str, label: str = "document") -> str:
     run.stats["dropped"] += dropped
     pool = None
     try:
+        # ⛔⛔ A RUN THAT KEEPS NOTHING STORES NO IMAGE (wave 10.9, #536). Every
+        # image here would be fetched and written into the web's Storage bucket,
+        # which has no TTL and no purge — the one residue class that outlives
+        # both the record and its documents. So the network half is refused and
+        # each image becomes its caption.
+        #
+        # ⛔ THE SKIP IS HERE, INSIDE THE IMAGE HALF, AND NOT AT THE FUNNEL. The
+        # caller runs `_doc_scrub_private_links` on whatever this hands back, and
+        # a document that skipped the funnel would skip the scrub with it —
+        # writing the agents' signed file links and conversation URLs into the
+        # saved text and into everything built from it, which for an incognito
+        # run is the mail. The privacy fix must not open a privacy hole.
+        #
+        # ⭐ IT TAKES THE PASS THIS FUNCTION ALREADY HAS for "no network at all",
+        # rather than a second one beside it.
+        if _is_incognito_research(rid):
+            log(f"[{label}] document images: a run that keeps nothing stores "
+                "none — every image becomes a caption", "INFO")
+            raise _DocImgStopRequested()
         # ⛔⛔ An exit already scheduled: no worker, no fetch, no upload — the pass
         # below writes at once, so the save lands before the process exits.
         if _doc_img_exit_coming():
@@ -47100,7 +51752,7 @@ def _doc_img_prose_len(text: str) -> int:
 # Converting to numbered footnotes [1][2][3] was considered + rejected:
 # the turn{N}{view|search|file}{M} indices reference ChatGPT's internal
 # source list, NOT the source URLs we capture via observer-side
-# extraction (research.py:~18261). Without a mapping we'd produce
+# extraction. Without a mapping we'd produce
 # footnotes that point nowhere — strip is the correct choice.
 _CHATGPT_CITE_TOKEN_RE = re.compile('[^]*')
 
@@ -47958,11 +52610,11 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     "T1 = X, T2 = Y, T3 = Z" describes the META-pattern — DOM → CUA →
     clipboard-hijack — not a uniform per-agent mapping):
       - ChatGPT (this fn): CUA download → HTML→MD → CUA copy hijack
-      - Gemini (`extract_gemini_response`, research.py:19575): Share&Export
+      - Gemini (`extract_gemini_response`): Share&Export
         hijack → HTML→MD → Ctrl+A/C hijack (reordered 2026-05-24 — native
         Share & Export menu is Gemini's authoritative export path; DOM
         scrape is the deterministic fallback when CUA can't drive the menu)
-      - Claude (`extract_claude_response`, research.py:16640): two-mode —
+      - Claude (`extract_claude_response`): two-mode —
         3 tiers in Deep Research artifact-aware mode (T1 CUA-download →
         T2 HTML→MD of the open artifact panel → T3 CUA + clipboard hijack;
         publish moved OUT of T2 to the end share-link step on 2026-06-03 so
@@ -48542,8 +53194,8 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         pass
     # E2 / DGOPS-7364 — chat mode early return.
     # Claude in chat mode emits a regular assistant reply, NO artifact.
-    # The artifact-aware Tiers 1-3 below (Research-mode path, line ~16877
-    # onward — CUA download / publish + claude.site / CUA + clipboard
+    # The artifact-aware Tiers 1-3 below (the Research-mode path — CUA
+    # download / HTML→MD of the open artifact panel / CUA + clipboard
     # hijack) all target aside / artifact-panel / [class*="artifact"]
     # selectors that don't exist in chat mode, so they'd all return empty
     # and the function would falsely report "All extraction methods
@@ -48657,7 +53309,8 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
 
         # #777 ROOT FIX: the DOM pre-click (_click_claude_artifact) sometimes
         # reports success but matched a WRONG element (research-tracking card /
-        # context-menu trigger — see the comment at ~23130) so the final-report
+        # context-menu trigger — see the 2026-05-14 comment at the pre-click
+        # above) so the final-report
         # panel never actually opened. The CUA open above only ran on `not
         # clicked`, so a FALSE-success pre-click SKIPPED it → Tier 1's Download
         # menu, Tier 2's Publish button, and Tier 3's Ctrl+A all run against a
@@ -48793,8 +53446,9 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             '[role="complementary"] [class*="markdown"]',
             '[role="complementary"] .prose',
         ], label)
-        # Floor = 2000 to match Gemini's sibling DOM-scrape tier (research.py
-        # ~22824): a DOM panel scrape can catch a sparse PARTIAL render that is
+        # Floor = 2000 to match Gemini's sibling DOM-scrape tier (in
+        # `extract_gemini_response`): a DOM panel scrape can catch a sparse
+        # PARTIAL render that is
         # NEITHER a checklist nor a nav-sidebar (so both reject guards miss it).
         # Genuine Claude DR reports are >5000 chars, so a 2000 floor rejects a
         # truncated panel while accepting every real report; a short-but-real doc
@@ -49972,9 +54626,10 @@ async def _chatgpt_p2_effort_tier(page) -> str:
 _P2_THINKING_STATE: dict = {}
 
 # Phoenix (model_refresh) — last model VERSION the setup actually selected per
-# platform (numeric), written by setup_*_dr and read by the caller to record
-# the latest verified-working model as known_good (on-the-fly learning). Float
-# or None; process-local; last write wins.
+# platform, written by setup_*_dr and read by the caller to record the latest
+# verified-working model as known_good (on-the-fly learning). Dotted TEXT as the
+# ranker matched it ("5.10", "3.8") or None — never a float, because 5.10 is not
+# 5.1 (see models.version_key). Process-local; last write wins.
 _P2_PICKED_VERSION: dict = {}
 
 # Phoenix — the model FAMILY this run is actually on, per platform, when it is
@@ -50156,6 +54811,44 @@ async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) ->
         return False
 
 
+# ⭐⭐ THE BROWSER'S ONE DEFINITION OF VERSION ORDER (2026-09-23), spliced into all
+# four page scripts that read a model version: the Gemini Flash ranker below, and
+# Claude's trigger read, picker and offered-probe inside `setup_claude_dr`.
+#
+# ⛔ Every one of them used to end in `parseFloat(m[1])`, so "5.10" read as 5.1:
+# {Opus 5.5, Opus 5.10} picked 5.5, Gemini {3.8 Flash, 3.10 Flash} picked 3.8,
+# and an account already on 5.10 was "upgraded" back to 5.5 with the log calling
+# it an UPGRADE. The same number was the exact-pin test, the step-back bound and
+# the learned known-good, so the fix is one ORDER, not four patched comparisons.
+# The regexes that find the number are untouched — what matches does not change,
+# only what it is worth.
+#
+# The Python twin is `models.version_key`. It drops trailing zeros where this
+# pads with them; both order "5" and "5.0" as equal, and Python must normalise
+# only because tuple EQUALITY does not pad. A pin arrives as text ("5.10") or, from
+# a computer that learned it before this change, as a number — `String(5.0)` is
+# "5" and `String(3.8)` is "3.8", so a stored pin still exact-matches its row.
+# Regex-free for the #913 reason this file states.
+_VERSION_ORDER_JS = """
+    const verKey = x => {
+        const out = [];
+        for (const part of String(x).split('.')) {
+            if (!part) return null;
+            for (const c of part) if (c < '0' || c > '9') return null;
+            out.push(parseInt(part, 10));
+        }
+        return out;
+    };
+    const cmpVer = (a, b) => {
+        for (let i = 0; i < Math.max(a.length, b.length); i++) {
+            const x = i < a.length ? a[i] : 0, y = i < b.length ? b[i] : 0;
+            if (x !== y) return x < y ? -1 : 1;
+        }
+        return 0;
+    };
+"""
+
+
 # Gemini "pick the newest Flash" ranker. Mirrors models.pick_highest_model
 # (Python, unit-tested): among visible dropdown rows, reject Flash-Lite / Pro /
 # Deep-Think FIRST, parse the version (row text is title+desc concatenated, so no
@@ -50171,7 +54864,8 @@ async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) ->
 # empty the menu — but it is never a step-back target, since it cannot be proven
 # older than what just failed.
 _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
-                             nouns, verbs, upsellWindow, dropUpsell}) => {
+                             nouns, verbs, upsellWindow, dropUpsell}) => {""" + _VERSION_ORDER_JS + """
+    const pinK = verKey(pin), belowK = verKey(below);
     const items = [...document.querySelectorAll(
         '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')];
     const famRe = new RegExp(fam, 'i');
@@ -50184,9 +54878,10 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
     // success — a silent downgrade, and `version: null` also disarms the step-back.
     const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
     const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
+    // The matched TEXT, never parseFloat — its worth is `verKey`'s to say.
     const flashVer = t => {
         const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-        return m ? parseFloat(m[1]) : null;
+        return m ? m[1] : null;
     };
     // Character-level port of models.reject_matches — ONE definition of reject
     // semantics, not a second opinion. A term matches at a word boundary on the
@@ -50267,6 +54962,7 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
     // clicking it just shuts the menu while we report a successful pick.
     const trig = (triggerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
     let bestEl = null, best = '', bestRank = null, bestLen = Infinity, bestAdv = false;
+    let bestVer = null;
     const adverts = [];
     for (const el of items) {
         if (!el.offsetParent) continue;
@@ -50296,8 +54992,9 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
         if (dropUpsell && adv) continue;
         const v = flashVer(t);
         if (v === null && !famRe.test(t)) continue;
+        const k = verKey(v);
         let rank;
-        if (pin != null && v !== null && Math.abs(v - pin) <= 0.001) {
+        if (pinK !== null && k !== null && cmpVer(k, pinK) === 0) {
             // ⭐ Exact known-good — outranks everything below, but as a RANK TIER,
             // never a `break`. `items` is a document-wide query returned in
             // document order, so the first element whose text carries the pinned
@@ -50306,21 +55003,23 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
             // model, yet clicked:true is returned and the caller logs a successful
             // pick. Falling through applies the same shortest-text leaf preference
             // the rest of this ranker uses — the same fix as in _pick_opus_js.
-            rank = [2, v];
+            rank = [2, k];
         } else {
-            if (pin != null || below != null) {
+            if (pinK !== null || belowK !== null) {
                 // Step-back: only rows strictly older than what just failed. When a
                 // pin was requested this is the FALLBACK for a pin that is no longer
                 // on the menu — see the same rule in _pick_opus_js.
-                const bound = below != null ? below : pin;
-                if (v === null || v >= bound - 0.001) continue;
+                const bound = belowK !== null ? belowK : pinK;
+                if (k === null || cmpVer(k, bound) >= 0) continue;
             }
-            rank = v === null ? [0, 0] : [1, v];
+            rank = k === null ? [0, []] : [1, k];
         }
-        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
-                || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
+        const d = bestEl === null ? 0 : cmpVer(rank[1], bestRank[1]);
+        if (bestEl === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && d > 0)
+                || (rank[0] === bestRank[0] && d === 0 && t.length < bestLen)) {
             bestEl = el; best = t.slice(0, 40); bestRank = rank; bestLen = t.length;
             bestAdv = adv;
+            bestVer = v;
         }
     }
     if (doClick && bestEl) bestEl.click();
@@ -50328,7 +55027,9 @@ _GEMINI_FLASH_RANK_JS = """({below, doClick, pin, fam, reject, triggerText,
     // `adverts` is a bounded sample for reading the vendor's actual copy back
     // out of a log — 60 chars each so a row's plan phrase survives the slice,
     // 8 rows because that is already more than a Gemini model menu holds.
-    return { pick: best, version: bestRank && bestRank[0] ? bestRank[1] : null,
+    // `version` is the winner's matched TEXT ("3.10"), not its sort key, and
+    // null for a version-less winner (its `v` was null).
+    return { pick: best, version: bestVer,
              clicked: !!(doClick && bestEl),
              advertPick: !!(bestEl && bestAdv), adverts };
 }"""
@@ -51047,6 +55748,23 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
 _CLAUDE_MODEL_TRIGGER_TESTID = "model-selector-dropdown"
 _CLAUDE_EFFORT_TRIGGER_TESTID = "effort-menu-trigger"
 
+# ⭐⭐ 2026-09-23 — THE EFFORT ROW STEP 1C CHOSE, written onto the row itself.
+#
+# The live capture of 2026-09-23 (tests/fixtures/panels/claude_model_popover_
+# 20260923.html) has NO `effort-menu-trigger` test id: the Effort row is a plain
+# `role="menuitem"` inside the `role="menu"` popover. The submenu probe and the
+# row picker both told "the popover" from "the submenu" by that id alone, so on
+# today's page the popover counted as a submenu: the picker searched it first,
+# and the 09-20 log's "no 'max' row in the submenu — rows=[opus 5…, effortlow,
+# more models]" is the POPOVER's rows, not the submenu's. The one line that
+# could have diagnosed the miss described the wrong menu.
+#
+# So the Step 1C marker, which is the one place that decides which row is the
+# Effort row, now also leaves this attribute on it, and the probe and the picker
+# exclude the menu that holds it. One decision, read three times — not a second
+# definition of "the Effort row" that could drift from the first.
+_CLAUDE_EFFORT_ROW_ATTR = "data-sr-effort-row"
+
 
 def _claude_effort_option_testid(effort: str) -> str:
     """The option row's test id for a policy effort word.
@@ -51092,6 +55810,144 @@ def _claude_effort_is_set(*, marked: bool, already: bool,
     if already:
         return True
     return bool(pressed and checked)
+
+
+# ⭐⭐ 2026-09-23 — WHICH EFFORT IS THE RUN ACTUALLY ON? Everything above answers
+# "did we set the tier we wanted". Nothing answered "which tier did we get", so
+# the 09-20 run marked the Effort row as 'effortlow', found no 'max' row, logged
+# "NOT confirmed", and went out at Low with no record anywhere that it was Low.
+# The Effort row in the model popover SHOWS the tier in effect beside its label;
+# these three read it, decide what the page proved, and word it. Pure, so the
+# answer and the words a person reads are tested by calling them.
+
+def _claude_effort_from_row(text) -> "str | None":
+    """The effort tier Claude's Effort row shows: 'effort low' → 'low'.
+
+    Step 1C reads the row with the gap-aware walker (copied from the ChatGPT
+    trigger reader), because `textContent` glues its spans — the 09-20 log has
+    'effortlow' — and a value rendered as two spans ('High' + 'Default', the
+    captured default rung) only separates when the walker supplies the gaps.
+    The tier is the word AFTER "effort". A row that is ONE text node
+    ('EffortLow': no element boundary for the walker to see) is read by prefix.
+    Icon-font glyphs and punctuation split words like spaces do.
+
+    No tier list on purpose: this reports what the row SAYS, and the caller
+    compares it with what was wanted. None when the row names no tier."""
+    words = [w for w in re.split(r"[^a-z0-9]+", str(text or "").lower()) if w]
+    for i, w in enumerate(words):
+        if w == "effort":
+            return words[i + 1] if i + 1 < len(words) else None
+        if w.startswith("effort"):
+            return w[len("effort"):]
+    return None
+
+
+def _claude_effort_in_effect(*, confirmed: bool, wanted, row_shows,
+                             pressed: bool) -> "str | None":
+    """The effort tier the run is on, as far as the page PROVED it. None when
+    nothing proved one.
+
+      * `confirmed` — the wanted tier was read off the trigger, or set in the
+                      submenu and read back as selected: that tier.
+      * `pressed`   — a press on an option landed and did NOT read back as
+                      selected. The row was read BEFORE that press, so what it
+                      showed may no longer be true — unknown, never a guess.
+      * otherwise   — what the Effort row showed; nothing here changed it.
+    """
+    if confirmed:
+        return str(wanted or "").strip().lower() or None
+    if pressed:
+        return None
+    return row_shows or None
+
+
+def _claude_effort_row_confirms(row_shows, wanted) -> bool:
+    """Does the Effort row ALREADY show the tier we want? Then there is nothing
+    to set, and the submenu stays shut.
+
+    ⭐ 2026-09-23. The live capture shows the popover's Effort row carrying the
+    tier in effect beside its label ("Effort" + "Max"), the same fact the model
+    button carries when it reads "Opus 5 Max" — and a trigger read of that is
+    already trusted to skip the whole popover. Reading it one level down means
+    today's page, which shows Max, is confirmed WITHOUT pressing into a submenu
+    whose markup has never been captured.
+
+    ⛔ Only a POSITIVE read confirms. An unread row, or one showing another tier,
+    falls through to the submenu exactly as before; nothing here can turn a miss
+    into a confirmation. And no wanted tier means nothing to confirm."""
+    w = str(wanted or "").strip().lower()
+    return bool(w) and str(row_shows or "").strip().lower() == w
+
+
+def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict:
+    """What the post-setup telemetry line says about Claude's effort, once the
+    computer-use pass has run.
+
+    ⭐ 2026-09-23. That line used to say "unconfirmed (max effort)" whenever the
+    DOM setup had not confirmed the tier — even when setup had READ the tier in
+    effect ('low') and recorded it, and even when the computer-use pass had since
+    set it. It is written just before the brief is sent, so it can say both:
+
+      * `state["effort"]`       — setup confirmed the wanted tier: nothing to add.
+      * `button_shows_wanted`   — the pre-send read of the model button (taken
+                                  AFTER the computer-use pass) shows the wanted
+                                  tier: it was set after setup. A note, no miss.
+      * `state["effort_got"]`   — the tier setup read and could not change: named.
+      * otherwise               — unknown, worded exactly as before, so the model
+                                  refresh report keeps counting it.
+
+    Returns {"missing": clause for the "unconfirmed (…)" list or None,
+             "note": a line to log or None}.
+    ⛔ No parentheses in a clause: the report reads the list up to the first ')'.
+    """
+    w = str(wanted or "").strip().lower()
+    st = state if isinstance(state, dict) else {}
+    if not w or st.get("effort"):
+        return {"missing": None, "note": None}
+    if button_shows_wanted:
+        return {"missing": None,
+                "note": (f"effort '{w}' now shows on the model button — set after "
+                         f"setup, by the computer-use pass")}
+    got = str(st.get("effort_got") or "").strip().lower()
+    if got == w:
+        return {"missing": None, "note": None}
+    if got:
+        return {"missing": f"effort is '{got}', not the '{w}' wanted", "note": None}
+    return {"missing": f"{w} effort", "note": None}
+
+
+def _claude_effort_report(wanted, got) -> dict:
+    """What the run says about its effort tier: the log line (and its level),
+    the DOM-ledger detail, and the caption a person sees on Claude's tile.
+
+    ⛔ THE CAPTION IS ONLY FOR A TIER THAT WAS READ AND IS NOT THE ONE WANTED.
+    An unread tier goes to the log and the ledger, never to the person: "could
+    not confirm the effort" on nearly every run is the false alarm the
+    2026-06-22 decision took out of their view.
+
+    ⛔ A CAPTION, NOT AN ALERT, for the reason `_report_claude_plan_limit` gives:
+    a fact the run cannot change, not a question for the person. And not a
+    lasting notice either — the computer-use pass that runs after this may still
+    set the tier, and a notice that outlived that would be false. The log line
+    and the end-of-run `[dom-summary]` are the durable record."""
+    w = str(wanted or "").strip().lower()
+    g = str(got or "").strip().lower()
+    if g and (g == w or not w):
+        return {"log": f"effort in effect: '{g}'", "level": "INFO",
+                "detail": f"the Effort row shows '{g}'", "notice": None}
+    if not g:
+        return {"log": (f"effort in effect: unknown — wanted '{w}', and the page "
+                        f"did not show which tier the run is on"),
+                "level": "WARN",
+                "detail": (f"tier left as it was; wanted '{w}' — the answer may "
+                           f"be weaker than the run reports"),
+                "notice": None}
+    return {"log": f"effort in effect: '{g}' — wanted '{w}', which could not be set",
+            "level": "WARN",
+            "detail": (f"tier is '{g}', not the '{w}' wanted — the answer may be "
+                       f"weaker than the run reports"),
+            "notice": (f"Claude is researching at {g.capitalize()} effort — "
+                       f"{w.capitalize()} could not be set")}
 
 
 def _claude_validator_effort_ok(thinking_state) -> bool:
@@ -51178,6 +56034,9 @@ _CLAUDE_TRIGGER_EXPANDED_JS = r"""(P) => {
 # amount of sidebar can crowd the answer out. Same scoping rule Step 1C' already
 # uses to PICK the row: the submenu is the visible menu that does NOT contain the
 # Effort trigger; the parent popover carries its own 'EffortMax' row.
+# ⚠ 2026-09-23: "contains the Effort trigger" is read by the test id OR by
+# `P.rowAttr`, the mark Step 1C left on the row. Today's page has no test id, and
+# without the mark the popover alone read as 'maybe' rather than 'closed'.
 _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
     // Icon-font ligatures live in the private-use area and are invisible in a
     // screenshot but present in text — strip them before comparing, exactly as
@@ -51203,8 +56062,12 @@ _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
         const labels = rows.map(e => norm(e.textContent))
                            .filter(t => t && t.length <= 24);
         out.overlays.push({
-            trigger: !!(P.trigTestid &&
-                        c.querySelector('[data-testid="' + P.trigTestid + '"]')),
+            // The parent popover: the menu holding the Effort row — by its old
+            // test id, or by the attribute Step 1C's marker wrote on the row it
+            // chose (today's page has no test id; see _CLAUDE_EFFORT_ROW_ATTR).
+            trigger: !!((P.trigTestid &&
+                         c.querySelector('[data-testid="' + P.trigTestid + '"]'))
+                        || (P.rowAttr && c.querySelector('[' + P.rowAttr + ']'))),
             option: !!(P.optTestid &&
                        c.querySelector('[data-testid="' + P.optTestid + '"]')),
             rungs: labels.filter(isRung).length,
@@ -51845,7 +56708,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
     # (Step 1A FAIL, Step 1B FAIL, the outer except). A stale entry from a
     # PREVIOUS run would then be read as "the version that just failed" by the
     # step-back path and steer the retry off a number from another run.
+    # ⛔ The effort state too, for the same reason: it is written only once
+    # setup reaches its end, so a setup that returns early left the LAST run's
+    # tier in place, and the pre-send line and caption named a tier this run
+    # never read.
     _P2_PICKED_VERSION.pop("claude", None)
+    _P2_THINKING_STATE.pop("claude", None)
     try:
         await asyncio.sleep(2)
 
@@ -51954,7 +56822,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # "the FOURTH parsing site and the easiest to forget", whose answer
         # decides whether an upgrade fires. Two copies drifting is not a
         # hypothetical here; it is the failure this file keeps recording.
-        _TRIGGER_READ_JS = """({effortWord, fam}) => {
+        _TRIGGER_READ_JS = """({effortWord, fam}) => {""" + _VERSION_ORDER_JS + """
             const famRe = new RegExp(fam, 'i');
             // The SAME two-order, adjacency-bounded parse as the picker and the
             // probe. This is the FOURTH parsing site and the easiest to forget:
@@ -51965,9 +56833,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             // upgrade re-fires on every single run.
             const verFamFirst = new RegExp(fam + '[ ._/()-]{0,3}([0-9]+(?:\\\\.[0-9]+)?)', 'i');
             const verNumFirst = new RegExp('([0-9]+(?:\\\\.[0-9]+)?)[ ._/()-]{0,3}' + fam, 'i');
+            // The matched TEXT, never parseFloat — see _VERSION_ORDER_JS.
             const verOf = t => {
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-                return m ? parseFloat(m[1]) : null;
+                return m ? m[1] : null;
             };
             // An upsell chip ("Try Opus 6", "Upgrade to Opus") names the family
             // and a version without being the selected model. Reading one as the
@@ -51993,11 +56862,14 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const tid = (b.getAttribute('data-testid') || '').toLowerCase();
                 return a.includes('model') || tid.includes('model');
             };
-            let best = null, bestText = '', famOnly = '';
+            let best = null, bestK = null, bestText = '', famOnly = '';
             for (const b of btns) {
                 const t = b.textContent || '';
                 const v = verOf(t);
-                if (v !== null && (best === null || v > best)) { best = v; bestText = t; }
+                const k = verKey(v);
+                if (k !== null && (bestK === null || cmpVer(k, bestK) > 0)) {
+                    best = v; bestK = k; bestText = t;
+                }
                 // Family word with NO version: the day the platform drops version
                 // numbers from the label, this is the only evidence the family is
                 // selected. Shortest such button wins (a leaf, not a wrapper).
@@ -52063,6 +56935,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # Carried so the single intent record at the end of this function can tell
         # a correct skip from a real verification, which the boolean alone cannot.
         _effort_via = ""
+        # ⭐ 2026-09-23 — what the Effort row SHOWED when Step 1C found it (the
+        # tier in effect before anything here touched it: 'low' on the 09-20
+        # run), and whether a press on an effort OPTION landed after that read,
+        # which makes the read stale. See `_claude_effort_in_effect`.
+        _eff_row_shows = None
+        _eff_option_pressed = False
         if model_ok:
             # Model already correct — record it but DO NOT re-pick (the #744
             # re-click loop). We still open the popover below for Effort/Thinking.
@@ -52084,7 +56962,8 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # version". A family row with NO version is a valid last-resort candidate
         # (a version-less rename must not empty the menu), but it is never a
         # step-back target — we cannot prove it is below what just failed.
-        _pick_opus_js = """({pin, below, fam, triggerText, verbs, upsellWindow}) => {
+        _pick_opus_js = """({pin, below, fam, triggerText, verbs, upsellWindow}) => {""" + _VERSION_ORDER_JS + """
+            const pinK = verKey(pin), belowK = verKey(below);
             const vis = el => el.getClientRects().length > 0;
             const famRe = new RegExp(fam, 'i');
             // ⭐ BOTH VERSION ORDERS, deliberately — see models.parse_family_version,
@@ -52104,9 +56983,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
             const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            // The matched TEXT, never parseFloat — see _VERSION_ORDER_JS.
             const verOf = t => {
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-                return m ? parseFloat(m[1]) : null;
+                return m ? m[1] : null;
             };
             // Character-level port of models.is_upsell — ONE definition of what
             // a sales prompt looks like, not a second opinion. "Upgrade to Opus"
@@ -52163,7 +57043,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             // would happily treat the TRIGGER BUTTON as a row and click it,
             // which just toggles the popover shut while reporting success.
             const trig = norm(triggerText);
-            let best = null, bestRank = null, bestLen = Infinity;
+            let best = null, bestRank = null, bestLen = Infinity, bestVer = null;
             for (const el of items) {
                 const t = (el.textContent || '').trim();
                 if (trig && norm(t) === trig) continue;        // never click the trigger
@@ -52175,8 +57055,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const v = verOf(t);
                 const isFam = v !== null || famRe.test(t);
                 if (!isFam) continue;
+                const k = verKey(v);
                 let rank;
-                if (pin != null && v !== null && Math.abs(v - pin) <= 0.001) {
+                if (pinK !== null && k !== null && cmpVer(k, pinK) === 0) {
                     // ⭐ Exact known-good — outranks every other candidate, but as a
                     // RANK TIER, never a `break`. `items` is document order,
                     // ancestors first, so the FIRST element carrying the pinned
@@ -52186,9 +57067,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     // truthy and the caller logs an upgrade and records a known-good.
                     // Falling through keeps the shortest-text leaf preference the
                     // rest of this function already applies.
-                    rank = [2, v];
+                    rank = [2, k];
                 } else {
-                    if (pin != null || below != null) {
+                    if (pinK !== null || belowK !== null) {
                         // ⭐ A PIN THAT IS NO LONGER ON THE MENU MUST NOT PARK THE RUN.
                         // The learned known-good has no expiry, so weeks later the
                         // platform may have retired it. Treating "exact pin absent"
@@ -52196,22 +57077,25 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // and sent the leg to the chat-mode gate — losing the retry
                         // this whole path exists to provide. Fall back to the same
                         // strictly-older rule the no-history route uses.
-                        const bound = below != null ? below : pin;
-                        if (v === null || v >= bound - 0.001) continue;
+                        const bound = belowK !== null ? belowK : pinK;
+                        if (k === null || cmpVer(k, bound) >= 0) continue;
                     }
-                    // Any version outranks no version; then higher wins; tie → shorter
-                    // text (a leaf menu item, not a wrapper listing several models).
-                    rank = v === null ? [0, 0] : [1, v];
+                    // Any version outranks no version; then higher wins (by ORDER:
+                    // 5.10 above 5.9); tie → shorter text (a leaf menu item, not a
+                    // wrapper listing several models).
+                    rank = k === null ? [0, []] : [1, k];
                 }
-                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && rank[1] > bestRank[1])
-                        || (rank[0] === bestRank[0] && rank[1] === bestRank[1] && t.length < bestLen)) {
-                    best = el; bestRank = rank; bestLen = t.length;
+                const d = best === null ? 0 : cmpVer(rank[1], bestRank[1]);
+                if (best === null || rank[0] > bestRank[0] || (rank[0] === bestRank[0] && d > 0)
+                        || (rank[0] === bestRank[0] && d === 0 && t.length < bestLen)) {
+                    best = el; bestRank = rank; bestLen = t.length; bestVer = v;
                 }
             }
             if (best) {
                 best.click();
+                // The winner's matched TEXT ("5.10"); null for a version-less row.
                 return { label: best.textContent.trim().slice(0, 60),
-                         version: bestRank[0] === 0 ? null : bestRank[1] };
+                         version: bestVer };
             }
             return null;
         }"""
@@ -52225,7 +57109,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # already have" — so a popover that mounts a beat slowly would report
         # "nothing newer" and, under the weekly cadence, burn the whole interval's
         # check on a no-op. `menu` tells the caller whether the answer is real.
-        _probe_opus_js = """({fam, verbs, upsellWindow}) => {
+        _probe_opus_js = """({fam, verbs, upsellWindow}) => {""" + _VERSION_ORDER_JS + """
             const vis = el => el.getClientRects().length > 0;
             // Same two-order parse as the picker — they must agree on what a row
             // is worth. A probe that could not read the renamed order would report
@@ -52244,9 +57128,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             const seen = new Set();
             const items = menus.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
                 .filter(el => vis(el) && !seen.has(el) && seen.add(el));
+            // The matched TEXT, never parseFloat — see _VERSION_ORDER_JS.
             const verOf = t => {
                 const m = (t || '').match(verFamFirst) || (t || '').match(verNumFirst);
-                return m ? parseFloat(m[1]) : null;
+                return m ? m[1] : null;
             };
             // Same port, same reason, as the picker's — and it has to be here
             // too or the two disagree in the one direction that costs a run
@@ -52302,7 +57187,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             // did nothing on that markup. A count that is right about the number
             // and blind to the fact is worse than no count: the fact is the part
             // a decision rests on.
-            let n = 0, highest = null, chips = 0, chipsAny = false;
+            let n = 0, highest = null, highK = null, chips = 0, chipsAny = false;
             for (const el of items) {
                 const raw = (el.textContent || '').trim();
                 if (isUpsell(raw)) {
@@ -52318,8 +57203,10 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 const v = verOf(raw);
                 if (v === null) continue;
                 n += 1;
-                if (highest === null || v > highest) highest = v;
+                const k = verKey(v);
+                if (highK === null || cmpVer(k, highK) > 0) { highest = v; highK = k; }
             }
+            // `highest` is the matched TEXT ("5.10"), compared by ORDER above.
             return {menu: true, n: n, highest: highest, chips: chips, chipsAny: chipsAny};
         }"""
 
@@ -52544,9 +57431,16 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     # `model_trigger_ver` is None on a version-less label; any
                     # numbered row then counts as newer (we can't compare, and a
                     # named version is the more specific choice).
-                    _cur = model_trigger_ver if isinstance(model_trigger_ver, (int, float)) else None
-                    if isinstance(_offered, (int, float)) and (
-                            _cur is None or _offered > _cur + 0.001):
+                    # ⛔ Compared by ORDER (models.version_key), not as floats and
+                    # not through a numbers-only gate. The page scripts return the
+                    # matched TEXT ("5.10"): a numbers-only gate reads every one of
+                    # them as "nothing offered" and the weekly upgrade goes quiet
+                    # for good, and as floats a computer on 5.10 read 5.1 and was
+                    # "upgraded" DOWN to 5.5 on every probe.
+                    _cur_k = version_key(model_trigger_ver)
+                    _off_k = version_key(_offered)
+                    _cur = model_trigger_ver if _cur_k is not None else None
+                    if _off_k is not None and (_cur_k is None or _off_k > _cur_k):
                         # Select it through the ONE picker that exists, stepping
                         # everything below the newer version out of contention.
                         _up = await page.evaluate(
@@ -52663,6 +57557,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     for (const el of document.querySelectorAll('[' + P.attr + ']')) {
                         el.removeAttribute(P.attr);
                     }
+                    // The row mark from an EARLIER pass must not name a row now:
+                    // the probe and the picker exclude whatever menu holds it.
+                    if (P.rowAttr) {
+                        for (const el of document.querySelectorAll('[' + P.rowAttr + ']')) {
+                            el.removeAttribute(P.rowAttr);
+                        }
+                    }
                     // Icon-font ligatures land in the private-use area: they are
                     // invisible on screen but present in text, and they are why the
                     // log read the row as 'effortmax' plus a stray glyph. It also
@@ -52670,11 +57571,43 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     const norm = s => (s || '')
                         .replace(/[\\ue000-\\uf8ff]/g, ' ')
                         .replace(/\\s+/g, ' ').trim().toLowerCase();
+                    // ⭐ 2026-09-23 — THE ROW READ THE WAY IT IS RENDERED. The
+                    // Effort row carries the tier in effect as its own span
+                    // ("Effort" + "Low"), and `textContent` glues them: the
+                    // 09-20 log says 'effortlow'. Copied, unchanged, from the
+                    // ChatGPT trigger reader (`_CHATGPT_MODEL_TRIGGER_JS`),
+                    // which explains why `innerText` is not the answer either:
+                    // walk the tree and put a gap at every element boundary.
+                    const spaced = el => {
+                        let out = '';
+                        const walk = n => {
+                            for (const c of n.childNodes || []) {
+                                if (c.nodeType === 3) out += c.nodeValue || '';
+                                else if (c.nodeType === 1) { out += ' '; walk(c); out += ' '; }
+                            }
+                        };
+                        walk(el);
+                        // Fall back to textContent for a node the walk cannot read — a glued
+                        // label still beats no label, and every caller tolerates a miss.
+                        return norm(out) || norm(el.textContent);
+                    };
                     const linky = el => (el.tagName === 'A' && el.getAttribute('href'))
                         || (el.closest && el.closest('a[href]'))
                         || (el.querySelector && el.querySelector('a[href]'));
                     const rejected = [];
                     let trigger = null, via = '';
+                    // ⭐⭐ 2026-09-23 — INSIDE AN OPEN MENU, NEVER ANYWHERE ON THE
+                    // PAGE. The comment above asked for container-scoping and
+                    // said it needed a capture. The 2026-09-23 capture settles
+                    // it: the Effort row is a `role="menuitem"` inside the
+                    // `role="menu"` popover, and it no longer carries the
+                    // 08-17 test id — so every run since fell through to the
+                    // text search below, which walked the DOCUMENT in order, and
+                    // the sidebar comes first. Both searches now look only inside
+                    // visible menus: a sidebar conversation, a markdown bullet or
+                    // a button elsewhere on the page cannot be the row pressed.
+                    const menus = [...document.querySelectorAll('[role="menu"]')]
+                        .filter(m => m.getClientRects().length > 0);
                     // ⭐⭐ 2026-08-17 — THE TEST ID, FIRST. The comment below asked
                     // for "container-scoping … it needs a live claude.ai capture
                     // we do not have". The capture arrived, and it is better than
@@ -52684,27 +57617,33 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     // prefix, no length bound, no anchor arms, nothing that a
                     // sidebar conversation or a markdown bullet can satisfy.
                     if (P.testid) {
-                        for (const el of document.querySelectorAll(
-                                '[data-testid="' + P.testid + '"]')) {
-                            if (!el.getClientRects().length) continue;
-                            trigger = el; via = 'testid'; break;
+                        for (const m of menus) {
+                            for (const el of m.querySelectorAll(
+                                    '[data-testid="' + P.testid + '"]')) {
+                                if (!el.getClientRects().length) continue;
+                                trigger = el; via = 'testid'; break;
+                            }
+                            if (trigger) break;
                         }
                     }
-                    // The text search stays as the FALLBACK, unchanged, for an
-                    // older layout that predates the id. It keeps its guards: they
-                    // are what make it survivable, and it is now reached only when
-                    // the exact hook is absent.
+                    // The text search stays as the FALLBACK for a layout without
+                    // the id — which, since 2026-09-23, is today's. It keeps its
+                    // guards: a menu can hold a link, and the length bound still
+                    // separates a row from prose.
                     if (!trigger) {
-                        for (const el of document.querySelectorAll(
-                                '[role="menuitem"], button, [role="option"], li')) {
-                            if (!el.getClientRects().length) continue;
-                            const t = norm(el.textContent);
-                            if (!t.startsWith('effort')) continue;
-                            // The Effort row shows its current value + a submenu chevron.
-                            if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }
-                            if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }
-                            trigger = el; via = 'text';
-                            break;
+                        for (const m of menus) {
+                            for (const el of m.querySelectorAll(
+                                    '[role="menuitem"], button, [role="option"], li')) {
+                                if (!el.getClientRects().length) continue;
+                                const t = norm(el.textContent);
+                                if (!t.startsWith('effort')) continue;
+                                // The Effort row shows its current value + a submenu chevron.
+                                if (linky(el)) { rejected.push(['link', t.slice(0, 60)]); continue; }
+                                if (t.length > 40) { rejected.push(['long', t.slice(0, 60)]); continue; }
+                                trigger = el; via = 'text';
+                                break;
+                            }
+                            if (trigger) break;
                         }
                     }
                     // ⭐ 2026-08-17 — THE ANCESTRY IS CAPTURED **HERE**, while the
@@ -52738,27 +57677,53 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     };
                     if (trigger) {
                         trigger.setAttribute(P.attr, P.value);
+                        // Left on the row for the submenu probe and the picker:
+                        // the menu holding it is the popover, not the submenu.
+                        if (P.rowAttr) trigger.setAttribute(P.rowAttr, '1');
                         const chain = [];
                         for (let el = trigger, i = 0; el && i < 8; i++, el = el.parentElement) {
                             chain.push(desc(el));
                         }
                         return {marked: true, via: via,
                                 text: norm(trigger.textContent).slice(0, 60),
-                                chain: chain,
+                                shows: spaced(trigger).slice(0, 60),
+                                chain: chain, menus: menus.length,
                                 rejected: rejected.slice(0, 5)};
                     }
                     return {marked: false, via: '', text: '', chain: [],
-                            rejected: rejected.slice(0, 5)};
+                            menus: menus.length, rejected: rejected.slice(0, 5)};
                 }""", {"attr": _SR_CLICK_MARK, "value": "claude-effort",
-                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID}) or {}
+                       "testid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                       "rowAttr": _CLAUDE_EFFORT_ROW_ATTR}) or {}
                 _eff_marked = bool(_eff_mark.get("marked"))
+                # The tier the row SHOWS — the one in effect before anything
+                # below touches it. Read from the gap-aware text (`shows`).
+                _eff_row_shows = _claude_effort_from_row(_eff_mark.get("shows"))
                 if _eff_mark.get("rejected"):
                     log(f"[setup_claude_dr] Step 1C: refused "
                         f"{len(_eff_mark['rejected'])} 'Effort…' candidate(s) — "
                         f"{json.dumps(_eff_mark['rejected'], ensure_ascii=False)}", "INFO")
                 # 'open' | 'maybe' | 'closed' — see `_claude_effort_submenu_verdict`.
                 _eff_state, _eff_opened = "closed", False
-                if _eff_marked:
+                # ⭐⭐ 2026-09-23 — THE ROW ALREADY SHOWS THE TIER: NOTHING TO SET.
+                # Today's page reads "Effort Max" on this row. Pressing into the
+                # submenu to "set" Max would run a picker against markup nobody
+                # has captured, for a tier that is already in effect — and that
+                # picker's miss is what made every run report Max unconfirmed.
+                # See `_claude_effort_row_confirms`: only a positive read counts.
+                # ⛔ Not when the policy wants the Thinking toggle: it lives INSIDE
+                # the submenu, so the submenu has work to do whatever the row says.
+                if _eff_marked and not _claude_wants_thinking \
+                        and _claude_effort_row_confirms(_eff_row_shows, _claude_effort):
+                    _effort_confirmed = True
+                    _effort_via = "row"
+                    log(f"[setup_claude_dr] Step 1C OK: the Effort row already shows "
+                        f"{_eff_row_shows!r} — nothing to set, the submenu stays shut")
+                    try:
+                        await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+                    except Exception:
+                        pass
+                elif _eff_marked:
                     log(f"[setup_claude_dr] Step 1C: marked the Effort row "
                         f"{_eff_mark.get('text','')!r} (via {_eff_mark.get('via')})")
                     _how = await _sr_real_click(page, "claude-effort",
@@ -52785,6 +57750,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             _eff_probe = await page.evaluate(
                                 _CLAUDE_EFFORT_SUBMENU_JS,
                                 {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                                 "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,
                                  "optTestid": _claude_effort_option_testid(
                                      _claude_effort)}) or {}
                         except Exception:
@@ -52989,8 +57955,15 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         // it — the same "chose the wrong sink" shape as the gate
                         // above. Falls back to the newest menu, then the document,
                         // so an older UI without the test id still resolves.
+                        // ⭐⭐ 2026-09-23 — OR THE ROW STEP 1C MARKED. Today's page
+                        // has no trigger test id, so on its own this let the
+                        // popover through as a "submenu": it was searched FIRST,
+                        // and the 09-20 miss reported the popover's rows
+                        // ("opus 5…", "effortlow", "more models") as the
+                        // submenu's. See _CLAUDE_EFFORT_ROW_ATTR.
                         const cands = menus.filter(m =>
-                            !m.querySelector('[data-testid="' + P.trigTestid + '"]'));
+                            !m.querySelector('[data-testid="' + P.trigTestid + '"]')
+                            && !(P.rowAttr && m.querySelector('[' + P.rowAttr + ']')));
                         // ⛔ 2026-08-17 — NO FALLBACK INTO THE TRIGGER'S OWN MENU.
                         // This used to end `|| menus[menus.length - 1]`, which is
                         // reached in exactly one situation: every visible menu
@@ -53055,10 +58028,26 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             if (hit) { pick = hit; scope = c; items = rows; break; }
                         }
                         if (!pick) {
+                            // ⭐ 2026-09-23 — A MISS NAMES THE SUBMENU'S OWN ROWS,
+                            // long ones included (cut, not dropped). The submenu's
+                            // markup has never been captured, and a row that carries
+                            // a description, as every model row on the popover does,
+                            // is longer than the 24 characters this used to keep —
+                            // so the one log line that could say what the submenu
+                            // offers came back empty. Rows only (no wrapper divs),
+                            // and only from a MENU: the document pool keeps the
+                            // short-label rule, because there a long text is the
+                            // user's own conversation.
+                            const fromMenu = pools.length > 0 && pools[0] !== document;
+                            const saw = fromMenu
+                                ? [...pools[0].querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], button, li')]
+                                    .filter(el => el.getClientRects().length > 0)
+                                    .map(el => norm(el.textContent).slice(0, 40)).filter(Boolean)
+                                : items.map(el => norm(el.textContent))
+                                    .filter(t => t && t.length <= 24);
                             return {set: null, scoped: cands.length > 0,
                                     menus: menus.length, cands: cands.length,
-                                    saw: items.map(el => norm(el.textContent))
-                                        .filter(t => t && t.length <= 24).slice(0, 10)};
+                                    saw: saw.slice(0, 10)};
                         }
                         const already = pick.getAttribute('aria-checked') === 'true' ||
                                         pick.dataset.state === 'checked' || pick.dataset.state === 'on';
@@ -53084,6 +58073,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                 scoped: scope !== document, menus: menus.length,
                                 cands: cands.length};
                     }""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
+                           "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,
                            "optTestid": _claude_effort_option_testid(_claude_effort),
                            "word": str(_claude_effort or "").lower(),
                            "attr": _SR_CLICK_MARK,
@@ -53112,6 +58102,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     if _eff_set and not _eff_already:
                         _eff_pressed = bool(await _sr_real_click(
                             page, "claude-effort-option", tag="[setup_claude_dr]"))
+                        _eff_option_pressed = _eff_pressed
                         if _eff_pressed:
                             await asyncio.sleep(0.4)
                             _eff_ok = {}
@@ -53148,10 +58139,17 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             f"{_claude_effort!r} was NOT confirmed in the submenu "
                             f"— the run proceeds at whatever the model's default "
                             f"is, and reports it as unconfirmed", "WARN")
-                elif not _effort_already_known:
-                    log("[setup_claude_dr] Step 1C WARN: Effort control not found "
-                        "(the popover closes when a model is picked — it should "
-                        "have been re-opened above) — reported as unconfirmed", "WARN")
+                elif not _effort_confirmed and not _eff_marked:
+                    # ⚠ `_effort_confirmed`, not `_effort_already_known`: the row
+                    # read above confirms without opening anything, and a WARN
+                    # about a control we chose not to press would be false.
+                    # ⚠ And only when NO row was marked: a row that was found and
+                    # pressed without a submenu mounting has its own WARN above,
+                    # and "not found" after it is a wrong diagnosis.
+                    log(f"[setup_claude_dr] Step 1C WARN: Effort control not found "
+                        f"in the {_eff_mark.get('menus', 0)} open menu(s) (the popover "
+                        f"closes when a model is picked — it should have been "
+                        f"re-opened above) — reported as unconfirmed", "WARN")
             except Exception as _ee:
                 log(f"[setup_claude_dr] Step 1C/1D errored: {_ee}", "WARN")
             await asyncio.sleep(0.3)
@@ -53388,7 +58386,21 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # Phoenix model_refresh — record the advisory thinking/effort state for
         # the caller's soft notice (NOT part of the success contract — model +
         # research remain the only hard gates).
-        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed}
+        # ⭐ 2026-09-23 — AND WHICH TIER THE RUN IS ON, said in the log, in the
+        # ledger below and, when it was read and is not the one wanted, on
+        # Claude's tile. A Low run says Low. See `_claude_effort_report`.
+        # ⛔ NOT ON THE TILE FROM HERE. The computer-use pass that runs after
+        # this is told to set the tier, so a caption posted now said "Low — Max
+        # could not be set" for minutes after that pass had set Max. The caption
+        # goes up in `start_agent_no_gemini_wait`, once that pass has run and
+        # the model button has been read again.
+        _effort_got = _claude_effort_in_effect(
+            confirmed=_effort_confirmed, wanted=_claude_effort,
+            row_shows=_eff_row_shows, pressed=_eff_option_pressed)
+        _eff_report = _claude_effort_report(_claude_effort, _effort_got)
+        log(f"[setup_claude_dr] {_eff_report['log']}", _eff_report["level"])
+        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed,
+                                        "effort_got": _effort_got}
         # ⭐⭐ 2026-08-06 — Claude's effort tier had NO entry in the run's DOM-intent
         # ledger while ChatGPT's model pill did, so when the Effort submenu failed
         # to mount the run carried on with whatever tier was already set and the
@@ -53404,9 +58416,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             "claude.select_effort_tier",
             _claude_effort_outcome(_effort_confirmed, _effort_via),
             phase=2, via=(_effort_via or "none"),
-            detail=("" if _effort_confirmed else
-                    f"tier left as it was; wanted '{_claude_effort}' — the "
-                    f"answer may be weaker than the run reports"))
+            detail=("" if _effort_confirmed else _eff_report["detail"]))
         # Record the selected model version for on-the-fly known-good learning.
         # ⚠ PREFER THE PICK. The trigger read is a page-wide max over every
         # visible button, so an upsell chip naming a model the account cannot
@@ -53414,9 +58424,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # later fallback — a poisoned value that outlives the run. A version we
         # clicked in the menu is ground truth; the trigger is only the backstop
         # for the path where nothing was picked because nothing needed picking.
+        # ⛔ "Is it a version" is `version_key`'s question, not `isinstance(…,
+        # float)`: the picker returns TEXT, and a numbers-only gate would throw
+        # every real pick away and fall through to re-parsing the label.
         _P2_PICKED_VERSION["claude"] = (
             _picked_version
-            if isinstance(_picked_version, (int, float))
+            if version_key(_picked_version) is not None
             else (parse_family_version(opus_selected or "", _claude_family)
                   or (model_trigger_ver if model_ok else None)))
         # Success only when all three critical knobs are in place
@@ -54939,9 +59952,13 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             log(f"[{label}] Claude DR pre-send check: active={ok} reactivate={reactivate}"
                 f" extended={bool(state.get('hasExtended'))}"
                 f" research={bool(state.get('researchOn'))}", "DEBUG")
+            # `effortOk` is REPORTED, never gated on (see the detector): it is the
+            # only read of the effort taken AFTER the computer-use pass, and the
+            # post-setup telemetry line uses it to say what that pass left.
             return {"platform": "claude", "active": ok,
                     "hasExtended": bool(state.get("hasExtended")),
-                    "researchOn": bool(state.get("researchOn"))}
+                    "researchOn": bool(state.get("researchOn")),
+                    "effortOk": bool(state.get("effortOk"))}
     except Exception as e:
         log(f"[{label}] ensure_deep_mode_active error: {e}", "WARN")
     return {"platform": platform_l, "active": True}
@@ -56709,12 +61726,22 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
     # body actually holds our brief. Never adopt an entry we can't prove is ours.
     _owned = [_t for _t in _titles if _gemini_owns_candidate(_t, pasted_head)]
     if not _owned:
-        log(f"[{label}] top recent sidebar chats {[t[:40] for t in _titles]} do NOT "
+        # ⛔⛔ THE LENGTHS, NEVER THE TITLES — see `_log_job_ref`. A sidebar entry
+        # is another member's chat and its title is their research subject; this
+        # line goes to the machine-wide `backend.log`, whose tail ships in the
+        # OWNER's support bundle. Measured 2026-09-22 in this owner's live log.
+        # What this line is read for is "how many did we see and did the
+        # ownership gate reject all of them", and the lengths distinguish an
+        # empty entry from a real one.
+        log(f"[{label}] top {len(_titles)} recent sidebar chat(s) "
+            f"({[len(t) for t in _titles]} chars) do NOT "
             "match our brief — not adopting (won't hijack a past run)", "WARN")
         return page, False
     for _ci, _cand_title in enumerate(_owned):
-        log(f"[{label}] opening owned sidebar chat '{_cand_title[:60]}' "
-            f"({_ci + 1}/{len(_owned)}) from the sidebar", "WARN")
+        # ⛔ NO TITLE — same reason. The candidate's INDEX is what the attempts
+        # below and the adopt/abandon lines are followed by.
+        log(f"[{label}] opening owned sidebar chat #{_ci + 1}/{len(_owned)} "
+            f"({len(_cand_title)} chars) from the sidebar", "WARN")
         # 2026-07-19 e2e: ONE click + one 15s route-wait abandoned adoption of
         # the CORRECT sole candidate — the wedged SPA (the same platform state
         # that dropped our send and left us on the bare /app home) silently ate
@@ -56738,7 +61765,10 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
                 _before_u = ""
             try:
                 if not await page.evaluate(_CLICK_ENTRY_BY_TITLE_JS, _cand_title):
-                    log(f"[{label}] sidebar entry '{_cand_title[:40]}' vanished before open — trying next", "WARN")
+                    # ⛔ NO TITLE — see `_log_job_ref`. The index names the same
+                    # candidate the line above opened.
+                    log(f"[{label}] sidebar entry #{_ci + 1} ({len(_cand_title)} chars) "
+                        "vanished before open — trying next", "WARN")
                     _entry_gone = True
                     break
             except Exception:
@@ -56908,7 +61938,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     #   /new IS Claude's canonical fresh composer (cheaper than a
                     #   fresh tab + a second authenticated surface).
                     # Gemini: url == https://gemini.google.com — a bare /app load
-                    #   re-triggers Layer 0.6 below (@~34135), which force-New-
+                    #   re-triggers Layer 0.6 below, which force-New-
                     #   chats any /app/<id> so we always land on a clean composer.
                     # Both: a same-tab nav on the warm, challenge-passed tab
                     #   AVOIDS a scored cold top-level navigation.
@@ -57358,21 +62388,30 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 _kg = p2_known_good(platform_l, _step_fam)
             except Exception:
                 _kg = None      # a malformed overlay must never kill the retry
-            _failed_f = float(_failed) if isinstance(_failed, (int, float)) else None
+            # ⛔⛔ BY VERSION ORDER, AND TEXT GETS THROUGH (2026-09-23). The
+            # rankers return the matched text ("5.10") and the learned value is
+            # now stored as text; this used to accept numbers only, so a text
+            # version left BOTH targets None and the guard below skipped the
+            # one retry this path exists for. As floats, a failed 5.10 read 5.1
+            # and a known-good 5.9 was "not older". `version_key` reads text and
+            # the legacy stored number alike; `version_text` is what travels on.
+            _failed_v = version_text(_failed)
             # Only pin to known-good when it is a strictly OLDER model than the
             # one that just failed: re-pinning the same version can't help (it
             # just failed) and would needlessly re-click an already-correct model
             # (the #744-adjacent action).
-            # ⚠ `_failed_f is None` is NOT "any pin is fine". With the failed
+            # ⚠ `_failed_v is None` is NOT "any pin is fine". With the failed
             # version unknown we cannot prove the pin is older, so pinning could
             # re-select the model that just failed and burn the single retry.
-            _pin = (_kg if isinstance(_kg, (int, float))
-                    and _failed_f is not None and _kg < _failed_f - 0.001 else None)
+            # (`_kg` is already dotted text — p2_known_good normalises it.)
+            _pin = (_kg if _failed_v is not None
+                    and version_key(_kg) is not None
+                    and version_key(_kg) < version_key(_failed_v) else None)
             # `below` rides along WITH the pin, not instead of it: the picker
             # prefers an exact pin match and falls back to the best strictly-older
             # row when the pinned version is no longer on the menu (a learned
             # known-good never expires, so weeks later it may simply be gone).
-            _below = _failed_f
+            _below = _failed_v
             if _pin is not None or _below is not None:
                 log(f"[{label}] step-back: {platform_l} v{_failed} did not verify into Deep "
                     f"Research — retrying once on an older model "
@@ -57408,10 +62447,10 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     # a literal "vNone" in an amber notice, attached to a claim
                     # that was false. Prove the retreat before reporting it.
                     _stepped_to = _P2_PICKED_VERSION.get(platform_l)
-                    # `_below` IS `_failed_f` and `_pin` can only be set when
-                    # `_failed_f` is a number, so the guard above guarantees a
+                    # `_below` IS `_failed_v` and `_pin` can only be set when
+                    # `_failed_v` is a version, so the guard above guarantees a
                     # reachable step-back knows the version that failed.
-                    if stepped_back_to(_stepped_to, _failed_f):
+                    if stepped_back_to(_stepped_to, _failed_v):
                         _emit_model_drift_alert(
                             platform_l,
                             f"{_agent_name} used an older model (v{_stepped_to}) for Deep Research",
@@ -57458,8 +62497,32 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             _missing = []
             if _pol.get("thinking") and not _tstate.get("thinking"):
                 _missing.append("extended thinking" if platform_l == "gemini" else "the thinking toggle")
-            if platform_l == "claude" and _pol.get("effort") and not _tstate.get("effort"):
-                _missing.append("max effort")
+            if platform_l == "claude" and _pol.get("effort"):
+                # ⭐ 2026-09-23 — RE-READ, not left "unconfirmed". Setup recorded
+                # the tier it read (`effort_got`), and the pre-send check just
+                # read the model button again — AFTER the computer-use pass. Say
+                # what those found; "max effort" alone is left for "unknown".
+                _eff_after = _claude_effort_after_setup(
+                    _pol.get("effort"), _tstate,
+                    bool((mode_state or {}).get("effortOk")))
+                if _eff_after["note"]:
+                    log(f"[{label}] Phoenix: {_eff_after['note']}", "INFO")
+                if _eff_after["missing"]:
+                    _missing.append(_eff_after["missing"])
+                # ⭐ The tile caption goes up HERE, not in setup: the computer-use
+                # pass has now had its turn at the tier and the button has been
+                # read again, so "Low — Max could not be set" is still true when
+                # the person reads it. Only a tier that was READ
+                # (`_claude_effort_report` gives no caption for an unknown one).
+                _eff_caption = (_claude_effort_report(
+                    _pol.get("effort"), _tstate.get("effort_got"))["notice"]
+                    if _eff_after["missing"] else None)
+                if _eff_caption:
+                    try:
+                        emit_event("agent_progress", phase=2, agent="claude",
+                                   status="starting", progress=_eff_caption)
+                    except Exception:
+                        pass
             if _missing:
                 _ms = " + ".join(_missing)
                 # Telemetry only — deliberately NOT an _emit_model_drift_alert (see
@@ -58412,6 +63475,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # force=True: this is a legitimate relaunch reset, so it must override a
         # stale "skipped"/"errored" (the guard blocks only the stale retry path).
         _write_agent_terminal_status("chatgpt", "running", force=True)
+        # ⭐ Wave 10.9: a launch un-finishes the agent in the durable record, so a
+        # crash during THIS attempt can never hand back the last attempt's file.
+        _p2_mark_agent_done(_p2_run_dir(), "chatgpt", False)
         # 2026-07-06 bot-score work: REUSE the warm Phase-1 ChatGPT tab instead
         # of opening a second one. Every cold top-level chatgpt.com load is a
         # Cloudflare-scored event; P1 already paid it and left a warm,
@@ -58471,7 +63537,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # conversation was started — verify just couldn't read the
             # active state (cross-origin DR iframe). The round-robin
             # poller at poll_all_agents_round_robin already handles the
-            # "verified=False but page exists" case (line ~13515), so we
+            # "verified=False but page exists" case, so we
             # hand off without firing the false-alarm banner that would
             # tempt the user into a hard retry that closes the working
             # tab. The fail_agent path remains for genuinely dead pages
@@ -58594,6 +63660,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             f"effort) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
+        _p2_mark_agent_done(_p2_run_dir(), "claude", False)  # wave 10.9 — see 2A
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -58705,6 +63772,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("gemini", "running", force=True)
+        _p2_mark_agent_done(_p2_run_dir(), "gemini", False)  # wave 10.9 — see 2A
         gemini_page, gemini_setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
@@ -58976,7 +64044,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # (2026-07-09 live false alarm → card → auto-skip of a working
         # Gemini). While the heartbeat scrape shows the plan actively
         # generating (status='generating': stop button / streaming attr /
-        # running animation — scrape_progress_gemini ~16620), we hold the
+        # running animation — scrape_progress_gemini), we hold the
         # early card and extend the wait, bounded by a hard cap so a
         # misread animation can't dwell forever.
         _stream_max_sec = int(os.environ.get("GEMINI_PLAN_STREAM_MAX_SEC", "900"))
@@ -59594,7 +64662,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # plan" from "running the research", so without a confirmed click it would
         # falsely stamp a not-yet-started run as researching (+ research_started_at).
         # No confirmed click ⇒ not running; the round-robin keeps the tab (it does
-        # NOT drop a not-verified agent — see ~19298) and the wall-clock cap
+        # NOT drop a not-verified agent — see `poll_all_agents_round_robin`)
+        # and the wall-clock cap
         # surfaces an honest fail_agent if the plan never starts.
         if _gemini_2d_skipped:
             # #929: the skip was finalized in place (agent_skipped emitted,
@@ -59743,8 +64812,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _swept = apply_off_topic_sweep(results, _p2_run_dir())
         if _swept:
             log(f"[Phase 2] off-topic sweep rejected {_swept} — their text will not be "
-                f"written to documents/, mirrored to Firestore, merged into "
-                f"consolidated.md, or handed to NotebookLM", "ERROR")
+                f"written to documents/, mirrored to Firestore, merged into the "
+                f"run's summary and title, or handed to NotebookLM", "ERROR")
     except Exception as _swe:
         log(f"[Phase 2] off-topic sweep errored ({_swe}) — results unchanged", "WARN")
 
@@ -59752,6 +64821,40 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
 
 
 # ── Phase 2 → Phase 3 handoff ────────────────────────────────────────────────
+
+def _p2_to_p3_link_for(name, r, conversation_url) -> str:
+    """The report page this agent publishes into the P2→P3 link map, or "" for
+    no row at all.
+
+    `conversation_url` is what the handoff's two guards left of the agent's
+    CONVERSATION address — blank when the off-topic sweep rejected the leg or
+    the tab predates the run — because those two are the only things in the
+    pipeline that can judge one.
+
+    ⛔⛔ A KEPT AGENT HAS NO CONVERSATION ADDRESS BY CONSTRUCTION (wave 10.9,
+    repair round 2). `_p2_resume_plan` hands one back with `url=""` — it is not
+    reattached, and the address is only a reattach key — and the gate here read
+    that as "this agent contributed nothing". So a crash retry dropped the one
+    agent whose report SURVIVED from `links.json`, from delivery.json's
+    `research_links` and from the "Links saved:" line, while its markdown went
+    to NotebookLM as usual: a third state that read on disk exactly like "this
+    run produced no reports", which is the distinction this map exists to draw.
+    What earns a row is a surviving CONTRIBUTION, and a kept agent's is its
+    restored report page — the same page the relaunched agents publish.
+
+    ⚠ The sweep still vetoes either way: it runs over the merged results, kept
+    legs included, and a rejected leg is not a source however it got here.
+    """
+    if r.get("off_topic_rejected"):
+        return ""
+    if not conversation_url and not r.get("_restored"):
+        return ""
+    # ⚠ The key stays the DISPLAY name (`ChatGPT`, not `chatgpt`) because
+    # `links.json` is read by people; the value is built from the agent key,
+    # which is the same normalisation the phase-2 completion emit uses, so the
+    # two agree by construction rather than by luck.
+    return in_app_document_url(name.lower().replace(" ", ""))
+
 
 def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
     """Populate _runtime.p2_links_for_p3 + _runtime.p2_md_files_for_p3 from
@@ -59817,35 +64920,34 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             log(f"[Phase 2→3 handoff] dropping {_name}'s link {_url!r} — that "
                 f"conversation predates this run", "WARN")
             _url = ""
-        if _url:
-            # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — WHAT IS PUBLISHED IS NO LONGER
-            # WHAT IS JUDGED. The two guards above still read the CONVERSATION
-            # address, because that is the only thing they can judge: the sweep's
-            # verdict is recorded against it, and the age test decodes an id out
-            # of it. But the value that goes into this map — and from here into
-            # `links.json`, the delivery mirror and the run log — is now the
-            # agent's report page in OUR app.
-            #
-            # ▶ Emptying the map instead was the obvious move and it was wrong
-            # twice. It would have left both guards above with nothing to act on,
-            # so the four tests that execute them would have gone from proving a
-            # drop to proving an empty dict — passing for a reason that has
-            # nothing to do with the guard. And it would have made "this run
-            # produced no reports" and "this run refused its reports" the same
-            # record on disk, which is exactly the distinction the guards exist
-            # to draw.
-            #
-            # ⚠ The key stays the DISPLAY name (`ChatGPT`, not `chatgpt`) because
-            # `links.json` is read by people; the value is built from the agent
-            # key, which is the same normalisation the phase-2 completion emit
-            # uses, so the two agree by construction rather than by luck.
-            p3_links[_name] = in_app_document_url(_name.lower().replace(" ", ""))
+        # ⛔⛔ 2026-09-02, stretch 7.5 step 5 — WHAT IS PUBLISHED IS NO LONGER
+        # WHAT IS JUDGED. The two guards above still read the CONVERSATION
+        # address, because that is the only thing they can judge: the sweep's
+        # verdict is recorded against it, and the age test decodes an id out
+        # of it. But the value that goes into this map — and from here into
+        # `links.json`, the delivery mirror and the run log — is the agent's
+        # report page in OUR app.
+        #
+        # ▶ Emptying the map instead was the obvious move and it was wrong
+        # twice. It would have left both guards above with nothing to act on,
+        # so the four tests that execute them would have gone from proving a
+        # drop to proving an empty dict — passing for a reason that has
+        # nothing to do with the guard. And it would have made "this run
+        # produced no reports" and "this run refused its reports" the same
+        # record on disk, which is exactly the distinction the guards exist
+        # to draw.
+        #
+        # ⛔ The decision itself is `_p2_to_p3_link_for`, because a kept agent
+        # is a THIRD answer and an inline `if _url:` could only ever give two.
+        _link_url = _p2_to_p3_link_for(_name, _r, _url)
+        if _link_url:
+            p3_links[_name] = _link_url
         # ⛔⛔ 2026-09-02 — AND THE SWEEP'S OWN SENTENCE WAS HALF FALSE. When it
         # rejects a leg it logs that the text "will not be written to documents/,
-        # mirrored to Firestore, merged into consolidated.md, or handed to
-        # NotebookLM". True of the link, which the branch above drops. NOT true of
-        # the FILE: the append below asked only whether a file exists on disk and
-        # was over 100 bytes. Nothing about the rejection reached it.
+        # mirrored to Firestore, merged into the run's summary and title, or
+        # handed to NotebookLM". True of the link, which the branch above drops.
+        # NOT true of the FILE: the append below asked only whether a file exists
+        # on disk and was over 100 bytes. Nothing about the rejection reached it.
         #
         # Today that gap is closed by luck rather than by design — the writers are
         # all gated on the text the sweep blanks, so a rejected leg leaves no file
@@ -60606,7 +65708,9 @@ async def _nlm_dom_rename(page, title, label="NotebookLM"):
             return false;
         }""", title)
         if committed:
-            log(f"[{label}] DOM rename OK (read-back verified): '{title}'")
+            # ⛔ The read-back proves the field holds the title; printing it
+            # would put the topic in the machine log — see `_log_job_ref`.
+            log(f"[{label}] DOM rename OK (read-back verified, {len(title)} chars)")
             return True
         log(f"[{label}] DOM rename did not commit (read-back mismatch) — "
             f"CUA fallback will handle it", "WARN")
@@ -61020,7 +66124,11 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # Rename notebook — use the smart title (Firestore-synced) so NotebookLM,
             # YouTube, and the email subject all line up on the same short name.
             title = smart_title(topic)
-            log(f"Renaming notebook to '{title}'...")
+            # ⛔ THE LENGTH, NOT THE TITLE — see `_log_job_ref`. The smart title
+            # IS the topic, and this line goes to the machine-wide backend.log.
+            # The length is what this line was ever read for: the FIFA run's
+            # appended title showed up as a doubled character count.
+            log(f"Renaming notebook (smart title, {len(title)} chars)...")
             emit_event("agent_progress", phase=3, agent="notebooklm",
                        status="renaming", stage="notebook",
                        progress=f"Renaming notebook to '{title}'…")
@@ -61112,6 +66220,44 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             break  # Successful upload — exit retry loop
         except Exception as e:
             log(f"NotebookLM upload error: {e}", "ERROR")
+            # ⛔⛔ 2026-09-20 — A DEAD BROWSER IS NOT AN UPLOAD FAILURE, and
+            # calling it one is what parked bundle 8D9CWHZJ for nine hours.
+            # Chrome had segfaulted a few seconds earlier, so `new_page()` threw
+            # "Target page, context or browser has been closed" — and this
+            # handler, which classifies only login-vs-generic, told the user
+            # "We couldn't upload the reports to NotebookLM. Retry to try
+            # again" about a browser that no longer existed. Retry could not
+            # have worked; nothing here can upload anything until Chrome is
+            # relaunched.
+            #
+            # The fix is to unwind the way every other browser-death site does,
+            # into the silent relaunch-and-resume that `_plan_pipeline_auto_retry`
+            # exists to perform.
+            #
+            # ⛔ AND TO ASK THE CONTEXT, NOT JUST THE TEXT (wave 10.9). That
+            # string also means one closed TAB, and a closed tab on a live
+            # browser needs a fresh tab, not a relaunch — the next attempt opens
+            # one. Silently, while an attempt is left; the last one falls through
+            # to the card below, because a run that quietly drops NotebookLM is
+            # worse than a question.
+            _p3_fail_kind = await _p3_upload_failure_kind(e, browser)
+            if _p3_fail_kind == "browser_dead":
+                _runtime.last_failure_kind = "browser_crash"
+                log("[Phase3] the browser is gone, not the upload — unwinding "
+                    "for checkpoint recovery", "WARN")
+                raise RuntimeError(
+                    "research browser died before the NotebookLM upload (browser crash)")
+            if _p3_fail_kind == "tab_closed" and p3_attempt < p3_max_retries:
+                log("[Phase3] the NotebookLM tab closed but the browser is alive — "
+                    "retrying the upload in a fresh tab", "WARN")
+                p3_attempt += 1
+                # A crashed tab can linger as a sad tab; close it the way the
+                # Retry path below does, so the fresh one is the only one.
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                continue
             # Distinguish session-expired from generic upload failure — the
             # frontend can offer "re-login then retry" vs "just retry".
             _err_msg = str(e)
@@ -61462,6 +66608,7 @@ def _playwright_foreign_artifact_dirs(browser):
     return out
 
 
+@_watched_for_a_hung_browser("the phase-3 audio wait")
 async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False, podcast_length="long", prefer_existing_audio: bool = False):
     """Phase 3 (step b): Generate audio overview in NotebookLM + share public.
 
@@ -61524,7 +66671,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
     # 2026-05-06 (Stream 2 D1): single-attempt audio generation. The outer
     # _await_phase_with_active_deadline(3, PHASE_3_AUDIO_MAX_MIN,
-    # soft_warn_only=True) at the call site (:20049) is the sole audio
+    # soft_warn_only=True) at the call site in run_pipeline is the sole audio
     # ceiling. User retry routes through that helper's
     # _PhaseSoftDecision('retry') OR through the post-helper no-audio loop
     # — no inner retry/timeout machinery here.
@@ -61717,7 +66864,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             await stop_narration_ticker(_stop, _task)
 
         # 2026-05-14: capture CUA abort signals. The audio-generate prompt
-        # (prompts.py:674-688) instructs CUA to emit exact "abort: …"
+        # (`make_prompt_audio_generate` in prompts.py) instructs CUA to emit
+        # exact "abort: …"
         # strings when it detects unsafe states (no customize affordance,
         # customize panel never opened, default audio fired by misclick,
         # or audio already present). Previously the caller ignored the
@@ -61837,7 +66985,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             return {"audio_path": None}
 
     # Poll for completion — refresh + CUA check every 3 min. No inner cap;
-    # the outer _await_phase_with_active_deadline at :20049 (soft_warn_only=True)
+    # the outer _await_phase_with_active_deadline in run_pipeline (soft_warn_only=True)
     # is the sole audio ceiling.
     log("Polling for audio completion (every 3 min with refresh; outer soft-warn handles ceiling)...")
     poll_start = time.time()
@@ -61869,6 +67017,16 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             _browser_dead = _poll_pg is None or _poll_pg.is_closed()
         except Exception:
             _browser_dead = True
+        # ⛔⛔ AND ASK THE CONTEXT TOO (2026-09-20). `is_closed()` is a question
+        # about ONE TAB, and bundle 8D9CWHZJ was a whole browser PROCESS dying:
+        # the page object can go on reporting open while every call through it
+        # fails. That lens cost nine hours in the phase-2 sweep. The cheap
+        # per-tab question is asked first and the driver round-trip only happens
+        # when the tab still looks alive — at one cycle per three minutes that
+        # is free, and it is the difference between unwinding and looping
+        # "Audio still generating..." until somebody notices.
+        if not _browser_dead:
+            _browser_dead = await _browser_context_is_dead(browser)
         if _browser_dead:
             if _login_interrupt_active():
                 _runtime.last_failure_kind = "login_interrupt"
@@ -61911,7 +67069,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             pass
 
         # Mid-poll duplicate detection (2026-05-14). The post-generate
-        # +5s invariant at :19518 only catches duplicates that render
+        # +5s invariant above only catches duplicates that render
         # immediately. In practice the misclick-fired default audio
         # can take 5-10 min to appear in the Studio panel — long after
         # the post-gen check has passed. Recount every poll cycle so
@@ -62362,8 +67520,6 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         except Exception as _ie:
             log(f"[Phase3] Post-cleanup invariant check failed: {_ie}", "WARN")
 
-    audio_stored_url = ""
-
     # ── The audio SHARE page: REMOVED 2026-08-28 (stretch 6.6C) ──
     #
     # ⛔⛔ IT SPENT CUA CALLS TO PRODUCE A URL ITS OWN FALLBACK ALREADY HELD.
@@ -62388,68 +67544,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # ("Delete" sits two rows below "Download").
 
     # ── Sync to Firebase Storage + Firestore audios subcollection ──
-    # Upload the audio file so the Vercel Podcasts page can stream it
-    # without needing the local backend to be reachable. Duration via
-    # ffprobe for nice display (M:SS). Best-effort — pipeline continues
-    # even if sync fails.
-    if audio_path and audio_path.exists():
-        try:
-            # B2 (2026-05-01): to_thread so the asyncio event loop (and
-            # _heartbeat_loop on it) keeps ticking — a blocking probe ate
-            # 1/6 of the 30s offline threshold. 2026-07-12: probing goes
-            # through _audio_duration_sec (tinytag primary — pure Python,
-            # pip-installed, works on a clean machine with no ffmpeg;
-            # ffprobe fallback). durationSec: 0 froze the FE player's
-            # progress bar (seek clamps to 0), so a failed probe WARNs.
-            dur_sec = await asyncio.to_thread(_audio_duration_sec, audio_path)
-            if dur_sec <= 0:
-                log("[Phase3] audio duration probe failed (tinytag + ffprobe) "
-                    "— writing durationSec=0; FE will self-heal from media "
-                    "metadata", "WARN")
-            # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
-            # biggest single blocker — easily blew past the 30s offline window.
-            audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
-            # Use the filename stem as doc id so re-runs upsert in place
-            # instead of stacking duplicates. Display name = research
-            # title from Firestore (set by FE's /api/title early in P1)
-            # so the Podcasts page shows one human-readable title instead
-            # of the auto-generated underscore .m4a filename. If the
-            # Firestore title isn't set (rare P3-before-P1-write race),
-            # smart_title falls back to a stem-derived topic with
-            # underscores swapped for spaces — still readable.
-            display_name = smart_title(audio_path.stem.replace("_", " "))
-            # B2: sync Firestore .set() — small payload but on slow links
-            # still worth offloading.
-            await asyncio.to_thread(save_audio_to_firestore,
-                                    audio_path.stem, display_name, dur_sec, audio_url)
-            # FE-P4 cutover (2026-05-10): also pin the Storage URL into
-            # research.links.audio_file so the FE-P4 trigger
-            # (readResearchForP4 → /api/uploadYouTube) can fetch the
-            # downloadable audio without query-walking the audios
-            # subcollection. links.audio stays as the NLM share URL
-            # (page, not a media file) — the Doc still renders that as
-            # "Audio Overview"; links.audio_file is purely for the FE
-            # YouTube upload step.
-            if audio_url:
-                update_link_in_firestore("audio_file", audio_url,
-                                         label="Podcast Audio (Storage)", phase=3,
-                                         verified=True)
-                # ⛔⛔ RETURNED, NOT JUST WRITTEN. Until 2026-08-28 this URL was
-                # written to Firestore and then dropped on the floor — the return
-                # below carried only `audio_path`, so the phase's own completion
-                # gate could not see whether the bytes had actually reached
-                # Storage. A local file with a failed upload emitted a green
-                # phase_complete:3 and a "Podcast ready" notice, while FE-P4 read
-                # `links.audio_file`, found nothing, and silently skipped the
-                # video. Completion and delivery disagreed about the same run.
-                audio_stored_url = audio_url
-            # Storage upload is best-effort — local playback still works via
-            # the backend, and Phase 5 can still upload to YouTube from the
-            # local file. Warn (not error) if it failed.
-            if not audio_url:
-                log("[Phase3] Firebase Storage upload failed — audio still saved locally", "WARN")
-        except Exception as e:
-            log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
+    # ⛔ CALLED UNCONDITIONALLY. The decision inside it is the whole subject of a
+    # test, and a caller that guarded the call would put half of that decision
+    # back where nothing executes it.
+    audio_stored_url = await _p3_publish_audio(audio_path, _fb_research_id)
 
     # ⛔ `audio_stored_url` IS THE COMPLETION ARTEFACT. It is non-empty only when
     # `upload_audio_to_storage` returned a URL, which means firebasestorage
@@ -63295,6 +68393,100 @@ def _find_heading_title(text: str) -> str:
     if out == text:
         return text
     return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+#: The last CLOSED emphasis run before the URL, plus whatever follows it.
+#:
+#: Group 2 — the gap — is captured rather than bounded inside the pattern, so the
+#: decision about whether that gap means "this is a bibliography entry" or "this
+#: is a sentence" is made in Python, where it can be stated in words and tested.
+#: A character budget in the regex cannot tell those apart: the real reference
+#: line's gap (" Current breed materials.  \n", 28 chars) is SHORTER than an
+#: ordinary prose gap (" Prices fell by a fifth, reported at ", 37), so any
+#: threshold generous enough for the first admits the second.
+_FIND_CITE_EMPH_RE = re.compile(
+    r'(?:\*\*|\*|__|_)([^*_\n]{4,160}?)(?:\*\*|\*|__|_)([^*_]{0,200})\Z')
+
+#: A line holding nothing but a URL (a trailing comma/period/bracket is still
+#: "nothing but a URL"). This is the shape of a reference-list entry.
+_FIND_URL_ALONE_RE = re.compile(r'^\s*(?:[-*•]\s*)?<?https?://\S+>?[\s.,;)\]]*$')
+
+
+def _find_source_title(md: str, idx: int, url: str) -> str:
+    """The cited page's OWN name, read from the markdown around its URL. ``""``
+    when the report does not name it.
+
+    ⛔⛔ WHY THIS EXISTS. The title used to be "the nearest `##` heading above the
+    URL", which is a heading in OUR OWN generated markdown, not the page's name.
+    Every citation in a report whose references sit in one trailing block
+    therefore got the SAME title: all twelve rows of the 2026-09-19 ChatGPT
+    document read "Final synthesis, appendices, and references". A bibliography
+    where every entry has one name tells a reader nothing, and the repo had
+    written that symptom down as accepted behaviour with the ` — host` suffix as
+    its mitigation. The host is provenance; it is not a title.
+
+    Two rungs, both reading what the REPORT says rather than what we wrote:
+
+      1. THE LINK LABEL. `[Reuters annual outlook](https://…)` — the author named
+         the page. Nothing beats that, and it needs no heuristic.
+
+      2. THE REFERENCE LINE'S EMPHASISED TITLE. A bibliography entry is
+         `Publisher. *The page's title.* Note.` followed by the bare URL, and the
+         emphasis IS the title — that is what emphasis means in a citation.
+
+    ⛔ RUNG 2 IS STRUCTURALLY GATED, NOT LENGTH-GATED, and the difference is the
+    whole safety of it. Emphasis is also how prose opens a paragraph
+    ("**Appendix: method.** Prices fell by a fifth, reported at <url>"), and
+    stealing that as a page title would be a silent, confident lie on ordinary
+    text — strictly worse than the duplicate heading it replaces. So rung 2 fires
+    only on a shape prose does not have:
+
+      * the URL STANDS ALONE ON ITS LINE (the reference-list wrap), or
+      * only whitespace and punctuation separate the emphasis from the URL
+        (`*Title.* https://…`).
+
+    A sentence that merely mentions a URL satisfies neither: it has words between
+    the emphasis and the link, and its line carries the rest of the sentence.
+
+    Never raises.
+    """
+    try:
+        # ── rung 1: the link label ────────────────────────────────────────
+        if idx >= 2 and md[idx - 2:idx] == "](":
+            # Bounded window: a label is capped at 200 chars by the pattern, and
+            # scanning the whole document per URL is what the heading pre-scan
+            # above exists to avoid.
+            for m in _FIND_MD_LINK_RE.finditer(md, max(0, idx - 260),
+                                               idx + len(url) + 2):
+                if m.start(2) != idx:
+                    continue
+                label = _FIND_MD_IMG_RE.sub("", m.group(1))
+                label = re.sub(r'\s+', ' ', label).strip(" \t*_`")
+                # A label that is just the URL again names nothing.
+                if len(label) >= 2 and not label.lower().startswith(("http://", "https://")):
+                    return label[:80]
+                break
+
+        # ── rung 2: the reference line's emphasised title ────────────────
+        line_start = md.rfind("\n", 0, idx) + 1
+        prev_start = md.rfind("\n", 0, max(0, line_start - 1)) + 1
+        m = _FIND_CITE_EMPH_RE.search(md[prev_start:idx])
+        if not m:
+            return ""
+        gap = m.group(2)
+        line_end = md.find("\n", idx)
+        line = md[line_start:(line_end if line_end >= 0 else len(md))]
+        url_alone = bool(_FIND_URL_ALONE_RE.match(line))
+        # "Only punctuation between" — no letters, no digits.
+        gap_is_quiet = not re.search(r'[^\W_]', gap, re.UNICODE)
+        if not (url_alone or gap_is_quiet):
+            return ""
+        title = re.sub(r'\s+', ' ', m.group(1)).strip(" \t*_`")
+        if len(title) < 4 or title.lower().startswith(("http://", "https://")):
+            return ""
+        return title[:80]
+    except Exception:
+        return ""
 #: Bare URLs in a report. Hoisted out of `save_meta` (which harvests the same
 #: markdown for `sourceUrls`) so one definition serves both — the two disagreeing
 #: about what a URL is would put a source in the list and not in the findings.
@@ -63470,7 +68662,7 @@ def _find_is_platform_host(u: str) -> bool:
     return _is_platform_host(host)
 
 
-def _extract_findings(md: str, source_urls: list) -> list:
+def _extract_findings(md: str, source_urls: list, source_items: list = None) -> list:
     """For each cited source URL, locate the enclosing sentence in the
     agent's markdown report and return a structured finding entry:
     `{"url": str, "snippet": str, "sourceTitle": str}`.
@@ -63488,8 +68680,12 @@ def _extract_findings(md: str, source_urls: list) -> list:
       - Skip when expanded snippet is < 30 chars (almost certainly a
         bare reference list entry, not a real cited mention).
 
-    SourceTitle = first non-empty heading (`##` / `###`) preceding the
-    URL, or hostname fallback if no heading is found before it.
+    SourceTitle — the page's OWN name, by the ladder in `_find_source_title`:
+    the report's link label, then the emphasised title on a reference line, then
+    the title the platform's source panel scraped (`source_items`), then the
+    nearest preceding heading, then the hostname. ⛔ The heading rung used to be
+    the WHOLE rule, which gave every citation in a trailing reference block one
+    identical title; see `_find_source_title` for the incident.
 
     Caps result list at 12 per agent. Order = first-mention order in
     the markdown, deduped by URL.
@@ -63563,6 +68759,22 @@ def _extract_findings(md: str, source_urls: list) -> list:
     _candidates = _candidates[:_SOURCE_LIST_CAP]
     source_urls = [c["lookup"] for c in _candidates]
     _emit_for = {c["lookup"]: c["emit"] for c in _candidates}
+    # The titles the platform's own source panel scraped, keyed by NORMALISED
+    # url. Normalised because the panel's spelling and the report's are routinely
+    # different for the same page — the panel's carries the platform's tracking
+    # parameter (`?utm_source=chatgpt.com`) and the report's does not, so a
+    # raw-string key misses every time and the rung silently never fires.
+    # ⚠ A panel item's title is often "" (the inline-activity capture path writes
+    # it empty by construction), so empty entries are dropped rather than stored
+    # — an empty title must fall THROUGH to the heading, not shadow it.
+    _panel_titles: dict = {}
+    for _it in (source_items or []):
+        try:
+            _u, _t = str(_it.get("url") or ""), str(_it.get("title") or "").strip()
+            if _u and _t:
+                _panel_titles.setdefault(_find_normalize_url(_u), _t[:80])
+        except Exception:
+            continue
     findings: list = []
     seen_urls: set = set()
     # Pre-scan headings so we can find the nearest preceding heading
@@ -63611,12 +68823,27 @@ def _extract_findings(md: str, source_urls: list) -> list:
         snippet = re.sub(r'\s+', ' ', snippet).strip()
         if len(snippet) > 280:
             snippet = snippet[:279].rstrip() + "…"
-        # Locate nearest preceding heading.
-        title = ""
-        for h_pos, h_text in headings:
-            if h_pos > idx:
-                break
-            title = h_text
+        # ── The source's TITLE, best evidence first. ────────────────────────
+        # ⭐⭐ THE HEADING IS NOW THE THIRD-BEST ANSWER, NOT THE ONLY ONE. It is a
+        # heading in OUR markdown, so a report whose references all sit under one
+        # trailing heading gave every row the same name — twelve rows reading
+        # "Final synthesis, appendices, and references" in the 2026-09-19
+        # document. It stays as a rung because it is genuinely right for a report
+        # that cites inline under topic headings; it was only ever wrong as the
+        # FIRST answer.
+        #
+        # 1. what the report calls the page (link label, reference emphasis)
+        # 2. what the platform's own source panel called it
+        # 3. the nearest heading above it        ← the old rule
+        # 4. the host
+        title = _find_source_title(md, idx, url)
+        if not title:
+            title = _panel_titles.get(_find_normalize_url(url), "")
+        if not title:
+            for h_pos, h_text in headings:
+                if h_pos > idx:
+                    break
+                title = h_text
         if not title:
             try:
                 from urllib.parse import urlparse as _urlparse
@@ -63714,7 +68941,8 @@ _DOC_SOURCE_MARK_RE = re.compile(r'\[\\\[\d{1,3}\\\]\]\(')
 #: second identical `Sources` shows in the document, the share and the
 #: delivered Google Doc.
 #: ⛔ THE ALTERNATE STILL BEGINS WITH THE WORD. The web collapses a trailing
-#: sources section on `/^sources\b/i` (`markdown-components.tsx:151`), and it is
+#: sources section on `/^sources\b/i` (`SOURCES_HEADING_RE` in
+#: markdown-components.tsx), and it is
 #: deliberately not widened to References/Citations — "Numbered sources" would
 #: have quietly stopped collapsing.
 _DOC_SOURCES_TITLE = "Sources"
@@ -63752,14 +68980,16 @@ def _doc_sources_heading(title: str) -> str:
     chosen for looks. The same appended heading is read by:
 
       • THE WEB'S SUPER RESEARCH PLANNER, which indexes each agent report by
-        `/^(#{1,4})\\s+(.+?)\\s*$/gm` (`superresearch-doc.ts:228`) and offers
+        `/^(#{1,4})\\s+(.+?)\\s*$/gm` (`HEADING_LINE_RE` in superresearch-doc.ts)
+        and offers
         every match to a section writer as "Your material". At `##` our
         bibliography became a phantom research slice — up to three per run —
         and a section could be written from a list of links. It stops at FOUR.
       • THE WEB'S DOCUMENT VIEWER AND PUBLIC SHARE, which collapse the report's
         LAST heading into a `Sources · n` disclosure when it matches
         `/^ {0,3}(#{1,6})\\s+(.+?)\\s*#*\\s*$/` and `/^sources\\b/i`
-        (`markdown-components.tsx:140,151`). That one goes to SIX — so a setext
+        (`HEADING_RE` and `SOURCES_HEADING_RE` in markdown-components.tsx). That
+        one goes to SIX — so a setext
         heading, which renders byte-identically to `##`, would have silently
         stopped the bibliography collapsing on both surfaces. Level five is the
         only form the viewer still folds and the planner cannot see.
@@ -63848,12 +69078,24 @@ def _doc_sources_row(n: int, url: str, title: str) -> str:
     renderer-computed number would survive neither — the numbers in the prose
     would then point at positions nothing states.
 
-    ⭐ AND THE HOST IS PRINTED BESIDE THE TITLE. `_extract_findings`' title is
-    the nearest HEADING IN OUR OWN DOCUMENT, not the page's own name, so two
-    sources cited under one heading arrive with the same title — a bibliography
-    reading "1. Battery prices / 2. Battery prices" tells a reader nothing about
-    where either went. The web's row spends that column on the agent's name,
-    which a per-agent document already states in its H1."""
+    ⭐ AND THE HOST IS PRINTED BESIDE THE TITLE — as PROVENANCE, which is what it
+    was always good for. The web's row spends that column on the agent's name,
+    which a per-agent document already states in its H1.
+
+    ⛔⛔ THIS PARAGRAPH USED TO SAY SOMETHING ELSE, AND THE REPO WAS ARGUING
+    AGAINST ITS OWN FIX. It read: "`_extract_findings`' title is the nearest
+    HEADING IN OUR OWN DOCUMENT, not the page's own name, so two sources cited
+    under one heading arrive with the same title — a bibliography reading
+    '1. Battery prices / 2. Battery prices' tells a reader nothing" — and then
+    offered the host suffix as the mitigation. That is an accurate description of
+    a DEFECT written down as accepted behaviour, and on 2026-09-19 it reached its
+    worst case: all twelve rows of a delivered document read "Final synthesis,
+    appendices, and references", because that report put every reference under
+    one trailing heading. `_extract_findings` now reads the page's own name from
+    the report (link label, reference-line emphasis) and from the platform's
+    source panel, and only then falls back to a heading. The host suffix stays
+    because a reader still wants to know where a title came from, and
+    `tail = "" if host == title` already suppresses it when it would be noise."""
     host = _doc_source_host(url)
     tail = "" if not host or host == title else " — %s" % host
     return "%d. [%s](%s)%s" % (n, _doc_escape_link_text(title),
@@ -64063,6 +69305,48 @@ def _strip_numbered_sources_section(md: str) -> str:
     return _DOC_SOURCES_BLOCK_RE.sub("", md)
 
 
+#: Our inline marker, with the space the numbering inserts in front of it.
+#: ⛔ THE SPACE IS OPTIONAL AND IT HAS TO BE. `_number_document_sources` adds one
+#: only when the character before the insertion point is not whitespace, so a
+#: marker that follows a newline has none — and taking a space off only when a
+#: non-space precedes it cannot eat one the report wrote itself.
+#: The address never contains a bracket, a space or a parenthesis: linkable URLs
+#: reject whitespace and `_doc_markdown_url` percent-encodes the parentheses.
+_DOC_SOURCE_MARK_INLINE_RE = re.compile(
+    r'(?:(?<=\S) )?\[\\\[\d{1,3}\\\]\]\([^()\s]*\)')
+
+
+def _document_without_sources(md: str) -> str:
+    """The document as the extractor handed it over: our bibliography off AND
+    our inline numbers out.
+
+    ⛔⛔ THE READER IS A PHASE-2 RE-ENTRY. `documents/<agent>.md` is written
+    NUMBERED, so an agent kept across a crash retry (`_p2_restorable_agents`)
+    reads its own report back with `[\\[n\\]](url)` markers and a `##### Sources`
+    list in it, while the agents that re-ran hand back plain text. Concatenated,
+    that lands a numbered list in the MIDDLE of the consolidated report — and the
+    web's own strip (`MACHINE_SOURCES_TAIL_RE`) is anchored at the end of the
+    string, so it removes the markers and leaves the list sitting next to the
+    web's own, differently numbered one in the Summary prompt.
+
+    Only ever removes this module's own grammar: the tail
+    `_strip_numbered_sources_section` owns, then the escaped-bracket markers
+    `_doc_source_marker` writes. An agent's own `[Title](url)` links and its own
+    sources list are left alone.
+
+    ⚠ A marker an agent ECHOED comes off too, and that is the same trade the
+    web's own strip makes on model output — the escaped brackets are this
+    machine's grammar wherever they turn up. `_number_document_sources` refuses
+    to number a document that already carries one, so an echo is the only marker
+    such a document has.
+
+    ⚠ Trailing whitespace does not come back — the numbering rstrips the document
+    before appending its list — so this is the extraction's text, not its bytes.
+
+    ⛔ ORDER: the strip is gated on the markers being present, so it runs FIRST."""
+    return _DOC_SOURCE_MARK_INLINE_RE.sub("", _strip_numbered_sources_section(md))
+
+
 def _document_with_sources(md: str, source_urls=None, findings=None) -> str:
     """The write-site face: number `md`, extracting its findings if none given.
 
@@ -64105,9 +69389,147 @@ def _run_started_ms(queue_dir) -> int:
     return min(stamps) if stamps else int(time.time() * 1000)
 
 
-def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
+def _downsample_progress_history(raw, cap=60):
+    """The per-agent progressHistory ring (240 live samples) cut down to `cap`
+    evenly-spaced points, the first and the last among them.
+
+    The FE GraphAnalysis All-Agents sparklines and the post-reload in-tile chart
+    restoration both consume the result — without it, reopening a finished run
+    shows a flat "No data" because the in-memory ring is already gone.
+
+    ⭐ ONE DOWNSAMPLER, TWO WRITERS (wave 10.9, repair round 2). `save_meta`
+    persists the live ring; the Phase-2 completion record stores the same curve
+    per agent, so an agent kept across a crash retry can put back the curve it
+    earned. Two copies of this arithmetic would drift, and a kept agent's curve
+    would stop matching the one its own attempt persisted.
+
+    ⛔ THE STEP SPANS THE GAPS, NOT THE SAMPLES — `(n-1)/(cap-1)`, so the last
+    index is exactly `n-1` and the endpoints are the agent's real first and last
+    reading. This used to be followed by two lines that overwrote `out[0]` and
+    `out[-1]` with `raw[0]` and `raw[-1]` "so the endpoints land on real
+    values"; with this step they never had anything to correct — mutation
+    proved it, no test could tell them from nothing — and against a WRONG step
+    they would have made a mis-sampled curve look right at both ends, which is
+    the one thing a reader checks. The arithmetic is pinned by a test instead.
+    """
+    raw = list(raw or [])
+    if len(raw) <= cap:
+        return raw
+    step = (len(raw) - 1) / float(cap - 1)
+    seen: set = set()
+    out: list = []
+    for i in range(cap):
+        idx = min(int(round(i * step)), len(raw) - 1)
+        if idx not in seen:
+            seen.add(idx)
+            out.append(raw[idx])
+    return out
+
+
+#: ⛔ One writer of a run's `meta.json` at a time, in this process (wave 10.10).
+#: The phase-3 save runs on a thread and reads the file BEFORE a podcast scan of
+#: a few seconds; the hand-off closes phase 3 in the same file in between. Held
+#: only across a read-and-write that is fast — never across the scan.
+_meta_json_lock = threading.RLock()
+
+
+def _phase_rows(meta, phase, now_ms, _began, _rid):
+    """The run's phase rows, backfilled up to `phase`, with `phase` closed at
+    `now_ms` and each row carrying the status recorded for research `_rid`.
+
+    Moved out of `save_meta` (wave 10.10) so the hand-off closes phase 3 with
+    exactly these rules — `_record_hand_off` — rather than a second copy of
+    them. `_began` is when the caller's phase began, if it knows (see below).
+    Mutates and returns `meta["phases"]` when it exists."""
+    phases = meta.get("phases", [])
+    # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
+    # NOT a separate phase — the BE records the whole NLM+audio span as phase 3
+    # (see the phase_complete phase=3 with the full _p3_start duration). Phase 4
+    # is YouTube, phase 5 is Delivery (both FE-stamped). The old 7-entry array
+    # split "Audio Overview" out as its own phase, which mislabeled the Analytics
+    # timeline; kept in lockstep with web PHASE_META + the FE P4/P5 phase stamps.
+    phase_labels = ["Initializing", "Research Brief", "Deep Research",
+                    "Links + NotebookLM + Audio", "Video + YouTube", "Delivery"]
+    # Ensure all phases up to current exist
+    while len(phases) <= phase:
+        p_idx = len(phases)
+        # Start time: use previous phase's completedAt, or createdAt for first phase
+        start = meta.get("createdAt", now_ms)
+        if p_idx > 0 and len(phases) > 0 and phases[-1].get("completedAt"):
+            start = phases[-1]["completedAt"]
+        phases.append({
+            "phase": p_idx,
+            "label": phase_labels[p_idx] if p_idx < len(phase_labels) else f"Phase {p_idx}",
+            "startedAt": start,
+            "completedAt": None,
+            "durationSec": 0,
+        })
+    # ⛔⛔ A PHASE ENDS WHEN THE NEXT ONE STARTS (wave 10.10). The first write is
+    # the END of phase 1, and the loop above backfills phase 0 open, so phase 0
+    # never had an end and phase 1 — starting at the run's start — carried
+    # phase 0's whole span. A caller that knows when its phase began says so in
+    # `started_ms`, and that instant opens this phase and closes phase 0.
+    #
+    # ⛔ ONLY PHASE 0 IS CLOSED THIS WAY, and not for want of generality. Its
+    # start is the run's own start; every other row this function leaves open is
+    # a backfill whose start is a guess (a phase skipped, or never saved), so
+    # closing it would print a duration for a phase that may never have run —
+    # the invention the web's timeline refuses and shows as "—" instead.
+    # ⛔ And a start before the run began or after now is two clocks
+    # disagreeing, not a boundary: it is ignored. A row already closed is never
+    # rewritten.
+    if (isinstance(_began, int) and meta.get("createdAt", 0) <= _began <= now_ms
+            and 0 < phase < len(phases) and phases[phase]["completedAt"] is None):
+        phases[phase]["startedAt"] = _began
+        _prev = phases[phase - 1]
+        if phase == 1 and _prev.get("completedAt") is None:
+            _prev["completedAt"] = _began
+            _prev["durationSec"] = max(0, (_began - int(_prev.get("startedAt") or _began)) // 1000)
+    # Mark current phase as completed with actual duration
+    if phase < len(phases) and phases[phase]["completedAt"] is None:
+        phases[phase]["completedAt"] = now_ms
+        started = phases[phase].get("startedAt", now_ms)
+        phases[phase]["durationSec"] = max(0, (now_ms - started) // 1000)
+
+    # #722 Bug A: carry per-phase terminal status onto the rebuilt entries.
+    # A Firestore array can't be dotted-merged, so the whole-array
+    # .update({"phases": …}) below always replaces it — the status that
+    # _write_phase_terminal_status wrote (via the daemon-thread read-modify-
+    # write) would be lost unless we re-stamp it here. Only overwrite when the
+    # runtime knows a status for that phase; otherwise leave any status already
+    # carried in meta.json (resume) intact.
+    _pstat = _phase_status_by_rid.get(_rid, {}) or {}
+    for _entry in phases:
+        if isinstance(_entry, dict):
+            _ps = _pstat.get(_entry.get("phase"))
+            if _ps:
+                _entry["status"] = _ps
+    return phases
+
+
+def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None,
+              runtime=None, scans_only=False, **extra):
     """Save/update meta.json — powers ALL frontend components (graphs, analytics, tracking).
-    Contains: Research object + per-agent stats + phase timeline + source references."""
+    Contains: Research object + per-agent stats + phase timeline + source references.
+
+    ⛔ `research` is `(uid, research_id)` for a caller that can still be running
+    after its run has ended — the phase-3 thread (`_save_meta_in_background`).
+    Without it the record is whichever one the pipeline globals name when the
+    write happens, which by then can be the next member's.
+
+    ⛔ `runtime` is that caller's per-agent data, captured when it was
+    dispatched (`_runtime_at_dispatch`) — the same argument as `research`, for
+    the data rather than the address. None reads the live `_runtime`.
+
+    ⛔⛔ `scans_only` is that caller again (wave 10.10): write what this save
+    SCANNED — documents, podcasts, agents — and nothing about where the run IS.
+    No `status`, no `phase`, no phase list, on disk or in the cloud. The thread
+    usually lands after the hand-off, and from the hand-off on the cloud owns
+    all three: its `phase: 3` dragged the pointer back off the upload the route
+    had just claimed, and its phase list was a whole-array write over the rows
+    the web stamps for phases 4 and 5."""
+    _uid, _rid = research if research else (_fb_uid, _fb_research_id)
+    _rt = runtime if runtime is not None else _runtime
     queue_dir = Path(queue_dir)
     meta_path = queue_dir / "meta.json"
     meta = {}
@@ -64240,7 +69662,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             _panel_urls = []
             try:
                 _panel_urls = [
-                    u for u in (getattr(_runtime, "agent_progress_snapshots", {})
+                    u for u in (getattr(_rt, "agent_progress_snapshots", {})
                                 .get(platform, {}) or {}).get("source_urls", []) or []
                     if isinstance(u, str) and u.lower().startswith(("http://", "https://"))
                     and not _find_is_platform_host(u)
@@ -64271,7 +69693,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             # window prunes past 50 entries and the values defaulted to 0,
             # making the stub show only chars+sources after a long break.
             try:
-                _snap = dict(getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
+                _snap = dict(getattr(_rt, "agent_progress_snapshots", {}).get(platform, {}) or {})
             except Exception:
                 _snap = {}
             # Downsample the per-agent progressHistory ring (cap 240) to
@@ -64281,28 +69703,27 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             # finished run shows flat "No data" because the in-memory
             # ring is already gone.
             try:
-                _raw_hist = list(getattr(_runtime, "agent_progress_history", {}).get(platform, []) or [])
+                _raw_hist = list(getattr(_rt, "agent_progress_history", {}).get(platform, []) or [])
             except Exception:
                 _raw_hist = []
-            _down_hist: list = []
-            if len(_raw_hist) <= 60:
-                _down_hist = _raw_hist
-            elif _raw_hist:
-                _step = (len(_raw_hist) - 1) / 59.0
-                _seen: set = set()
-                for _i in range(60):
-                    _idx = min(int(round(_i * _step)), len(_raw_hist) - 1)
-                    if _idx not in _seen:
-                        _seen.add(_idx)
-                        _down_hist.append(_raw_hist[_idx])
-                # Always pin first + last so the curve endpoints land on
-                # real values, not the closest sampled neighbor.
-                if _down_hist and _down_hist[0] is not _raw_hist[0]:
-                    _down_hist[0] = _raw_hist[0]
-                if _down_hist and _down_hist[-1] is not _raw_hist[-1]:
-                    _down_hist[-1] = _raw_hist[-1]
+            _down_hist = _downsample_progress_history(_raw_hist)
+            # ⛔⛔ AND A REBUILD WITH NOTHING TO SAY DOES NOT ERASE WHAT A
+            # PREVIOUS ATTEMPT PERSISTED (wave 10.9, repair round 2). The write
+            # below replaces the whole `agents` field, and `run_pipeline` resets
+            # the live ring on every re-entry — so a resume that KEEPS a
+            # finished agent (it is never relaunched, so nothing ticks its ring
+            # this attempt) overwrote its persisted curve with [], and the one
+            # agent that did the work was the one reading "No data". Every other
+            # field on this entry already falls back to `existing`; the history
+            # does too now. The kept agent's own curve comes back through
+            # `_p2_announce_restored`; this is the belt for a record written
+            # before that existed, or one that failed to write.
+            if not _down_hist:
+                _prev_hist = existing.get("progressHistory")
+                if isinstance(_prev_hist, list) and _prev_hist:
+                    _down_hist = _prev_hist
             try:
-                _findings = list(getattr(_runtime, "agent_findings", {}).get(platform, []) or [])
+                _findings = list(getattr(_rt, "agent_findings", {}).get(platform, []) or [])
             except Exception:
                 _findings = []
             agents[platform] = {
@@ -64341,7 +69762,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         # entry to hold the status. Config-disabled agents never call
         # _write_agent_terminal_status and have no md, so _astat stays falsy →
         # no spurious entry is created for them.
-        _astat = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get(platform) \
+        _astat = (_agent_status_by_rid.get(_rid, {}) or {}).get(platform) \
             or _prior_agent_status.get(platform)
         if _astat:
             agents.setdefault(platform, {})["status"] = _astat
@@ -64373,7 +69794,7 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         if platform not in agents or "sources" not in agents.get(platform, {}):
             try:
                 _fallback_snap = dict(
-                    getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
+                    getattr(_rt, "agent_progress_snapshots", {}).get(platform, {}) or {})
             except Exception:
                 _fallback_snap = {}
             _fallback_urls = list(_fallback_snap.get("source_urls", []) or [])[:_SOURCE_LIST_CAP]
@@ -64395,50 +69816,32 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 # sources below being mistaken for a report that was produced.
                 _entry.setdefault("outputChars", 0)
 
-    # ── Phase timeline (for timeline graph) ──
-    phases = meta.get("phases", [])
-    # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
-    # NOT a separate phase — the BE records the whole NLM+audio span as phase 3
-    # (see the phase_complete phase=3 with the full _p3_start duration). Phase 4
-    # is YouTube, phase 5 is Delivery (both FE-stamped). The old 7-entry array
-    # split "Audio Overview" out as its own phase, which mislabeled the Analytics
-    # timeline; kept in lockstep with web PHASE_META + the FE P4/P5 phase stamps.
-    phase_labels = ["Initializing", "Research Brief", "Deep Research",
-                    "Links + NotebookLM + Audio", "Video + YouTube", "Delivery"]
-    now_ms = int(time.time() * 1000)
-    # Ensure all phases up to current exist
-    while len(phases) <= phase:
-        p_idx = len(phases)
-        # Start time: use previous phase's completedAt, or createdAt for first phase
-        start = meta.get("createdAt", now_ms)
-        if p_idx > 0 and len(phases) > 0 and phases[-1].get("completedAt"):
-            start = phases[-1]["completedAt"]
-        phases.append({
-            "phase": p_idx,
-            "label": phase_labels[p_idx] if p_idx < len(phase_labels) else f"Phase {p_idx}",
-            "startedAt": start,
-            "completedAt": None,
-            "durationSec": 0,
-        })
-    # Mark current phase as completed with actual duration
-    if phase < len(phases) and phases[phase]["completedAt"] is None:
-        phases[phase]["completedAt"] = now_ms
-        started = phases[phase].get("startedAt", now_ms)
-        phases[phase]["durationSec"] = max(0, (now_ms - started) // 1000)
+    # ── How long each agent took (wave 10.10) ──
+    # ⛔⛔ THE CLOUD USED TO GET 0 HERE FOR EVERY RUN NOBODY WATCHED. The
+    # rebuild above keeps `completionTimeSec` from meta.json, and the phase-2
+    # block wrote the real value into meta.json only AFTER this function had
+    # sent the agents to the cloud. Phase 2's `results` now come in, and each
+    # time lands in the entry this write already carries — beside every
+    # sibling field, which is the lesson recorded at `_merge_field_paths`.
+    #
+    # ⛔ ONLY A REAL TIME, AND ONLY FOR AN AGENT THAT RAN. A zero is what a
+    # resume hands back for an agent it kept rather than re-ran, and letting it
+    # through would erase the time that agent earned last attempt. An agent
+    # absent from the results was switched off and gets no row at all. An agent
+    # that ran and died with no report DOES get one: it ran, and for how long
+    # is the one thing its entry can still say.
+    for _name, _r in (extra.get("agent_results") or {}).items():
+        _key = str(_name).lower().replace(" ", "")
+        _secs = _r.get("elapsed_sec") if isinstance(_r, dict) else None
+        if (_key in ("chatgpt", "gemini", "claude")
+                and isinstance(_secs, (int, float)) and not isinstance(_secs, bool)
+                and _secs > 0):
+            agents.setdefault(_key, {})["completionTimeSec"] = int(_secs)
 
-    # #722 Bug A: carry per-phase terminal status onto the rebuilt entries.
-    # A Firestore array can't be dotted-merged, so the whole-array
-    # .update({"phases": …}) below always replaces it — the status that
-    # _write_phase_terminal_status wrote (via the daemon-thread read-modify-
-    # write) would be lost unless we re-stamp it here. Only overwrite when the
-    # runtime knows a status for that phase; otherwise leave any status already
-    # carried in meta.json (resume) intact.
-    _pstat = _phase_status_by_rid.get(_fb_research_id, {}) or {}
-    for _entry in phases:
-        if isinstance(_entry, dict):
-            _ps = _pstat.get(_entry.get("phase"))
-            if _ps:
-                _entry["status"] = _ps
+    # ── Phase timeline (for timeline graph) ──
+    # The rows are built by `_phase_rows`, which the hand-off shares.
+    now_ms = int(time.time() * 1000)
+    phases = _phase_rows(meta, phase, now_ms, extra.get("started_ms"), _rid)
 
     # ── Write meta ──
     meta.update({
@@ -64454,40 +69857,318 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         "phases": phases,
         "updatedAt": now_ms,
     })
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    with _meta_json_lock:
+        if scans_only:
+            # ⛔ Where the run IS, as the file says it NOW — not as it said when
+            # this save began, before a podcast scan the hand-off did not wait
+            # for. Read under the lock the hand-off writes under.
+            try:
+                _on_disk = (json.loads(meta_path.read_text(encoding="utf-8"))
+                            if meta_path.exists() else {})
+            except Exception:
+                _on_disk = {}
+            for _k in ("status", "phase", "phases"):
+                if _k in _on_disk:
+                    meta[_k] = _on_disk[_k]
+                else:
+                    meta.pop(_k, None)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     # ── Propagate structured agents/phases to Firestore research doc ──
     # Without this, the frontend Analytics page never sees per-agent stats or
     # phase timelines for live runs — they live only on disk. Uses a shallow
     # update so we don't clobber other fields (like pipelineConfig).
+    _record = {
+        "agents": agents,
+        "phases": phases,
+        "status": status,
+        "phase": phase,
+        "updatedAt": now_ms,
+    }
+    if scans_only:
+        _record = {"agents": agents, "updatedAt": now_ms}
+    # ⛔⛔ Under `_phases_write_lock` (wave 10.10): this whole-array write is the
+    # one a phase-status thread's stale read used to land on top of.
+    _phases_write_lock.acquire()
     try:
-        _update_firestore_research({
-            "agents": agents,
-            "phases": phases,
-            "status": status,
-            "phase": phase,
-            "updatedAt": now_ms,
-        })
+        if research:
+            _update_research_doc(_uid, _rid, _record)
+        else:
+            _update_firestore_research(_record)
     except Exception as _e:
         log(f"save_meta: firestore propagation failed: {_e}", "WARN")
+    finally:
+        _phases_write_lock.release()
+
+
+def _save_meta_in_background(queue_dir, topic, phase) -> None:
+    """`save_meta` on a daemon thread, for the research running NOW.
+
+    ⛔⛔ THE THREAD OUTLIVES THE RUN (wave 10.9, last repair). Phase 3 hands this
+    off so the ffprobe per podcast (~5 s a file) does not hold up
+    `phase_complete`, and the run hands phases 4 and 5 to the cloud and returns
+    moments later — teardown, the next member's run dequeued, setup. Asked at
+    write time, the thread wrote this run's agents map — every agent's sources
+    and findings — onto THAT person's record. The research is named here, at
+    dispatch.
+
+    ⛔⛔ AND SO IS WHAT IT WRITES (wave 10.10). Naming the research moved the
+    write to the right record and left it reading `_runtime` — the panel
+    sources, the progress curves, the findings — at write time, and the next
+    run's `_runtime.reset()` empties exactly those. So the late write put an
+    empty findings list and no curves on its OWN run's record. They are copied
+    here, before the thread exists.
+
+    ⛔⛔ AND IT SAYS NOTHING ABOUT WHERE THE RUN IS (`scans_only`): no status, no
+    phase, no phase list. It usually lands after the hand-off, and the hand-off
+    is where phase 3 ends (`_record_hand_off`) — after it, the phase list is the
+    cloud's."""
+    try:
+        # ⛔ Under a copy of the run's context, so its WARN and heal lines keep
+        # the run's origin and stay out of the next run's folder (wave 10.10) —
+        # the same late-thread shape as the title refresh.
+        _threading.Thread(
+            target=_log_contextvars.copy_context().run,
+            args=(save_meta, queue_dir, topic, phase),
+            kwargs={"research": (_fb_uid, _fb_research_id),
+                    "runtime": _runtime_at_dispatch(),
+                    "scans_only": True},
+            name=f"p{phase}-savemeta-ffprobe",
+            daemon=True,
+        ).start()
+    except Exception as _smt_e:
+        log(f"[Phase {phase}] failed to dispatch save_meta thread: {_smt_e}", "WARN")
+
+
+def _runtime_at_dispatch():
+    """The per-agent data `save_meta` reads off `_runtime`, copied NOW, for a
+    save that will run after this run's runtime is gone.
+
+    ⛔ A COPY, NOT A REFERENCE. `reset()` rebinds these maps today, so holding
+    the old ones would happen to work — until a reset that clears in place, or
+    a late mutation by this run's own teardown. The copy is the only form that
+    means "as of dispatch" whatever either of those does."""
+    import copy as _copy
+
+    class _AtDispatch:
+        pass
+
+    held = _AtDispatch()
+    for name in ("agent_progress_snapshots", "agent_progress_history", "agent_findings"):
+        live = dict(getattr(_runtime, name, {}) or {})
+        try:
+            setattr(held, name, _copy.deepcopy(live))
+        except Exception:
+            setattr(held, name, live)
+    return held
+
+
+def _record_hand_off(queue_dir, research, phase3_began_ms) -> None:
+    """THE HAND-OFF'S WRITE: `beDone`, and phase 3's end with it (wave 10.10).
+
+    ⛔⛔ PHASE 3 HAD NO END ON A RUN THAT FINISHED NORMALLY. Only a stop saved
+    phase 3; the phase-3 thread closed it BEFORE the no-audio retries and
+    `phase_complete`, and then the status write that `phase_complete` fires —
+    a read-modify-write on a daemon thread — landed the array it had read over
+    it. What the web's timeline measured was the status write's own row: a
+    "Phase 3" label, a `startedAt` that is really when the phase FINISHED, no
+    end and no duration.
+
+    ⭐ THE HAND-OFF IS PHASE 3'S END, and it already makes one write. The row
+    goes into that write, so there is no later machine write of the phase list
+    to race anything: from `beDone` on, phases 4 and 5 are the cloud's and the
+    web writes them.
+
+    ⛔ ONLY PHASE 3's ROW CHANGES. The record's array is read and every other row
+    is written back as read — including a phase-4 row a watched run's browser
+    may already have had the route stamp — under `_phases_write_lock`, so the
+    machine's own status write cannot interleave either.
+    ⚠ ONE WINDOW IS LEFT, AND NAMED: a route write that lands between this read
+    and this write. Only on a watched run, whose browser can kick the route on
+    `phase_complete:3` before this write; an unwatched run's kick is sent after
+    it. A transaction would close it and is not available here — Track D
+    denies this machine transactional reads on the user tree (#720) — and the
+    route's own read-modify-write has the same window from its side.
+
+    ⛔ NOTHING IS INVENTED. `phase3_began_ms` is when phase 3 began in THIS
+    process; a phase 3 that was skipped or resumed past has none, and a start
+    the rows refuse (before the run, after now) is no start. Either way the
+    write is the hand-off alone, exactly as before.
+
+    ⛔ AND THE HAND-OFF ALWAYS LANDS. `beDone` is what stops a restart stamping
+    a run the cloud is finishing; if the read-and-write that carries the row
+    fails, the hand-off is written on its own."""
+    uid, rid = research
+    handoff_ms = int(time.time() * 1000)
+    handoff = {"beDone": True, "beDoneAt": handoff_ms}
+    try:
+        row = _close_phase_three_on_disk(queue_dir, rid, phase3_began_ms, handoff_ms)
+    except Exception as e:
+        log(f"hand-off: could not close phase 3 in meta.json ({e})", "WARN")
+        row = None
+    if row is None or not (_firebase_db and uid and rid):
+        _update_research_doc(uid, rid, handoff)
+        return
+    ref = _firebase_db.collection("users").document(uid) \
+        .collection("researches").document(rid)
+
+    def _op():
+        with _phases_write_lock:
+            snap = ref.get()
+            data = (snap.to_dict() or {}) if snap.exists else {}
+            rows = list(data.get("phases") or [])
+            for i, have in enumerate(rows):
+                if isinstance(have, dict) and have.get("phase") == 3:
+                    rows[i] = {**have, **row}
+                    break
+            else:
+                rows.append(dict(row))
+            ref.update(_be_payload(_with_incognito_renewal(
+                {**handoff, "phases": rows}, rid)))
+
+    try:
+        _grpc_write_with_heal(_op, what=f"hand-off rid={rid[:8]}…")
+    except Exception as e:
+        log(f"hand-off: phase 3's end did not reach the record ({e}) — "
+            f"writing the hand-off on its own", "WARN")
+        _update_research_doc(uid, rid, handoff)
+
+
+def _close_phase_three_on_disk(queue_dir, rid, began_ms, end_ms):
+    """Phase 3's row in `meta.json`, closed at the hand-off; returned for the
+    record, or None when there is nothing true to write (see
+    `_record_hand_off`).
+
+    ⛔ A ROW AN EARLIER ATTEMPT CLOSED IS REOPENED. A stop or a pause saves
+    phase 3 closed at that moment; a resume that runs phase 3 again ends it
+    HERE, and that is the span it ran. `_phase_rows` never rewrites a closed
+    row, which is right for a repeat save and wrong for this.
+
+    ⭐ THE REFUSAL IS THE LAST CHECK, not the first: `_phase_rows` believes a
+    start only if it is an int between the run's start and the hand-off, and a
+    row whose start is not the one handed in is never written. The `None` test
+    below only spares the file a read on a run where phase 3 did not run."""
+    if began_ms is None:
+        return None
+    meta_path = Path(queue_dir) / "meta.json"
+    with _meta_json_lock:
+        try:
+            meta = (json.loads(meta_path.read_text(encoding="utf-8"))
+                    if meta_path.exists() else {})
+        except Exception:
+            return None
+        if "id" not in meta:
+            # The same first-write stamp as `save_meta`: a run that skipped
+            # phases 1 and 2 has written no meta.json before this.
+            meta.update(id=Path(queue_dir).name, createdAt=_run_started_ms(queue_dir))
+        rows = meta.get("phases")
+        if isinstance(rows, list) and len(rows) > 3 and isinstance(rows[3], dict):
+            rows[3]["completedAt"] = None
+        rows = _phase_rows(meta, 3, end_ms, began_ms, rid)
+        row = rows[3] if len(rows) > 3 and isinstance(rows[3], dict) else None
+        if row is None or row.get("startedAt") != began_ms:
+            return None
+        meta["phases"] = rows
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return dict(row)
+
+
+def _handed_off_to_cloud(queue_dir) -> bool:
+    """Has this run's queue directory recorded the hand-off to the cloud?
+
+    ⛔⛔ `delivery.json`'s "completed" MEANS THE HAND-OFF IS DONE, NOT THAT THE
+    RUN IS. There are exactly two writers of that value and both are the
+    hand-off itself: `update_delivery(status="completed")` fires at the end of
+    PHASE 3, in the same breath as the `beDone` marker and the cloud kick, with
+    phases 4 and 5 not yet started. Reading it as "the run finished" is how a
+    Resume came to do nothing at all (`detect_resume_phase` answers 6) and how
+    the boot sweep came to stamp a run the cloud was actively uploading.
+
+    ⭐ THIS IS THE ONE DEFINITION (wave 10.9, 542-4). The dead-worker sweep had
+    a private copy of it inline, the boot gate had none at all and stamped
+    "stopped" over the runs it names, and the resume path read the same file
+    through `detect_resume_phase` and drew the opposite conclusion. Three
+    readers, three answers, one file.
+
+    A directory that is missing, unreadable, or has no delivery record at all
+    reads as NOT handed off — the fail-toward-recovery direction, since a run
+    the machine never finished is one a checkpoint resume can still pick up.
+    """
+    if queue_dir is None:
+        return False
+    try:
+        delivery_path = Path(queue_dir) / "delivery.json"
+        if not delivery_path.exists():
+            return False
+        return json.loads(
+            delivery_path.read_text(encoding="utf-8")).get("status") == "completed"
+    except Exception:
+        return False
+
+
+def _claim_is_handed_off(claimed_run_id) -> bool:
+    """Does this research document's `backendRunId` name a run directory whose
+    hand-off to the cloud is already recorded?
+
+    ⛔ THE RUN ID ON A DOCUMENT IS A CLAIM, NOT A PATH. `_run_dir_inside_queues`
+    is what turns it into a directory at all: a claim carrying a separator, or
+    one whose join lands anywhere but directly inside `queues/`, is treated
+    exactly as an absent one — the same refusal every other reader of that field
+    makes, so a path claim cannot decide this branch on a file that was never a
+    run's."""
+    return _handed_off_to_cloud(_run_dir_inside_queues(claimed_run_id))
+
+
+def _recovery_sees_handoff(research_id, data) -> bool:
+    """Has this run already been handed off to the cloud, as far as a RECOVERY
+    path can tell?
+
+    ⛔⛔ THE DISK PROOF IS DELETED FOR A RUN THAT KEEPS NOTHING (wave 10.9,
+    #536). `_claim_is_handed_off` asks the run's own `delivery.json`, and for an
+    incognito run `_purge_incognito_run_dirs` removes that directory in the same
+    breath as the hand-off — while the encode, the upload, the Doc and THE EMAIL
+    are still minutes of cloud tail away. So both recovery paths answered "never
+    handed off" for the one run type that has no other way back: the rehydrate
+    branch stamped it `stopped`, `_safe_enqueue` refuses a stopped run for ever,
+    and where the original kick had not landed (no token, a dead socket, a 5xx)
+    nobody ever ran phases 4 and 5 — the person paid, the chat said the run
+    ended, and the report they were promised by email was never sent.
+
+    ⭐ THE RECORD CARRIES THE ANSWER AND IS WRITTEN BEFORE THE PURGE. `beDone`
+    lands on the document AT the hand-off (contract rule 1), one line after
+    `delivery.json` is told the same thing. A path that believes the record
+    re-fires the kick and leaves the status alone — which a run that keeps
+    nothing needs MORE than an ordinary one, because it has no chat to reopen
+    and no Resume card anybody could press.
+
+    ⛔ THE DISK STAYS THE ANSWER FOR AN ORDINARY RUN, deliberately. `beDone` is
+    never cleared, and an ordinary run can go round again — a Resume or a Retry
+    puts it back to "ongoing" with the previous pass's marker still on the
+    document, and a restart during THAT pass must still park it for the Resume
+    its checkpoint supports. An incognito run has no second pass to be confused
+    with: the first restart ends it and no enqueue path will take it again."""
+    if _claim_is_handed_off((data or {}).get("backendRunId")):
+        return True
+    if _is_incognito_research(research_id):
+        return bool((data or {}).get("beDone"))
+    return False
 
 
 def detect_resume_phase(queue_dir):
     """Detect which phase to resume from based on existing output files.
     Returns (phase_number, description). 5-phase BE model (0-4) plus
-    FE-owned Phase 5 (Doc + email). Return value of 5 means "BE work is
-    done, FE-P5 still needs to fire" — run_pipeline handles this by
-    re-emitting phase_complete phase=4 to retrigger triggerFeP5 on the
-    frontend (its CAS guard makes a re-trigger idempotent). 6 means
-    "delivery.json marks the run completed — nothing to resume"."""
+    cloud-owned Phase 5 (Doc + email). Return value of 5 means "BE work is
+    done, phase 5 still needs to fire" — run_pipeline handles this by
+    handing off: `beDone`, the marker and the kick to the cloud route.
+
+    6 means "this run was already handed off — the machine has nothing left to
+    resume". ⛔ It does NOT mean the run is complete: `delivery.json` says
+    hand-off, not completion (see `handed_off_to_cloud`). The caller decides
+    what to do about a handed-off run whose document still says "ongoing" —
+    which is to re-fire the kick, not to sit down."""
     queue_dir = Path(queue_dir)
-    if (queue_dir / "delivery.json").exists():
-        try:
-            delivery = json.loads((queue_dir / "delivery.json").read_text(encoding="utf-8"))
-            if delivery.get("status") == "completed":
-                return 6, "Pipeline already complete"
-        except Exception:
-            pass
+    if _handed_off_to_cloud(queue_dir):
+        return 6, "Already handed off to the cloud — nothing left for this machine to run"
     cp = load_checkpoint(queue_dir)
     # Phase 4 done — BE work complete, FE-P5 retriggered via re-emit of
     # phase_complete phase=4 inside run_pipeline.
@@ -64512,19 +70193,18 @@ def detect_resume_phase(queue_dir):
     if marker.exists():
         return 3, "Phase 2 complete marker present — resuming from Phase 3"
     # No marker but some MDs on disk → P2 was interrupted. Restart Phase 2
-    # so the unfinished agents complete. NOTE: re-running P2 re-extracts
-    # ALL enabled agents from scratch (`run_phase2` doesn't currently scan
-    # disk to skip already-finished agents). Existing MDs are overwritten
-    # via the Firestore upsert in `save_document_to_firestore`. Wasteful
-    # on time but safe — the only correctness cost is a few extra minutes
-    # of agent work; data-wise the new MDs are at least as good as the
-    # old. An idempotency guard ("if documents/{agent}.md exists, skip
-    # launching") would be a real refactor, not landed here.
+    # so the unfinished agents complete.
+    # ⛔⛔ WAVE 10.9 — THIS SAID RE-RUNNING P2 "RE-EXTRACTS ALL ENABLED AGENTS
+    # FROM SCRATCH" and called the cost "a few extra minutes". It was every
+    # finished Deep Research bought again, on every silent crash relaunch, with
+    # its tile flipped back to "running". The main Phase-2 entry now keeps an
+    # agent that finished (`_p2_resume_plan`) and launches only the rest. This
+    # function still only picks the PHASE; which agents run is decided there.
     research_dir = queue_dir / "documents"
     has_partial_research = research_dir.exists() and any(
         f for f in research_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief")
     if has_partial_research:
-        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"
+        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (unfinished agents)"
     # Phase 1 done → resume from Phase 2: check if brief exists
     brief = queue_dir / "documents" / "brief.md"
     if not brief.exists():
@@ -64534,6 +70214,532 @@ def detect_resume_phase(queue_dir):
     return 0, "Starting from Phase 0 (Init)"
 
 
+# ── Phase 2 re-entry keeps the agents that finished (wave 10.9) ─────────────
+# ⛔⛔ A CRASH RETRY USED TO BUY EVERY DEEP RESEARCH AGAIN. An interrupted Phase 2
+# resumes through `run_phase2`, which launched every enabled agent from zero —
+# so each silent relaunch after a Chrome death (up to BROWSER_CRASH_MAX_RETRIES
+# of them, and a daemon restart resumes the same way) paid again for reports
+# already on disk and in Firestore, and flipped their finished tiles back to
+# "running".
+#
+# ⭐ THE RECORD IS WRITTEN WHERE `complete` IS ANNOUNCED AND NOWHERE ELSE. A
+# report file proves nothing on its own: the Stop path and the finalize re-save
+# both write `documents/<agent>.md` from a salvaged partial. Only the complete
+# branch of `extract_and_record_agent` adds an agent here, and every LAUNCH of
+# that agent in `run_phase2` takes it out again, so an entry always describes
+# the agent's latest attempt. It is a file because the in-process status map
+# dies with the daemon.
+#
+# ⚠ Not covered: an agent still GENERATING when Chrome died is re-run from zero
+# (reattaching it through the pause checkpoint's addresses is a separate change).
+_P2_AGENTS_DONE_FILE = "phase2_agents_done.json"
+
+
+#: The progress fields a `complete` emit carries, kept in the record so a restored
+#: agent's card can carry them too. `source_items` is deliberately NOT here: it is
+#: the findings extractor's raw input, it is the big one, and the findings it
+#: produced are already stored.
+_P2_SNAPSHOT_LISTS = ("source_urls", "sections", "steps")
+_P2_SNAPSHOT_COUNTS = ("searches", "observed_sources", "sources")
+
+
+def _p2_progress_snapshot(snapshot) -> dict:
+    """The part of an agent's live progress snapshot worth keeping on disk, in
+    the shapes the emit needs.
+
+    It runs on both sides — writing the record from the live ring and reading it
+    back off disk — because a kept agent's card is not worth an exception at
+    either end, and the emit that carries it also carries its report link."""
+    if not isinstance(snapshot, dict):
+        return {}
+    out = {}
+    for k in _P2_SNAPSHOT_LISTS:
+        if isinstance(snapshot.get(k), list):
+            out[k] = list(snapshot[k])
+    for k in _P2_SNAPSHOT_COUNTS:
+        if k in snapshot:
+            try:
+                out[k] = int(snapshot[k] or 0)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _p2_mark_agent_done(queue_dir, agent_key, done, elapsed_sec=0, findings=None,
+                        progress=None, history=None):
+    """Add one agent to the durable Phase-2 completion record, or with
+    `done=False` take it out.
+
+    Never raises: a record that fails to write only means the agent is re-run
+    on a crash retry, which is what always happened before."""
+    if not queue_dir or not agent_key:
+        return
+    path = Path(queue_dir) / _P2_AGENTS_DONE_FILE
+    key = str(agent_key).lower()
+    try:
+        agents = json.loads(path.read_text(encoding="utf-8")).get("agents") or {}
+    except Exception:
+        agents = {}
+    if not isinstance(agents, dict):
+        agents = {}
+    if done:
+        agents[key] = {"completedAt": int(time.time() * 1000),
+                       "elapsedSec": int(elapsed_sec or 0),
+                       # Kept so a restored agent's Findings tab is the one its
+                       # own extraction built, not save_meta's heading fallback.
+                       "findings": list(findings or []),
+                       # ⭐ And the sources / sections / steps its own `complete`
+                       # emit carried: a resume re-seeds the web's Phase-2 details,
+                       # so a card announced without these sits on 0 sources and no
+                       # sections for the rest of the phase. The in-process
+                       # snapshot ring dies with the daemon, like the record itself.
+                       "progress": _p2_progress_snapshot(progress),
+                       # ⛔⛔ AND THE CURVE, for the same reason one step later
+                       # (wave 10.9, repair round 2). `save_meta` persists
+                       # `progressHistory` off the live ring, and a kept agent is
+                       # never relaunched — so nothing ticks its ring on the
+                       # attempt that finishes the run, and the whole-field
+                       # `agents` write replaced its real curve with []. Stored
+                       # downsampled, the same shape `save_meta` writes, so what
+                       # comes back is what the first attempt would have saved.
+                       "progressHistory": _downsample_progress_history(history)}
+    elif key in agents:
+        del agents[key]
+    else:
+        # Nothing to take out, so nothing is written: a launch on a fresh run
+        # never creates the file, or recreates a deleted run's folder.
+        return
+    try:
+        _atomic_write_text(path, json.dumps({"agents": agents}), create_parents=False)
+    except Exception as _e:
+        log(f"[phase2] completion record for {key} not written ({_e}) — a crash "
+            f"retry will re-run it", "WARN")
+
+
+def _p2_restorable_agents(queue_dir, enabled_agents) -> dict:
+    """{agent_key: {"text", "elapsed_sec", "findings", "progress", "history"}}
+    for each enabled agent a Phase-2 re-entry must NOT launch again.
+
+    ⛔ BOTH HALVES, ALWAYS. An agent qualifies only with a completion record AND
+    its report still on disk over 100 bytes (`detect_resume_phase`'s bar). The
+    record alone is not enough: a feedback-targeted resume unlinks every agent
+    report and leaves the record behind. The file alone is not enough: see the
+    block comment above. Anything unreadable answers "run it again"."""
+    if not queue_dir:
+        return {}
+    qd = Path(queue_dir)
+    try:
+        done = json.loads((qd / _P2_AGENTS_DONE_FILE).read_text(encoding="utf-8")).get("agents")
+    except Exception:
+        return {}
+    if not isinstance(done, dict):
+        return {}
+    out = {}
+    for agent in enabled_agents or ():
+        key = str(agent).lower()
+        entry = done.get(key)
+        if not isinstance(entry, dict):
+            continue
+        doc = qd / "documents" / f"{key}.md"
+        try:
+            if doc.stat().st_size <= 100:
+                continue
+            md = doc.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        # Our own `# <Agent> Deep Research` header comes off: the extractor's
+        # `text` never carried it, and every re-save adds it back.
+        first, _nl, rest = md.partition("\n")
+        if first.startswith("# ") and "Deep Research" in first:
+            md = rest.lstrip("\n")
+        # …and so does our numbering. ⛔⛔ THE FILE IS WRITTEN NUMBERED AND THE
+        # `text` IN `results` NEVER WAS: the agents that re-ran hand back plain
+        # text, so a kept agent's `##### Sources` list would land in the MIDDLE of
+        # the consolidated report, where the web's end-anchored strip leaves it.
+        # See `_document_without_sources`.
+        md = _document_without_sources(md)
+        if not md.strip():
+            continue
+        try:
+            elapsed = int(entry.get("elapsedSec") or 0)
+        except (TypeError, ValueError):
+            elapsed = 0
+        findings = entry.get("findings")
+        history = entry.get("progressHistory")
+        out[key] = {"text": md, "elapsed_sec": elapsed,
+                    "findings": findings if isinstance(findings, list) else [],
+                    "progress": _p2_progress_snapshot(entry.get("progress")),
+                    "history": history if isinstance(history, list) else []}
+    return out
+
+
+def _p2_resume_plan(queue_dir, enabled_agents):
+    """(agents to launch, results to keep) for one entry into Phase 2.
+
+    The launch list is `enabled_agents` minus the finished agents, in order.
+    The kept results have the shape of `extract_and_record_agent`'s successful
+    return, keyed by display name as `run_phase2`'s are, and are marked
+    `_restored` so the finalize re-save leaves their files alone.
+
+    On a fresh run there is no record, so this launches everything."""
+    restored = _p2_restorable_agents(queue_dir, enabled_agents)
+    launch = [a for a in (enabled_agents or []) if str(a).lower() not in restored]
+    kept = {}
+    for key, r in restored.items():
+        kept[_agent_display_name(key)] = {
+            "status": "done",
+            "text": r["text"],
+            # No conversation address: it is only a reattach key, and this agent
+            # is not reattached. The P2→P3 hand-off still finds its report file.
+            "url": "",
+            "_in_app_url": in_app_document_url(key),
+            "verified": True,
+            "page": None,
+            "elapsed_sec": r["elapsed_sec"],
+            "md_saved": True,
+            "_findings": r["findings"],
+            "_progress": r["progress"],
+            "_history": r["history"],
+            "_restored": True,
+        }
+    return launch, kept
+
+
+def _p2_needs_resave(r) -> bool:
+    """Does the Phase-2 finalize pass re-write this agent's report? Not for a
+    kept agent: its file and its Firestore copy are the ones written when it
+    finished, and re-wrapping its text would stack a second header on it."""
+    return bool(r.get("text")) and not r.get("_restored")
+
+
+def _p2_announce_restored(kept) -> None:
+    """Tell the app each kept agent is done, the way its own completion did.
+
+    ⛔ NOT COSMETIC. A checkpoint resume emits a FULL `phase_restart`, and the
+    web re-seeds every Phase-2 agent's detail on it, so without this a kept
+    agent would sit on its seed row for the whole phase. The persisted status
+    is written too, because a daemon restart starts with an empty status map.
+
+    ⛔⛔ AND IT CARRIES THE SAME FIELDS THE AGENT'S OWN `complete` EMIT DID. The
+    re-seeded row is the SEED, and the web's `agent_progress` merge keeps the seed
+    for anything an event does not carry — so an announce without the sources,
+    sections and steps left the kept agent reading "complete, 0 sources, no
+    sections" for the rest of the phase. The snapshot comes off the record because
+    the in-process ring is empty after a daemon restart; it is put back into the
+    ring too, for `save_meta`'s own readers.
+
+    ⛔⛔ AND SO DOES THE CURVE (repair round 2). `save_meta` reads TWO things off
+    `_runtime` per agent, and the round-1 restore put back one of them. A kept
+    agent is never relaunched, so nothing ticks its `agent_progress_history` on
+    this attempt — and the run's final save writes the whole `agents` field, so
+    an empty ring erased the sparkline the agent that did the work had earned,
+    while the relaunched ones kept theirs."""
+    for name, r in (kept or {}).items():
+        key = name.lower().replace(" ", "")
+        n = len(r.get("text") or "")
+        url = r.get("_in_app_url") or in_app_document_url(key)
+        label = f"Read {name} report"
+        snap = r.get("_progress") or {}
+        hist = r.get("_history") or []
+        log(f"[phase2] {name} finished before the restart — keeping its report "
+            f"({n} chars), not launching it again")
+        if r.get("_findings"):
+            _runtime.agent_findings[key] = list(r["_findings"])
+        if snap:
+            _runtime.agent_progress_snapshots[key] = dict(snap)
+        if hist:
+            _runtime.agent_progress_history[key] = list(hist)
+        try:
+            emit_event("link_extracted", phase=2, agent=key, url=url, label=label,
+                       verified=True, primary=True)
+            emit_event("agent_progress", phase=2, agent=key, status="complete",
+                       progress=f"Finished before the restart — kept its report ({n:,} chars)",
+                       partialTextLen=n, elapsedSec=int(r.get("elapsed_sec") or 0),
+                       sourceUrls=snap.get("source_urls", []),
+                       sections=snap.get("sections", []),
+                       steps=snap.get("steps", []),
+                       searches=int(snap.get("searches", 0) or 0),
+                       observedSources=int(snap.get("observed_sources", 0) or 0),
+                       sources=max(int(snap.get("sources", 0) or 0),
+                                   len(snap.get("source_urls", []) or [])),
+                       links=[{"label": label, "url": url, "verified": True,
+                               "primary": True}])
+        except Exception:
+            pass
+        try:
+            _write_agent_terminal_status(key, "complete")
+        except Exception:
+            pass
+
+
+def _p2_only_enabled(results, enabled_agents) -> dict:
+    """Phase-2 results with only the agents this run enabled left in.
+
+    ⛔ THE ROSTER, NEVER THE LAUNCH LIST. A re-entry launches only the agents
+    that had not finished, and the ones it kept are in these results under their
+    display names — filtering on what was launched throws every kept report away.
+
+    Keyed through the one display-name helper `_p2_resume_plan` already uses, so
+    the two sides agree by construction."""
+    if not enabled_agents:
+        return dict(results or {})
+    names = {_agent_display_name(a) for a in enabled_agents}
+    return {n: r for n, r in (results or {}).items() if n in names}
+
+
+async def _p2_run_with_resume(queue_dir, enabled_agents, research_brief, *,
+                              run_attempt, soft_decision_exc, hard_timeout_decision):
+    """Phase 2 from one entry into it: plan → attempts → merge → safety filter.
+
+    Returns `(results, user_skipped, stopped)`. `stopped` means the person chose
+    neither Retry nor Skip at the hard timeout card and `pipeline_stopped` has
+    been emitted — the caller must return.
+
+    ⛔⛔ THIS IS THE DECISION, AND IT LIVES HERE SO A TEST CAN RUN IT. It used to
+    be ninety lines inside `run_pipeline` — a 5,000-line coroutine nothing can
+    drive — where the only thing holding the shape together was a pin on the
+    AST: one added line reassigning the launch list or the kept results put
+    every finished Deep Research back on the bill with the whole suite green.
+
+    `run_attempt(launch, brief)` is one attempt under the phase's active-time
+    deadline; it may raise `soft_decision_exc` (`.decision` is "retry"/"skip") or
+    `asyncio.TimeoutError`, and `hard_timeout_decision()` answers the second.
+    They are parameters because `run_pipeline` defines all three inside itself.
+
+    ⭐ A DELIBERATE RE-RUN MEANS THE WHOLE PHASE, kept agents included: the
+    soft-timeout card's Retry and Skip, the legacy timeout card's, and a restart
+    with new input each widen the launch back to the roster and drop the kept
+    results FIRST, before the decision is acted on.
+
+    ⛔ `enabled_agents` is not trimmed to the launch list — `run_pipeline`'s
+    phase_start emits read it, and so does the safety filter this ends with; a
+    kept agent missing from it would lose its tile or be filtered out."""
+    launch, kept = _p2_resume_plan(queue_dir, enabled_agents)
+    _p2_announce_restored(kept)
+    # Restart loop: if mid-phase pause + input triggers a restart, merge the new
+    # context into the brief and rerun the whole phase. Cap at 3 restarts to
+    # prevent infinite loops if something goes sideways.
+    results = {}
+    user_skipped = False
+    for _p2_attempt in range(3):
+        _runtime.restart_requested = False
+        while True:  # timeout-retry loop
+            try:
+                results = await run_attempt(launch, research_brief)
+                break  # success
+            except soft_decision_exc as _sd:
+                # ⭐ Wave 10.9: a person's Retry or Skip decides for the WHOLE
+                # phase, as it always has — kept agents included.
+                launch, kept = list(enabled_agents), {}
+                # User picked Retry/Skip on the soft-timeout warn.
+                # Wait is implicit — never reaches this except (the
+                # helper keeps polling on Wait until run_task either
+                # finishes naturally OR user picks Retry/Skip).
+                if _sd.decision == "retry":
+                    emit_event("phase_restart", phase=2, reason="user_retry_after_soft_timeout")
+                    results = {}
+                    continue
+                if _sd.decision == "skip":
+                    emit_event("phase_skipped", phase=2, reason="user_skip_after_soft_timeout")
+                    user_skipped = True
+                    results = {}
+                    break
+                # Defensive — the soft decision only carries "retry"/"skip";
+                # anything else means the helper contract drifted. Log +
+                # re-raise so it surfaces.
+                log(f"[P2] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
+                raise
+            except asyncio.TimeoutError:
+                # Legacy hard-path. With soft_warn_only=True the helper
+                # raises the soft decision instead of TimeoutError, so this
+                # except block is normally unreachable for P2. Kept as a
+                # safety net in case something inside run_phase2 raises a
+                # bare TimeoutError that escapes the helper's wrap.
+                launch, kept = list(enabled_agents), {}  # wave 10.9, as above
+                _decision = await hard_timeout_decision()
+                if _decision == "retry":
+                    emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
+                    results = {}
+                    continue
+                if _decision == "skip":
+                    emit_event("phase_skipped", phase=2, reason="user_skip_after_timeout")
+                    user_skipped = True
+                    results = {}
+                    break
+                emit_event("pipeline_stopped", phase=2, reason=f"user_{_decision}_after_timeout")
+                return results, user_skipped, True
+        if user_skipped:
+            break  # exit outer for loop too
+        if not _runtime.restart_requested:
+            break
+        extra_ctx_retry = _controls.pop_extra_context()
+        if not extra_ctx_retry:
+            log("[Phase 2] restart_requested but extra_context empty — continuing", "WARN")
+            break
+        # ⭐ Wave 10.9: new input re-runs the whole phase, kept agents too.
+        launch, kept = list(enabled_agents), {}
+        research_brief += f'\n\nADDITIONAL USER CONTEXT (restart #{_p2_attempt+1}):\n{extra_ctx_retry}'
+        log(f"[Phase 2] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
+        emit_event("phase_restart", phase=2,
+                   reason="mid_phase_input_on_resume",
+                   chars=len(extra_ctx_retry), attempt=_p2_attempt+1)
+    # ⭐ Wave 10.9: the kept agents join the results HERE, so every reader in
+    # `run_pipeline` — the off-topic sweep, the links, the per-agent status, the
+    # marker, save_meta, the P2→P3 hand-off — sees the whole phase.
+    results.update(kept)
+    return _p2_only_enabled(results, enabled_agents), user_skipped, False
+
+
+async def _p2_persist_reports(results, queue_dir, topic, brief_text) -> None:
+    """Everything a finished Phase 2 PERSISTS, and everything it hands on.
+
+    ⛔⛔ THIS IS THE DECISION, AND IT LIVES HERE SO A TEST CAN RUN IT. Inside
+    `run_pipeline` it was four thousand lines deep behind a browser and a queue,
+    so the only pins it could ever have were on its source TEXT — and the one
+    claim that matters here is about what a completed run WRITES. Driven with a
+    fake Firestore, this answers it: the three agent reports go out, and nothing
+    else does (`tests/test_consolidated_write_retired_109.py`).
+
+    Writes each agent's numbered report to `documents/<agent>.md` and to the
+    Firestore documents subcollection, builds the merged corpus in memory, and
+    dispatches the two readers that take it as text."""
+    # ⭐ Wave 4: rehost images in `results` BEFORE the re-save and the merged
+    # corpus below. Texts from extract_and_record_agent are already references
+    # (no fetch); a salvaged partial is not.
+    await _rehost_result_texts(results)
+    for name, r in results.items():
+        if _p2_needs_resave(r):  # wave 10.9: a kept agent's copies stand
+            fname = name.lower().replace(" ", "") + ".md"
+            _agent_md = f"# {name} Deep Research\n\n{r['text']}"
+            _agent_lc = name.lower().replace(" ", "")
+            # Backstop findings extraction at the P2 finalize re-save
+            # site. The primary site is in extract_and_record_agent,
+            # but this resave path can run on
+            # resume / manual re-finalize when the snapshot ring may
+            # have been cleared. Reuses findings that already exist.
+            #
+            # ⛔⛔ WAVE 10 — AHEAD OF THE WRITE, for the reason the
+            # primary site states: the numbering below appends a
+            # bibliography, and a findings pass run after it would read
+            # that bibliography as the report's own citations.
+            _findings = []
+            try:
+                _findings = list((getattr(_runtime, "agent_findings", {}) or {}).get(_agent_lc) or [])
+                if not _findings:
+                    _snap_f = getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}) or {}
+                    _src_urls = list(_snap_f.get("source_urls", []) or [])
+                    _src_items = list(_snap_f.get("source_items", []) or [])
+                    # Same de-gating as the primary site: this backstop
+                    # exists for resume/re-finalize, exactly when the
+                    # snapshot ring may have been cleared — so keying it
+                    # on the panel list made it useless in the one case
+                    # it was written for.
+                    if _agent_md:
+                        _findings = _extract_findings(_agent_md, _src_urls, _src_items) or []
+                        if _findings:
+                            _runtime.agent_findings[_agent_lc] = _findings
+            except Exception:
+                _findings = []
+            # ⭐ Wave 10 — numbered sources, on the same document both
+            # writes below carry.
+            _agent_md = _document_with_sources(_agent_md, findings=_findings)
+            (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
+            # Sync to Firestore documents subcollection — doc_type is the
+            # agent key (chatgpt / gemini / claude), consistent with the
+            # frontend's Documents page expectation.
+            save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
+    # ⛔⛔ 2026-09-22, WAVE 10.9 — THE MACHINE NO LONGER PERSISTS THE STACKED
+    # DOCUMENT ANYWHERE, AND THE STRING BELOW IS ALL THAT IS LEFT OF IT. The
+    # stack is exactly what it looks like: one H1 and each agent's report
+    # verbatim, no model, no budget, no cap. `documents/consolidated.md` went on
+    # 09-18; the Firestore mirror under the `consolidated` doc type goes here.
+    #
+    # ▶ WHY NOW — and it is the condition THIS BLOCK wrote down for itself, "no
+    # surface needs a combined document for a run without a synthesis":
+    #   * the P5 SUMMARY reads the Super Research document and only it (owner's
+    #     decision D-3 — `summary-generate.ts` takes `documents/synthesis`, the
+    #     three agent reports for the contributor roster alone, and this stack
+    #     not at all). It used to read `documents/consolidated` as its ONLY
+    #     source and refuse without it; that is why the mirror outlived the disk
+    #     copy, and it is why the mirror could not go until the web half shipped.
+    #   * the cloud route is the ONLY runner of phases 4 and 5 — the browser asks
+    #     it to run and nothing else does — and `/api/summary` and
+    #     `/api/superresearch` no longer exist, so there is no second path left
+    #     that could want the stack as an input.
+    #   * a run that never reaches phase 5 has no synthesis AND no summary, and
+    #     every phase-4 exit is terminal with its reason on the run. "No
+    #     synthesis" is a stated outcome now, not a gap a stand-in document
+    #     papers over.
+    #
+    # ▶ AND A PERSISTED STACK WAS WRONG ON EVERY RE-RUN ANYWAY. It was built HERE
+    # and nowhere else, while the pause-with-extra-context resume and the Retry
+    # at the Phase-3 "no documents" gate each re-write and re-mirror
+    # `documents/<agent>.md` — so a resumed run's saved stack was the previous
+    # attempt's text under a name that claimed otherwise. If a combined DOCUMENT
+    # is ever wanted again it is the web's synthesis, which is rebuilt from the
+    # reports that exist at the time.
+    #
+    # ⛔⛔ THE STRING STAYS, AND IT IS NOT A LEFTOVER. `_consolidated_md` is the
+    # in-memory input to the two readers below — the one-line `summary` FIELD on
+    # /researches and the post-P2 title refresh — which both need all three
+    # reports at once and take the TEXT, never a saved document. Deleting the
+    # build along with the write stops both of them silently: the gate goes
+    # False, no error and no log line.
+    #
+    # ▶ HISTORICAL RUNS KEEP THEIRS, so the readers stay put. Every run made
+    # before today still has a saved `consolidated` document and must keep
+    # opening: the chat's document catalogue still lists it, and the web's
+    # `visibleDocuments` hides the stack when a synthesis exists and KEEPS it
+    # when none does. The three derived-stem exclusions (the P3 NotebookLM scan,
+    # the Flow-B fallback scan, the P1 attach scan) stay for the same reason — a
+    # resume of an old run reads a directory that still holds `consolidated.md`.
+    consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
+    for name in ["ChatGPT", "Gemini", "Claude"]:
+        r = results.get(name, {})
+        if r.get("text"):
+            consolidated_parts.append(f"\n## {name} Research\n\n{r['text']}")
+    if len(consolidated_parts) > 1:
+        _consolidated_md = "\n".join(consolidated_parts)
+        # 2026-05-10: kick off the final post-research summary using
+        # the merged agent reports (all 3, as built above).
+        # Overwrites the earlier brief-based stub with a "what the
+        # research found" line — this is the version users see on
+        # /researches after the pipeline finishes. Non-blocking
+        # daemon thread; subsequent P3 (podcast) and FE P4/P5
+        # (distribution) phases add no new research content, so
+        # this is the final refresh of THIS field.
+        # ⭐ NOT the P5 Summary DOCUMENT, which is the web's and is
+        # built from the Super Research document: this is the
+        # `summary` FIELD on the research, the paragraph the
+        # /researches tile animates. `_consolidated_md` reaches it as
+        # in-process text, which is why retiring the Firestore mirror
+        # left this line untouched.
+        try:
+            _generate_research_summary_async(
+                topic,
+                brief_text,
+                _consolidated_md,
+            )
+        except Exception as _sum_e:
+            log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
+        # 2026-05-11: also refresh research.title now that we have
+        # actual findings (not just the user's raw brief). The FE
+        # /api/title call at pipeline start gave us a 4-8 word
+        # startup title based ONLY on the user's input — often a
+        # paragraph with "Goal:" / "Already sorted" sections that
+        # produces a less-focused title. Post-P2 the agents have
+        # produced concrete findings; the refresh reflects what
+        # was actually researched.
+        try:
+            _refresh_research_title_async(
+                topic,
+                brief_text,
+                _consolidated_md,
+            )
+        except Exception as _tit_e:
+            log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")
+
+
 # ── Browser-crash recovery (#725) ───────────────────────────────────────────
 # Max CONSECUTIVE silent browser-crash auto-retries before run_pipeline
 # escalates to a user-facing Retry/Skip card. 2 silent retries = 3 total
@@ -64541,12 +70747,73 @@ def detect_resume_phase(queue_dir):
 # `_crash_retries` param (NOT _runtime, which `reset()`s per run).
 BROWSER_CRASH_MAX_RETRIES = 2
 
+# How long `_browser_context_is_dead` waits for the context to answer. A live
+# Chrome answers `cookies()` in milliseconds; this only has to outlast a stall,
+# not a page load. See the docstring for what a timeout is taken to MEAN.
+_CTX_PROBE_TIMEOUT_SEC = 10.0
+
+
+async def _browser_context_is_dead(browser) -> bool:
+    """Is the whole BrowserContext gone, as opposed to one tab having closed?
+
+    ⛔⛔ THE DISTINCTION THAT WAS MISSING. `page.is_closed()` answers a question
+    about ONE TAB, and every caller that only had that answer treated a dead
+    browser as N independent tab crashes. On 2026-09-20 (bundle 8D9CWHZJ) that
+    turned a recoverable Chrome segfault into a run that sat parked for nine
+    hours: Phase 2 reported "COMPLETE: 1/3", and the silent relaunch-and-resume
+    machinery that exists for exactly this never ran.
+
+    ⭐ PROBES THE CONTEXT, AND THE PROBE IS THE ONE THE FAILURE ALREADY GAVE US.
+    In that bundle the context's own death surfaced twice within four seconds —
+    `BrowserContext.cookies: Target page, context or browser has been closed`
+    and `BrowserContext.new_page: …` — so `cookies()` is a known-good, cheap,
+    side-effect-free question to ask. `_is_browser_close_error` classifies the
+    answer, so this shares its string set with the navigate() retry path rather
+    than growing a second opinion about what "gone" looks like.
+
+    ⚠ FAILS SAFE TOWARDS "ALIVE" ON AN ERROR IT DOES NOT RECOGNISE. A False
+    here costs what we have today — a per-agent failure — while a wrong True
+    would unwind a healthy run and relaunch Chrome underneath it. So an
+    unrecognised exception answers False. (A missing context handle answers
+    True: there is nothing left to run the phase on.)
+
+    ⛔⛔ BUT A PROBE THAT NEVER ANSWERS IS DEAD, NOT ALIVE (wave 10.9). The probe
+    used to await `cookies()` with no bound, and the driver gives that call no
+    timeout of its own. A HUNG Chrome — process alive, CDP silent — therefore
+    parked this coroutine for ever, at every call site — and the notebook park
+    sits outside any phase ceiling, so nothing above it would ever time out: the
+    run froze with no card and nothing in the log after the last line.
+
+    The probe is bounded now, and a timeout answers True, on purpose: a context
+    that cannot answer a cookie read in ten seconds cannot run a phase either,
+    and True is what sends the run down the crash path — unwind,
+    `Browser.close()` (bounded, and it kills our profile's Chrome when the close
+    does not finish), silent relaunch and resume, and the Retry card once
+    BROWSER_CRASH_MAX_RETRIES is spent. False would hand the hung browser back
+    to a caller whose next call hangs the same way.
+    """
+    ctx = getattr(browser, "context", None)
+    if ctx is None:
+        return True
+    try:
+        await asyncio.wait_for(ctx.cookies(), timeout=_CTX_PROBE_TIMEOUT_SEC)
+        return False
+    except asyncio.TimeoutError:
+        # ⛔ Caught BEFORE the generic arm, which would read an empty
+        # TimeoutError as "unrecognised" and answer alive.
+        log(f"[browser] the context did not answer a cookie read within "
+            f"{_CTX_PROBE_TIMEOUT_SEC:g}s — treating a hung Chrome as a dead one "
+            f"so the crash path can replace it", "WARN")
+        return True
+    except Exception as _e:
+        return _is_browser_close_error(_e)
+
 
 def _is_browser_close_error(exc) -> bool:
     """True when `exc` is a Chromium/patchright "the page or browser went away"
     failure — the user closed the window, an OOM kill, a profile-lock fight, or
     a driver EPIPE. Reuses the SAME string set the navigate() retry path keys
-    on (see ~research.py:15975). These strings originate in the CDP driver, not
+    on (see `Browser.navigate`). These strings originate in the CDP driver, not
     the OS, so they read identically on Windows / Linux / macOS — the
     classification is fully cross-platform. `TargetClosedError` is matched by
     type name so a future message-wording change still classifies."""
@@ -64559,7 +70826,193 @@ def _is_browser_close_error(exc) -> bool:
         or "browser has been closed" in msg
         or "bring_to_front" in msg
         or "targetclosed" in tname
+        # ⛔⛔ OUR OWN MARKER, ADDED 2026-09-20. Every site that detects a dead
+        # browser raises a RuntimeError of its own wording — "died during phase
+        # 2", "died before the NotebookLM upload", "died during a phase 2 hard
+        # retry" — and NONE of those texts matched the patterns above, because
+        # they are our sentences, not the driver's. So the whole recovery rode
+        # on `_runtime.last_failure_kind` surviving the unwind: one side channel,
+        # set on the line before the raise, with nothing pinning the coupling.
+        # Anything that reset the runtime mid-unwind would silently downgrade a
+        # browser crash to an ordinary one-shot failure and put a Retry card in
+        # front of somebody instead of relaunching.
+        #
+        # ⭐ Every such message ends in the marker below, so the top-level
+        # handler can re-derive the kind from the exception ALONE. The flag is
+        # still set and still preferred; this is the belt to its braces, and it
+        # is the half that cannot be lost by a `reset()`.
+        or "(browser crash)" in msg
     )
+
+
+async def _p3_upload_failure_kind(exc, browser) -> str:
+    """Why did a Phase-3 NotebookLM upload attempt fail? One of
+    "browser_dead", "tab_closed" or "other".
+
+    ⛔ THE UPLOAD WAS THE ONE BROWSER-DEATH SITE THAT JUDGED BY TEXT ALONE
+    (wave 10.9). Every other site asks the context; this handler read "Target
+    page, context or browser has been closed" and unwound the whole run — a
+    Chrome relaunch plus one unit of the crash budget — when all that had gone
+    was the NotebookLM TAB, which each attempt opens afresh anyway.
+
+    ⭐ So the context is asked FIRST, for every failure: a dead or hung browser
+    unwinds whatever the exception said (an upload that timed out on a dead
+    Chrome says nothing about closing, and its Retry card could never work).
+    Only a live context lets the close text mean "just this tab".
+    """
+    if await _browser_context_is_dead(browser):
+        return "browser_dead"
+    if _is_browser_close_error(exc):
+        return "tab_closed"
+    return "other"
+
+
+# ── The browser hang watchdog ──────────────────────────────────────────────
+# ⛔⛔ EVERY GUARD ABOVE RUNS INSIDE THE RUN, AND A HUNG CHROME NEVER GIVES THE
+# RUN ITS TURN BACK (wave 10.9, repair round). The bounded probe answers "dead"
+# beautifully — at the call sites that reach it. Phase 2's round-robin does not:
+# its tick awaits `browser.switch_to_page(page)` → `page.bring_to_front()` and
+# `page.evaluate(...)`, which the driver sends with no timeout of its own, and
+# `_browser_context_is_dead` is consulted only after a tab reports CLOSED. A
+# hung Chrome's tabs never do. So the tick parks inside one of those awaits and
+# the phase ceiling above it only warns (soft_warn_only), leaving the run frozen
+# until the worker's five-hour ceiling — the freeze #547 is about.
+#
+# ⛔⛔ AND THE SAME SENTENCE IS TRUE OF TWO MORE WAITS (repair round 2). Phase
+# 1's poll and the phase-3 audio wait carry the same unbounded page calls under
+# the same buttonless soft ceiling, and neither asks `_browser_context_is_dead`
+# anywhere. The first repair wrapped phase 2 only, so #547 stayed live in both.
+# `_watched_for_a_hung_browser` now decorates all three; the constants below
+# are the ladder for every one of them, which is why they are not named for a
+# phase.
+#
+# ⛔ AND A TICK THAT OVERRAN CANNOT REPORT ITS OWN OVERRUN, because the overrun
+# IS an await that never returns: there is no line after it to check the clock
+# on. The only thing that can see it is somebody OUTSIDE the tick — hence a
+# watchdog task beside the poll rather than more bounds inside it. Bounding each
+# page call in turn would also have to be redone for every call the loop grows.
+#
+# ⭐ AND IT ASKS THE ONE QUESTION THAT SEPARATES A HANG FROM EVERYTHING ELSE:
+# did the browser ANSWER? A context that is closed — the pause path closes the
+# browser and blocks for as long as the person likes, and a crash closes it
+# outright — answers instantly, with an error, and is NOT this watchdog's
+# business: the poll's own crash sweep already handles a closed browser, and a
+# pause must never be mistaken for one. Only silence counts.
+#: How often the watchdog asks, while a watched wait runs.
+_BROWSER_HANG_CHECK_SEC = 120.0
+#: How many consecutive silences unwind the run. Each one is a full
+#: `_CTX_PROBE_TIMEOUT_SEC` of silence and they are a check apart, so three
+#: means the browser PROCESS has not answered a trivial CDP read across ~four
+#: minutes. A live Chrome answers one in milliseconds however hard its tabs are
+#: working — cookies are the browser process's, not the renderer's — so three
+#: buys immunity to a one-off stall (a laptop waking, a disk stall on the
+#: profile) for four minutes of a ceiling measured in hours.
+_BROWSER_HANG_STRIKES = 3
+#: How long the cancelled wait gets to unwind before we raise anyway. It is
+#: cancelled INSIDE a call that is not answering, so its own unwind may be slow.
+_BROWSER_HANG_UNWIND_GRACE_SEC = 30.0
+
+
+async def _browser_context_is_unresponsive(browser) -> bool:
+    """Did the context fail to ANSWER, as opposed to answering "I am closed"?
+
+    ⭐ THE DISTINCTION `_browser_context_is_dead` DELIBERATELY DOES NOT MAKE.
+    That question is "can this context run a phase", and a closed context and a
+    silent one both answer no. This one is narrower on purpose: it is asked by
+    the watchdog, on a schedule, about a browser NOBODY has reported anything
+    wrong with — so it must say yes only to the state that no other guard can
+    see. A context that answers with a close error is a browser somebody closed
+    (a pause) or one that died (the poll's crash sweep raises within a tick).
+    Neither is a hang, and neither is ours to act on.
+    """
+    ctx = getattr(browser, "context", None)
+    if ctx is None:
+        return False
+    try:
+        await asyncio.wait_for(ctx.cookies(),
+                               timeout=_CTX_PROBE_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        return True
+    except Exception:
+        # It answered. Whatever it said, it is talking to us.
+        return False
+    return False
+
+
+def _discard_task_outcome(task):
+    """Consume an abandoned task's exception so Python does not print
+    "Task exception was never retrieved" for a failure we have already
+    reported and acted on."""
+    if not task.cancelled():
+        try:
+            task.exception()
+        except Exception:
+            pass
+
+
+async def _run_watching_for_a_hung_browser(browser, wait_coro, what):
+    """Run one of the run's long browser waits with somebody watching the
+    browser. `what` names the wait — "phase 2", "phase 1's poll", "the phase-3
+    audio wait" — and goes into the log line and the unwind's sentence.
+
+    Returns whatever the wait returns and re-raises whatever it raises — the
+    crash sweep's own RuntimeError included, untouched. The one thing it adds:
+    when Chrome has gone silent for `_BROWSER_HANG_STRIKES` checks in a row, the
+    wait is cancelled and the SAME "(browser crash)" RuntimeError the sweep
+    raises is raised in its place, with `last_failure_kind` set the same way, so
+    the recovery that already exists — unwind, bounded close (which kills our
+    profile's Chrome), silent relaunch and resume, and the Retry card once
+    BROWSER_CRASH_MAX_RETRIES is spent — runs exactly as it does for a crash.
+    No second opinion about what a dead browser means, and no second unwind.
+
+    ⭐ THE SAME RECOVERY FOR ALL THREE WAITS. A crash in phase 1 or in phase 3
+    already resumes from its own checkpoint, so a hang unwound here rejoins the
+    path a crash at the same point has always taken.
+    """
+    task = asyncio.ensure_future(wait_coro)
+    silences = 0
+    try:
+        while True:
+            done, _still_running = await asyncio.wait(
+                {task}, timeout=_BROWSER_HANG_CHECK_SEC)
+            if done:
+                return task.result()
+            if not await _browser_context_is_unresponsive(browser):
+                # ⭐ ACCEPT POLARITY, and the whole reason for the counter: a
+                # browser that is merely SLOW — a heavy page, an agent mid
+                # stream, a tick that legitimately runs for minutes — answers,
+                # and answering wipes the slate.
+                silences = 0
+                continue
+            silences += 1
+            log(f"[browser] Chrome did not answer a cookie read within "
+                f"{_CTX_PROBE_TIMEOUT_SEC:g}s while {what} was waiting on it "
+                f"({silences}/{_BROWSER_HANG_STRIKES})", "WARN")
+            if silences < _BROWSER_HANG_STRIKES:
+                continue
+            if task.done():
+                # ⭐ THE RACE THE LADDER CREATES. Each rung costs a full probe,
+                # and the wait can come back during one — with the phase's
+                # results. Unwinding on a browser nobody is waiting on any more
+                # would buy the whole of phase 2 a second time.
+                return task.result()
+            log("[browser] the research browser has been silent for "
+                f"{silences} checks and {what} is waiting on it — unwinding "
+                "the run so the crash path can replace it", "WARN")
+            _runtime.last_failure_kind = "browser_crash"
+            raise RuntimeError(
+                f"research browser hung during {what} (browser crash)")
+    finally:
+        if not task.done():
+            task.cancel()
+            # It is cancelled inside an await that is not answering, so give it
+            # a bounded moment to unwind and then leave — this path is the run's
+            # way out and may not wait on the thing it is escaping. The relaunch
+            # builds a new Browser; the bounded close kills the Chrome this task
+            # may still be stuck on, and its await fails then. The callback is
+            # attached rather than called so it also covers that late finish.
+            task.add_done_callback(_discard_task_outcome)
+            await asyncio.wait({task}, timeout=_BROWSER_HANG_UNWIND_GRACE_SEC)
 
 
 def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries):
@@ -64799,29 +71252,63 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # `clear_local_storage` device-command handler treats this dir
         # as protected. Without this, a clear fired during the lengthy
         # checkpoint-restore / config-load block below could rmtree the
-        # dir we're about to resume from. Also re-set at line ~17235
-        # for symmetry with the new-run branch — idempotent.
+        # dir we're about to resume from. Also re-set by the common
+        # `init_tracks` call after both branches — idempotent.
         init_tracks(queue_dir.name)
-        # Mark as retry/resume so browser-crash sites surface the real alert
-        # (auto-retry won't fire from finally for this attempt — the guard
-        # at the bottom of run_pipeline gates on `not resume_dir`).
+        # ⛔⛔ BOTH HALVES OF THIS COMMENT WERE FALSE, and the second one is the
+        # dangerous kind — it describes a safety property the code does not
+        # have. It said auto-retry "won't fire from finally for this attempt —
+        # the guard at the bottom of run_pipeline gates on `not resume_dir`".
+        # Since #725 that guard reads
+        #     if not ((not resume_dir) or (is_crash and crash_budget_ok)):
+        # so a browser crash on a RESUMED run retries anyway, up to the budget.
+        # That is deliberate and it is why a person's Retry buys three more
+        # silent relaunches — but anyone reading here would have concluded the
+        # opposite.
+        #
+        # ⛔ And the assignment itself does nothing: `is_retry_attempt` is read
+        # nowhere. Kept with the field, not silently dropped, so the two facts
+        # stay together.
         _runtime.is_retry_attempt = True
         start_phase, reason = detect_resume_phase(queue_dir)
         log(f"RESUME: {reason}")
         # Emit resume marker so frontend knows to ignore events before this point
         emit_event("pipeline_resumed", phase=start_phase, resumeReason=reason)
         # #929: full-restart marker. A checkpoint resume re-runs the phase
-        # from scratch (run_phase2 relaunches ALL enabled agents — a pre-pause
+        # (every enabled agent that had not FINISHED is relaunched — a pre-pause
         # user skip is a per-attempt decision, not persisted), so the FE must
         # reset that phase's UI state too: per-agent icons/steppers/details
-        # and any stale alert cards from the paused attempt. full=True is
+        # and any stale alert cards from the paused attempt. (Wave 10.9: a kept,
+        # finished P2 agent re-announces itself — `_p2_announce_restored`.) full=True is
         # emitted ONLY here — the many soft-retry phase_restart sites must
         # NOT wipe live phase UI (their agents keep running).
         if isinstance(start_phase, int) and 0 <= start_phase <= 3:
             emit_event("phase_restart", phase=start_phase,
                        reason="resume_from_checkpoint", full=True)
         if start_phase >= 6:
-            log("Pipeline already complete — nothing to resume")
+            # ⛔⛔ THIS BRANCH SAID "already complete" AND SAT DOWN (wave 10.9,
+            # 542-4). Six means the HAND-OFF is recorded, not that the run
+            # finished — `delivery.json` is written at the end of phase 3 — so a
+            # Resume pressed on a run whose cloud tail never ran logged one line
+            # and did nothing at all. That is the last door out of #542 for a
+            # person with no tab open: the machine's part is genuinely over, but
+            # the kick it owns may never have landed.
+            #
+            # ⭐ SO IT RE-FIRES THE KICK, and writes nothing. The run's status,
+            # phase and fe* fields belong to the cloud route from `beDone`
+            # onward; the route's own claim makes a repeated kick safe (202
+            # while one is fresh). An unreadable document kicks too —
+            # `on_error=False` — because the cost of an extra 202 is nothing
+            # beside a run that stays ongoing for ever.
+            if _research_is_terminal(_fb_uid, _fb_research_id, on_error=False):
+                log("Already handed off and the run has since finished — nothing to do")
+                return
+            log("Already handed off to the cloud, and the run is still open — "
+                "re-firing the cloud kick")
+            try:
+                _post_fe_p4p5_trigger(_fb_uid, _fb_research_id)
+            except Exception as _trig_err:
+                log(f"FE trigger dispatch failed on handed-off resume (non-fatal): {_trig_err}", "WARN")
             return
         if start_phase == 5:
             # P4 was done before crash but FE-P5 may not have completed
@@ -64845,14 +71332,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        summary="Resumed from checkpoint — frontend handles Phase 5")
             log("Resume: P4 already done, re-emitted phase_complete phase=4 to retrigger FE-P5")
             update_delivery(status="completed")
-            # Mirror the success-path handoff (~line 18663): advance both
-            # phase AND currentPhase to 5 so the homepage tile diagram
+            # Advance both phase AND currentPhase to 5 (P4 is already done on
+            # this branch; the normal hand-off, `_record_hand_off`, leaves them
+            # to the cloud, which writes phases 4 and 5) so the homepage tile diagram
             # stops glowing the YouTube node and FE-P5 picks up cleanly.
             # Pre-fix this only wrote phase=4, leaving currentPhase stale
             # at 4 and the diagram painting YouTube as the active node
             # forever post-resume.
-            # 2026-05-11: same beDone marker as the main exit so the
-            # queue gate also fires for resume-from-checkpoint runs.
+            # 2026-05-11: the same beDone marker as the main exit, so a
+            # resume-from-checkpoint hands off exactly as a clean finish does.
+            # ⭐ THIS WRITE IS THE HAND-OFF ITSELF, which is why it may still
+            # touch `status` and `phase`: contract rule 1 closes the machine out
+            # of those fields FROM `beDone` ONWARD, and this is the line that
+            # sets it. Everything after it on this run is the cloud's.
             _update_firestore_research({
                 "status": "ongoing", "phase": 5, "currentPhase": 5,
                 "beDone": True, "beDoneAt": int(time.time() * 1000),
@@ -64902,15 +71394,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _labels.append(_lbl)
             if _labels:
                 topic = "Research from " + ", ".join(_labels[:5])
-        run_name = run_id or f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = run_id or _mint_run_id(topic, research_id)
         queue_dir = Path(__file__).parent / "queues" / run_name
         queue_dir.mkdir(parents=True, exist_ok=True)
         (queue_dir / "documents").mkdir(exist_ok=True)
         # Set the active-run global immediately after mkdir so a
         # `clear_local_storage` device command fired during Flow B
         # source downloads / config write doesn't rmtree this dir
-        # mid-construction. The init_tracks call at line ~17235 is
-        # now redundant on this branch but harmless (idempotent).
+        # mid-construction. The common init_tracks call after both
+        # branches is now redundant on this branch but harmless (idempotent).
         init_tracks(queue_dir.name)
         start_phase = 1
         cp = {}
@@ -65070,8 +71562,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # 2026-05-13: Firestore overlay — read pipelineConfig from research doc
         # and merge restrictively (skip wins, agents-off wins, video/email-off
         # wins, podcastLength latest wins). Catches queued-state toggles that
-        # don't propagate via writeCommand (30s stale-command gate at line
-        # ~3348 discards old writes; the BE command listener also isn't
+        # don't propagate via writeCommand (the 30s stale-command gate,
+        # STALE_COMMAND_AGE_MS, discards old writes; the BE command listener also isn't
         # attached until the run picks up its slot, so writes from the
         # queued window land in Firestore but never reach _config_updates).
         # The research doc's pipelineConfig is the FE's authoritative snapshot,
@@ -65151,7 +71643,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # the skip-brief Settings toggle, and makes downstream phases work.
         # 2026-05-13: also require `2 not in sp` — when the user explicitly
         # toggles all P2 agents off, the FE cascades by adding 2 to
-        # skippedPhases (ChatInput.tsx:312). Honoring that explicit intent
+        # skippedPhases (ChatInput.tsx). Honoring that explicit intent
         # means we must NOT silently re-enable ChatGPT just because ac is
         # all-False; the user wants P2 skipped wholesale. Without this gate
         # the new Firestore overlay would correctly disable all 3 agents,
@@ -65200,9 +71692,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
     links, notebook_url, youtube_url = {}, cp.get("notebook_url", ""), cp.get("youtube_url", "")
-    # CRITICAL: audio_overview_url must be initialized at module scope so
-    # P5 (line ~15272 _effective_audio_url) doesn't NameError when resuming
-    # past P3 (start_phase >= 4). The P3 sub-step normally assigns this
+    # CRITICAL: audio_overview_url must be initialized at function scope so
+    # the reads after Phase 3 (the checkpoint and delivery writes) don't
+    # NameError when resuming past P3 (start_phase >= 4). (The Phase 5 reader
+    # this note first named, `_effective_audio_url`, went when Phase 5 moved
+    # to the web.) The P3 sub-step normally assigns this
     # inside its `elif start_phase <= 3` branch; on resume, we restore it
     # from checkpoint. P4 path also sets `audio_overview_url = ""` so the
     # variable is always defined regardless of which branch P3 takes.
@@ -65215,6 +71709,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # supposed to report what happened. The comment directly above records that
     # this exact trap was already paid for once with `audio_overview_url`.
     _p3_audio_stored = ""
+    # ⛔ AND ONCE MORE (wave 10.10): the hand-off reads when phase 3 began, to
+    # close its row. A run that skipped phase 3 or resumed past it never
+    # assigns this, and must reach the hand-off saying "no start", not raising.
+    _p3_start = None
 
     # #910: a resumed run is ongoing again. Clear a stale local "paused"
     # (login-interrupt / in-process pause) so _plan_pipeline_auto_retry's
@@ -65604,18 +72102,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Checking vision/CUA availability…")
                 try:
                     await _probe_cua_available(cua_client)
-                    # #724 item 4: a PRIOR failed probe iteration set the queue
-                    # gate's "_errored" flag via fail_phase; clear it now that
-                    # the probe succeeded, so a run that fully RECOVERED (user
-                    # fixed the key + Retry) isn't mis-flagged as errored in the
-                    # job-finally gate (which would short-circuit the next
-                    # dequeue's FE-P5 wait, "next run starts sooner"). Fail-open
-                    # no-op on a first-try success. See gate at job-finally
-                    # (_QUEUE_STATE.pop("_errored", ...)).
-                    try:
-                        _QUEUE_STATE.pop("_errored", None)
-                    except Exception:
-                        pass
+                    # ⛔ #724 item 4 CLEARED THE QUEUE GATE'S "_errored" FLAG
+                    # HERE — a prior failed probe iteration had raised it via
+                    # fail_phase, and a run that fully RECOVERED (the person
+                    # fixed the key and hit Retry) must not be filed as errored.
+                    # The flag and its one reader retired with the gate (wave
+                    # 10.9, N8); nothing carries a run's probe failure past its
+                    # own recovery any more.
                     break  # reachable — proceed to login walk / phases
                 except CuaUnavailableError as cua_err:
                     log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
@@ -65642,7 +72135,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         return
                     # Retract the durable pendingDecision the #715 seam mirrored
                     # when fail_phase fired. The central clear keys off
-                    # pipeline_resumed/stopped (research.py:~10591); in the
+                    # pipeline_resumed/stopped (in `emit_event`); in the
                     # skipInitVerify path NO downstream P0 gate emits one (the
                     # platform walk is blanked + env-check passes), so without
                     # this the card re-surfaces on a cold chat-open during a
@@ -65657,7 +72150,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # Retry — re-probe with the (presumably) fixed key. NO Skip
                     # branch here (unlike the login walk): a dead-key infra
                     # failure is fail-closed and skipInitVerify must not bypass
-                    # it. Mirrors the platform-walk retry tail at :28229.
+                    # it. Mirrors the platform-walk retry tail below.
                     _controls.consume_retry_phase(0)
                     _controls.retry_init_verify = False
                     continue
@@ -65823,7 +72316,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # into Phase 1/2/3 where it crashes harder and later.
                     # Only Retry. The global Settings → Skip login
                     # verification toggle still bypasses the loop entirely
-                    # at the top of the platform-walk (line ~18677); that
+                    # at the top of the platform-walk; that
                     # path is the right escape hatch for "I know what I'm
                     # doing, run without CUA on purpose".
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
@@ -65850,7 +72343,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # retry loop. Without this check the function just falls
                     # through to consume_retry_phase and continues, ignoring
                     # the user's skip signal. Mirrors the login_required
-                    # pattern at line ~21700.
+                    # pattern in this walk.
                     if _controls.skip_init_verify:
                         log("Phase 0: SKIP_INIT_VERIFY during cua_unavailable — bailing CUA loop", "INFO")
                         _global_skip = True
@@ -66169,7 +72662,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # ChatGPT-runs-twice design (P1 brief + P2 task), skip-at-P1
                 # cannot silently produce an empty brief — Phase 2 hard-fails
                 # with "No brief text available". Mirror the existing post-fail
-                # manual_brief flow at ~line 20554: emit manual_brief_required,
+                # manual_brief flow in Phase 1: emit manual_brief_required,
                 # block on extra_context (3h backstop), consume the user-typed
                 # brief, then steer the dispatch into SKIP so brief_artifact
                 # is created and Phase 2 runs with the manual brief.
@@ -66451,7 +72944,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 # never-die contract: fail_phase emits the
                                 # actionable alert, await the user's
                                 # decision, and act on it. Mirrors the
-                                # pattern at research.py:22131-22146.
+                                # Phase 1 timeout decision above
+                                # (`_phase_timeout_decision`: retry / skip / stop).
                                 fail_phase(1,
                                            "No brief received",
                                            "We waited for you to type a research brief in "
@@ -66479,7 +72973,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                     break
                                 # "stop" / "timeout" — terminate the run.
                                 # pipeline_stopped emit matches the
-                                # canonical pattern at research.py:22128.
+                                # canonical `user_{_decision}_after_timeout`
+                                # stop in the Phase 1 timeout branch above.
                                 emit_event("pipeline_stopped", phase=1,
                                            reason=f"user_{_bs_decision}_after_brief_wait_backstop")
                                 return
@@ -66487,8 +72982,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # 2026-05-15: skip-after-backstop propagation.
                         # When the 3h-backstop skip branch breaks the inner
                         # loop with _p1_skipped_after_error=True, exit the
-                        # outer `while True:` so the run_phase1 tail at
-                        # ~line 22275 sees the flag and emits the stub
+                        # outer `while True:` so the Phase 1 tail below
+                        # (`if _p1_skipped_after_error:`) sees the flag and emits the stub
                         # phase_complete + sets up an empty brief artifact.
                         # Without this guard we'd fall through to the
                         # "user typed a brief" path below and reset the flag.
@@ -66578,7 +73073,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     skipped=True,
                     summary="Phase 1 skipped after error — no brief generated")
                 _update_firestore_research({"phase": 1, "status": "ongoing"})
-                # Tile/Icon Consistency (mirrors P2 at line ~19244): persist
+                # Tile/Icon Consistency (mirrors P2's): persist
                 # a terminal P1+ChatGPT status to the root doc so the listing
                 # tile + chat phase icon + agent dropdown stay correct after
                 # reload. Without this, on reopen the FE falls back to the
@@ -66592,7 +73087,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # before P2 ChatGPT had run. P1's status is fully captured by
                 # phases[1].status (read by the Brief icon, which has no
                 # `agent` field). P2 ChatGPT writes its own agents.chatgpt
-                # at P2 finalize (research.py:12716).
+                # at P2 finalize.
             elif _brief_from_file:
                 # Phase 1 bypassed via --brief-file (or frontend briefText).
                 # Persist to disk + Firestore. The user supplied the text;
@@ -66632,7 +73127,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # from it, or an earlier fail_phase's "errored" is what lands
                 # on disk and nothing rewrites the file.
                 _write_phase_terminal_status(1, "complete")
-                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
+                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),
+                          started_ms=int(_p1_start * 1000))
                 emit_event("phase_complete", phase=1,
                     durationSec=int(time.time() - _p1_start), links=_p1_links,
                     summary=f"Research brief loaded from file ({brief_artifact.chars} chars)")
@@ -66690,9 +73186,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # VALUE IS GONE, AND IT IS THE TWIN OF THE ONE STEP 5 REMOVED IN
                 # PHASE 2. Nothing in this repository ever read
                 # `delivery.json["brief_url"]`, and that file is returned
-                # verbatim by `GET /api/runs/{id}` on a local server that binds
-                # every interface with no auth — so an unread copy there is
-                # exposure with no upside. Step 5 took the phase-2 mirror for
+                # verbatim by `GET /api/runs/{id}` on the local server — which,
+                # when this was written, listened on every interface with no
+                # auth (it binds 127.0.0.1 behind `ServeTokenMiddleware` now) —
+                # so an unread copy there was exposure with no upside. Step 5 took the phase-2 mirror for
                 # exactly this reason and left the phase-1 one behind.
                 # ⭐ THE CHECKPOINT WRITE ABOVE IS THE LIVE ONE and stays: a
                 # resume at phase 5 reads `brief_url` back off it and renders the
@@ -66712,7 +73209,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # while Firestore (written after) said complete. Recording first
                 # makes the file and the doc agree.
                 _write_phase_terminal_status(1, "complete")
-                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
+                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),
+                          started_ms=int(_p1_start * 1000))
                 emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
                     links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
@@ -66805,7 +73303,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # the public video description.
                         # ▶ Now identical to the three sibling branches: the
                         # brief's own in-app page, primary and verified.
-                        # ⛔ THE LABEL IS LOAD-BEARING — see #746 at :60576. It
+                        # ⛔ THE LABEL IS LOAD-BEARING — see the #746 notes above. It
                         # must be exactly "Read Brief report" or a phone/cold
                         # reopen renders the brief row TWICE, because the FE's
                         # hydration backfill synthesizes that label for the same
@@ -66866,10 +73364,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # returns, teardown_firestore_run() drops the per-run command
                 # listener, so Retry/Skip would write to a dead command bus
                 # (dead-end buttons). actions=[] renders a title/details card
-                # with a corner ✕ and no buttons. fail_phase is KEPT (its
-                # unconditional _QUEUE_STATE["_errored"]=True is what lets the
-                # next queued run dequeue promptly). Distinct alert_id avoids the
-                # generic phase2_error dismiss-ledger collision.
+                # with a corner ✕ and no buttons. fail_phase is KEPT — it is
+                # what records the phase's errored status on the document.
+                # Distinct alert_id avoids the generic phase2_error
+                # dismiss-ledger collision.
                 fail_phase(2, "No brief to research",
                            "There's no research brief yet, so deep research "
                            "can't start. This run stopped here.",
@@ -66943,8 +73441,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # tears down the FE run + BE command listener). Every agent
                     # was already skipped by the user, so there's no action left
                     # to offer; the per-agent agent_skipped events above carry
-                    # the reasons. fail_phase is KEPT (its _errored=True advances
-                    # the queue). Both all-skipped sites (verify-gate + preskip)
+                    # the reasons. fail_phase is KEPT — it records the phase's
+                    # errored status. Both all-skipped sites (verify-gate + preskip)
                     # share one alert_id so they're one logical card, not two
                     # byte-dup cards colliding on the generic phase2_error slot.
                     fail_phase(2,
@@ -66978,8 +73476,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # tears down the FE run + BE command listener). Every agent
                     # was already skipped by the user, so there's no action left
                     # to offer; the per-agent agent_skipped events above carry
-                    # the reasons. fail_phase is KEPT (its _errored=True advances
-                    # the queue). Both all-skipped sites (verify-gate + preskip)
+                    # the reasons. fail_phase is KEPT — it records the phase's
+                    # errored status. Both all-skipped sites (verify-gate + preskip)
                     # share one alert_id so they're one logical card, not two
                     # byte-dup cards colliding on the generic phase2_error slot.
                     fail_phase(2,
@@ -67006,7 +73504,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
             for da in disabled_agents:
                 # F2 (2026-05-06): emit with `reason` so the emit_event hook
-                # at :5818-5833 persists agents[<da>].status="skipped" to the
+                # persists agents[<da>].status="skipped" to the
                 # root doc. Pre-fix, the for-loop omitted reason and the hook
                 # gated persistence on truthy reason — leaving individually-
                 # config-skipped agents (e.g. Claude off, others on) without
@@ -67032,85 +73530,42 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 research_brief += f'\n\nUSER FEEDBACK (incorporate this into your research): {fb2}'
                 log(f"Phase 2: Injecting user feedback: {fb2[:100]}")
                 clear_feedback(2)
-            # Restart loop: if mid-phase pause + input triggers a restart, merge
-            # the new context into the brief and rerun the whole phase. Cap at
-            # 3 restarts to prevent infinite loops if something goes sideways.
-            results = {}
-            _p2_user_skipped = False
-            for _p2_attempt in range(3):
-                _runtime.restart_requested = False
-                while True:  # timeout-retry loop
-                    try:
-                        results = await _await_phase_with_active_deadline(
-                            2, PHASE_2_MAX_MIN,
-                            lambda: run_phase2(browser, cua_client, research_brief, verbose,
-                                               enabled_agents=enabled_agents),
-                            soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
-                        )
-                        break  # success
-                    except _PhaseSoftDecision as _sd:
-                        # User picked Retry/Skip on the soft-timeout warn.
-                        # Wait is implicit — never reaches this except (the
-                        # helper keeps polling on Wait until run_task either
-                        # finishes naturally OR user picks Retry/Skip).
-                        if _sd.decision == "retry":
-                            emit_event("phase_restart", phase=2, reason="user_retry_after_soft_timeout")
-                            results = {}
-                            continue
-                        if _sd.decision == "skip":
-                            emit_event("phase_skipped", phase=2, reason="user_skip_after_soft_timeout")
-                            _p2_user_skipped = True
-                            results = {}
-                            break
-                        # Defensive — _PhaseSoftDecision only carries
-                        # "retry"/"skip"; anything else means the helper
-                        # contract drifted. Log + re-raise so it surfaces.
-                        log(f"[P2] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
-                        raise
-                    except asyncio.TimeoutError:
-                        # Legacy hard-path. With soft_warn_only=True the
-                        # helper raises _PhaseSoftDecision instead of
-                        # TimeoutError, so this except block is normally
-                        # unreachable for P2. Kept as a safety net in case
-                        # something inside run_phase2 raises a bare
-                        # TimeoutError that escapes the helper's wrap.
-                        _decision = await _phase_timeout_decision(2, PHASE_2_MAX_MIN)
-                        if _decision == "retry":
-                            emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
-                            results = {}
-                            continue
-                        if _decision == "skip":
-                            emit_event("phase_skipped", phase=2, reason="user_skip_after_timeout")
-                            _p2_user_skipped = True
-                            results = {}
-                            break
-                        emit_event("pipeline_stopped", phase=2, reason=f"user_{_decision}_after_timeout")
-                        return
-                if _p2_user_skipped:
-                    break  # exit outer for loop too
-                if not _runtime.restart_requested:
-                    break
-                extra_ctx_retry = _controls.pop_extra_context()
-                if not extra_ctx_retry:
-                    log("[Phase 2] restart_requested but extra_context empty — continuing", "WARN")
-                    break
-                research_brief += f'\n\nADDITIONAL USER CONTEXT (restart #{_p2_attempt+1}):\n{extra_ctx_retry}'
-                log(f"[Phase 2] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
-                emit_event("phase_restart", phase=2,
-                           reason="mid_phase_input_on_resume",
-                           chars=len(extra_ctx_retry), attempt=_p2_attempt+1)
-            # Safety filter: ensure only enabled agents appear in results
-            if enabled_agents:
-                agent_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
-                enabled_names = {agent_name_map.get(a, a) for a in enabled_agents}
-                results = {n: r for n, r in results.items() if n in enabled_names}
+
+            async def _p2_attempt(_launch, _brief):
+                """One Phase-2 attempt, under the phase's active-time ceiling."""
+                return await _await_phase_with_active_deadline(
+                    2, PHASE_2_MAX_MIN,
+                    lambda: run_phase2(browser, cua_client, _brief, verbose,
+                                       enabled_agents=_launch),
+                    soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
+                )
+
+            # ⭐⭐ Wave 10.9 — A RE-ENTRY RUNS ONLY THE AGENTS THAT HAD NOT
+            # FINISHED. A crash retry or a daemon-restart resume lands here with
+            # some agents' reports already recorded; those are kept, announced and
+            # merged instead of bought again.
+            # ⛔⛔ THE WHOLE DECISION — plan, attempts, merge, safety filter — IS
+            # `_p2_run_with_resume`, and it is there because a test can run it
+            # and cannot run this coroutine. Nothing may stand between this call
+            # and the sweep below: everything from here down reads `results`, and
+            # `enabled_agents` stays the roster (the phase_start emits above and
+            # the helper's own filter read it).
+            results, _p2_user_skipped, _p2_stopped = await _p2_run_with_resume(
+                queue_dir, enabled_agents, research_brief,
+                run_attempt=_p2_attempt,
+                soft_decision_exc=_PhaseSoftDecision,
+                hard_timeout_decision=lambda: _phase_timeout_decision(2, PHASE_2_MAX_MIN))
+            if _p2_stopped:
+                return
 
             # ── ⭐⭐ THE OFF-TOPIC SWEEP AT THE SINK (2026-08-05) ──
             #
             # Everything below this line reads `results[name]["text"]`: the link
             # buckets, the per-agent `documents/<agent>.md` write, the Firestore
-            # documents subcollection, consolidated.md, save_meta, and the P2→P3
-            # handoff that hands those files to NotebookLM. So this is the ONE
+            # documents subcollection, the merged corpus the one-line summary and
+            # the title refresh are built from (wave 10.9: it is a string now, no
+            # longer a document anywhere), save_meta, and the P2→P3 handoff that
+            # hands those files to NotebookLM. So this is the ONE
             # place a wrong-topic report can be stopped before it becomes the run's
             # deliverable, regardless of which path produced it.
             #
@@ -67127,14 +73582,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if _off_topic:
                 log(f"[Phase 2] off-topic sweep rejected {_off_topic} — their text "
                     f"will not be written to documents/, mirrored to Firestore, "
-                    f"merged into consolidated.md, or handed to NotebookLM", "ERROR")
+                    f"merged into the run's summary and title, or handed to "
+                    f"NotebookLM", "ERROR")
             # ── 2026-05-10: Emit phase_complete:2 EARLY (before heavy persistence) ──
-            # The MD writes, consolidated.md build, save_meta enrichment, and
+            # The MD writes, the merged corpus, save_meta enrichment, and the
             # P2→P3 handoff are BE-internal (FE doesn't gate on them). Emitting
             # phase_complete:2 FIRST:
             #   • Flips the P2 tile to green immediately on the FE.
-            #   • Auto-cancels the per-tick narrator (emit_event hook at
-            #     ~line 6225) so "Claude is refining..." stops echoing
+            #   • Auto-cancels the per-tick narrator (an emit_event
+            #     hook) so "Claude is refining..." stops echoing
             #     while the user waits for P3.
             #   • Writes the per-agent terminal status to the root doc so
             #     reopen / tile listing renders correctly post-reload.
@@ -67350,134 +73806,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log("[Phase 2] stop/pause detected — skipping phase2_complete.marker so resume re-runs P2", "INFO")
 
             # ── Heavy persistence (BE-internal, FE-invisible) ──
-            # Per-agent MD disk writes + Firestore documents subcollection,
-            # consolidated.md build, save_meta enrichment, P2→P3 handoff.
-            # Runs AFTER phase_complete:2 so the user sees P2 turn green
-            # immediately while this work completes invisibly.
-            # ⭐ Wave 4: rehost images in `results` BEFORE the re-save and the
-            # consolidated build below. Texts from extract_and_record_agent are
-            # already references (no fetch); a salvaged partial is not.
-            await _rehost_result_texts(results)
-            for name, r in results.items():
-                if r["text"]:
-                    fname = name.lower().replace(" ", "") + ".md"
-                    _agent_md = f"# {name} Deep Research\n\n{r['text']}"
-                    _agent_lc = name.lower().replace(" ", "")
-                    # Backstop findings extraction at the P2 finalize re-save
-                    # site. The primary site is in extract_and_record_agent
-                    # (~research.py:10988), but this resave path can run on
-                    # resume / manual re-finalize when the snapshot ring may
-                    # have been cleared. Reuses findings that already exist.
-                    #
-                    # ⛔⛔ WAVE 10 — AHEAD OF THE WRITE, for the reason the
-                    # primary site states: the numbering below appends a
-                    # bibliography, and a findings pass run after it would read
-                    # that bibliography as the report's own citations.
-                    _findings = []
-                    try:
-                        _findings = list((getattr(_runtime, "agent_findings", {}) or {}).get(_agent_lc) or [])
-                        if not _findings:
-                            _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}).get("source_urls", []) or [])
-                            # Same de-gating as the primary site: this backstop
-                            # exists for resume/re-finalize, exactly when the
-                            # snapshot ring may have been cleared — so keying it
-                            # on the panel list made it useless in the one case
-                            # it was written for.
-                            if _agent_md:
-                                _findings = _extract_findings(_agent_md, _src_urls) or []
-                                if _findings:
-                                    _runtime.agent_findings[_agent_lc] = _findings
-                    except Exception:
-                        _findings = []
-                    # ⭐ Wave 10 — numbered sources, on the same document both
-                    # writes below carry.
-                    _agent_md = _document_with_sources(_agent_md, findings=_findings)
-                    (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
-                    # Sync to Firestore documents subcollection — doc_type is the
-                    # agent key (chatgpt / gemini / claude), consistent with the
-                    # frontend's Documents page expectation.
-                    save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
-            # ⛔⛔ 2026-09-18, WAVE 10 — THE STACKED DOCUMENT NO LONGER REACHES
-            # DISK, AND THE STACK ITSELF IS ON ITS WAY OUT. This block is exactly
-            # what it looks like: one H1 and each agent's report verbatim, written
-            # to `documents/consolidated.md` AND mirrored to Firestore under the
-            # `consolidated` doc type. No model, no budget, no cap. The web now
-            # SYNTHESISES the real combined document at P5
-            # (`superresearch-generate.ts` → `documents/synthesis`: planner →
-            # sections → stitch, sources numbered before the first call), and it
-            # reads THE THREE PER-AGENT REPORTS, never this stack — so the
-            # concatenation has no reader of its own left.
-            #
-            # ▶ THE DISK COPY IS GONE, and dropping it settles three things at
-            # once rather than one:
-            #   * the redundancy. Every consumer of `documents/` already refused
-            #     this file BY NAME — the P3 NotebookLM scan, the Flow-B fallback
-            #     scan and the P1 attach scan each carry a derived-stem exclusion
-            #     for it — so all it did was cost ~250 KB a run.
-            #   * it disagreed with its own inputs on every re-run. `run_phase2`
-            #     has three consumers, and the pause-with-extra-context resume and
-            #     the Retry at the Phase-3 "no documents" gate each re-write
-            #     `documents/<agent>.md` and re-mirror it; neither rebuilt the
-            #     stack, because it was built HERE and nowhere else. A resumed
-            #     run's combined file was the previous attempt's text, under a
-            #     name that claimed otherwise.
-            #   * it was written unguarded — one `write_text`, no retry, and on a
-            #     targeted resume the feedback sweep unlinks every non-brief MD,
-            #     so the file could also simply vanish and be rebuilt by nothing.
-            #
-            # ⛔⛔ THE FIRESTORE MIRROR STAYS, AND THAT IS NOT THE TASK LEFT HALF
-            # DONE — IT HAS A LIVE READER ON THE WEB. The P5 SUMMARY document
-            # reads `documents/consolidated` as its ONLY source and refuses
-            # without it ("no consolidated report to summarise" —
-            # summary-generate.ts:103, summary-doc.ts:76). On BOTH P5 legs the
-            # summary runs BEFORE the synthesis, so `documents/synthesis` does not
-            # exist yet at the moment that input is built, and the web's own note
-            # calls swapping the two call sites FILED, NOT BUILT.
-            # ▶ So this mirror is the last line of the stack, and it goes the
-            # moment the summary reads the synthesis instead (or joins the three
-            # agent documents itself). Deleting it today costs every run its
-            # Summary document, silently, and that document is minted a share link
-            # and quoted in the delivery mail.
-            consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
-            for name in ["ChatGPT", "Gemini", "Claude"]:
-                r = results.get(name, {})
-                if r.get("text"):
-                    consolidated_parts.append(f"\n## {name} Research\n\n{r['text']}")
-            if len(consolidated_parts) > 1:
-                _consolidated_md = "\n".join(consolidated_parts)
-                save_document_to_firestore("consolidated", _consolidated_md, "Consolidated Report")
-                # 2026-05-10: kick off the final post-research summary using
-                # the merged agent reports (all 3, as built above).
-                # Overwrites the earlier brief-based stub with a "what the
-                # research found" line — this is the version users see on
-                # /researches after the pipeline finishes. Non-blocking
-                # daemon thread; subsequent P3 (podcast) and FE P4/P5
-                # (distribution) phases add no new research content, so
-                # this is the final summary refresh.
-                try:
-                    _generate_research_summary_async(
-                        topic,
-                        brief_artifact.text if brief_artifact else "",
-                        _consolidated_md,
-                    )
-                except Exception as _sum_e:
-                    log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
-                # 2026-05-11: also refresh research.title now that we have
-                # actual findings (not just the user's raw brief). The FE
-                # /api/title call at pipeline start gave us a 4-8 word
-                # startup title based ONLY on the user's input — often a
-                # paragraph with "Goal:" / "Already sorted" sections that
-                # produces a less-focused title. Post-P2 the agents have
-                # produced concrete findings; the refresh reflects what
-                # was actually researched.
-                try:
-                    _refresh_research_title_async(
-                        topic,
-                        brief_artifact.text if brief_artifact else "",
-                        _consolidated_md,
-                    )
-                except Exception as _tit_e:
-                    log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")
+            # Per-agent MD disk writes + Firestore documents subcollection and
+            # the merged corpus's two in-memory readers (`_p2_persist_reports`),
+            # then save_meta enrichment and the P2→P3 handoff. Runs AFTER
+            # phase_complete:2 so the user sees P2 turn green immediately while
+            # this work completes invisibly.
+            # ⭐ Wave 10.9: the writes live in the helper so a test can DRIVE
+            # them — the claim "a completed run saves the three agent reports
+            # and no combined document" is about what is written, and inside
+            # this function nothing could ever have executed it.
+            await _p2_persist_reports(
+                results, queue_dir, topic,
+                brief_artifact.text if brief_artifact else "")
             log(f"\nPHASE 2 COMPLETE: {done_count}/{len(results)} agents finished")
             for name, r in results.items():
                 log(f"  {name:10s} status={r['status']:12s} text={len(r['text']):>6d} chars")
@@ -67491,32 +73831,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             #
             # ⛔ "Nothing reads the field" was true and was not the whole story.
             # `GET /api/runs/{id}` on the local server returns `delivery.json`
-            # verbatim, and that server binds every interface with no auth and no
-            # origin restriction — so the field had no reader in this repo and one
-            # on the network.
+            # verbatim, and when this was written that server listened on every
+            # interface with no auth and no origin restriction (it binds
+            # 127.0.0.1 behind `ServeTokenMiddleware` now) — so the field had no
+            # reader in this repo and one on the network.
             #
             # ▶ Removed rather than filtered. The one thing it fed is the file the
             # hand-off writes forty lines later, from a map that IS guarded and
             # now carries our own in-app pages; a second, earlier, unguarded copy
             # of the same idea has nothing left to contribute.
-            # Enrich meta with per-agent data from results + track events
-            save_meta(queue_dir, topic, 2)
-            meta_path = queue_dir / "meta.json"
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                agents = meta.get("agents", {})
-                for name, r in results.items():
-                    key = name.lower().replace(" ", "")
-                    if key not in agents:
-                        agents[key] = {}
-                    agents[key]["completionTimeSec"] = r.get("elapsed_sec", 0)
-                # 2026-04-29: events.jsonl scrape merge removed — events.jsonl
-                # is no longer written to disk (Firestore pipeline_events is
-                # the single transport). The agents map is already kept in
-                # sync via per-event `_update_firestore_research` calls
-                # during P2; the disk-merge here was a redundant backstop.
-                meta["agents"] = agents
-                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            # Enrich meta with per-agent data from results + track events.
+            # ⛔⛔ EACH AGENT'S TIME RIDES THE SAME WRITE (wave 10.10). It used
+            # to be written into meta.json here, AFTER `save_meta` had already
+            # sent the agents to the cloud with whatever the file held before —
+            # 0 on a fresh run — so only a browser tab left open recorded how
+            # long each agent took, and an unwatched run's analytics said "—".
+            # `save_meta` now puts the time into the entry it builds, and the
+            # disk and the cloud get one number from one write.
+            save_meta(queue_dir, topic, 2, agent_results=results)
             # ── 2026-04-25: Markdown-as-primary phase_complete (P1 mirror) ──
             # extract_and_record_agent already emitted link_extracted with the
             # in-app /documents primary the moment each agent's MD landed.
@@ -67617,7 +73949,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # consolidated.md is a P2 byproduct of claude+gemini concatenation
         # used for the Documents page only. 2026-05-11 fix: on a
         # checkpoint resume after PC death, `results` is empty and the
-        # synthesis loop at ~21117 used to hydrate results from this scan;
+        # synthesis loop used to hydrate results from this scan;
         # consolidated.md slipped in as a fourth "agent" and the rebuilt
         # NotebookLM notebook included it alongside chatgpt/claude/gemini.
         _P3_DERIVED_STEMS = {"brief", "consolidated"}
@@ -67653,6 +73985,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p3gate_attempt += 1
             log(f"No research output (attempt {_p3gate_attempt}) — awaiting user decision "
                 f"(flow_b_intent={_flow_b_intent}, p2_was_skipped={_p2_was_skipped})", "WARN")
+            # ⛔⛔ WHY IS THERE NO OUTPUT? ASK BEFORE PARKING FOR A DAY
+            # (2026-09-20). "None of the agents produced a report" is a true
+            # sentence about a dead browser and a useless one — the card offers
+            # "Retry Phase 2", which cannot work, and the wait below takes
+            # `await_phase_decision`'s 24-hour default. Phase 2 now raises on a
+            # browser death, so this gate should not normally be reached that
+            # way; it is checked anyway because "should not be reached" is what
+            # was believed about the sweep, and the cost of being wrong here is
+            # a silent day.
+            if await _browser_context_is_dead(browser):
+                _runtime.last_failure_kind = (
+                    "login_interrupt" if _login_interrupt_active() else "browser_crash")
+                log("[Phase3] there is no research output because the browser is gone "
+                    "— unwinding for checkpoint recovery rather than offering a Retry "
+                    "that cannot run", "WARN")
+                raise RuntimeError(
+                    "research browser died before phase 3 could start (browser crash)")
             if _flow_b_intent:
                 # Flow B: P1+P2 skipped, user expected to bring source docs.
                 # Either none were attached, or all downloads failed (the
@@ -67750,12 +74099,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Pre-fix, the verify gate (when skip_init_verify=True) ran a 5-15s
         # CUA call BEFORE phase_start:3 was emitted — FE saw P2 done + blank
         # gap. Now: flip P3 to "running" first; the gate runs visibly under
-        # the P3 tile (the gate's own agent_progress notebooklm status emits
-        # at line ~6529 light up the dropdown). If the gate or downstream
-        # skip-check decides skip, the existing phase_skipped:3 emit at
-        # line ~20875 cleanly flips running → skipped via the FE's
+        # the P3 tile (the gate's own agent_progress notebooklm status emits,
+        # from `_phase_verify_gate`, light up the dropdown). If the gate or
+        # downstream skip-check decides skip, the existing phase_skipped:3 emit
+        # below cleanly flips running → skipped via the FE's
         # deterministic phaseId. The canonical phase_start:3 emit later in
-        # the elif at ~line 20939 is idempotent (same phaseId, just refreshes
+        # the `elif start_phase <= 3` branch is idempotent (same phaseId, just refreshes
         # description).
         if (start_phase <= 3
                 and 3 not in skip_phases
@@ -67768,7 +74117,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # NotebookLM (no tab/CUA/pause — run_phase3_upload/audio own real
         # verification via their work-tab preflights). 'skipped' =
         # prior-skip echo; it cascades to P4 (no YouTube without podcast —
-        # same rule as the skip_phase command handler at ~line 2833).
+        # same rule as the skip_phase command handler in `_start_command_listener`).
         if (start_phase <= 3 and 3 not in skip_phases
                 and 3 not in _controls.skipped_phases
                 and _controls.skip_init_verify
@@ -68000,6 +74349,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 "DEBUG")
                         break
                     log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
+                    # ⛔⛔ IS THE BROWSER EVEN THERE? ASKED FIRST, 2026-09-20.
+                    # Every rung below assumes a live page and answers softly
+                    # when it does not: `extract_notebooklm_url` returns an
+                    # unverified RESULT rather than raising, and
+                    # `_page_shows_login_wall` is documented never to raise and
+                    # answers None on a dead page. So a browser that died in
+                    # THIS window fell straight through to the 24-hour park
+                    # below — and unlike the upload and audio-poll paths this
+                    # block sits outside `_await_phase_with_active_deadline`, so
+                    # there is no 15-minute ceiling either. A straight
+                    # twenty-four-hour hang, with a card offering a Retry that
+                    # cannot work. Same symptom as bundle 8D9CWHZJ, one window
+                    # later, which is why it is closed in the same pass.
+                    if await _browser_context_is_dead(browser):
+                        if _login_interrupt_active():
+                            _runtime.last_failure_kind = "login_interrupt"
+                            log("[NotebookLM] browser closed by the login command before the "
+                                "notebook could be opened — pausing at the checkpoint", "WARN")
+                            raise RuntimeError(
+                                "research browser closed by the login command (login interrupt)")
+                        _runtime.last_failure_kind = "browser_crash"
+                        log("[NotebookLM] the browser is gone, not the notebook — unwinding "
+                            "for checkpoint recovery instead of parking on a Retry that "
+                            "cannot work", "WARN")
+                        raise RuntimeError(
+                            "research browser died before the notebook could be opened (browser crash)")
                     # #893: a stale trusted Google cookie lands here as a
                     # sign-in redirect — name the real cause so the card is
                     # actionable (and re-verify for real on the next gate).
@@ -68070,8 +74445,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # first version of this copy did. The gate reaches
                             # here from three states, and only one of them has
                             # a notebook: the upload threw and exhausted its
-                            # retries (56307), the login pause ended in a skip
-                            # (56220), or the upload landed somewhere that is
+                            # retries, the login pause ended in a skip,
+                            # or the upload landed somewhere that is
                             # not a /notebook/{id} page. "We uploaded your
                             # reports but the notebook didn't open" is false on
                             # the first two — and the user has just dismissed a
@@ -68273,15 +74648,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # waiting on this and the P3→P4 transition looked stuck for
             # ~5s. save_meta only enriches meta.json with audio duration;
             # no downstream phase reads from meta.json synchronously.
-            try:
-                _threading.Thread(
-                    target=save_meta,
-                    args=(queue_dir, topic, 3),
-                    name="p3-savemeta-ffprobe",
-                    daemon=True,
-                ).start()
-            except Exception as _smt_e:
-                log(f"[Phase 3] failed to dispatch save_meta thread: {_smt_e}", "WARN")
+            # ⛔ And it names THIS research for its write — see the helper.
+            _save_meta_in_background(queue_dir, topic, 3)
             # Build Phase 3 links — include both notebook and audio overview
             # Only include links that pass validation (no fake/placeholder URLs)
             _p3_links = []
@@ -68515,7 +74883,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             #
             # `_p3a_user_skipped` is the sibling, found in adversarial review of
             # that fix. A Skip on the P3 UPLOAD-timeout card does emit
-            # phase_skipped:3 (line ~44346) — so it looked correct — but it was
+            # phase_skipped:3 — so it looked correct — but it was
             # missing from this gate, so the phase then ALSO emitted
             # phase_complete:3: a double terminal event that flips the tile from
             # greyed-skipped back to green and overwrites the durable phase
@@ -68546,9 +74914,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # and the second one still has the file sitting on the research
                 # computer — telling the user only that Phase 3 did not finish
                 # would throw that away.
-                _p3_audio_reason = (
-                    "audio_generated_but_upload_failed" if audio_path
-                    else "no_audio_generated")
+                #
+                # ⛔⛔ AND FOR A RUN THAT KEEPS NOTHING, NAME NEITHER — nothing
+                # failed there, the machine declined to publish, and the file
+                # this sentence used to point at is deleted minutes later. All
+                # three sentences live in `_p3_no_podcast_report`, which is the
+                # half of this decision a test can run.
+                _p3_audio_reason, _p3_audio_detail = _p3_no_podcast_report(
+                    audio_path, _fb_research_id)
                 log(f"[Phase3] no deliverable podcast ({_p3_audio_reason}) — "
                     f"reporting phase 3 as skipped rather than complete", "WARN")
                 # ⛔⛔ `detail=`, NOT `summary=`. The frontend's phase_skipped
@@ -68561,10 +74934,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # path already prefers.
                 emit_event("phase_skipped", phase=3, reason=_p3_audio_reason,
                            durationSec=int(time.time() - _p3_start), links=_p3_links,
-                           detail=("NotebookLM notebook created. The podcast was generated but "
-                                   "couldn't be uploaded — it's still on your research computer."
-                                   if audio_path else
-                                   "NotebookLM notebook created. No audio overview was produced."))
+                           detail=_p3_audio_detail)
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():
@@ -68641,21 +75011,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _controls._awaiting_user = False
         except Exception as _clr_err:
             log(f"terminal pause-clear (non-fatal): {_clr_err}", "WARN")
+        # ⛔⛔ "completed" HERE MEANS THE HAND-OFF, NOT THE RUN — and this is
+        # the line that writes it. Phases 4 and 5 have not started. Every reader
+        # of this file goes through `_handed_off_to_cloud`, which says so.
         update_delivery(status="completed")
-        # 2026-05-11: write beDone marker so the queue gate
-        # (_wait_for_prior_fe_completion) knows BE handed off to FE.
-        # research.status stays "ongoing" until FE-P5 flips it to
-        # "completed" — that's the signal the gate actually waits on;
-        # beDoneAt anchors the 4200s fallback timer.
-        _update_firestore_research({"beDone": True, "beDoneAt": int(time.time() * 1000)})
-        # 2026-05-12: autonomous P4/P5 trigger. BE has finished its work
-        # through P3 (audio in Firebase Storage). Enqueue a Cloud Task that
-        # POSTs to /api/uploadYouTube so Cloud Run runs P4 (YouTube upload)
-        # + P5 (Doc + email) + flips status="completed" server-side. The
-        # queue gate (_wait_for_prior_fe_completion) waits on status, so
-        # this chain advances the queue even when the user's phone or tab
-        # isn't open. Cloud Tasks owns delivery + retries; the call below
-        # is a fast unary RPC (~50ms typical) — no thread held.
+        # THE HAND-OFF (contract rule 1). `beDone` is the line after which this
+        # machine writes no `status`, no `phase` and no fe* field on this run:
+        # a restart, a rehydrate or a Resume from here on re-fires the kick
+        # instead of stamping the run. research.status deliberately stays
+        # "ongoing" through the cloud tail — the route's final phase-5 write is
+        # what makes it "completed".
+        # ⛔⛔ AND PHASE 3 ENDS IN THIS WRITE (wave 10.10) — the only place it can
+        # without a later machine write of the phase list. See the helper.
+        _record_hand_off(queue_dir, (_fb_uid, _fb_research_id),
+                         int(_p3_start * 1000) if _p3_start else None)
+        # The cloud kick. The machine has finished its work through P3 (audio in
+        # Firebase Storage); `/api/uploadYouTube` runs P4 (YouTube upload), then
+        # chains P5 (Super Research, summary, Doc, email) and writes
+        # status="completed" — all of it on Cloud Run, so the run finishes
+        # whether or not a tab is ever opened.
+        # ⛔ NOT A CLOUD TASK AND NOT A UNARY RPC. This comment said "Enqueue a
+        # Cloud Task … ~50ms typical, no thread held" for months; there has been
+        # no Admin SDK service account to enqueue with since Track D's cutover.
+        # It is an HTTPS POST from a detached daemon thread, retried on its own
+        # (`_post_fe_p4p5_trigger`), and on a long upload it stays open for
+        # minutes — which is exactly why `_fe_handoff_begin(drive=True)` holds
+        # the respawn while it runs.
         try:
             _post_fe_p4p5_trigger(_fb_uid, _fb_research_id)
         except Exception as _trig_err:
@@ -68684,10 +75065,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Uncaught exception anywhere in the pipeline — surface it with
         # whatever phase context we have so the frontend can route the
         # error to the correct phase tile instead of silently dropping it.
-        import traceback
         _dom_summary("run failed")
         log(f"Fatal: {e}", "ERROR")
-        traceback.print_exc()
+        _print_pipeline_traceback(research_id)
         # _runtime.phase is the most-recently-entered phase — use it as
         # the routing hint so the error lands on the right phase tile
         # instead of defaulting to 0 and polluting the P0 dropdown.
@@ -68720,7 +75100,51 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # the `try`, so it's always bound here.
         _will_silent_retry, _, _ = _plan_pipeline_auto_retry(
             queue_dir, resume_dir, _captured_failure_kind, _crash_retries)
-        if _will_silent_retry:
+        # ⛔⛔ A STOP IS NOT A CRASH, AND SINCE 2026-09-20 IT LOOKS EXACTLY LIKE
+        # ONE. The Stop handler closes the research browser deliberately — that
+        # is how it ends a run mid-phase — and the five unwind sites added that
+        # day tag every browser death with the literal "(browser crash)" so
+        # `_is_browser_close_error` can re-derive the kind from the exception
+        # alone. Both changes are right; together they mean a person pressing
+        # Stop during phase 2 or 3 raises a crash error, lands here, and is
+        # shown "The run kept hitting errors" about a run they ended themselves.
+        #
+        # The auto-retry was already refused for the right reason (Gate 2 sees
+        # the `.stop` sentinel), so only the SENTENCE was wrong — and the run
+        # was left with no terminal status of its own, because this exit never
+        # wrote one. Both are fixed by taking the same exit the phase-boundary
+        # stop takes, which is the one every other stop path in this function
+        # already uses.
+        _stop_requested = False
+        try:
+            _stop_requested = _controls.is_stop() or (queue_dir / ".stop").exists()
+        except Exception:
+            pass
+        if _stop_requested:
+            log(f"STOP requested during phase {last_phase} — the browser closed "
+                f"because we closed it; not a crash", "WARN")
+            try:
+                save_meta(queue_dir, topic, last_phase, status="stopped")
+                update_delivery(status="stopped")
+            except Exception as _sm_err:
+                log(f"stop bookkeeping (non-fatal): {_sm_err}", "WARN")
+            emit_event("pipeline_stopped", phase=last_phase, reason="stop")
+            # ⛔⛔ AND IT DOES NOT OVERWRITE A TERMINAL STATUS SOMEBODY ELSE
+            # WROTE. Cross-verify caught this: a watchdog kill writes
+            # `stopped_by_watchdog` AND queues a stop command, whose handler
+            # closes the browser — so that death lands HERE, sees `.stop`, and
+            # a blind write of plain "stopped" erased the attribution seconds
+            # later. Plain `stopped` is not a recovery status, so the chat's
+            # listener then CLEARED the card: the person lost the only sentence
+            # explaining a ceiling stop, and both its buttons. Before this wave
+            # the block wrote no status at all, which is why it never showed.
+            if _fb_uid and _fb_research_id and not _research_is_terminal(
+                    _fb_uid, _fb_research_id, on_error=False):
+                _update_firestore_research({"status": "stopped", "phase": last_phase})
+            else:
+                log("STOP: the run already carries a terminal status — "
+                    "leaving it and its card alone", "INFO")
+        elif _will_silent_retry:
             _att = _crash_retries + 1
             log(f"Browser crash at phase {last_phase} (attempt {_att}/"
                 f"{BROWSER_CRASH_MAX_RETRIES + 1}) — auto-retrying from "
@@ -68783,12 +75207,72 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # firer is dead post-run, so the catalog correctly omits auto_skip —
             # no deadline is ever armed). [retry_resume, discard] expands
             # byte-identically to the explicit Retry/Skip list this dropped.
+            # ⛔⛔ AND AUTO-RECOVERY IS OVER, WHICH NOTHING ON DISK USED TO SAY.
+            # The crash budget lives in `_crash_retries`, a PARAMETER of this
+            # function — so it dies with the call. A supervised device's boot
+            # rehydration then finds artifacts on disk and no `.stop`, enqueues
+            # the run again, and `run_pipeline` starts over at attempt zero:
+            # three more Chrome launches on a run that just exhausted its
+            # budget, silently, with the person's terminal card still on screen.
+            #
+            # ⭐ NOT `.stop`, DELIBERATELY. That sentinel means "ended for good"
+            # and is checked by the resume path too — it would refuse the very
+            # Retry this card is offering, and since wave 10.8's drop write-back
+            # it would tell the person their run "was stopped for good", which
+            # is the wrong story for a crash. This marker refuses only the
+            # AUTOMATIC paths; a human pressing Retry clears it and gets a fresh
+            # budget, because they chose to spend it.
+            try:
+                (queue_dir / NO_AUTO_RETRY_MARKER).write_text(
+                    json.dumps({
+                        "at": int(time.time() * 1000),
+                        "phase": last_phase,
+                        "kind": _captured_failure_kind or "error",
+                    }), encoding="utf-8")
+            except Exception as _nar_err:
+                log(f"[no-auto-retry] marker write failed (non-fatal): {_nar_err}", "WARN")
+            # ⛔⛔ WHEN IT WAS CHROME, THE CARD SAYS CHROME (wave 10.10). This
+            # card said "The run kept hitting errors" for every kind, although
+            # the kind is known right here — captured above, spent on its own
+            # relaunch budget, written into the marker one line up. So somebody
+            # whose research Chrome closed three times in a row read "errors"
+            # and got a Retry into the same Chrome.
+            #
+            # ⭐ `browser_crash_copy` IS NOT REUSED, deliberately: it describes
+            # one page dying under a run that CARRIED ON ("the run continued
+            # without it") and never names a cause. Here the run stopped, and
+            # the advice about the person's side is the point.
+            #
+            # ⛔ "Kept closing" only when it did. The planner can also refuse
+            # a FIRST Chrome death (a run past the phases it can re-enter),
+            # and "1 times in a row" is the sentence this exists to remove.
+            #
+            # ⛔ THE TITLE KEEPS THE "stopped:" SHAPE. The web rewrites any title
+            # its `humanizeError` does not recognise into "Hit a snag at the
+            # research step — retrying.", which sat above a body saying we
+            # stopped. "<who> stopped: <what>" is the shape it passes through
+            # verbatim (the 09-19 evidence headline), so no web change is needed.
+            if _captured_failure_kind == "browser_crash":
+                _closes = _crash_retries + 1
+                _card_error = ("Research stopped: Chrome kept closing" if _closes > 1
+                               else "Research stopped: Chrome closed unexpectedly")
+                _card_reason = (
+                    (f"Chrome closed {_closes} times in a row on the research "
+                     f"computer, so we stopped reopening it. " if _closes > 1
+                     else "Chrome closed on the research computer while the run "
+                          "was using it. ")
+                    + "Quit other Chrome windows there, update Chrome, or "
+                      "restart that computer, then Retry to start again from "
+                      "the last checkpoint — or Skip to stop here.")
+            else:
+                _card_error = "The run kept hitting errors"
+                _card_reason = ("We tried to recover a couple of times and it didn't "
+                                "take. Retry to start again from the last checkpoint, "
+                                "or Skip to stop here.")
             fail_phase(
                 phase=last_phase,
-                error="The run kept hitting errors",
-                reason="We tried to recover a couple of times and it didn't "
-                       "take. Retry to start again from the last checkpoint, "
-                       "or Skip to stop here.",
+                error=_card_error,
+                reason=_card_reason,
                 agent=None,
                 intent="crash_loop",
                 # #62: distinct alert_id so a dismissed phase-timeout card
@@ -68913,9 +75397,60 @@ async def run_pipeline_captured(*args, **kwargs):
     # exactly like a legacy start doc.
     _claimed = kwargs.pop("_submitted_by", None)
     _rid, _attempt, _submitter = _run_pipeline_capture_key(args, kwargs)
-    with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                        submitted_by=_submitter, claimed_by=_claimed):
-        return await run_pipeline(*args, **kwargs)
+    # ⭐ SAID BEFORE THE CAPTURE ARMS, so it is the one line of this run the
+    # owner's log does get: from here the run's own lines go only to its folder
+    # (`_console_withholds_line`), and an hour of silence must not read as a hang.
+    if _is_incognito_research(_rid):
+        log(f"[incognito] {_rid[:8]}… keeps nothing — its own lines stay out of "
+            f"this log")
+    try:
+        with _RunLogCapture(research_id=_rid, attempt=_attempt,
+                            submitted_by=_submitter, claimed_by=_claimed):
+            # ⭐ THE RUN'S ORIGIN, around exactly the run's own work — so the
+            # capture's own lines and the purge's line below stay the
+            # machine's, and a disk that refused the folder still names the run.
+            _origin = _LOG_RUN.set(_rid)
+            try:
+                return await run_pipeline(*args, **kwargs)
+            finally:
+                _LOG_RUN.reset(_origin)
+    finally:
+        # ⛔⛔ AND NOW THE FOLDERS GO, for a run that keeps nothing (wave 10.9,
+        # #536). Here rather than at the end of the pipeline body for three
+        # reasons: this runs on EVERY exit, including the eight early returns
+        # the body has; the sink is finalized by the time the `with` has
+        # closed, so the log folder is no longer live and can be removed; and
+        # the auto-retry recursion happens INSIDE the body, so by the time
+        # control reaches this point the last attempt is genuinely the last.
+        #
+        # ⭐ The helper refuses unless `delivery.json` says the run is over, so
+        # a crash card's Retry and a login interrupt's Resume both keep the
+        # checkpoint they resume from.
+        try:
+            _purge_incognito_run_dirs(_run_pipeline_queue_dir(args, kwargs), _rid)
+        except Exception as _pe:
+            log(f"[incognito] run-folder cleanup failed (non-fatal): {_pe}", "WARN")
+
+
+def _run_pipeline_queue_dir(args, kwargs) -> "Path | None":
+    """The queue directory a `run_pipeline` call will work in, or None.
+
+    ⛔ RESOLVED THROUGH `_run_dir_inside_queues`, which is this file's one answer
+    to "a run id is a NAME, not a path". A resume carries a full path and only
+    its last segment is a name; anything that would land outside `queues/` is
+    refused rather than followed.
+
+    ⭐ None when the call mints its own id — the CLI's local runs, which have no
+    Firestore record and so can never be incognito. An incognito run always
+    arrives from the start listener with the id it minted."""
+    try:
+        bound = _RUN_PIPELINE_SIG.bind(*args, **kwargs)
+        bound.apply_defaults()
+    except Exception:
+        return None
+    resume = bound.arguments.get("resume_dir")
+    claim = Path(str(resume)).name if resume else bound.arguments.get("run_id")
+    return _run_dir_inside_queues(claim)
 
 
 def _run_pipeline_capture_key(args, kwargs) -> "tuple[str | None, int, str | None]":
@@ -68983,6 +75518,19 @@ def _tm_platform(agent) -> "object | None":
     }.get(key, tm.Platform.OTHER)
 
 
+def _tm_research_id(research_id):
+    """The research id telemetry may carry, or None.
+
+    ⛔⛔ ONE ANSWER FOR ALL THREE EMITTERS. `RUN_STARTED`, `RUN_FINISHED` and the
+    per-event tap each hold the id and each would have to remember this on its
+    own — and `tm_emit` drops a `None` field silently, so a site that forgot
+    would look exactly like a site that remembered until somebody read the
+    spool. An incognito run reports its phases and its outcome; it does not
+    report WHICH run they belonged to, because that key is what would join its
+    whole timeline back together."""
+    return None if _is_incognito_research(research_id) else research_id
+
+
 def _tm_note_event(event_type, phase=None, agent=None) -> None:
     """`emit_event`'s tap into the content-free tier.
 
@@ -68990,7 +75538,21 @@ def _tm_note_event(event_type, phase=None, agent=None) -> None:
     mapped onto an enum. `**data` is structurally never passed, and
     `test_the_tier1_tap_forwards_a_literal_tuple` pins that set, because
     "temporarily" adding one field is how free text re-enters a content-free
-    path."""
+    path.
+
+    ⛔⛔ AND AN INCOGNITO RUN SENDS NO RESEARCH ID AT ALL (wave 10.9, #536). Two
+    reasons, and either alone would be enough. The telemetry module admits ONE
+    string shape — `RESEARCH_ID_RE`, `chat_<13 digits>_<counter>` — so an
+    `incog_…` id makes `coerce_field` raise, and `tm_emit` then logs a WARNING
+    and spools a TELEMETRY_INVALID counter for EVERY event of the run: a warning
+    flood on the person's own machine, and an invalid-event count that says the
+    product is broken when it is behaving. Widening that regex would be the
+    wrong repair — the id is the one field here that could join a run's whole
+    timeline back together, which is the thing an incognito run does not leave
+    behind. The events still ride (phase and platform are content-free); they
+    just stop naming the run.
+
+    ⭐ The ordinary path is untouched: a `chat_` run still carries its id."""
     mapped = _TM_EVENT_MAP.get(str(event_type))
     if mapped is None:
         return
@@ -69006,6 +75568,7 @@ def _tm_note_event(event_type, phase=None, agent=None) -> None:
         rid = sink.research_id if sink is not None else None
     except Exception:
         rid = None
+    rid = _tm_research_id(rid)
     if rid:
         fields["research_id"] = rid
     tm.tm_emit(mapped, **fields)
@@ -69056,8 +75619,8 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
         .collection("researches")
     # 2026-05-22: dropped "queued" from rehydration. The
     # Firestore on_snapshot listener replays every existing
-    # queue doc as ADDED on first attach (research.py:3458)
-    # and the FIFO pre-query (3955-3989) handles ordering
+    # queue doc as ADDED on first attach (the start listener's `on_snapshot`)
+    # and its FIFO pre-query handles ordering
     # across all submitters (owner + sharers). Rehydrating
     # queued docs was owner-tree-only AND created a dual-
     # processing race. "ongoing" status is still rehydrated
@@ -69174,23 +75737,49 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 _i_own = (_owner_worker == WORKER_ID)
                 if not _i_own:
                     if 1 <= _owner_worker <= _fleet_size:
-                        # KNOWN LIMITATION (#966, documented 2026-07-16): if the
-                        # owning sibling is PERMANENTLY dead (the daemon-loop marks
-                        # a worker≥2 `_dead` after a crash loop / repeated spawn
-                        # failure) it never runs its own rehydration, so this run
-                        # stays frozen "ongoing" with no Resume CTA until the
-                        # operator repairs that worker (a loud `_sup_audit` ERROR
-                        # fires on the death; the on-disk checkpoint survives, so
-                        # the run self-heals once the worker is back). A worker-1
-                        # backstop that marked such runs paused was prototyped and
-                        # REVERTED: the only cheap liveness signal (the per-run
-                        # worker-lock) is released the moment BE phases finish, so
-                        # it can't tell a dead worker from one whose run is simply
-                        # in its long FE-owned P4/P5 tail (or tab-closed) — it
-                        # would false-mark routine healthy runs, which is worse
-                        # than the rare abandonment. A correct backstop needs a
-                        # real per-worker liveness heartbeat (not present in
-                        # Firestore today); tracked for a follow-up.
+                        # ⛔⛔ THIS COMMENT SAID THE OPPOSITE OF THE CODE FOR
+                        # TWO MONTHS, AND IT IS WHAT A READER FINDS FIRST. It
+                        # was written 2026-07-16 as `KNOWN LIMITATION (#966)`:
+                        # a run owned by a permanently dead sibling "stays
+                        # frozen ongoing with no Resume CTA until the operator
+                        # repairs that worker", and a worker-1 backstop had
+                        # been "prototyped and REVERTED" because the only cheap
+                        # liveness signal could not tell a dead worker from one
+                        # in its long FE-owned P4/P5 tail.
+                        #
+                        # ⭐ #64 SHIPPED THE NEXT MORNING and solved exactly
+                        # that. It does not use the worker-lock: the SUPERVISOR
+                        # drops an on-disk `.worker.{k}.dead` marker when it
+                        # stops respawning a worker, and worker 1's
+                        # `_dead_worker_reconcile_loop` marks those runs
+                        # `paused_backend_restart`. The tail case the revert
+                        # feared is handled by reading `delivery.json` — a run
+                        # the BE already handed off is skipped. Worst-case
+                        # latency is about 150 seconds.
+                        #
+                        # ⛔ The comment survived its own fix, so a reader
+                        # following it would rebuild a backstop that exists —
+                        # and a cross-check lens did exactly that in wave 10.8,
+                        # reporting the item as open on the strength of these
+                        # words. Wave 10.8 also widened the marker from ONE
+                        # death path to four (boot spawn, watchdog respawn,
+                        # crash loop, crash respawn); before that it covered a
+                        # quarter of the cases, which is the grain of truth the
+                        # comment had left.
+                        #
+                        # ⚠ WHAT IS STILL TRUE, and it is narrow: Firestore has
+                        # no per-worker liveness heartbeat — `lastHeartbeatAt`
+                        # is worker-1-only — so the mechanism rests on the
+                        # supervisor's marker rather than on a pulse. And
+                        # `_reconcile_dead_worker_runs` queries the paired
+                        # OWNER's tree only, so a run a SHARER submitted is not
+                        # covered. Both are real; neither is this comment's
+                        # original claim.
+                        #
+                        # ⭐ NO LINE NUMBER ON PURPOSE. The previous note here
+                        # cited one that had drifted; see
+                        # `_dead_worker_reconcile_loop` and
+                        # `_write_worker_dead_marker` by name.
                         log(
                             f"[rehydrate] {research_id[:24]}… owned by sibling "
                             f"worker {_owner_worker} (fleet={_fleet_size}) — leaving "
@@ -69201,6 +75790,56 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                     if WORKER_ID != 1:
                         # Orphan (owner ∉ fleet), but I'm not the marker of record.
                         continue
+                    _orphan_safety_net = True
+                else:
+                    _orphan_safety_net = False
+                # ⭐ THE PICKUP RULE, ASKED OF THE RECORD NOW (wave 10.10). The
+                # query said "ongoing" when the scan began; every branch below
+                # writes this record or restarts its run, and a paused mark on a
+                # record archived since then would undo the archive and offer a
+                # Resume for it. Unreadable is taken, as the scan always did.
+                if (await asyncio.to_thread(
+                        _pickup_withdrawn, tree_uid, research_id, "rehydrate"))[0]:
+                    continue
+                # ⛔⛔ AFTER THE HAND-OFF THE RUN IS THE CLOUD'S, AND THIS SCAN
+                # USED TO TAKE IT BACK (wave 10.9, 542-4). The query is
+                # status=="ongoing", and a run in its cloud tail is deliberately
+                # "ongoing" for the whole of phases 4 and 5 — so every restart
+                # during a tail either stamped the run `paused_backend_restart`
+                # (a Resume CTA over an upload that was fine) or, on a supervised
+                # device, RE-ENQUEUED it: a second worker on the same research,
+                # re-running phase 3, while Cloud Run finished the first one.
+                # The dead-worker sweep had this guard from the day it was
+                # written; this scan, which sees far more runs, never did.
+                #
+                # ⭐ AND SITTING STILL IS NOT THE ANSWER EITHER. If the kick
+                # never landed — no token, a POST that died, a 5xx — nobody is
+                # running those phases and no tab is open to notice. So the
+                # machine re-fires the kick it already owns. The route is
+                # idempotent through its own claim (it answers 202 while one is
+                # fresh), and this machine is the only party awake.
+                #
+                # ⛔⛔ AND THE QUESTION IS ASKED OF THE RECORD, NOT ONLY THE DISK
+                # (wave 10.9, #536). A run that keeps nothing has had its folder
+                # deleted at the hand-off, so `delivery.json` — the disk half of
+                # this answer — cannot exist for exactly the run that most needs
+                # the re-kick. See `_recovery_sees_handoff`.
+                if _recovery_sees_handoff(research_id, data):
+                    log(f"[rehydrate] {research_id[:24]}… was handed off to the cloud "
+                        f"before this restart — re-firing the kick, leaving status alone",
+                        "INFO")
+                    try:
+                        await asyncio.to_thread(
+                            _post_fe_p4p5_trigger, tree_uid, research_id)
+                    except Exception as _kick_err:
+                        log(f"[rehydrate] re-kick failed for {research_id[:24]}…: "
+                            f"{_kick_err}", "WARN")
+                    continue
+                # ⛔ SAID AFTER THE HAND-OFF GUARD, NOT BEFORE IT. This line used
+                # to be printed at the moment the orphan branch was taken, so a
+                # handed-off orphan announced a paused mark that the guard above
+                # then (correctly) did not make.
+                if _orphan_safety_net:
                     log(
                         f"[rehydrate] {research_id[:24]}… owned by out-of-fleet "
                         f"worker {_owner_worker} (fleet={_fleet_size}) — marking "
@@ -69215,6 +75854,30 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 # queues/{run}/) let detect_resume_phase() skip completed phases.
                 # Only a run I OWN needs the supervised read (an orphan is marked
                 # paused regardless — I can't re-open it on my profile).
+                #
+                # ⛔⛔ EXCEPT A RUN THAT KEEPS NOTHING, WHICH IS ENDED HERE (wave
+                # 10.9, #536). Neither outcome below is available to it: an
+                # auto-resume would re-open somebody's private research on this
+                # machine's browser profiles hours later, on a device whose owner
+                # was told only that a run happened; and the paused mark is an
+                # offer of a Resume card in a chat that is in no list and cannot
+                # be reopened, which would hold the run's documents and its
+                # folder non-terminal until the fuse burned out instead.
+                #
+                # ⭐ PLACED AFTER EVERY OWNERSHIP GUARD ABOVE, deliberately. A
+                # run a LIVE sibling holds, or one an in-fleet worker will
+                # rehydrate onto its own profile, has already `continue`d — so
+                # this cannot stop a run that is fine.
+                if _is_incognito_research(research_id):
+                    if _update_research_doc(tree_uid, research_id,
+                                            _restart_recovery_patch(research_id)):
+                        orphaned += 1
+                        log(f"Rehydrate: {research_id[:24]}… keeps nothing — "
+                            "stopped rather than parked for a Resume nobody "
+                            "can reach", "INFO")
+                    else:
+                        log(f"Rehydrate: stop-mark failed for {research_id[:24]}…", "WARN")
+                    continue
                 is_supervised = False
                 if _i_own:
                     device_id = data.get("deviceId") or ""
@@ -69249,7 +75912,15 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
 
                 auto_resumed = False
                 if _i_own and is_supervised:
-                    run_id = data.get("backendRunId") or ""
+                    # ⛔⛔ THE SAME CLAIM AS THE RESUME PAYLOAD'S (wave 10.9).
+                    # This document sits in the scanned person's own tree, which
+                    # the rules let them create under any research id with any
+                    # `backendRunId` — so on a sharer's tree an unchecked field
+                    # auto-resumed another member's run directory into it at the
+                    # next boot. Refused, it falls through to the paused mark in
+                    # the scanned tree, which is theirs to write.
+                    run_id = _corroborated_run_id(data.get("backendRunId"),
+                                                  research_id, tree_uid)
                     if run_id:
                         queue_dir = Path(__file__).parent / "queues" / run_id
                         # Only auto-resume if the on-disk artifacts are intact
@@ -69276,8 +75947,8 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                 # cited one that had drifted ~70 lines.)
                                 # This function is at MODULE scope while `_job_queue`
                                 # is a LOCAL of run_server, so the bare name raised
-                                # NameError here — the SAME bug already fixed at
-                                # research.py:~5405 for the device-cmd listener, and
+                                # NameError here — the SAME bug already fixed in
+                                # `_start_device_command_listener`'s hard_reset branch, and
                                 # worse in this spot: the caller's `except Exception`
                                 # logs one "Queue rehydration failed" WARN and abandons
                                 # the whole block, so neither the auto-resume nor the
@@ -69324,10 +75995,8 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                     # — this fires at worker boot, the exact window a stale/
                     # claim-propagation-race token would 403 and the FE Resume
                     # CTA never fire.
-                    if _update_research_doc(tree_uid, research_id, {
-                        "status": "paused_backend_restart",
-                        "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-                    }):
+                    if _update_research_doc(tree_uid, research_id,
+                                            _restart_recovery_patch(research_id)):
                         orphaned += 1
                     else:
                         log(f"Rehydrate: mark paused_backend_restart failed for {research_id}", "WARN")
@@ -69396,27 +76065,38 @@ async def _reconcile_dead_worker_runs(tree_uid: str, dead_ids: "set[int]") -> in
         # the scanner's PID-alive guard, so it never blocks here).
         if _scan_sibling_locks_for_research(research_id, WORKER_ID):
             continue
-        # BE-tail guard: once delivery.json flips to "completed" the BE has handed
-        # P4/P5 to an autonomous Cloud-Run task that finishes the run on its own
-        # (research.status stays "ongoing" until FE-P5 flips it). Unreadable /
-        # missing delivery.json ⇒ treat as BE-incomplete ⇒ mark (recoverable from
-        # the on-disk checkpoint).
-        run_id = data.get("backendRunId") or ""
-        if run_id:
-            _dpath = Path(__file__).parent / "queues" / run_id / "delivery.json"
-            try:
-                if _dpath.exists() and json.loads(
-                        _dpath.read_text(encoding="utf-8")).get("status") == "completed":
-                    continue
-            except Exception:
-                pass
-        if _update_research_doc(tree_uid, research_id, {
-            "status": "paused_backend_restart",
-            "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-        }):
+        # BE-tail guard: once the hand-off is recorded the cloud route finishes
+        # the run on its own (research.status stays "ongoing" through that tail),
+        # so marking it paused would pop a false Resume on a healthy run.
+        # Unreadable / missing delivery.json ⇒ treat as BE-incomplete ⇒ mark
+        # (recoverable from the on-disk checkpoint).
+        # ⛔ THE RUN ID ON THE DOCUMENT IS A CLAIM HERE TOO, and joining it raw
+        # read `delivery.json` from anywhere on the disk — a path claim decided
+        # this branch on a file that was never a run's. Both halves — the claim
+        # test and what the delivery record MEANS — now live in
+        # `_claim_is_handed_off`, which is also what the boot rehydrate and the
+        # resume path ask (wave 10.9, 542-4); this branch used to be the only
+        # place in the file that got the meaning right, in a private copy.
+        # ⛔⛔ AND THE RECORD IS ASKED TOO — a run that keeps nothing no longer
+        # has the directory that file lives in (see `_recovery_sees_handoff`),
+        # so the disk alone said "not handed off" for every one of them.
+        if _recovery_sees_handoff(research_id, data):
+            continue
+        # ⭐ THE PICKUP RULE, ASKED OF THE RECORD NOW (wave 10.10) — the query
+        # is a scan old by the time this write lands, and the mark would undo an
+        # archive made since and offer a Resume for it. Unreadable is marked.
+        if (await asyncio.to_thread(
+                _pickup_withdrawn, tree_uid, research_id, "dead-worker-reconcile"))[0]:
+            continue
+        # ⛔ THE SAME PATCH AS BOOT RECOVERY'S — see `_restart_recovery_patch`.
+        # A run whose worker died is recovered the same way whether the whole
+        # process restarted or one worker was given up on, and an incognito run
+        # is ended in both rather than parked for a card nobody can reach.
+        _patch = _restart_recovery_patch(research_id)
+        if _update_research_doc(tree_uid, research_id, _patch):
             marked += 1
             log(f"[dead-worker-reconcile] {research_id[:24]}… owned by dead worker "
-                f"{owner} — marked paused_backend_restart")
+                f"{owner} — marked {_patch['status']}")
         else:
             log(f"[dead-worker-reconcile] mark failed for {research_id[:24]}…", "WARN")
     return marked
@@ -69759,6 +76439,114 @@ async def _arm_stop_signals(server, port):
         _hold_stop_signals(_sig, _signums, _on_stop, _reported)
 
 
+# ── What this computer's own run folders say about their runs ────────────────
+
+#: The queue folder name `_mint_run_id` gives a run that keeps nothing:
+#: `incognito_<13-digit ms>_<counter>_<YYYYMMDD>_<HHMMSS>`.
+_INCOGNITO_RUN_DIR_RE = re.compile(r"^incognito_[0-9]{13}_[0-9]{1,6}_[0-9]{8}_[0-9]{6}$")
+
+
+def _queue_dir_keeps_nothing(queue_dir) -> bool:
+    """Is this run folder an incognito run's?
+
+    ⭐ TWO WITNESSES, AND EITHER IS ENOUGH, because every caller uses the answer
+    to HOLD SOMETHING BACK — a refusal or a redaction — never to delete. The
+    folder's `owner.json` is the record `_queue_dir_research_id` reads; the
+    folder NAME is the mint's own shape, and it covers the run whose
+    `owner.json` write failed. A deletion must never rest on the name (it is
+    sanitised); holding back on it costs, at worst, an ordinary run that
+    somebody named exactly like a private one."""
+    if not queue_dir:
+        return False
+    p = Path(queue_dir)
+    return (_is_incognito_research(_queue_dir_research_id(p))
+            or bool(_INCOGNITO_RUN_DIR_RE.fullmatch(p.name)))
+
+
+def _local_run_state(queue_dir, delivery=None) -> str:
+    """What a run folder says its run is doing: "stopped", "paused",
+    "completed" or "running".
+
+    ⛔⛔ ONE READING FOR BOTH OF THE LOCAL SERVE API'S VIEWS (wave 10.10). The
+    single-run route read the stop and pause markers and the delivery status;
+    the list read "delivery.json exists" as "completed" — but delivery.json is
+    written at the START of a run, as "ongoing", so the list called every run
+    finished the moment it began. Both routes now ask this.
+
+    `delivery` is the parsed file when the caller already has it; otherwise
+    it is read here, and an unreadable one says nothing either way."""
+    q = Path(queue_dir)
+    if (q / ".stop").exists():
+        return "stopped"
+    if (q / ".pause").exists():
+        return "paused"
+    if delivery is None:
+        try:
+            delivery = json.loads((q / "delivery.json").read_text(encoding="utf-8"))
+        except Exception:
+            delivery = None
+    if isinstance(delivery, dict) and delivery.get("status") == "completed":
+        return "completed"
+    return "running"
+
+
+#: `_local_run_state` in the list's vocabulary, which is the app's `Research`
+#: status: a run that is running is "ongoing" there.
+_LOCAL_RUN_LIST_STATUS = {"running": "ongoing"}
+
+
+def _local_run_row(queue_dir) -> dict:
+    """One row of `GET /api/runs` for one run folder: its `meta.json` when it
+    has a readable one, else a row built from the checkpoint and
+    `_local_run_state`.
+
+    ⛔⛔ AN INCOGNITO RUN'S ROW CARRIES NO SUBJECT (wave 10.10). This API
+    answers whoever holds the serve token — the computer's owner, whom the
+    feature promises is told only that a run happened — and it returned an
+    in-flight private run's `meta.json` whole: its title, its topic and every
+    report's section titles. Such a folder is now described only by what
+    carries no subject — its folder name (minted without the topic), state,
+    phase and times — with `_BUNDLE_TOPIC_MARK` where the subject was, the mark
+    `_loggable_topic` puts in the log and the bundle redactor in a bundle."""
+    d = Path(queue_dir)
+    private = _queue_dir_keeps_nothing(d)
+    meta_path = d / "meta.json"
+    if meta_path.exists() and not private:
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    cp = load_checkpoint(d)
+    phase = cp.get("last_completed_phase", 0) if cp else 0
+    state = _local_run_state(d)
+    subject = (_BUNDLE_TOPIC_MARK if private
+               else (cp.get("topic", d.name) if cp else d.name))
+    return {
+        "id": d.name,
+        "title": subject,
+        "topic": subject,
+        "status": _LOCAL_RUN_LIST_STATUS.get(state, state),
+        "phase": max(0, phase - 1),
+        "platforms": ["chatgpt", "gemini", "claude"],
+        "documents": [], "audios": [],
+        "createdAt": int(d.stat().st_ctime * 1000),
+        "updatedAt": int(d.stat().st_mtime * 1000),
+    }
+
+
+#: What the local serve API says instead of an incognito run's report or podcast.
+_LOCAL_RUN_PRIVATE_REFUSAL = ("this run is incognito — its documents and audio "
+                              "are not served here")
+
+
+def _local_run_private_details(queue_dir) -> dict:
+    """`GET /api/runs/{id}` for an incognito run's folder: the redacted row as
+    its meta, its state, and nothing else. The checkpoint and the delivery
+    record both hold the topic, and the checkpoint the brief's address too."""
+    return {"meta": _local_run_row(queue_dir), "checkpoint": None,
+            "delivery": None, "pipeline_state": _local_run_state(queue_dir)}
+
+
 async def run_server(port=8000):
     """Start FastAPI server for real-time web app streaming."""
     from fastapi import FastAPI
@@ -69775,12 +76563,42 @@ async def run_server(port=8000):
     _exit_scheduled = False
 
     app = FastAPI(title="Research Pipeline API")
-    # ⛔⛔ NOT `allow_origins=["*"]` ANY MORE. This API has no authentication of any
-    # kind: `GET /api/runs` returns every run folder on the machine across every
-    # account that shares it, `/documents/{type}` and `/audio/{name}` serve the
-    # report bodies and the podcasts, and `POST /api/runs` starts a run taking the
-    # `uid` FROM THE REQUEST BODY. A wildcard origin means any page a person
-    # visits, in any tab, can read and drive all of it.
+
+    # ── The caller check. Wave 10.5, and it is the thing the two comments
+    # below used to say was missing ──────────────────────────────────────────
+    # ⛔⛔ UNTIL NOW THIS API AUTHENTICATED NOBODY. Loopback binding narrowed
+    # WHO could reach it to this machine; every route still served whoever
+    # asked. `GET /api/runs` returned every run folder on the machine across
+    # every account that shares it, `/documents/{type}` and `/audio/{name}`
+    # served the report bodies and the podcasts, `DELETE` removed them, and
+    # `POST /api/runs` started a run billing the `uid` IT WAS HANDED IN THE
+    # BODY. Open since 2026-08-31; skipped by two waves.
+    #
+    # ⭐ ONE GATE AT THE ASGI LAYER, NOT A DECORATOR PER ROUTE. There are
+    # fourteen routes below and a route is protected by EXISTING, so the
+    # fifteenth is covered the day it is written. `/api/health` is the only
+    # exemption and `auth/serve_token.py` holds the reason.
+    #
+    # ⛔ THE TOKEN MUST EXIST BEFORE THE FIRST REQUEST CAN BE ANSWERED, and
+    # `ensure_token` is the exclusive-create that settles which of the N
+    # workers mints it.
+    from auth.serve_token import ServeTokenMiddleware, ensure_token, token_path
+    try:
+        ensure_token()
+    except Exception as _te:
+        # ⛔ FAIL CLOSED, LOUDLY. The middleware refuses everything without a
+        # readable token, so serving on is safe — but say why, or the operator
+        # sees only blanket 401s from a backend that boots perfectly.
+        log(f"[serve] local API token unavailable ({_te}) — every request "
+            f"except /api/health will be refused until {token_path()} is "
+            f"readable", "ERROR")
+    app.add_middleware(ServeTokenMiddleware)
+
+    # ⛔⛔ NOT `allow_origins=["*"]`, AND ADDED **AFTER** THE GATE ON PURPOSE.
+    # Starlette's `add_middleware` makes the LAST-added the OUTERMOST, so this
+    # CORS layer wraps the token gate. Swap the two and the gate answers the
+    # browser's preflight — which carries no headers to authenticate with — so
+    # every cross-origin call would 401 before the origin policy ever ran.
     #
     # ⭐ THE LIST IS LOOPBACK-ONLY BECAUSE NOTHING ELSE HAS EVER CALLED IT. The web
     # app talks to the machine through Firestore (Track D) and contains zero
@@ -69889,6 +76707,29 @@ async def run_server(port=8000):
     ORPHAN_SWEEP_INTERVAL_SEC = 300
     ORPHAN_SWEEP_MIN_AGE_SEC = 300
     ORPHAN_SWEEP_IN_FLIGHT_STATUSES = {"ongoing", "queued"}
+    # ⛔⛔ 2026-09-20 — THE SWEEP BILLED ONE FIRESTORE READ PER FINISHED QUEUE
+    # DIRECTORY, EVERY FIVE MINUTES, FOREVER. The age gate below only skips
+    # directories YOUNGER than five minutes, and nothing else prunes a
+    # completed one — the 7-day startup sweep explicitly spares them. So every
+    # research this machine has ever finished stayed in the listing and cost a
+    # read on every tick, and the answer was `exists == True` every single
+    # time: 288 reads a day for one old run, and the count only ever grows.
+    #
+    # A research that exists does not stop existing often, so the answer is
+    # worth remembering. A directory confirmed present is re-checked at most
+    # hourly; one never seen before is still checked on the very next tick, so
+    # a genuine orphan is detected exactly as fast as it was.
+    #
+    # ⛔⛔ BUT NOT A RUN FROM TODAY (wave 10.10). The memo's stated cost was "a
+    # deleted research survives up to an hour", and that hour landed on exactly
+    # the research somebody had just deleted: its folders and logs stayed here
+    # for up to about sixty-five minutes after the app said it was gone. A
+    # folder whose `delivery.json` was written within the last day is asked
+    # about on every tick again (`_orphan_recheck_due`, `last_write_at`); only
+    # older ones keep the hour, so the read bill stays bounded by one day of
+    # runs rather than by every run this machine has ever finished.
+    ORPHAN_RECHECK_SEC = 3600
+    _orphan_verified: dict = {}
 
     # Its one line is a verdict about OTHER runs' queue directories
     # ("purged N orphan(s)") — measured landing inside two of the five run
@@ -69921,6 +76762,13 @@ async def run_server(port=8000):
                         continue
                     if not status or status in ORPHAN_SWEEP_IN_FLIGHT_STATUSES:
                         continue
+                    # ⭐ WHEN THIS RUN LAST WROTE, for the recency tier. The
+                    # file, not the directory: a directory's time moves only
+                    # when an entry is added or removed.
+                    try:
+                        _wrote_at = delivery_path.stat().st_mtime
+                    except OSError:
+                        _wrote_at = None
                     owner_path = d / "owner.json"
                     if not owner_path.exists():
                         continue
@@ -69931,10 +76779,17 @@ async def run_server(port=8000):
                         continue
                     if not uid or not rid:
                         continue
+                    _seen_key = f"{uid}/{rid}"
+                    if not _orphan_recheck_due(
+                            _orphan_verified.get(_seen_key, 0.0), now_ts_inner,
+                            rid, ORPHAN_RECHECK_SEC, _wrote_at):
+                        continue
                     try:
                         ref = _firebase_db.collection("users").document(uid) \
                             .collection("researches").document(rid)
                         if ref.get().exists:
+                            # Remember it, so the next eleven ticks cost nothing.
+                            _orphan_verified[_seen_key] = now_ts_inner
                             continue
                     except Exception:
                         continue
@@ -69960,6 +76815,10 @@ async def run_server(port=8000):
                     except Exception as _e:
                         log(f"[orphan-sweep] rmtree {d.name} failed: {_e}", "WARN")
                         continue
+                    # ⚠ The memo tracks the LISTING, so a removed directory
+                    # takes its entry with it. Without this the dict is the one
+                    # thing in this loop that could grow without bound.
+                    _orphan_verified.pop(_seen_key, None)
                     swept_n += 1
                     # ⛔⛔ AND NOW THE LOG FOLDER, WHICH THIS SWEEP HAS NEVER
                     # TOUCHED. Deleting a run in the app cascaded its cloud
@@ -70040,28 +76899,10 @@ async def run_server(port=8000):
             for d in sorted(queues_root.iterdir(), reverse=True):
                 if not d.is_dir():
                     continue
-                meta_path = d / "meta.json"
-                if meta_path.exists():
-                    try:
-                        runs.append(json.loads(meta_path.read_text(encoding="utf-8")))
-                        continue
-                    except Exception:
-                        pass
-                # Fallback: build from checkpoint
-                cp = load_checkpoint(d)
-                has_delivery = (d / "delivery.json").exists()
-                phase = cp.get("last_completed_phase", 0) if cp else 0
-                runs.append({
-                    "id": d.name,
-                    "title": cp.get("topic", d.name) if cp else d.name,
-                    "topic": cp.get("topic", d.name) if cp else d.name,
-                    "status": "completed" if has_delivery else "ongoing",
-                    "phase": max(0, phase - 1),
-                    "platforms": ["chatgpt", "gemini", "claude"],
-                    "documents": [], "audios": [],
-                    "createdAt": int(d.stat().st_ctime * 1000),
-                    "updatedAt": int(d.stat().st_mtime * 1000),
-                })
+                # ⛔ One row per folder through `_local_run_row`, whose fallback
+                # reads the run's state the way `get_run` does — it used to
+                # call a run "completed" as soon as delivery.json existed.
+                runs.append(_local_run_row(d))
         return runs
 
     @app.get("/api/runs/{run_id}")
@@ -70070,20 +76911,19 @@ async def run_server(port=8000):
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
+        # ⛔ An incognito run is described without its subject — its meta,
+        # checkpoint and delivery record all carry it. See `_local_run_row`.
+        if _queue_dir_keeps_nothing(queue):
+            return _local_run_private_details(queue)
         # Load meta (frontend-compatible Research object)
         meta_path = queue / "meta.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
         cp = load_checkpoint(queue)
         delivery_file = queue / "delivery.json"
         delivery = json.loads(delivery_file.read_text(encoding="utf-8")) if delivery_file.exists() else None
-        # Pipeline state: stopped is terminal, paused is resumable
-        pipeline_state = "running"
-        if (queue / ".stop").exists():
-            pipeline_state = "stopped"
-        elif (queue / ".pause").exists():
-            pipeline_state = "paused"
-        elif delivery and delivery.get("status") == "completed":
-            pipeline_state = "completed"
+        # Pipeline state: stopped is terminal, paused is resumable. The same
+        # reading the list uses — see `_local_run_state`.
+        pipeline_state = _local_run_state(queue, delivery)
         return {"meta": meta, "checkpoint": cp, "delivery": delivery, "pipeline_state": pipeline_state}
 
     # 2026-04-29: GET /api/runs/{id}/events + WS /ws/{run_id} +
@@ -70181,6 +77021,11 @@ async def run_server(port=8000):
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
+        # ⛔ THE SAME DOOR AS THE TERMINAL'S `--resume` (wave 10.10): this
+        # enqueues a job with no account on it, so no lease keeps an incognito
+        # run's record alive while it runs. Refused with the same policy.
+        if _queue_dir_keeps_nothing(queue):
+            return JSONResponse({"error": _resume_refusal(queue, "here")}, 409)
         # Block resume of stopped (terminal) runs
         if (queue / ".stop").exists():
             return JSONResponse({"error": "Run was stopped (terminal). Cannot resume — start a new run."}, 409)
@@ -70453,7 +77298,7 @@ async def run_server(port=8000):
                 # Position #1's "behind" is the currently-running pipeline
                 # when there is one. Two callers reach this branch with
                 # different semantics:
-                #   • Completion flow (after task_done at :25549) —
+                #   • Completion flow (after `_job_worker`'s task_done) —
                 #     `_QUEUE_STATE["running"]` was just flipped False and
                 #     `current_job` set to None. The else-branch clears
                 #     behind fields (no run ahead — position #1 is next up).
@@ -70516,12 +77361,12 @@ async def run_server(port=8000):
     # _do_cancel deferred-cancel branch. See helper docstring.
     _QUEUE_STATE["recompute_deferred_fn"] = _recompute_deferred_queue_positions
     # 2026-05-15: initialise the hard-reset lock here, before the device-cmd
-    # listener thread is spawned at research.py:24898. The lock makes the
-    # gate-state clear+persist (in the device-cmd thread) atomic w.r.t. the
-    # worker `finally` block writes (in the asyncio main thread). Without it,
-    # a worker finishing between the clear (line 1916-1918) and the persist
-    # (line 1919) of hard_reset would write stale uid_X back to _QUEUE_STATE,
-    # which the persist would then snapshot to disk — defeating the reset.
+    # listener thread is spawned further down run_server. The lock makes
+    # hard_reset's snapshot persist (in the device-cmd thread) atomic w.r.t.
+    # the worker `finally` block writes (in the asyncio main thread). Without
+    # it, a worker finishing inside the exit window could write a job back
+    # into the snapshot hard_reset just cleaned — defeating the reset. (It
+    # also guarded a prior-run gate-state clear until wave 10.9 removed it.)
     _QUEUE_STATE["_hard_reset_lock"] = _threading.Lock()
     _QUEUE_STATE["_pending_enq_lock"] = _threading.Lock()
 
@@ -70530,24 +77375,26 @@ async def run_server(port=8000):
     # exits — daemon-loop relaunch otherwise restarts with an empty queue,
     # losing any work that hadn't reached `status=queued` in Firestore yet.
     # Snapshot to disk on every worker boundary so a Phoenix restart can
-    # restore. Firestore-driven rehydration (line ~17850) takes precedence;
+    # restore. Firestore-driven rehydration (run_server's "Queue rehydration"
+    # block) takes precedence;
     # this is a belt-and-suspenders fallback for racing/network-blocked cases.
     # Per-worker pending-queue file (2026-05-21). Pre-multi-worker, all
     # writers raced on `_pending_queue.json` (+ its `.tmp` sibling). With
     # N workers, the tmp-then-replace dance still races: two workers
     # writing different snapshots both name the tmp the same, the second
     # write clobbers the first mid-buffer. Per-worker file isolates each
-    # snapshot. Restore (research.py:~26649, 26991) reads MY worker's
+    # snapshot. Restore (the disk-restore blocks in run_server) reads MY worker's
     # file only — siblings restore their own. Single-worker installs
     # keep the legacy filename (worker 1 = no suffix) so a pre-PR install
     # that never re-pairs into multi-worker still finds its snapshot.
-    if WORKER_ID == 1:
-        _pending_queue_path = queues_root / "_pending_queue.json"
-    else:
-        _pending_queue_path = queues_root / f"_pending_queue_worker_{WORKER_ID}.json"
+    # ⭐ ONE ANSWER for the name, shared with the cancel path that sheds a run
+    # that keeps nothing from this file (`_shed_from_pending_snapshot`) — two
+    # spellings of one path are how a writer and a rewriter drift apart.
+    _pending_queue_path = _pending_queue_snapshot_path()
 
-    # Forward declaration so the module-scope device-cmd listener at
-    # research.py:1766 can call this closure via _QUEUE_STATE["persist_fn"].
+    # Forward declaration so the module-scope device-cmd listener
+    # (`_start_device_command_listener`) can call this closure via
+    # _QUEUE_STATE["persist_fn"].
     # The assignment happens immediately after the function body below.
     def _persist_pending_queue(current_job=None):
         """Snapshot _job_queue contents (+ optional current_job) to disk.
@@ -70558,41 +77405,19 @@ async def run_server(port=8000):
         research's Firestore doc so the FE recovery banner surfaces. The
         Phoenix auto-restore path on respawn relies on this snapshot — if
         it didn't write, there's nothing to restore from, and the run
-        would otherwise be silently lost on BE restart."""
+        would otherwise be silently lost on BE restart.
+
+        ⛔ WHAT MAY BE WRITTEN ABOUT THE RUNNING JOB IS `_snapshot_job_view`'s
+        business, not this closure's: the claimed job used to go to disk whole,
+        topic, address and brief, in a file the purge never reaches."""
         try:
             queues_root.mkdir(parents=True, exist_ok=True)
             try:
                 pending = list(_job_queue._queue)
             except Exception:
                 pending = []
-            payload = {
-                "ts_ms": int(time.time() * 1000),
-                "current": current_job,
-                "pending": pending,
-                # 2026-05-11: persist the queue-gate's prior-run state so
-                # a daemon restart mid-FE-P5 doesn't lose the wait
-                # context. Without this, fresh _QUEUE_STATE after respawn
-                # means the gate skips and the next pipeline races
-                # against the in-flight FE-P5 of the prior run.
-                "gate": {
-                    "last_completed_uid": _QUEUE_STATE.get("last_completed_uid"),
-                    "last_completed_rid": _QUEUE_STATE.get("last_completed_rid"),
-                    "last_be_done_at": int(_QUEUE_STATE.get("last_be_done_at") or 0),
-                },
-            }
-            # 2026-05-11: atomic write — write to tmp, then os.replace
-            # (atomic on POSIX and Windows same-volume). Protects against
-            # the Q7 watchdog path where _schedule_server_exit's 3s timer
-            # can race os._exit(0) past a slow in-progress write_text(),
-            # leaving _pending_queue.json truncated. On respawn the
-            # truncated file fails json.loads and disk-restore silently
-            # skips, losing the gate state for the very FIRST post-restart
-            # dequeue (the case the boot-race fix already mitigates, but
-            # the truncated-file mode would also lose pending in-memory
-            # jobs not yet visible in Firestore).
-            _tmp_path = _pending_queue_path.with_suffix(".json.tmp")
-            _tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            os.replace(str(_tmp_path), str(_pending_queue_path))
+            _write_pending_queue_snapshot(
+                _pending_queue_path, current_job, pending)
             return True
         except Exception as e:
             log(f"[pending_queue] persist failed: {e}", "WARN")
@@ -70614,7 +77439,8 @@ async def run_server(port=8000):
             return False
 
     # 2026-05-15: expose the persist closure to the module-scope device-cmd
-    # listener at research.py:1766 so hard_reset can flush a clean snapshot
+    # listener (`_start_device_command_listener`) so hard_reset can flush a
+    # clean snapshot
     # to disk before os._exit (the listener can't directly close over this
     # function — it lives in a different scope).
     _QUEUE_STATE["persist_fn"] = _persist_pending_queue
@@ -70635,186 +77461,17 @@ async def run_server(port=8000):
     # audio soft-warn advisories (60+120+90 = 270 min) of real work before
     # the deadlock backstop. 2026-05-06 (Stream 2 F12): bumped 4h → 5h.
     WORKER_OUTER_TIMEOUT_SEC = 5 * 60 * 60
-    # BE_PHASES_TIMEOUT_SEC lives at module scope (research.py:1224) since
-    # 2026-05-12 so the Firestore start listener (also module-level) can
-    # predict whether the gate will block when assigning queue position.
-    # This block kept as a doc anchor — the constant itself moved.
-
-    async def _wait_for_prior_fe_completion(_current_job=None):
-        """Hold the next dequeue until the prior run's FE-P5 reports
-        completion via research.status=='completed', or the fallback
-        timer expires.
-
-        `_current_job` is the just-dequeued job (passed in by the worker
-        BEFORE _QUEUE_STATE["current_job"] is set). Used to detect the
-        resume-of-same-rid edge case described below."""
-        _puid = _QUEUE_STATE.get("last_completed_uid")
-        _prid = _QUEUE_STATE.get("last_completed_rid")
-        _pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
-        if not _firebase_db or not _puid or not _prid:
-            return  # first run or missing context — nothing to wait on
-        # 2026-05-11: skip the gate when the dequeued job IS the same rid
-        # as the just-finished run. This happens on resume-from-checkpoint
-        # paths where Firestore re-enqueues the same rid after a BE crash
-        # or restart — the "prior" run from the gate's POV is actually
-        # the current dequeued run; waiting on its own FE-P5 would
-        # circular-deadlock (BE never starts → FE-P5 never fires → gate
-        # waits the full 4200s fallback). Resume semantics handle the
-        # state machine separately; the gate only matters for the
-        # successor-pipeline-after-different-prior case.
-        if _current_job and (_current_job.get("research_id") or "") == _prid:
-            log(f"[queue-gate] dequeued rid {_prid[:8]}… matches last_completed_rid — resume path, skipping wait")
-            return
-        if _pdone <= 0:
-            # Error path marker: prior run was watchdog-stopped /
-            # errored / never reached BE PIPELINE COMPLETE. FE-P5
-            # will never write "completed" for it, so don't block.
-            log("[queue-gate] prior run errored — skipping FE-completion wait")
-            return
-        deadline = _pdone + BE_PHASES_TIMEOUT_SEC * 1000
-        # Mid-session stuck-status self-heal — if the prior FE-P5 just
-        # legitimately ghosted (user closed the tab, FE-P5 errored without
-        # flipping status, browser was force-quit), the gate previously
-        # waited the full 70-min deadline before giving up. Now: take a
-        # snapshot of (status, feP5State) on entry and force-release if
-        # both stay unchanged for STUCK_STATUS_RELEASE_MS (5 min). The
-        # deadline still backstops the slow-FE-P5 case (large YouTube
-        # uploads), but the common-case stuck-prior gets unstuck in 5 min
-        # without needing a BE restart or Reset Backend tap.
-        STUCK_STATUS_RELEASE_MS = 5 * 60 * 1000
-        _stuck_first_seen_ms: int = 0
-        _stuck_status_signature: str = ""  # f"{status}|{feP5State}"
-        # 2026-08-11: say how long is ACTUALLY left, not the constant. The
-        # deadline is anchored to when the PRIOR run finished, not to when this
-        # gate opened — so on a device that has been idle for longer than the
-        # window (the normal case: the owner starts the next run hours later)
-        # it is already in the past. The old line announced a 4200s wait and
-        # the very next line, in the same second, announced that 4200s had
-        # elapsed. Both were false, and chasing them cost real time.
-        _gate_left_ms = deadline - int(time.time() * 1000)
-        if _gate_left_ms > 0:
-            log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion "
-                f"(fallback in {int(_gate_left_ms / 1000)}s)")
-        else:
-            log(f"[queue-gate] prior run {_prid[:8]}… finished "
-                f"{int((int(time.time() * 1000) - _pdone) / 1000)}s ago, past its "
-                f"{BE_PHASES_TIMEOUT_SEC}s FE-P5 window — checking its status once, "
-                f"not waiting")
-        # 2026-05-12: register the gate-pending job so cancel handlers can
-        # see it. Without this, a cancel that arrives while the worker is
-        # blocked in the gate wait silently no-ops — neither in job_queue
-        # (already popped) nor in current_job (not set until after gate).
-        # User saw "Cancel: rid=… removed_from_queue=False" with no status
-        # flip + no banner unmount. Cleared on gate return.
-        if _current_job:
-            _QUEUE_STATE["gate_pending_job"] = _current_job
-        while True:
-            # 2026-05-12: honor explicit stop requests during gate wait.
-            # When the cancel handler matches gate_pending_job and calls
-            # request_stop, this poll loop exits cleanly so the worker can
-            # bail out of the gate and drop the job.
-            try:
-                if _controls.is_stop():
-                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")
-                    _QUEUE_STATE.pop("gate_pending_job", None)
-                    return
-            except Exception:
-                pass
-            now_ms = int(time.time() * 1000)
-            try:
-                # 2026-05-11: offload the blocking Firestore .get() to a
-                # worker thread so the gate's 2s poll doesn't block the
-                # event loop on the round-trip (50-200ms typical, longer
-                # under network contention). Keeps heartbeat / listener
-                # callbacks responsive while the gate waits.
-                _doc_ref = _firebase_db.collection("users").document(_puid) \
-                    .collection("researches").document(_prid)
-                snap = await asyncio.to_thread(_doc_ref.get)
-                if not snap.exists:
-                    # Prior research doc was deleted (user purged from
-                    # /researches). Treat as terminal — there's nothing
-                    # left to wait on. Without this branch the gate
-                    # would spin silently until the deadline fires
-                    # (worst case BE_PHASES_TIMEOUT_SEC = 70 min).
-                    log(f"[queue-gate] prior run {_prid[:8]}… doc missing — dequeueing")
-                    _QUEUE_STATE.pop("gate_pending_job", None)
-                    return
-                if snap.exists:
-                    data = snap.to_dict() or {}
-                    status = data.get("status", "")
-                    fe_p5_state = data.get("feP5State", "")
-                    if status in ("completed", "stopped", "stopped_by_watchdog",
-                                  "cancelled", "terminated_by_user_discard", "errored"):
-                        log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")
-                        _QUEUE_STATE.pop("gate_pending_job", None)
-                        return
-                    # 2026-05-11: markFeP5Failed writes feP5State="failed"
-                    # but doesn't flip research.status — so a thrown FE-P5
-                    # exception would hang the gate for the full 4200s.
-                    # Release the gate on this fast-fail marker too.
-                    if fe_p5_state == "failed":
-                        log("[queue-gate] prior run's FE-P5 failed — dequeueing")
-                        _QUEUE_STATE.pop("gate_pending_job", None)
-                        return
-                    # Stuck-status self-heal: if (status, feP5State) hasn't
-                    # changed in STUCK_STATUS_RELEASE_MS, the prior FE has
-                    # ghosted and is never coming back. Force-release. The
-                    # first-seen marker resets on any signature change so
-                    # a slow-but-progressing FE-P5 (e.g., long YouTube
-                    # upload that flips feP5State queued→running→completed
-                    # over several minutes) doesn't trip the heal.
-                    _sig = f"{status}|{fe_p5_state}"
-                    if _sig != _stuck_status_signature:
-                        _stuck_status_signature = _sig
-                        _stuck_first_seen_ms = now_ms
-                    elif (now_ms - _stuck_first_seen_ms) >= STUCK_STATUS_RELEASE_MS:
-                        log(
-                            f"[queue-gate] prior run {_prid[:8]}… stuck at "
-                            f"({status},{fe_p5_state}) for "
-                            f"{int((now_ms - _stuck_first_seen_ms) / 1000)}s — "
-                            f"FE-P5 ghosted, force-dequeueing"
-                        )
-                        _QUEUE_STATE.pop("gate_pending_job", None)
-                        return
-            except Exception as e:
-                _e_str = str(e)
-                if (
-                    "403" in _e_str
-                    or "PERMISSION_DENIED" in _e_str
-                    or "Missing or insufficient permissions" in _e_str
-                ):
-                    # Track D: synth user denied on prior run's research
-                    # doc. We can't poll its terminal status — but we
-                    # also can't sit in a 2-second poll loop spamming
-                    # 403s and wedging the queue for BE_PHASES_TIMEOUT_SEC
-                    # (4200s by default). The on-disk gate-state and
-                    # _safe_enqueue's whitelist already de-dupe restart
-                    # races, so release the gate immediately and let
-                    # the worker proceed. Under-Track-D this is the
-                    # right behavior: every research is owned by some
-                    # device, the BE only sees its own device-queue
-                    # entries, and two queued runs on the same device
-                    # arrive in order via the start listener.
-                    log("[queue-gate] read denied (synth user) — releasing gate (Track D)", "DEBUG")
-                    _QUEUE_STATE.pop("gate_pending_job", None)
-                    return
-                log(f"[queue-gate] Firestore read failed: {e}", "WARN")
-            # 2026-08-11: deadline check moved BELOW the status read. It used
-            # to be the first thing in the loop, so an already-expired deadline
-            # returned before the poll had read anything even once — the gate
-            # released without ever learning that the prior run was sitting
-            # right there at status="completed", and then reported the one
-            # thing it had not checked ("FE never reported completed"). Every
-            # earlier branch returns, and the read is wrapped, so this stays
-            # reachable on every path: no read, failed read, or non-terminal.
-            if now_ms >= deadline:
-                log(f"[queue-gate] prior run {_prid[:8]}… is "
-                    f"{int((now_ms - _pdone) / 1000)}s past its backend finish with no "
-                    f"terminal status seen (FE-P5 window {BE_PHASES_TIMEOUT_SEC}s) — "
-                    f"force-dequeueing")
-                _QUEUE_STATE.pop("gate_pending_job", None)
-                return
-            await asyncio.sleep(2)
+    # ⛔⛔ `_wait_for_prior_fe_completion` STOOD HERE AND IS GONE (wave 10.9,
+    # N8). It held the next dequeue until the PREVIOUS run's cloud tail flipped
+    # research.status to "completed", or for up to 4200 seconds. Phases 4 and 5
+    # run on Cloud Run — no browser, no ffmpeg, nothing of this computer's — so
+    # the contention it was written for does not exist, and the browser lock it
+    # was paired with is deleted (D-1). What it actually did was hold one
+    # person's run on a shared computer behind another person's cloud tail, for
+    # as long as that tail took; its 5-minute stuck-status heal and its
+    # "force-dequeueing" fallback were both apologies for that. The YouTube
+    # ceiling it is sometimes justified by is a DAILY COUNT, not a concurrency
+    # limit, so serializing starts buys nothing there either.
 
     async def _rescan_queue_for_unclaimed():
         """Multi-worker orphan recovery (2026-05-21).
@@ -70863,14 +77520,12 @@ async def run_server(port=8000):
         if (
             _QUEUE_STATE.get("running")
             or _job_queue.qsize() > 0
-            or _QUEUE_STATE.get("gate_pending_job")
         ):
-            # Not actually idle: running a job, a job already queued locally, OR
-            # blocked in _wait_for_prior_fe_completion (gate_pending_job is set
-            # while the worker holds a dequeued job in the FE-completion gate with
-            # running=False/qsize=0). Without the gate check a periodic rescan
-            # would treat a gated worker as idle and claim a SECOND doc, serializing
-            # it behind the still-gated job.
+            # Not actually idle: running a job, or a job already queued locally.
+            # ⛔ A third clause read `gate_pending_job` — the slot a worker held
+            # while it waited on the previous run's cloud tail. Both the wait and
+            # the slot retired in wave 10.9 (N8); `running` is set in the same
+            # breath as the dequeue now, so there is no window left to miss.
             return
         # #903: a resting worker never claims — neither fresh docs nor
         # orphans. The wake transition is caught by the next rescan tick.
@@ -70938,7 +77593,6 @@ async def run_server(port=8000):
                 _exit_scheduled
                 or _QUEUE_STATE.get("running")
                 or _job_queue.qsize() > 0
-                or _QUEUE_STATE.get("gate_pending_job")
                 or await asyncio.to_thread(_worker_is_resting)
             ):
                 return
@@ -70958,14 +77612,14 @@ async def run_server(port=8000):
                 # account triage when the orphan is a sharer's doc.
                 log(
                     f"[idle-rescan] worker {WORKER_ID}: claim error — skipping {(d.get('researchId') or '')[:8]}… "
-                    f"topic={(d.get('topic') or '')[:40]!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
+                    f"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
                     "WARN",
                 )
                 continue
             if _outcome is False:
                 log(
                     f"[idle-rescan] worker {WORKER_ID}: lost to sibling — skipping {(d.get('researchId') or '')[:8]}… "
-                    f"topic={(d.get('topic') or '')[:40]!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
+                    f"topic={_loggable_topic(d.get('topic'), d.get('researchId'))!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
                     "INFO",
                 )
                 continue
@@ -71021,8 +77675,25 @@ async def run_server(port=8000):
                     pass
                 continue
 
-            run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… ({topic[:40]}) submittedBy={(d.get('submittedBy') or '?')[:8]}")
+            # ⛔⛔ THE RECORD, BEFORE THE WRITE BELOW (wave 10.10). That write is
+            # `status: "ongoing"`, so a doc whose research was archived while it
+            # waited had its archive UNDONE here and then passed the funnel's
+            # whitelist as an ordinary ongoing run. Deleted or archived stands
+            # down and the claimed doc goes; unreadable is taken — see the rule.
+            _withdrawn, _ = await asyncio.to_thread(
+                _pickup_withdrawn, uid, research_id, "idle-rescan")
+            if _withdrawn:
+                try:
+                    await asyncio.to_thread(snap.reference.delete)
+                except Exception:
+                    pass
+                continue
+
+            run_id = _mint_run_id(topic, research_id)
+            # ⛔ NO TOPIC — see `_log_job_ref`. This claim is logged to the
+            # machine-wide `backend.log`, whose tail travels in the owner's
+            # support bundle; the research id says which run this was.
+            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… submittedBy={(d.get('submittedBy') or '?')[:8]}")
 
             # Flip research-doc status to ongoing (the listener path
             # writes this when the worker is idle on first dequeue;
@@ -71066,7 +77737,10 @@ async def run_server(port=8000):
                 "user_sources": d.get("userSources") or [],
                 "user_links": d.get("userLinks") or [],
                 "submitted_by": str(d.get("submittedBy") or "").strip(),
-            }, source="idle-rescan")
+            }, source="idle-rescan",
+                # ⛔⛔ THE CLAIMED DOC IS DELETED JUST ABOVE, so a refusal on a
+                # failed read would drop the run for good. See `_safe_enqueue`.
+                take_unreadable=True)
             # Real-time deferred-doc renumber (2026-05-22): the just-
             # claimed orphan was at some position N in the global FIFO
             # (often head — idle-rescan picks the oldest unclaimed).
@@ -71087,42 +77761,38 @@ async def run_server(port=8000):
         """Process pipeline jobs one at a time from the queue."""
         while True:
             job = await _job_queue.get()
-            # 2026-05-25: clear stale stop flag before gate-wait. A
+            # 2026-05-25: clear a stale stop flag before the job starts. A
             # prior HARD_RESET that fired while the worker was idle
             # (no run in flight to consume the flag) leaves
             # _controls.is_stop()=True dangling. Without this reset,
-            # the next job's gate-wait check at ~29094 sees the stale
-            # flag and bails with "cancelled during gate wait — skipping
-            # run_pipeline" — the user's Kalki repro from today's E2E
+            # the next job starts with a stop already requested. Until
+            # wave 10.9 removed the gate-wait, that check saw the stale
+            # flag first and bailed with "cancelled during gate wait — skipping
+            # run_pipeline" — the user's Kalki repro from that day's E2E
             # (HARD_RESET at 18:13:28 with no active run → Kalki claimed
             # at 18:20:45 → bailed 18:20:46 without ever starting).
             # Safe because (a) cancels for in-queue jobs remove from
-            # queue (never reach pop), (b) cancels for THIS job's gate-
-            # pending phase will RE-SET the flag via the gate_pending_job
-            # match at research.py:4421, (c) cancels for the running job
+            # queue (never reach pop), and (b) cancels for the running job
             # set the flag and run_pipeline consumes it internally.
             try:
                 _controls.reset()
             except Exception:
                 pass
-            # 2026-05-11: gate on prior run's FE-P5 completion. Phases
-            # 4+5 are FE-owned — BE PIPELINE COMPLETE fires after P3,
-            # but the actual run isn't done until FE Doc+Email lands.
-            # Without this gate, the next pipeline's BE phases race
-            # against the prior pipeline's FE-P4/P5 (resource contention,
-            # listener cross-pollination, the queue-pileup symptom).
-            # Pass `job` so the gate can detect resume-of-same-rid and
-            # skip (otherwise circular deadlock — see helper docstring).
-            await _wait_for_prior_fe_completion(_current_job=job)
-            # 2026-05-12: stop-requested-during-gate-wait shortcut. The
-            # cancel handler at research.py:2208 flips status="stopped"
-            # and request_stop()s when a cancel matches gate_pending_job.
-            # Honor it here so we don't proceed to launch a browser for
-            # an already-cancelled job. Clear the stop flag so the next
-            # job runs clean.
+            # ⛔⛔ THE PRIOR-RUN WAIT STOOD HERE (wave 10.9, N8): the worker
+            # awaited `_wait_for_prior_fe_completion(_current_job=job)` before
+            # touching `running` or `current_job`, so a dequeued job was in
+            # limbo for as long as the PREVIOUS run's cloud tail took. The
+            # contention it named is not real — phases 4 and 5 run on Cloud Run
+            # — and on a shared computer it held one person's start behind
+            # another person's tail. The dequeue now flows straight through.
+            #
+            # ⚠ A stop that SURVIVED the reset above is still honoured: the
+            # reset is wrapped, so a reset that threw can leave the flag set,
+            # and starting a browser for a job somebody has already cancelled is
+            # the failure this branch was originally written against.
             try:
                 if _controls.is_stop():
-                    log(f"[worker] job {job.get('research_id', '')[:8]}… cancelled during gate wait — skipping run_pipeline", "INFO")
+                    log(f"[worker] job {job.get('research_id', '')[:8]}… carries a stop the reset did not clear — skipping run_pipeline", "INFO")
                     try:
                         _controls.reset()
                     except Exception:
@@ -71130,9 +77800,9 @@ async def run_server(port=8000):
                     # The listener bumped the pending counter when it
                     # claimed this job; we're skipping the running-flag
                     # flip below where the normal decrement lands. Drain
-                    # the counter here so a stop-during-gate-wait
-                    # doesn't leak a slot (would falsely defer all
-                    # subsequent submissions on this worker).
+                    # the counter here so this early drop doesn't leak a
+                    # slot (would falsely defer all subsequent
+                    # submissions on this worker).
                     _pending_enq_dec()
                     _job_queue.task_done()
                     # Keep the queue running but drop this job entirely.
@@ -71141,15 +77811,11 @@ async def run_server(port=8000):
                 pass
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
-            # Listener-replay counter decrement (Bug B fix). Tied to
-            # the running-flag flip rather than the earlier
-            # `_job_queue.get()` because `_wait_for_prior_fe_completion`
-            # above can suspend the coroutine for the full
-            # BE_PHASES_TIMEOUT_SEC window; decrementing at get() would
-            # let the gate at research.py:~4106 look idle (counter=0,
-            # qsize=0, running still False) for minutes while this
-            # worker is occupied waiting on FE-P5. Setting running=True
-            # FIRST then dec'ing closes that window.
+            # Listener-replay counter decrement (Bug B fix). Tied to the
+            # running-flag flip rather than the earlier `_job_queue.get()`:
+            # decrementing at get() would let the listener's idle gate see
+            # counter=0, qsize=0 and running still False in the window before
+            # the flip. Setting running=True FIRST then dec'ing closes it.
             _pending_enq_dec()
             # Multi-worker claim sentinel. Written here (at dequeue, the
             # earliest point we own the job) so a sibling worker booting
@@ -71209,7 +77875,10 @@ async def run_server(port=8000):
                 ).start()
             except Exception:
                 pass
-            log(f"Starting queued job: {job['topic'][:60]}")
+            # ⛔ THE RESEARCH ID, NOT THE TOPIC — see `_log_job_ref`. This line
+            # is in `backend.log`, which is every member's jobs in the owner's
+            # file, and the owner's support bundle ships its tail.
+            log(f"Starting queued job {_log_job_ref(job)}")
             # Publish currentRunId on the device doc so sharers / sibling
             # tabs can see "device is busy with run X" and render the
             # QueuedBanner correctly when they submit a NEW research.
@@ -71236,7 +77905,7 @@ async def run_server(port=8000):
                     _did = load_device_id()
                     if _firebase_db and _did:
                         # 2026-05-26: publish phase=0 alongside the run-meta
-                        # fields. The phase_start emit at ~line 26504 will
+                        # fields. The first phase_start emit (the `emit_event` hook) will
                         # re-write the same value within a few hundred ms
                         # — but BEFORE that fires there's a gap (job claim
                         # → run_pipeline entry → first phase_start) during
@@ -71309,6 +77978,12 @@ async def run_server(port=8000):
                 "stopped",
                 "cancelled",
                 "completed",
+                # ⛔⛔ AND ARCHIVED (wave 10.10). Missing from this set, a job
+                # whose research was archived while it waited in this queue —
+                # which the old archive allowed — met "actual_status=archived is
+                # active" below and ran. The pickup rule's own word, so the two
+                # cannot drift apart.
+                _PICKUP_WITHDRAWN_STATUS,
             }
             should_run = True
             # ⚠ 2026-08-06 — "COULD NOT EVALUATE" IS NOT "PROCEED". The flip has
@@ -71324,7 +77999,13 @@ async def run_server(port=8000):
                              .get())
                     _cur = ((_snap.to_dict() or {}).get("status")
                             if _snap.exists else None)
-                    if _cur:
+                    # ⛔ A READ THAT SUCCEEDS AND FINDS NOTHING IS AN ANSWER —
+                    # the record was deleted — and it used to fall into the
+                    # "could not be read" arm below and run. See the stand-down
+                    # after this block.
+                    if not _snap.exists:
+                        flip_outcome = "missing"
+                    elif _cur:
                         flip_outcome = f"skipped({_cur})"
                         log(f"[flip] the transaction was refused; a plain read says "
                             f"status={_cur!r} — deciding from that", "INFO")
@@ -71335,16 +78016,16 @@ async def run_server(port=8000):
                     log(f"[flip] the transaction was refused and the fallback "
                         f"read also failed ({type(_fe).__name__}) — "
                         f"proceeding, as before", "WARN")
+            # ⛔⛔ THE LAST PICKUP EVERY JOB PASSES (wave 10.10). "missing" was
+            # a WARN and a run: a Resume taken before its research was deleted
+            # reached this point, found no record, and ran and emailed anyway.
+            if flip_outcome == "missing":
+                should_run = False
+                _log_pickup_stand_down("dequeue", job.get("research_id"), "deleted")
             if flip_outcome and flip_outcome.startswith("skipped(") and flip_outcome.endswith(")"):
                 actual_status = flip_outcome[len("skipped("):-1]
                 if actual_status in BAIL_STATUSES:
                     should_run = False
-                    # 2026-05-11: flag bail as errored so the queue gate
-                    # short-circuits on the next dequeue. Without this,
-                    # a bail on paused_backend_restart* (which is NOT in
-                    # the gate's terminal status set) would wedge the
-                    # next gate for the full 4200s fallback.
-                    _QUEUE_STATE["_errored"] = True
                     log(f"[worker] Bailing on job — actual_status={actual_status} (terminal/recovery), skipping run_pipeline to spare sibling browsers", "INFO")
                 else:
                     log(f"[worker] Proceeding despite skipped flip — actual_status={actual_status} is active (FE pre-flipped or normal mid-run resume)", "INFO")
@@ -71425,16 +78106,9 @@ async def run_server(port=8000):
                         "status": "stopped_by_watchdog",
                         "summary": f"Stopped — pipeline exceeded {hours}h ceiling",
                     })
-                # 2026-05-11: error path — daemon-restart will reset
-                # _QUEUE_STATE anyway, but flag for completeness.
-                _QUEUE_STATE["_errored"] = True
                 _schedule_server_exit("worker-watchdog")
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
-                # 2026-05-11: error path — flag so the next dequeue's
-                # gate doesn't block waiting for FE-P5 on a run that
-                # will never reach it.
-                _QUEUE_STATE["_errored"] = True
             finally:
                 # Capture before clearing — `current_job` is the job that
                 # just finished. We need its uid+rid to clear stale queue
@@ -71455,39 +78129,17 @@ async def run_server(port=8000):
                 # too via _schedule_server_exit at research.py:_schedule_server_exit
                 # 2026-05-22).
                 _clear_current_run_id_best_effort("job-finally")
-                # 2026-05-11: record what the next dequeue's gate needs.
-                # last_be_done_at=0 on error/watchdog paths short-circuits
-                # the gate (since FE-P5 will never write "completed").
-                _errored = _QUEUE_STATE.pop("_errored", False)
-                # 2026-05-15: skip gate-state writes if a hard_reset is
-                # in progress. Without this guard, a worker finishing
-                # within hard_reset's exit window resurrects the wedged
-                # prior-run pointer the user just clicked Reset Backend
-                # to escape. The lock acquisition makes the check-and-act
-                # atomic w.r.t. hard_reset's clear+persist (research.py:
-                # ~1920) — without the lock, a thread schedule between
-                # our flag-read and our state-write lets hard_reset's
-                # clear land BEFORE our write, and our write resurrects
-                # the uid_X we should be discarding.
-                _hr_lock = _QUEUE_STATE.get("_hard_reset_lock")
-                if _hr_lock is not None:
-                    with _hr_lock:
-                        if not _QUEUE_STATE.get("_hard_reset_in_progress"):
-                            _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
-                            _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
-                            _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
-                else:
-                    # Lock not initialised yet (impossible at runtime: the
-                    # worker only runs inside run_server, which sets up
-                    # the lock at research.py:~24058 before launching the
-                    # worker — kept as belt-and-braces).
-                    _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
-                    _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
-                    _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
+                # ⛔ THE PRIOR-RUN POINTER WAS WRITTEN HERE (wave 10.9, N8):
+                # the just-finished run's uid, rid and finish time, for the next
+                # dequeue's gate to wait on — with a hard-reset lock around it
+                # so a worker finishing inside Reset Backend's exit window could
+                # not resurrect the wedge the person had just clicked to escape.
+                # Nothing waits on another run any more, so none of it is
+                # recorded and the `_errored` flag that fed it is gone too.
                 _job_queue.task_done()
                 # Clear the just-finished job's queue tracking fields from
                 # Firestore. `_flip_queued_to_ongoing` already deletes
-                # these on the queued→ongoing flip (:20869-20874), but if
+                # these on the queued→ongoing flip, but if
                 # the worker raced through completion before the listener
                 # delivered the "ongoing" intermediate frame — or the run
                 # errored / was watchdog-stopped without the flip running
@@ -71549,12 +78201,21 @@ async def run_server(port=8000):
 
     @app.get("/api/health")
     async def health_check():
-        """Server health check. Q8: includes lastHeartbeatAt (millis since
-        epoch) + consecutive heartbeat failure count so the FE can sanity-
-        check 'device offline despite localhost responsive' cases. The
-        Account-tile online indicator reads Firestore lastHeartbeat — if
-        Firestore writes are failing but local HTTP is fine, this endpoint
-        shows the disparity directly."""
+        """Server health check. ⭐ THE ONE ROUTE THAT NEEDS NO TOKEN — see
+        `auth/serve_token.EXEMPT_PATHS`, which names its four callers and the
+        reason (the supervisor watchdog force-respawns a worker whose health
+        goes unreachable, so this probe must never fail for an auth reason).
+
+        Q8: includes lastHeartbeatAt (millis since epoch) + consecutive
+        heartbeat failure count, so a PERSON AT THIS MACHINE can sanity-check
+        'device offline despite localhost responsive'. ⛔ It used to say "so
+        the FE can sanity-check" — the web app has never called this API at
+        all; it reaches the machine through Firestore and contains zero
+        references to this port. That sentence is the kind of imagined
+        consumer a later change widens CORS for. The Account-tile online
+        indicator reads Firestore `lastHeartbeat`; if Firestore writes are
+        failing but local HTTP is fine, this endpoint shows the disparity to
+        whoever is standing in front of the computer."""
         return {
             "status": "ok",
             "running": bool(_QUEUE_STATE.get("running")),
@@ -71658,15 +78319,44 @@ async def run_server(port=8000):
             return JSONResponse({"error": "topic is required"}, 400)
         topic = topic.strip()
         email = request_data.get("email", "")
-        uid = request_data.get("uid", "")  # Firebase user ID for Firestore bridge
+        # ⛔⛔ THE IDENTITY COMES FROM THE PAIRING, NOT FROM THE CALLER. This
+        # line used to be `request_data.get("uid", "")` — the single clearest
+        # statement that the API authenticated nobody: whoever could reach it
+        # chose which Firebase account the run was written to and billed to.
+        # `load_paired_uid()` is the machine's own answer to "whose computer is
+        # this", and it is the only one a caller cannot forge.
+        uid = load_paired_uid() or ""
+        # ⛔ A MISMATCH IS REFUSED, NOT QUIETLY REWRITTEN. A caller that names a
+        # uid is telling us where it believes the run is going; running it
+        # somewhere else would put somebody's research in an account they did
+        # not ask for and report success. Silence is the worse failure here.
+        # `str(...)` because the body is whatever JSON arrived — a dict or a
+        # list here would make `.strip()` raise and turn a refusal into a 500.
+        _claimed = str(request_data.get("uid") or "").strip()
+        if _claimed and _claimed != uid:
+            # ⛔ TWO DIFFERENT SENTENCES, because "omit it and the pairing is
+            # used" is a lie on a machine that has no pairing: the caller drops
+            # the uid, gets a 200, and the run executes on disk attached to
+            # nobody while they wait for it in the web app.
+            return JSONResponse(
+                {"error": ("uid does not match the account this machine is "
+                           "paired to — omit it and the pairing is used")
+                          if uid else
+                          ("this machine is not paired to any account, so it "
+                           "cannot start a run for uid "
+                           f"{_claimed[:8]}… — run `--pair` first")}, 403)
         config = request_data.get("config", {})
         brief_text = (request_data.get("briefText") or "").strip()
         # Validate config
         agents_cfg = config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         if not any(agents_cfg.values()):
             return JSONResponse({"error": "at least one agent must be enabled"}, 400)
-        from datetime import datetime as _dt
-        run_id = f"{safe_name(topic)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+        # ⭐ THE SAME MINT AS EVERY OTHER START, with no research id to hand it:
+        # a serve-API run has no Firestore record, so it can never be incognito
+        # and gets the ordinary `safe_name(topic)_<stamp>` name. Routed through
+        # the helper anyway so this file has ONE place a run id is built — a
+        # fifth literal here is how the fourth one survived until wave 10.9.
+        run_id = _mint_run_id(topic)
         await _job_queue.put({"topic": topic, "email": email, "config": config,
                               "run_id": run_id, "uid": uid, "brief_text": brief_text})
         position = _job_queue.qsize()
@@ -71677,6 +78367,9 @@ async def run_server(port=8000):
     @app.get("/api/runs/{run_id}/documents/{doc_type}")
     async def get_document(run_id: str, doc_type: str):
         """Get document content. doc_type: brief, chatgpt, gemini, claude."""
+        # ⛔ Not an incognito run's: the report IS its subject (wave 10.10).
+        if _queue_dir_keeps_nothing(queues_root / run_id):
+            return JSONResponse({"error": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)
         # All documents live in documents/ (brief included)
         path = queues_root / run_id / "documents" / f"{doc_type}.md"
         if not path.exists():
@@ -71695,6 +78388,9 @@ async def run_server(port=8000):
     async def get_audio(run_id: str, filename: str):
         """Serve audio file from podcasts directory."""
         from fastapi.responses import FileResponse as _FileResponse
+        # ⛔ Not an incognito run's podcast either (wave 10.10).
+        if _queue_dir_keeps_nothing(queues_root / run_id):
+            return JSONResponse({"error": _LOCAL_RUN_PRIVATE_REFUSAL}, 403)
         # Sanitize filename to prevent path traversal
         safe = Path(filename).name
         path = queues_root / run_id / "podcasts" / safe
@@ -71721,8 +78417,15 @@ async def run_server(port=8000):
     #      strip lands as a deliberate second beat instead of an orphan block.
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
     _serve_boot_preview(port)
-    # Banner shows localhost so users can copy-click; uvicorn still binds
-    # to 0.0.0.0 below so the FE web app can reach this BE.
+    # Banner shows localhost so users can copy-click, and that is also exactly
+    # where uvicorn binds.
+    # ⛔ THIS COMMENT USED TO CLAIM THE SERVER BOUND EVERY INTERFACE so the FE
+    # web app could reach it — untrue on both halves since 2026-09-05. The bind
+    # moved to `host="127.0.0.1"`, and the FE has never reached this API at all:
+    # it talks to the machine through Firestore, and the web source contains
+    # zero references to this port. A comment describing a security posture the
+    # code no longer has is how a future edit talks itself into restoring it,
+    # which is why the sentence is gone rather than corrected in place.
     log(f"Starting API server on http://localhost:{port}")
     # ⭐ 2026-08-17 — WHERE THE BLOCK CAME FROM, asked once at the earliest point
     # the app owns. The arm-time check runs AFTER Firestore, gRPC, four watchers
@@ -71780,106 +78483,29 @@ async def run_server(port=8000):
     # Track D: device identity loads via load_device_id() / the OS
     # keystore. No legacy researchToken to fetch here — if init_firebase
     # already failed, the user needs to run --pair first.
-    # 2026-05-11: hoist queue-gate state rehydration above worker
-    # creation. The full disk-restore block at the bottom of serve
-    # (rehydrates pending + current_job) runs much later, after the
-    # Firestore start listener has already enqueued docs. If the
-    # worker had been created first, it could dequeue a Firestore-
-    # rehydrated job and call _wait_for_prior_fe_completion() with
-    # fresh-init _QUEUE_STATE (last_completed_uid=None → gate skips)
-    # BEFORE the disk snapshot's gate sub-object lands. That'd race
-    # the first post-restart pipeline against the previous run's
-    # in-flight FE-P5. Pure dict mutation here — no I/O dependency on
-    # the later block.
-    try:
-        if _pending_queue_path.exists():
-            _snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
-            _gate = _snap.get("gate") or {}
-            _gate_uid = _gate.get("last_completed_uid")
-            _gate_rid = _gate.get("last_completed_rid")
-            if _gate_uid and _gate_rid:
-                # Orphan detection — three cases get treated as terminal so
-                # the gate doesn't wedge the next submission:
-                #   (a) Prior research doc DELETED (user purged it from
-                #       /researches → snap.exists False).
-                #   (b) Prior status is non-terminal ("queued"/"ongoing")
-                #       → BE crashed mid-run; without a worker to
-                #       advance it, the status never becomes terminal.
-                #   (c) Read failed entirely (network, transient denial)
-                #       → safer to release than wedge for 70 min.
-                # In every case we drop the gate-state IN-MEMORY *and* on
-                # disk; otherwise the next BE restart's rehydrate re-loads
-                # the same zombie pointer and the wedge re-engages.
-                _is_orphan = False
-                _orphan_reason = ""
-                if _firebase_db:
-                    try:
-                        _prior_snap = _firebase_db.collection("users") \
-                            .document(_gate_uid).collection("researches") \
-                            .document(_gate_rid).get()
-                        if not _prior_snap.exists:
-                            _is_orphan = True
-                            _orphan_reason = "doc deleted"
-                        else:
-                            _prior_status = (_prior_snap.to_dict() or {}).get("status", "")
-                            # Terminal-non-success statuses also qualify as
-                            # orphan: a prior run that errored / stopped /
-                            # was watchdog-killed never reaches FE-P5
-                            # (Phase 4 + 5 only run on a clean BE finish),
-                            # so the queue-gate's wait-for-prior-FE-P5
-                            # would block forever (BE_PHASES_TIMEOUT_SEC =
-                            # 4200s fallback). Treat them like queued/
-                            # ongoing — clear the gate so the next run
-                            # can dequeue. Pre-fix the gate wedged every
-                            # new submission with "waiting for prior run
-                            # … FE-P5 completion" for 70 minutes whenever
-                            # the prior run hit any failure path.
-                            if _prior_status in (
-                                "queued", "ongoing",
-                                "error", "errored", "stopped",
-                            ):
-                                _is_orphan = True
-                                _orphan_reason = f"status={_prior_status}"
-                    except Exception as _orphan_check_err:
-                        log(f"[queue-gate] orphan-check read failed — treating as orphan: {_orphan_check_err}", "DEBUG")
-                        _is_orphan = True
-                        _orphan_reason = "read failed"
-                if _is_orphan:
-                    log(f"[queue-gate] prior-run {_gate_rid[:8]}… orphaned ({_orphan_reason}) — clearing gate state")
-                    # Best-effort status flip (will silently 403 for legacy
-                    # research docs without a deviceId field, since
-                    # deviceUpdatingFor requires resource.data.deviceId match;
-                    # don't depend on it).
-                    try:
-                        _update_research_doc(_gate_uid, _gate_rid, {
-                            "status": "stopped",
-                            "lastError": "Backend restarted before this run reached completion. Resubmit to retry.",
-                        })
-                    except Exception:
-                        pass
-                    # Drop gate state both in memory AND on disk so next
-                    # restart doesn't re-engage the wedge.
-                    _QUEUE_STATE["last_completed_uid"] = None
-                    _QUEUE_STATE["last_completed_rid"] = None
-                    _QUEUE_STATE["last_be_done_at"] = 0
-                    try:
-                        _clean = {**_snap, "gate": {
-                            "last_completed_uid": None,
-                            "last_completed_rid": None,
-                            "last_be_done_at": 0,
-                        }}
-                        _tmp = _pending_queue_path.with_suffix(".json.tmp")
-                        _tmp.write_text(json.dumps(_clean, indent=2), encoding="utf-8")
-                        os.replace(str(_tmp), str(_pending_queue_path))
-                    except Exception as _persist_err:
-                        log(f"[queue-gate] orphan-clear persist failed (continuing): {_persist_err}", "WARN")
-                else:
-                    _QUEUE_STATE["last_completed_uid"] = _gate_uid
-                    _QUEUE_STATE["last_completed_rid"] = _gate_rid
-                    _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
-                    log(f"[queue-gate] pre-worker rehydrate: prior-run {_gate_rid[:8]}…")
-    except Exception as _e:
-        log(f"[queue-gate] pre-worker rehydrate failed (non-fatal): {_e}", "WARN")
+    # ⛔⛔ THE BOOT ORPHAN BLOCK STOOD HERE AND IS GONE (wave 10.9, N8/542-4).
+    # It re-loaded the queue gate's prior-run pointer from the disk snapshot
+    # before the worker started, read that run's research document, and — when
+    # the status was anything it could not wait on — STAMPED IT:
+    #
+    #     status: "stopped",
+    #     lastError: "Backend restarted before this run reached completion.
+    #                 Resubmit to retry."
+    #
+    # ⛔ THAT SENTENCE LANDED ON HANDED-OFF RUNS. After `beDone` the run is
+    # CLOUD-OWNED and deliberately stays "ongoing" for the whole of phases 4
+    # and 5, which Cloud Run finishes with no worker awake — and "ongoing" was
+    # in this block's orphan list. So every restart during a cloud tail told the
+    # person their run had died, over a run that was mid-upload, and offered
+    # them a resubmit; #542's report is exactly that screen.
+    #
+    # ⛔ AND IT RELABELLED FAILURES. "errored" was in the same list, so an
+    # errored run came back from the next restart reading "stopped" with a
+    # restart blamed for it — the cause overwritten by the sweep that found it.
+    #
+    # The gate it fed is gone, and a run's terminal status belongs to whoever
+    # actually ran it. `_rehydrate_ongoing_for_tree` (which sees the same runs,
+    # by their status rather than by a pointer) re-fires the cloud kick instead.
 
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
@@ -71901,6 +78527,13 @@ async def run_server(port=8000):
     # _firebase_db is set. After any reconnect it schedules a clean respawn (when
     # idle) so the fresh boot re-binds every Firestore listener.
     asyncio.create_task(_firebase_reconnect_loop())
+    # ⛔⛔ The lease on every incognito run this worker holds (wave 10.9
+    # repair) — a run waiting at a sign-in prompt or behind another run writes
+    # nothing, and without this its record's fuse burns under it. EVERY worker,
+    # not worker 1: each holds its own runs in its own process. Armed
+    # unconditionally, like the reconnect loop above, and idle while Firestore
+    # is down or nothing incognito is held.
+    asyncio.create_task(_incognito_lease_loop())
     # Start heartbeat so frontend can show Online/Offline status.
     # Multi-worker (2026-05-21): only worker 1 heartbeats. FE only needs
     # a single "device alive" signal and devices/{deviceId}.lastHeartbeat
@@ -72003,7 +78636,6 @@ async def run_server(port=8000):
                         _idle = (
                             not _QUEUE_STATE.get("running")
                             and _job_queue.qsize() == 0
-                            and not _QUEUE_STATE.get("gate_pending_job")
                             and not _exit_scheduled
                         )
                         if _idle and _pending_enq_read() > 0:
@@ -72059,7 +78691,7 @@ async def run_server(port=8000):
         # detector's worker-idle check).
         #
         # If a job is auto-resumed by rehydration below, its dequeue at
-        # research.py:~26948 will re-write the fields. The 1-15s window
+        # `_job_worker` will re-write the fields. The 1-15s window
         # between this clear and re-write is invisible to the FE
         # because the cross-user fallback predicate requires
         # `currentRunId` set; cleared state ⇒ fallback not engaged ⇒ no
@@ -72192,76 +78824,16 @@ async def run_server(port=8000):
                 log(f"Queue rehydration failed: {e}", "WARN")
 
         # ── pending_queue.json restoration (Phoenix T3 fallback) ──────────
-        # Firestore-driven rehydration above is the source of truth, but a
-        # research that hadn't yet reached `status=queued` (e.g. crashed in
-        # the put_nowait → Firestore-write window) won't appear there. The
-        # disk snapshot covers that gap. Dedupe by research_id so we don't
-        # double-enqueue something Firestore already restored — including
-        # ongoing runs that got marked paused_backend_restart and shouldn't
-        # silently re-launch from a stale disk snapshot.
+        # ⛔ The snapshot's "gate" sub-object was read back here so the queue
+        # gate could resume waiting on the previous run's cloud tail across a
+        # restart (wave 10.9, N8). A snapshot written by an older build still
+        # carries the key; nothing reads it.
+        # The decision — who is re-offered, who is dropped and what the file is
+        # left holding — is `_restore_pending_queue_snapshot`, which a test can
+        # run against a real file. This block is the boot's own state.
         try:
-            if _pending_queue_path.exists():
-                snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
-                # 2026-05-11: rehydrate queue-gate state so the worker
-                # gate respects a still-in-flight FE-P5 across daemon
-                # restart. The "gate" key was added 2026-05-11; legacy
-                # snapshots without it default to empty (gate becomes a
-                # no-op for that one boot — same as fresh start).
-                _gate = snap.get("gate") or {}
-                if _gate.get("last_completed_uid"):
-                    _QUEUE_STATE["last_completed_uid"] = _gate.get("last_completed_uid")
-                    _QUEUE_STATE["last_completed_rid"] = _gate.get("last_completed_rid")
-                    _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
-                    log(f"[queue-gate] rehydrated prior-run state for {(_gate.get('last_completed_rid') or '')[:8]}…")
-                # Seed dedupe with anything Firestore-rehydration touched
-                # (ongoing-status only — queued docs are handled by the
-                # listener, not rehydration), then add what's currently
-                # in the in-memory queue (auto-resumed supervised runs).
-                already = set(_rehydrated_rids)
-                try:
-                    for q in list(_job_queue._queue):
-                        rid = (q or {}).get("research_id") or ""
-                        if rid:
-                            already.add(rid)
-                except Exception:
-                    pass
-                # Restore current_job FIRST if it was mid-flight (so it
-                # resumes ahead of pending). Then the rest of pending in
-                # original order.
-                cur = snap.get("current") or None
-                disk_jobs = []
-                if cur and (cur.get("research_id") or "") not in already:
-                    disk_jobs.append(cur)
-                for j in (snap.get("pending") or []):
-                    rid = (j or {}).get("research_id") or ""
-                    if rid and rid in already:
-                        continue
-                    disk_jobs.append(j)
-                # Funnel each disk-restored job through _safe_enqueue
-                # (Q7) — it does the same Firestore existence check the
-                # Q1 inline loop did, plus a status-whitelist. Fail-closed
-                # posture is preserved (helper skips on missing/error/no-firebase
-                # rather than re-fire). The skipped-count is rolled up;
-                # per-job reasons are in the helper's own logs.
-                # #728: TIGHTER whitelist for the boot disk-restore —
-                # ("queued","ongoing") EXCLUDING paused_backend_restart. A run
-                # worker-1's rehydration just marked paused_backend_restart is
-                # intentionally awaiting a user Resume; auto-relaunching it from a
-                # stale per-worker disk snapshot would double-handle it (and on a
-                # sibling worker whose `_rehydrated_rids` never saw it, this is the
-                # only cross-worker guard). Genuinely-ongoing runs still restore.
-                restored = 0
-                skipped = 0
-                for j in disk_jobs:
-                    if _safe_enqueue(_job_queue, j, source="disk-restore",
-                                     allowed_statuses=("queued", "ongoing")):
-                        restored += 1
-                    else:
-                        skipped += 1
-                if restored or skipped:
-                    log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
-                else:
-                    log("[pending_queue] Disk snapshot empty — nothing to restore")
+            _restore_pending_queue_snapshot(
+                _pending_queue_path, _job_queue, _rehydrated_rids)
         except Exception as e:
             log(f"[pending_queue] restore failed: {e}", "WARN")
 
@@ -72437,10 +79009,21 @@ async def run_server(port=8000):
             _device_val = f"{_c(_BOLD, _device_name)}  {_state_chip}"
     else:
         _device_val = _c(_DIM, "(none)")
+    # ⭐ THE TOKEN'S HOME, NOT THE TOKEN. The person who just typed --serve is
+    # the one who needs to find it, and this strip is where they are looking.
+    # Printing the value here would put a live credential into every terminal
+    # scrollback, screenshot and pasted log — `--help` and this row both name
+    # the FILE, and the file is 0600.
+    try:
+        from auth.serve_token import token_path as _srv_token_path
+        _token_row = [("API token", _c(_DIM, str(_srv_token_path())))]
+    except Exception:
+        _token_row = []
     _ctx_rows_serve = [
         ("Paired to", _paired_val),
         ("Device",    _device_val),
         ("Local API", _c(_BOLD, f"http://localhost:{port}")),
+        *_token_row,
         # ⛔ A CADENCE IS NOT A HEARTBEAT. This row printed a constant, and the
         # task that does the beating is only created when the client exists —
         # so on a disconnected boot it advertised a rhythm nothing was keeping.
@@ -72534,13 +79117,12 @@ async def run_server(port=8000):
             ("python research.py --unpair", "fully disconnect this machine"),
         ])
 
-    # ⛔⛔ LOOPBACK, NOT `0.0.0.0`. Bound to every interface, this unauthenticated
-    # API was reachable by anything on the same network — a coffee-shop wifi, an
-    # office LAN, a shared house. `GET /api/runs` hands over every run topic on the
+    # ⛔⛔ LOOPBACK, NOT `0.0.0.0`. Bound to every interface, this API was
+    # reachable by anything on the same network — a coffee-shop wifi, an office
+    # LAN, a shared house. `GET /api/runs` hands over every run topic on the
     # machine for every account that shares it; `/api/runs/{id}/documents/{type}`
     # hands over the report bodies; `POST /api/runs/{id}/stop` stops somebody
-    # else's research; `POST /api/runs` starts one and takes the `uid` from the
-    # request body. None of it asks who is calling.
+    # else's research.
     #
     # ⭐ AND IT BREAKS NOTHING, WHICH IS WHY IT IS ONE LINE RATHER THAN A PROJECT.
     # Everything that has ever called this API already used loopback: the web app
@@ -72549,10 +79131,16 @@ async def run_server(port=8000):
     # function prints advertises `http://localhost:{port}`. The bind address was
     # the only thing claiming otherwise.
     #
-    # ⚠ THIS IS A REDUCTION IN EXPOSURE, NOT AUTHENTICATION. A process or a page on
-    # THIS machine can still reach it unauthenticated. The real answer is a token,
-    # which is a larger change; this removes the network from the problem so that
-    # what remains is somebody who is already on the computer.
+    # ✅ AND THE OTHER HALF IS NOW DONE TOO — wave 10.5, 2026-09-20. This block
+    # used to end "None of it asks who is calling… the real answer is a token,
+    # which is a larger change". The token exists: `ServeTokenMiddleware` is
+    # installed at the top of this function and every route but `/api/health`
+    # requires it, and `POST /api/runs` takes its identity from the pairing
+    # rather than from the request body.
+    #
+    # ⛔ THE BIND STILL MATTERS AND IS NOT REDUNDANT. The two are layers: the
+    # bind keeps the LAN out of a race with the gate, and neither has to be
+    # perfect alone. Do not widen it because authentication now exists.
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info",
                             log_config=_uvicorn_log_config())
     server = uvicorn.Server(config)
@@ -73235,7 +79823,7 @@ async def _pair_prompt_api_keys(uid: str):
 
 def _chrome_install_hint() -> str:
     """OS-appropriate one-liner for installing real Google Chrome — the browser
-    the pipeline drives via channel='chrome' (research.py:~16137). We never
+    the pipeline drives via channel='chrome' (`Browser.start`). We never
     auto-install it (needs admin/sudo + an assumed package manager); --pair and
     --doctor surface this hint when Chrome is absent."""
     plat = _supervisor_platform()
@@ -73772,31 +80360,6 @@ def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> int:
     return signaled
 
 
-def _count_chrome_for_profile(profile_dir: str) -> int:
-    """#907: read-only sibling of _kill_chrome_for_profile — how many Chrome
-    processes currently reference this profile dir. Used to wait for a
-    graceful close to actually finish before printing 'Browser closed'."""
-    try:
-        import psutil
-    except Exception:
-        return 0
-    raw = str(profile_dir).lower().replace("\\", "/")
-    try:
-        resolved = str(Path(profile_dir).resolve()).lower().replace("\\", "/")
-    except Exception:
-        resolved = raw
-    targets = {t for t in (raw, resolved) if t}
-    n = 0
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
-                continue
-            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
-            if any(_profile_matches_cmdline(t, cmdline) for t in targets):
-                n += 1
-        except Exception:
-            pass
-    return n
 
 
 def _chrome_procs_for_profile(profile_dir: str) -> list:
@@ -74007,8 +80570,15 @@ def _enumerate_ongoing_runs() -> "list[dict]":
                     continue
                 title = run_id
                 try:
-                    meta = json.loads((qdir / "meta.json").read_text(encoding="utf-8"))
-                    title = str(meta.get("title") or meta.get("topic") or run_id)
+                    # ⛔ NOT FOR A RUN THAT KEEPS NOTHING (wave 10.9 repair).
+                    # `--login` reads this title out on the OWNER's terminal —
+                    # "Closing Run 1 — <title>" — and into the session log their
+                    # support bundle carries; for a member's private run the
+                    # title is its topic. Its run id says which run it was and
+                    # carries no topic by construction (`_mint_run_id`).
+                    if not _is_incognito_research(_queue_dir_research_id(qdir)):
+                        meta = json.loads((qdir / "meta.json").read_text(encoding="utf-8"))
+                        title = str(meta.get("title") or meta.get("topic") or run_id)
                 except Exception:
                     pass
                 out.append({"worker": wid, "run_id": run_id, "title": title})
@@ -74181,7 +80751,8 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
             await asyncio.sleep(random.uniform(1.5, 3.0))
         try:
             # open_isolated_tab (not new_tab) so self.page isn't clobbered by a
-            # tab we immediately close (documented anti-pattern at :16891).
+            # tab we immediately close (documented anti-pattern: see
+            # `Browser.open_isolated_tab`).
             tab = await browser.open_isolated_tab(url)
         except Exception as e:
             log(f"verify: failed to open {name}: {e}", "WARN")
@@ -75056,10 +81627,11 @@ async def _continue_pair_stages_2_to_6(
     # Playwright DOM checks AND CUA vision before Stage 5 clears it.
     # Matches Phase 0 init rigor.
     _setup_cua_client = None
-    # Route through `resolve_api_key()` (research.py:203) so this site honors
+    # Route through `resolve_api_key()` so this site honors
     # the full precedence chain (Firestore → user-scope env → os.environ),
     # not just flat os.environ. Was previously a two-ladder inconsistency
-    # with vision.py:269 — both now go through the same resolver. After the
+    # with `VisionClient.__init__` in vision.py — both now go through the same
+    # resolver. After the
     # 2026-05-18 stage reorder, Stage 4 also busts `_RESOLVED_KEY_CACHE` so
     # a freshly-pasted key is visible here without restart.
     _setup_cua_api_key = resolve_api_key()
@@ -75458,7 +82030,8 @@ async def _continue_pair_stages_2_to_6(
 # Installs a Windows Scheduled Task that auto-starts `python research.py
 # --serve` at user logon, so a reboot (Windows Update, power blip, crash)
 # doesn't need manual re-launch. Paired with the backend's existing startup
-# auto-retry (research.py:8099 detects an incomplete checkpoint and resumes),
+# auto-retry (run_server's queue rehydration detects an incomplete checkpoint
+# and resumes),
 # this makes the pipeline survive unexpected downtime end-to-end.
 #
 # Task is scoped to the CURRENT USER — never elevated to SYSTEM — so it
@@ -75484,8 +82057,8 @@ _SUPERVISOR_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / _SUPERVIS
 # Per-machine env file consumed by the supervisor at startup. See PR-Env in
 # scripts/dg-supervisor.env.example. Values applied via `os.environ.setdefault()` —
 # existing process env (Windows user-scope from "Account → API Config") wins
-# for `resolve_api_key` callers (research.py:204-218). Missing file is fail-
-# soft (Vision defaults to off per research.py:66, CUA fallthrough is safe).
+# for `resolve_api_key` callers. Missing file is fail-soft (Vision defaults
+# to off per `vision.is_vision_enabled`, CUA fallthrough is safe).
 _SUPERVISOR_ENV_FILE_DEFAULT_PATH = Path(__file__).parent / ".dg-supervisor.env"
 
 
@@ -75533,9 +82106,10 @@ def _load_env_file(path) -> dict[str, str]:
 
 def _seed_env_file_if_missing() -> bool:
     """Copy scripts/dg-supervisor.env.example to .dg-supervisor.env if absent.
-    On POSIX, chmod 0600 (API key sensitivity). Idempotent — no-op if target
-    exists. Returns True if a fresh seed was written. Called by `--resurrect`
-    so first-time install lays down a documented, all-commented env file."""
+    Owner-only (0600) from its first byte, through the same writer as every key
+    save (API key sensitivity). Idempotent — no-op if target exists. Returns True
+    if a fresh seed was written. Called by `--resurrect` so first-time install
+    lays down a documented, all-commented env file."""
     target = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
     if target.exists():
         return False
@@ -75544,17 +82118,85 @@ def _seed_env_file_if_missing() -> bool:
         log(f"[env] no example template at {example} — skipping seed", "WARN")
         return False
     try:
-        target.write_text(example.read_text(encoding="utf-8-sig"), encoding="utf-8")
+        _write_owner_only_text(target, example.read_text(encoding="utf-8-sig"))
     except Exception as e:
         log(f"[env] failed to seed {target}: {e}", "WARN")
         return False
-    if sys.platform != "win32":
-        try:
-            os.chmod(target, 0o600)
-        except Exception as e:
-            log(f"[env] could not chmod 0600 {target}: {e}", "WARN")
     log(f"[env] seeded {target} from scripts/dg-supervisor.env.example", "INFO")
     return True
+
+
+def _queues_root() -> "Path":
+    """`<install>/queues/` — every run folder this machine writes, each named for
+    its topic and holding the brief, the reports and the podcast. The directory
+    the worker locks and `setup_firestore_run` spell out inline."""
+    return Path(__file__).parent / "queues"
+
+
+def _harden_owner_only_paths() -> None:
+    """Narrow, at every boot, what earlier builds left readable by the OTHER OS
+    accounts on this computer: the API-keys file, the state dir and its audit
+    logs, the whole logs/ tree (run logs, session logs, support zips in
+    outgoing/) and the queues/ root. Group and other bits come off; the owner's
+    own bits and every byte of content stay exactly as they were.
+
+    ⛔⛔ WHY AT BOOT AND NOT ONLY IN THE WRITERS. The writers are fixed for what
+    they write from now on; this is for what is already on disk. MEASURED
+    2026-09-21 on the owner's Mac: `.dg-supervisor.env` -rw-r--r-- (every key
+    save since August re-created it at the umask's 0644), ~/.super-research,
+    logs/, runs/, sessions/, outgoing/ and queues/ all drwxr-xr-x, support zips
+    and keystore-audit.log -rw-r--r--. The home is drwxr-x--- with group
+    `staff`, which EVERY macOS account is in, and a wheel puts the key file and
+    queues/ in site-packages under a 0755 ~/.local — so any other account on the
+    machine could read the keys, other members' uids and every topic.
+
+    ⭐ queues/ is CREATED 0700 when absent, not just narrowed: a worker makes it
+    on its first claim, AFTER this has run, so "narrow it next boot" would leave
+    a fresh install's run folders open for the whole life of its first serve.
+    Its sub-folders are not walked; a 0700 root already stops anyone else
+    reaching them. It is created ONLY WHEN THE INSTALL DIRECTORY IS THIS
+    ACCOUNT'S — see the mkdir below; narrowing an existing one is unconditional.
+
+    Only the DEFAULT env file: a custom `--env-file` is the user's own to
+    permission. Never raises — every command passes through here."""
+    if sys.platform == "win32":
+        return  # mode bits mean next to nothing on NTFS; the per-user profile ACL is the boundary there
+    try:
+        env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+        for p in (env_file,
+                  # A pre-#538 save that died between its write and its rename
+                  # left the key HERE, at 0644, under this fixed name.
+                  env_file.with_name(env_file.name + ".tmp"),
+                  _STATE_DIR,
+                  _STATE_DIR / "keystore-audit.log",
+                  _STATE_DIR / "selfheal-audit.log"):
+            _owner_only(p)
+        queues = _queues_root()
+        # ⛔⛔ CREATE IT ONLY IF THIS ACCOUNT WOULD OWN IT. The wheel ships no
+        # queues/ (pyproject excludes it) and the installers warn against
+        # `sudo` — but people still reach for it. One sudo'd command before the
+        # first real run would otherwise make <site-packages>/queues root-owned
+        # at 0700, and every later run as the actual user could never write a
+        # run folder into it again. The install directory's owner is the test:
+        # a normal run creates it, a sudo'd one leaves it to the worker that
+        # comes after, and an install that really is root's, run as root, still
+        # gets it. Narrowing below is unconditional — a chmod creates nothing.
+        try:
+            ours = os.stat(queues.parent).st_uid == os.geteuid()
+        except OSError:
+            ours = False  # no install directory to read: nothing to create in
+        if ours:
+            try:
+                queues.mkdir(mode=0o700, exist_ok=True)
+            except OSError:
+                pass
+        _owner_only(queues)
+        for root, _dirs, files in os.walk(_logs_root()):
+            _owner_only(root)
+            for name in files:
+                _owner_only(os.path.join(root, name))
+    except Exception:
+        pass
 
 
 def _supervisor_platform() -> str:
@@ -76443,6 +83085,56 @@ class _PortProbeUnavailable(Exception):
     """
 
 
+#: The foreign address a TCP row shows while it is LISTENING, IPv4 and IPv6.
+_NETSTAT_LISTEN_FOREIGN = ("0.0.0.0:0", "[::]:0")
+
+
+def _netstat_listening_pids(text: str, port: int) -> "set[int]":
+    """PIDs that Windows `netstat -ano` output shows listening on TCP `port`.
+
+    ⛔⛔ A ROW IS A LISTENER BY ITS FOREIGN ADDRESS, NOT BY ITS STATE WORD.
+    netstat translates the state column ("ABHÖREN" on a German Windows,
+    "ÉCOUTE" on a French one, "IN ASCOLTO" in Italian), and this parse used to
+    keep only rows containing the English "LISTENING". On those machines it
+    matched nothing, and `_listening_pids` still reported that the probe RAN, so
+    a held port came back as "nothing listening" rather than "could not look":
+    the confusion `_PortProbeUnavailable` exists to prevent. The address columns
+    are never translated, and a TCP row has `0.0.0.0:0` / `[::]:0` as its
+    foreign address only while it listens. (`netstat -q` would add bound, idle
+    rows with the same address; the caller does not pass `-q`.)
+
+    The port is matched on the LOCAL address only. The old substring test
+    matched `:8000 ` anywhere in the line, the foreign column included, which is
+    the `lsof -ti` defect again, held off only by the word filter.
+
+    Pure so it runs off Windows: this is the one branch of the probe that no
+    developer machine here executes.
+    """
+    pids: "set[int]" = set()
+    want = str(port)
+    for line in (text or "").splitlines():
+        # "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234". The foreign
+        # address alone also rules out the translated headers and every UDP row
+        # (whose foreign column is "*:*"). A translated state can be several
+        # words, so the pid is read from the END of the row, never a column.
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if parts[2] not in _NETSTAT_LISTEN_FOREIGN:
+            continue
+        if parts[1].rpartition(":")[2] != want:
+            continue
+        try:
+            pid = int(parts[-1])
+        except ValueError:
+            continue
+        # 0 is the System Idle Process. Nothing may be handed a pid to signal
+        # that is not a real process.
+        if pid > 0:
+            pids.add(pid)
+    return pids
+
+
 def _listening_pids(port: int) -> "set[int]":
     """PIDs LISTENING on `port` — psutil first, a shell tool only as fallback.
 
@@ -76498,26 +83190,20 @@ def _listening_pids(port: int) -> "set[int]":
         _p = str(port)
         try:
             if plat == "Windows":
+                # ⛔ No `-p TCP`: that filter is IPv4-only (`-p TCPv6` is a
+                # separate protocol), so a listener on `[::]` never reached the
+                # parse. ⛔ `errors="replace"`: netstat writes the console's OEM
+                # code page and text mode decodes with the ANSI one, so a French
+                # "ÉCOUTE" (0x90 in cp850, undefined in cp1252) raised
+                # UnicodeDecodeError and the whole probe read as "could not
+                # look". The parse needs no word from the state column anyway.
                 r = _sp.run(
-                    ["netstat", "-ano", "-p", "TCP"],
-                    capture_output=True, text=True, timeout=8,
+                    ["netstat", "-ano"],
+                    capture_output=True, text=True, errors="replace", timeout=8,
                     creationflags=_PS_NO_WINDOW,
                 )
-                for line in (r.stdout or "").splitlines():
-                    # Format: "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234"
-                    if "LISTENING" not in line:
-                        continue
-                    if f":{_p} " not in line and not line.endswith(f":{_p}"):
-                        if f" :{_p}\t" not in line and f"0.0.0.0:{_p}" not in line and f"[::]:{_p}" not in line:
-                            continue
-                    parts = line.split()
-                    if not parts:
-                        continue
-                    try:
-                        pid = int(parts[-1])
-                    except ValueError:
-                        continue
-                    if pid > 0 and pid != me:
+                for pid in _netstat_listening_pids(r.stdout or "", port):
+                    if pid != me:
                         pids.add(pid)
                 shell_ok = True
             elif plat in ("Darwin", "Linux"):
@@ -76657,7 +83343,7 @@ def _looks_like_our_backend(cmdline: str) -> bool:
     # holding the port, the caller printed "already in use by something that is
     # not Super Research" and refused to boot. Fail-safe, but a permanent
     # refusal on the one platform where reclaiming is most needed. `_prog_name`
-    # (research.py:210) has always stripped it; this function never did.
+    # has always stripped it; this function never did.
     base = [_strip_exe(os.path.basename(x).lower()) for x in toks]
     is_python = any(b.startswith("python") or b.startswith("pypy") for b in base)
     runs_script = any(b == "research.py" for b in base)
@@ -77282,8 +83968,8 @@ def run_daemon_loop(port: int = 8000):
     # platforms`. The pre-fix `getattr(...CREATE_NO_WINDOW, 0x08000000)`
     # fallback fired on Linux + macOS (CREATE_NO_WINDOW doesn't exist there
     # → 0x08000000 default), making every `--serve` respawn explode in the
-    # daemon-loop. Match the module-level `_PS_NO_WINDOW` pattern at
-    # research.py:128 — 0 on non-Windows is the only safe value.
+    # daemon-loop. Match the module-level `_PS_NO_WINDOW` pattern
+    # — 0 on non-Windows is the only safe value.
     _NO_WINDOW = (
         getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
         if sys.platform == "win32"
@@ -77580,8 +84266,24 @@ def run_daemon_loop(port: int = 8000):
                         f"health (in-process reconnect failing)")
 
         # Initial spawn of all workers.
+        #
+        # ⛔ A WORKER THAT NEVER COMES UP AT BOOT STILL OWNS YESTERDAY'S RUNS.
+        # This slot took `{"_dead": True}` and wrote nothing, so worker 1's
+        # reconciler could not see it and every run assigned to this worker in
+        # a previous session stayed frozen "ongoing" with no Resume. Marking is
+        # safe here for the same reasons it is safe on the crash-loop branch:
+        # the reconciler refuses a run a LIVE sibling holds the lock on, refuses
+        # one whose delivery.json says the BE already handed off, and a later
+        # successful boot of this worker retracts the marker itself.
         for k in range(1, n_workers + 1):
-            workers[k] = _spawn_worker(k) or {"_dead": True}
+            _st = _spawn_worker(k)
+            if _st is None:
+                _write_worker_dead_marker(k, reason="spawn_failed_at_boot")
+            # ⛔ AND ABSOLUTELY NOT AT BOOT. A marker left by the PREVIOUS
+            # supervisor session is the whole reason the mechanism exists;
+            # wiping it milliseconds into a restart is how the runs it was
+            # written about stay frozen for ever.
+            workers[k] = _st or {"_dead": True}
 
         try:
             while True:
@@ -77617,9 +84319,26 @@ def run_daemon_loop(port: int = 8000):
                         _time.sleep(2)
                         new_state = _spawn_worker(k)
                         if new_state is not None:
+                            # ⛔⛔ NO RETRACTION HERE — round two of cross-verify
+                            # reversed this, and the reversal is the point.
+                            # `_spawn_worker` returns the instant `Popen`
+                            # succeeds: no health check, no poll, no port probe
+                            # after launch. So retracting here measures a
+                            # successful FORK, not a live worker — and a worker
+                            # that dies at import had its marker cleared about
+                            # seven seconds after it was written, never reaching
+                            # the reader's 60-second grace. The repair removed
+                            # the very rescue it was widening. The child's own
+                            # `--serve` boot is the one honest retraction, and
+                            # it is already there.
                             new_state["watchdog_window"] = state.get("watchdog_window", [])
                             workers[k] = new_state
                         else:
+                            # ⛔ Same gap as the boot spawn: the watchdog killed
+                            # this worker and it would not come back, and the
+                            # runs it was holding had nothing to rescue them.
+                            _write_worker_dead_marker(
+                                k, reason="respawn_failed_after_watchdog")
                             workers[k] = {"_dead": True}
                         continue
                     if rc == 0:
@@ -77751,8 +84470,18 @@ def run_daemon_loop(port: int = 8000):
                         new_state["keystore_wiped"] = state["keystore_wiped"]
                         new_state["restarts"] = state["restarts"]
                         new_state["watchdog_window"] = state.get("watchdog_window", [])  # (#717)
+                        # No retraction here either — see the note on the
+                        # watchdog respawn above. A `Popen` that returned is not
+                        # a worker that is running.
                         workers[k] = new_state
                     else:
+                        # ⛔ The last of the three. A crash we were willing to
+                        # restart from, followed by a respawn that would not
+                        # start — indistinguishable to the person from the
+                        # crash-loop case one branch above, which DID mark.
+                        _write_worker_dead_marker(
+                            k, crash_count=len(state.get("crash_window") or []),
+                            reason="respawn_failed_after_crash")
                         workers[k] = {"_dead": True}
         except KeyboardInterrupt:
             _terminate_worker_fleet(workers, "Interrupted (Ctrl+C)")
@@ -78156,7 +84885,7 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
         killed_serve_count = _kill_pids(plain_serve_pids)
 
     # Belt-and-suspenders: gate creationflags on win32 to mirror
-    # `run_daemon_loop`'s pattern (research.py:27223-27240) — function is
+    # `run_daemon_loop`'s pattern — function is
     # already Windows-only by name + caller chain, but a future refactor
     # that bypasses the dispatcher could otherwise re-introduce the same
     # POSIX ValueError class. 2026-05-18: caught after Linux Track C smoke
@@ -78171,7 +84900,7 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     )
     # Capture the spawned daemon-loop's raw stdout/stderr to backend.err.log
     # instead of DEVNULL. The daemon-loop reassigns its own stdio to the
-    # backend logs once running (research.py ~37695), but a crash in the window
+    # backend logs once running (in `run_daemon_loop`), but a crash in the window
     # BEFORE that — the _sr_core import, a native-extension load, an early
     # dispatch error — would otherwise vanish into DEVNULL, leaving the device
     # silently offline (the exact failure this fixes). Append so we never
@@ -78312,9 +85041,9 @@ def run_resurrect():
         # them. Platform-specific install lives in `_arm_supervisor_<plat>`
         # which spawns the daemon-loop inline (vs Windows which spawns it in
         # Step 4 — that asymmetry is intentional, see Step 4 below).
-        # NOTE: init_firebase() + _fetch_paired_email() deliberately skipped
-        # — see the matching comment in the Windows path below. supervised
-        # flag goes through _pair_patch_device (REST), no gRPC dep.
+        # NOTE: init_firebase() and the gRPC device-doc read are deliberately
+        # skipped — see the matching comment in the Windows path below. The
+        # supervised flag goes through _pair_patch_device (REST), no gRPC dep.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
         # Pull friendly name + owner email from the device doc via REST so
@@ -78480,7 +85209,7 @@ def run_resurrect():
     # _arm_supervisor_quiet install path).
     task_run = f'"{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"'
 
-    # NOTE: deliberately skip `init_firebase()` + `_fetch_paired_email()` here.
+    # NOTE: deliberately skip `init_firebase()` and the gRPC device-doc read here.
     # The only Firestore-side action --resurrect needs is the supervised:true
     # flag write in step 3, which goes through _pair_patch_device (Firestore
     # REST + bootstrapped idToken — no gRPC client init). Skipping the cold
@@ -78651,7 +85380,7 @@ def run_resurrect():
             print(f"  {_c(_WARN, '     Could not check port 8000 — no psutil and no netstat/lsof here.')}")
             print(f"  {_c(_DIM, f'     If the backend does not start, look yourself: {_port_holder_hint(8000)}')}")
         # Belt-and-suspenders: gate on win32 (mirrors `run_daemon_loop`'s
-        # _NO_WINDOW pattern at research.py:27223-27240). This branch is
+        # _NO_WINDOW pattern). This branch is
         # already only reachable on Windows after the Darwin/Linux early-
         # returns above, but the constants now self-defend against future
         # refactors that bypass the dispatcher. 2026-05-18.
@@ -78806,8 +85535,8 @@ def run_retire():
         # scaffolding (Context strip → [1/3] Unbinding → [2/3] Stopping →
         # [3/3] Firestore sync → flourish + next-actions). Closes the
         # "Polish deferred" gap so --retire reads the same on every OS.
-        # NOTE: init_firebase + _fetch_paired_email skipped — supervised
-        # flag goes via _write_supervised_flag → _pair_patch_device REST.
+        # NOTE: init_firebase and the gRPC device-doc read are skipped — the
+        # supervised flag goes via _write_supervised_flag → _pair_patch_device REST.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
         # Pull friendly name + owner email from the device doc via REST so
@@ -80151,8 +86880,18 @@ def run_commands_help():
     # boot as six timestamped `[INFO]   GET /api/runs …` lines — a static
     # reference pushed through the logger, which no other command did. It is
     # reference material, so it lives on the reference surface.
+    # ⭐ THE TOKEN ROW LEADS, because without it every row under it answers 401
+    # and the reference would be describing an API the reader cannot call. The
+    # PATH is printed, never the value — `--help` output gets pasted into chats
+    # and screenshots, and a secret that travels that way is not one.
+    try:
+        from auth.serve_token import HEADER as _API_HEADER, token_path as _api_token_path
+        _token_rows = [(f"{_API_HEADER}: <token>",
+                        f"Required on every route but /api/health — value in {_api_token_path()}")]
+    except Exception:
+        _token_rows = []
     _section(f"Local API  (while {_PROG} --serve is running)",
-             [(route, desc) for route, desc in _LOCAL_API_ROUTES])
+             _token_rows + [(route, desc) for route, desc in _LOCAL_API_ROUTES])
 
     _section("Internal / Debug", [
         ("python research.py --daemon-loop",
@@ -80368,7 +87107,7 @@ def run_doctor():
         # Chromium boot on slow hardware (Crostini, low-power) can take
         # a while; this probe runs once per `--doctor`, not per request.
         # Probe REAL Google Chrome via channel="chrome" — the exact browser the
-        # pipeline drives (research.py:~16137 launch_persistent_context(channel=
+        # pipeline drives (`Browser.start`'s launch_persistent_context(channel=
         # "chrome")). Probing bundled Chromium instead would pass even when real
         # Chrome / its patchright wrapper is missing, masking the actual failure.
         _probe = (
@@ -80425,9 +87164,15 @@ def run_doctor():
             if "Environment=" in _unit_content and "DISPLAY=" in _unit_content:
                 _ok("Unit has DISPLAY embedded", "reboot-safe")
             else:
+                # ⛔ THE BARE REMEDY, AND THE HINT IN THE WARNING (wave 10.10).
+                # `_dedupe_actions` compares whole strings, so the remedy with
+                # the hint glued on and the plain one `--serve not running`
+                # adds were two different steps — and Linux listed
+                # `--resurrect` twice in one summary.
                 _warn("Unit missing Environment=DISPLAY=...",
-                      "browser may fail post-reboot — re-run --resurrect")
-                manual_actions.append(_remedy_resurrect() + "  — run it from a graphical-session terminal")
+                      "browser may fail post-reboot — re-run --resurrect from a "
+                      "graphical-session terminal")
+                manual_actions.append(_remedy_resurrect())
         else:
             _warn("Unit file not installed", "supervisor disabled")
             manual_actions.append(_remedy_resurrect())
@@ -80732,13 +87477,118 @@ def _delegate_agent_via_pipx(agent_args: "list[str]") -> int:
 
 
 def _sr_version() -> str:
-    """Installed package version (from wheel metadata), or a source-checkout
-    label when not pip-installed."""
+    """The INSTALLED package version, read from wheel metadata on disk.
+
+    ⛔⛔ THIS IS NOT "THE VERSION OF THE CODE THAT IS RUNNING", and reading it as
+    though it were cost a whole diagnosis on 2026-09-19 — see `_sr_build_label`
+    below, which is what every report about a RUN must use. `importlib.metadata`
+    answers from whatever `*.dist-info` is discoverable on `sys.path`, and that
+    is a different artifact from the module the interpreter actually loaded.
+
+    ⚠ Its old docstring promised "or a source-checkout label when not
+    pip-installed". That almost never fires: an editable install (`pip install
+    -e .`, which is how this repo is set up) leaves real, discoverable metadata,
+    so a checkout answers with a real number from the LAST wheel that was built.
+    Callers still testing `startswith("(")` as a source detector are testing a
+    branch that hardly ever runs; `_is_source_checkout()` is the real answer.
+
+    Correct callers: the update machinery, which genuinely asks "which
+    distribution is installed" so it can compare against PyPI.
+    """
     try:
         from importlib.metadata import version as _v
         return _v("superresearch")
     except Exception:
         return "(source checkout)"
+
+
+# What a SOURCE build's label ends with. A reader seeing it knows the number came
+# from the tree, and that package metadata has nothing to say about this process.
+_SRC_BUILD_SUFFIX = "+src"
+_BUILD_LABEL_CACHE: "str | None" = None
+
+
+def _source_tree_version() -> str:
+    """The version declared by the checkout this module was loaded from.
+
+    The tree's own `pyproject.toml`, beside `research.py` — the one artifact that
+    is guaranteed to exist in a checkout, needs no network, and is exactly what
+    settled the 2026-09-19 argument (it said 0.1.14 while the dist-info beside it
+    said 0.1.13). `tomllib` is stdlib from 3.11 and this repo requires ≥3.11; the
+    regex is there for the compiled build, where `pyproject.toml` may not ship
+    and a parse error must not cost the label."""
+    try:
+        p = Path(__file__).resolve().parent / "pyproject.toml"
+        raw = p.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    try:
+        import tomllib
+        v = ((tomllib.loads(raw).get("project") or {}).get("version") or "")
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+    try:
+        m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', raw)
+        return m.group(1).strip() if m else ""
+    except Exception:
+        return ""
+
+
+def _sr_build_label() -> str:
+    """⭐⭐ THE VERSION OF THE CODE THAT IS ACTUALLY EXECUTING. Use this in every
+    report ABOUT A RUN — log lines, run `meta.json`, the support bundle, the
+    `X-Build` header, the bundle row.
+
+    ⛔⛔ WHY THIS EXISTS, in one incident. On 2026-09-19 a machine executed source
+    stamped 0.1.14 while every log line, the support bundle index and the ingest
+    header all said `build=0.1.13`, because `_sr_version()` reads dist-info and
+    an editable install had left 0.1.13's behind. I read that label, told the
+    owner they had run a stale wheel, and was wrong — they said "I'm confident we
+    have used this code only" and they were right. The run was only pinned to the
+    real source by grepping log strings that exist in no earlier revision. A
+    label that can send the person reading it to the wrong revision is worse than
+    no label.
+
+    Two cases, and they are distinguishable at a glance:
+      * a source checkout → ``"<pyproject version>+src"``, e.g. ``0.1.14+src``.
+        The suffix is the point: it says the number came from the TREE and that
+        metadata has nothing to say about this process.
+      * an installed build → `_sr_version()`, where metadata and code ship as one
+        artifact and the two cannot disagree.
+
+    ⛔ NOT `_serving_version()`, which is a tempting near-miss: that is the SAME
+    metadata read, merely frozen at import so a pipx upgrade cannot flip it
+    mid-process. It answers 0.1.13 in the scenario above too.
+
+    Computed once. Both inputs are fixed for the life of the process, and this is
+    called on log lines — a `pyproject.toml` read per line is not free. Never
+    raises and never touches the network.
+    """
+    global _BUILD_LABEL_CACHE
+    if _BUILD_LABEL_CACHE is not None:
+        return _BUILD_LABEL_CACHE
+    label = ""
+    try:
+        if _is_source_checkout():
+            v = _source_tree_version()
+            # No readable pyproject: say "a checkout, version unknown" rather
+            # than borrowing the installed number, which is the whole defect.
+            label = (v + _SRC_BUILD_SUFFIX) if v else "(source checkout)"
+        else:
+            label = _sr_version()
+    except Exception:
+        label = ""
+    _BUILD_LABEL_CACHE = label or "(unknown build)"
+    return _BUILD_LABEL_CACHE
+
+
+def _is_src_build_label(label: "str | None") -> bool:
+    """True for a label this module minted for a source tree. One reader, so the
+    suffix and the fallback string cannot drift apart across call sites."""
+    s = str(label or "")
+    return s.endswith(_SRC_BUILD_SUFFIX) or s == "(source checkout)"
 
 
 # What THIS process is executing, frozen at import.
@@ -80773,12 +87623,23 @@ _RUNNING_VERSION_PATH = _STATE_DIR / "running-version.json"
 
 
 def _write_running_version() -> None:
-    """Record what this serve process is running. Best-effort — never blocks serve."""
+    """Record what this serve process is running. Best-effort — never blocks serve.
+
+    ⚠ TWO FIELDS, ON PURPOSE, and they answer different questions.
+      * `version` — the INSTALLED distribution as this process saw it at boot. It
+        is what `_restart_pending` compares against the currently-installed one
+        to decide "an update landed, the old code is still serving". Replacing it
+        with the honest build label would make every dev checkout report a
+        permanent phantom restart-pending (`0.1.14+src` never equals `0.1.13`).
+      * `build` — the code actually executing. Nothing compares it; it is here so
+        that anyone reading this file by hand, or any future consumer, gets the
+        truthful answer rather than inferring one from `version`.
+    """
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
         _RUNNING_VERSION_PATH.write_text(
-            json.dumps({"version": _sr_version(), "pid": os.getpid(),
-                        "started_at": time.time()}),
+            json.dumps({"version": _sr_version(), "build": _sr_build_label(),
+                        "pid": os.getpid(), "started_at": time.time()}),
             encoding="utf-8")
     except Exception:
         pass
@@ -80821,8 +87682,17 @@ def _restart_pending() -> "tuple[str, str] | None":
     running = _running_version()
     if not running:
         return None
+    # ⛔ A CHECKOUT IS NEVER PENDING A RESTART. There is no wheel to have landed;
+    # `git pull` is the update path (`--update` already answers "unsupported"
+    # here). The old guard below was `installed.startswith("(")`, which is the
+    # near-dead branch: an editable install leaves real, discoverable metadata,
+    # so a checkout answers with a number and sails past it. `_is_source_checkout`
+    # is the authoritative PATH check, the same one `_device_version_fields`
+    # already had to reach for after the VivobookPro bug.
+    if _is_source_checkout():
+        return None
     installed = _sr_version()
-    if not installed or installed.startswith("("):     # source checkout
+    if not installed or installed.startswith("("):     # metadata unreadable
         return None
     if running == installed:
         return None
@@ -81121,6 +87991,30 @@ def _send_logs_consent_lines(runs: int = BUNDLE_MAX_RUNS,
     return lines
 
 
+def _send_logs_left_out_line(count: int, keep_uid) -> str:
+    """What the terminal says about the runs the bundle left out. "" for none.
+
+    ⛔⛔ "ANOTHER MEMBER RAN THEM" IS A CLAIM, AND ON AN UNPAIRED MACHINE IT IS A
+    FALSE ONE. `--send-logs` is what somebody runs when their computer is in
+    trouble, which is exactly when the pairing may be gone: `--unpair`, a relink
+    that cleared it, a config that never carried it. `load_paired_uid()` is then
+    None, the builder rightly keeps nobody — and what it left out is the
+    person's OWN attributed runs, on a computer that may have no other member at
+    all. Measured through the real command: "0 run(s)" and "2 run(s) left out —
+    another member ran them", with both runs the owner's.
+
+    ⭐ THE OMISSION IS RIGHT EITHER WAY; only the reason changes. An unpaired
+    machine cannot prove whose run any folder is, and a support bundle is the
+    wrong place to guess."""
+    n = max(0, int(count or 0))
+    if not n:
+        return ""
+    if keep_uid:
+        return f"{n} run(s) left out — another member ran them"
+    return (f"{n} run(s) left out — this machine is not paired, so it cannot "
+            f"tell whose they are")
+
+
 def _queued_bundle_rows_path() -> "Path":
     return _logs_root() / "pending-bundle-rows.jsonl"
 
@@ -81209,7 +88103,10 @@ def _post_bundle_to_ingest(local_path: "Path", code: str,
         "Content-Type": BUNDLE_CONTENT_TYPE,
         "X-Support-Code": code,
         "X-Install-Id": str(_install_uuid_best_effort() or ""),
-        "X-Build": _sr_version(),
+        # The build that produced the logs being posted. ⚠ The receiver caps this
+        # at 32 chars and truncates SILENTLY (`/api/logs/ingest`), so the `+src`
+        # suffix has to stay short — it is 4 characters on a label of about 10.
+        "X-Build": _sr_build_label(),
     }
     if email:
         headers["X-Contact-Email"] = email
@@ -81311,7 +88208,8 @@ def _choose_runs_interactively(rows: "list[dict]") -> "list[str] | None":
     print(f"    {_c(_DIM, _hint)}")
     for _ in range(3):
         try:
-            answer = input(f"  {_c(_ACCENT, '>')}  Choose ")
+            with _console_quiet_for_prompt():
+                answer = input(f"  {_c(_ACCENT, '>')}  Choose ")
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -81379,10 +88277,18 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
     code = _mint_support_code()
     dest = _logs_root() / "outgoing" / f"support-{code}{BUNDLE_SUFFIX}"
 
+    # ⛔ THE PAIRED UID, read from this machine's own config: the terminal has
+    # no Firestore to ask who owns the device. An unpaired machine gets None,
+    # and the builder then keeps nobody's identity (#539). Read ONCE and kept,
+    # because the sentence printed below is only true if it describes the same
+    # answer the bundle was built from.
+    _keep_uid = load_paired_uid()
+
     # ── Rung 0: the file. Always, first, and printed. ──
     try:
         summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,
-                                    only_runs=only_runs)
+                                    only_runs=only_runs,
+                                    keep_uid=_keep_uid)
     except Exception as exc:
         print(f"  {_c(_WARN, '⚠')}  Could not build the log bundle: {exc}")
         print(f"  {_c(_DIM, 'The raw logs are still here:')}  "
@@ -81398,6 +88304,11 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
         # ⛔ Never a silent truncation: a bundle that quietly dropped the run
         # somebody is asking about reads as complete coverage.
         print(f"     {_c(_DIM, f'{_n_dropped} older item(s) left out for size')}")
+    # The same rule for the #539 omission: fewer runs than asked, said — and
+    # said truthfully, which on an unpaired machine is a different sentence.
+    _others_line = _send_logs_left_out_line(summary.get("runsOtherMembers"), _keep_uid)
+    if _others_line:
+        print(f"     {_c(_DIM, _others_line)}")
     print()
 
     landed_via = None
@@ -81413,7 +88324,8 @@ def cmd_send_logs(assume_yes: bool = False, email: "str | None" = None,
             patch = {"status": "done", "objectPath": object_path,
                      "runCount": int(summary["runCount"]),
                      "sessionCount": int(summary["sessionCount"]),
-                     "sizeBytes": int(summary["sizeBytes"])}
+                     "sizeBytes": int(summary["sizeBytes"]),
+                     **_log_bundle_left_out(summary)}
             # ⛔⛔ THE ROW IS THE ONLY THING CLEAR LOGS CAN SEE. It walks rows,
             # not objects — so a send whose row never lands leaves a readable
             # bundle in the bucket that the privacy button cannot reach.
@@ -81682,13 +88594,42 @@ def _newer_version_notice() -> "str | None":
     return _VERSION_NOTICE_MEMO  # type: ignore[return-value]
 
 
+#: ⛔⛔ WHAT THIS CODE KNOWS HOW TO DO, PUBLISHED SO THE APP CAN REFUSE IT — wave
+#: 10.9 (#536). An incognito run only keeps its promise if the machine that
+#: executes it understands one: a wheel shipped before this wave reads the
+#: record, sees an id it has no opinion about, and runs the ordinary pipeline —
+#: uploading the podcast, writing the `audios` row, stamping its events 30 days
+#: out and parking the run for Resume. Every one of those is the promise broken,
+#: and by then the person has paid for the run.
+#:
+#: The rules refuse those writes on every wheel (R1-R5), so nothing is KEPT
+#: either way — but a run that dies halfway through on a 403 has still spent the
+#: money. This key is what lets the app decline up front instead.
+#:
+#: ⭐ A VERSION NUMBER COULD NOT DO THIS JOB. A source checkout publishes
+#: `version: None` (below), which is exactly the owner's own machine, so a
+#: "newer than X" gate would refuse the developer's computer for ever. A
+#: capability answers the question that is actually being asked.
+#:
+#: ⭐ IT RIDES THE EXISTING THROTTLED VERSION PATCH rather than the 5-second
+#: heartbeat, and `incognitoRuns` was admitted to the device key list (and
+#: value-checked as an int) in the rules BEFORE this wheel sends it — a rules
+#: deploy lagging the wheel would refuse the whole patch under `hasOnly` and
+#: take the About row's update signal down with it.
+#:
+#: ⛔ THE VALUE IS A COUNT OF NOTHING; it is the KEY that carries the meaning.
+#: `1` is what the rules admit and what the app tests for presence of.
+_INCOGNITO_RUNS_CAPABILITY = 1
+
+
 def _device_version_fields(*, force: bool = False) -> dict:
     """Version fields the heartbeat publishes to the device doc: `version` (the
     BE's running package version) and `updateAvailable` (the newer version on
-    PyPI, or None when current). The FE reads these to show the backend version +
-    an update prompt. Sync (file read + 24h-cached PyPI); call OFF the event loop.
-    `force=True` does a FRESH PyPI check (the app's on-demand "Check for updates"
-    device command).
+    PyPI, or None when current), plus `incognitoRuns` — the capability the app
+    gates an incognito run on (see `_INCOGNITO_RUNS_CAPABILITY`). The FE reads
+    these to show the backend version + an update prompt. Sync (file read +
+    24h-cached PyPI); call OFF the event loop. `force=True` does a FRESH PyPI
+    check (the app's on-demand "Check for updates" device command).
 
     A SOURCE CHECKOUT yields version None + updateAvailable None: the app then
     shows "Backend version unknown" and offers no update, because a dev tree isn't
@@ -81703,8 +88644,12 @@ def _device_version_fields(*, force: bool = False) -> dict:
         # pull" and hide the Check/Update control — distinct from a pipx build
         # that just hasn't reported its version yet (offline/just-started), which
         # is also version None but SHOULD keep Check.
+        # ⛔ THE CAPABILITY IS ON THIS BRANCH TOO, and this is the branch that
+        # matters most today: the owner's own machine is a source checkout, and
+        # it is where the first incognito run will be fired.
         return {"version": None, "updateAvailable": None, "sourceCheckout": True,
-                "servingVersion": None}
+                "servingVersion": None,
+                "incognitoRuns": _INCOGNITO_RUNS_CAPABILITY}
     try:
         _v = _sr_version()
         version = _v if (_v and not _v.startswith("(")) else None
@@ -81739,7 +88684,8 @@ def _device_version_fields(*, force: bool = False) -> dict:
     _sv = _serving_version()
     serving = _sv if (_sv and not _sv.startswith("(")) else None
     return {"version": version, "updateAvailable": update_available,
-            "sourceCheckout": False, "servingVersion": serving}
+            "sourceCheckout": False, "servingVersion": serving,
+            "incognitoRuns": _INCOGNITO_RUNS_CAPABILITY}
 
 
 def _pipx_cmd() -> "list[str] | None":
@@ -83023,6 +89969,30 @@ def _self_uninstall() -> int:
     return 1
 
 
+def _resume_refusal(resume_path, where: str = "from the terminal") -> "str | None":
+    """The one sentence a resume answers with for an incognito run's folder,
+    or None to go ahead. `where` names the door: the terminal, or the local
+    serve API's resume route.
+
+    ⛔⛔ A RESUME BY FOLDER CANNOT KEEP AN INCOGNITO RUN'S PROMISES (wave 10.10).
+    Its record is kept alive by the lease, and the lease renews only jobs that
+    carry their account — `--resume` runs outside `--serve` altogether, and the
+    serve API's resume enqueues a job with no account on it. A run resumed
+    either way could lose its record to its own fuse halfway through and then
+    write for hours into nothing. Boot recovery already ends such a run rather
+    than parking it for Resume (`_restart_recovery_patch`); both doors now
+    follow the same policy instead of running it."""
+    if _queue_dir_keeps_nothing(resume_path):
+        return (f"This is an incognito run, and an incognito run can't be "
+                f"resumed {where} — start a new research in the app instead.")
+    return None
+
+
+def _terminal_resume_refusal(resume_path) -> "str | None":
+    """`_resume_refusal` for the terminal's `--resume`."""
+    return _resume_refusal(resume_path)
+
+
 def main():
     # Before anything else can log: auth/, vision, selfheal and narrate all use
     # the standard library, and without this their WARNINGs go to bare stderr
@@ -83181,11 +90151,26 @@ def main():
         _install_session_tee(_session_cmd)
 
     if args.show_version:
-        print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _sr_version())}")
-        # This line reports the INSTALLED build. If a different build is actually
-        # serving, say so right here — otherwise --version reads as "update done"
-        # while the old code is still live (the exact trap the old --update copy
-        # walked users into).
+        # ⭐ THE CODE THIS COMMAND IS RUNNING, not the metadata beside it. On a
+        # checkout those differ — 0.1.14+src against an 0.1.13 dist-info — and
+        # the whole of #484 is that the second number was the one being shown.
+        _blabel = _sr_build_label()
+        print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _blabel)}")
+        if _is_src_build_label(_blabel):
+            # Name the installed distribution too, and say which is which. A dev
+            # comparing this against a wheel needs both numbers, and leaving the
+            # metadata one out would just move the ambiguity rather than end it.
+            try:
+                _inst = _sr_version()
+            except Exception:
+                _inst = ""
+            if _inst and not _inst.startswith("("):
+                _lead = "running from source; the installed package metadata says"
+                _tail = "— it does not describe this process"
+                print(f"     {_c(_DIM, _lead)} {_c(_BOLD, 'v' + _inst)} {_c(_DIM, _tail)}")
+        # If a different build is actually serving, say so right here — otherwise
+        # --version reads as "update done" while the old code is still live (the
+        # exact trap the old --update copy walked users into).
         try:
             _pend = _restart_pending()
         except Exception:
@@ -83211,6 +90196,11 @@ def main():
     if not (args.serve or args.daemon_loop or args.restart or args.update
             or args.retire or args.unpair or args.resurrect):
         _warn_if_restart_pending()
+
+    # ⛔⛔ #538 / N4: take other OS accounts' access off what earlier builds left
+    # open — the keys file, the state dir, the logs tree, the queues root —
+    # before any subcommand runs. A bare call on purpose: every command passes.
+    _harden_owner_only_paths()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
     # (--serve, --daemon-loop, --resurrect, etc.) inherits the same values.
@@ -83338,6 +90328,10 @@ def main():
         resume_path = Path(args.resume)
         if not resume_path.is_absolute():
             resume_path = Path(__file__).parent / "queues" / args.resume
+        _refusal = _terminal_resume_refusal(resume_path)
+        if _refusal:
+            print(f"  {_c(_ERR, '✗')}  {_refusal}")
+            sys.exit(1)
         log(f"Resuming from: {resume_path}")
         global _cli_mode
         _cli_mode = True

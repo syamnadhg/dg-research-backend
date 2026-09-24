@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import time
 from typing import Any, Callable
 
@@ -157,6 +158,63 @@ def doc_id(name: str) -> str:
     return name.rsplit("/", 1)[-1]
 
 
+# ── a research that keeps nothing ───────────────────────────────────────────
+# ⛔⛔ THE ID IS THE SIGNAL, AND THIS PATTERN HAS FOUR OTHER COPIES. An incognito
+# research (wave 10.9) runs like any other paid run and leaves nothing in Super
+# Research once it ends. The web app mints its id as `incog_<13-digit ms>_<n>`,
+# and that id is the only thing that marks it: there is no field. The web app
+# (`src/lib/incognito.ts`), `firestore.rules`, `storage.rules` and the research
+# computer (`research.py`'s `_INCOGNITO_ID_RE`) all carry this exact pattern.
+# This package is published on its own and can import none of them, so
+# `tests/test_incognito_hidden_1010.py` holds this copy to research.py's.
+#
+# ⭐ WHOLE-STRING MATCH. `incog_notes`, `incog_1_1` and `xincog_…` are somebody's
+# ordinary research. It is `fullmatch`, not `match`, because Python's `$` also
+# matches before a trailing newline and the web's and the rules' `$` do not.
+_INCOGNITO_ID_RE = re.compile(r"^incog_[0-9]{13}_[0-9]{1,6}$")
+
+
+def is_incognito_research(research_id: Any) -> bool:
+    """True when this research id names a run that keeps nothing."""
+    return isinstance(research_id, str) and _INCOGNITO_ID_RE.fullmatch(research_id) is not None
+
+
+def unshown_husk(doc: dict[str, Any]) -> dict[str, Any]:
+    """All the assistant keeps of a research it must not show: its ``status``,
+    and whether a decision card sits on it. Nothing else of the document is
+    decoded — not its id, title, topic, links, or the card's own words.
+
+    ⛔⛔ WHY IT KEEPS ANYTHING AT ALL. Leaving the run out of every list made a
+    bare "stop" in chat stop the newest run it COULD see — the person's ordinary
+    run — while the one they had just started, the incognito one, kept going.
+    Stop cannot be undone. The chat has to know that a run it cannot show is
+    still going, so that it refuses to guess instead of guessing wrong. The path
+    says the run is one to hide; these two fields say whether it is still one a
+    person could mean. Neither says what it is about.
+
+    ⭐ THE CARD IS TESTED FOR PRESENCE ON THE RAW WIRE VALUE. A card's title and
+    message are words about the run, so they are never decoded here."""
+    fields = doc.get("fields") or {}
+    status = fields.get("status")
+    card = (fields.get("pendingDecision") or {}).get("mapValue") or {}
+    return {"status": from_value(status) if isinstance(status, dict) else None,
+            "card": bool(card.get("fields"))}
+
+
+class ResearchList(list):
+    """``list_researches``' answer: the rows it may show, newest first — and, on
+    ``unshown``, one ``unshown_husk`` per research it left out.
+
+    ⭐ A LIST, SO EVERY READER THAT TAKES A LIST STILL DOES. The husks ride on the
+    same answer because they come from the same read: a second request for them
+    would cost a Firestore list on every chat poll, and a separate method would
+    be a second read that a route could call instead of this one."""
+
+    def __init__(self, rows: Any = (), unshown: Any = ()) -> None:
+        super().__init__(rows)
+        self.unshown: list[dict[str, Any]] = list(unshown)
+
+
 def pair_state_usable(d: dict[str, Any]) -> bool:
     """Would the web app's submit gate accept this machine? Mirrors
     ``isDeviceEligible`` (``device-order.ts``): ``!pairState || pairState ===
@@ -253,7 +311,7 @@ class FirestoreRest:
         return resp.json() if resp.content else {}
 
     # ── reads ──
-    def list_researches(self, uid: str, *, page_size: int = 50) -> list[dict[str, Any]]:
+    def list_researches(self, uid: str, *, page_size: int = 50) -> ResearchList:
         """List the user's research docs, NEWEST first.
 
         The REST documents.list endpoint, absent ``orderBy``, returns docs by
@@ -261,14 +319,32 @@ class FirestoreRest:
         a "most recent run" query over a name-ordered window would pick the wrong
         docs once the account has more than a page of researches. We order by
         createdAt desc to mirror the web app (firestore.ts orderBy createdAt desc).
+
+        ⛔⛔ AN INCOGNITO RESEARCH IS NEVER IN THIS LIST. It is dropped HERE, at the
+        one read every list goes through, so no route can forget it: `/researches`
+        (the run list), `/updates` (which `sr list`, `sr status` and the bare
+        `stop`/`pause`/`resume` read WITHOUT `via=agent`, so they saw every run),
+        and `/logs/runs`, where a held run of an incognito research keeps its row
+        and reads by its date, as the web app's `labelHeldRuns` does. The test is
+        on the document's PATH, never on a field, because the path is the one
+        signal the rules and the web app read too.
+
+        ⭐ WHAT IS LEFT OUT IS COUNTED, NOT SHOWN: each dropped research leaves an
+        ``unshown_husk`` on the answer's ``unshown`` — its status and whether a
+        card is on it, and nothing else — so the bridge can tell the chat that a
+        run it cannot show is still going (see ``ResearchList``).
         """
         url = (f"{config.FIRESTORE_BASE}/users/{uid}/researches"
                f"?pageSize={page_size}&orderBy=createdAt%20desc")
         body = self._request("GET", url)
-        out: list[dict[str, Any]] = []
+        out = ResearchList()
         for d in body.get("documents", []):
+            rid = doc_id(d.get("name", ""))
+            if is_incognito_research(rid):
+                out.unshown.append(unshown_husk(d))
+                continue
             row = fields_to_dict(d)
-            row["id"] = doc_id(d.get("name", ""))
+            row["id"] = rid
             out.append(row)
         return out
 

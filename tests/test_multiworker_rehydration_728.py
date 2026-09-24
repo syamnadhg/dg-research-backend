@@ -114,7 +114,24 @@ def test_run_start_stamps_assigned_worker():
         "(#728)."
     )
     # Resume flip stamps it too (it re-enqueues onto whichever worker resumes).
-    assert '{"status": "ongoing", "assignedWorker": WORKER_ID}' in src, (
+    #
+    # ⛔⛔ AS A SET OF KEYS, NOT AN EXACT DICT LITERAL. This asserted
+    # `'{"status": "ongoing", "assignedWorker": WORKER_ID}' in src` and went red
+    # the moment that payload legitimately GREW — wave 10.8 added DELETE_FIELDs
+    # so a resume that succeeds retires the refusal it was answering. What the
+    # test is about is that both keys are written TOGETHER on the resume flip;
+    # an exact literal also says "and nothing else", which was never the rule
+    # and which no comment here ever claimed.
+    import ast as _ast
+    flips = [
+        n for n in _ast.walk(_ast.parse(src))
+        if isinstance(n, _ast.Dict)
+        and {k.value for k in n.keys if isinstance(k, _ast.Constant)}
+        >= {"status", "assignedWorker"}
+        and any(isinstance(v, _ast.Constant) and v.value == "ongoing" for v in n.values)
+        and any(isinstance(v, _ast.Name) and v.id == "WORKER_ID" for v in n.values)
+    ]
+    assert flips, (
         "the resume ongoing-flip must also stamp assignedWorker (#728)."
     )
 

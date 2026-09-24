@@ -247,8 +247,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_CLI]),
     ("D5", "under", "⛔ the terminal's --runs never reaches the builder, so the "
      "flag is accepted and ignored",
-     [('        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,\n                                    only_runs=only_runs)',
-       '        summary = _build_log_bundle(dest, support_code=code,\n                                    only_runs=only_runs)')],
+     # Re-anchored 2026-09-21 (#539): the call gained a `keep_uid=` line.
+     [('        summary = _build_log_bundle(dest, support_code=code, max_runs=n_runs,\n                                    only_runs=only_runs,',
+       '        summary = _build_log_bundle(dest, support_code=code,\n                                    only_runs=only_runs,')],
      [T_CLI]),
     ("D6", "under", "the terminal's consent screen describes a number it will not "
      "use",

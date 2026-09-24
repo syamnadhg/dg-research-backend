@@ -104,12 +104,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [("        if (!c.getClientRects().length) continue;\n        if (seen.has(c)) continue;",
        "        if (seen.has(c)) continue;")],
      [T_NEW]),
+    # ⚠ RE-ANCHORED 2026-09-23: the exclusion also reads the row mark Step 1C
+    # leaves (`P.rowAttr`), so the test-id half is now its first operand.
     ("E12", "over", "⛔ the trigger and the option test ids are swapped, so the "
      "SUBMENU is the overlay that gets excluded",
-     [("""            trigger: !!(P.trigTestid &&
-                        c.querySelector('[data-testid="' + P.trigTestid + '"]')),""",
-       """            trigger: !!(P.optTestid &&
-                        c.querySelector('[data-testid="' + P.optTestid + '"]')),""")],
+     [("""            trigger: !!((P.trigTestid &&
+                         c.querySelector('[data-testid="' + P.trigTestid + '"]'))""",
+       """            trigger: !!((P.optTestid &&
+                         c.querySelector('[data-testid="' + P.optTestid + '"]'))""")],
      [T_NEW]),
 
     # ── the wiring ──────────────────────────────────────────────────────────

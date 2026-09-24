@@ -57,10 +57,29 @@ def test_running_version_survives_a_corrupt_marker(tmp_path, monkeypatch):
 
 
 def test_restart_pending_when_installed_is_newer(tmp_path, monkeypatch):
+    # ⚠ 2026-09-19 — `_is_source_checkout` IS NOW PART OF THE SCENARIO. A wheel
+    # landing under a running process cannot happen in a source tree (`git pull`
+    # is the update path there, and `--update` already answers "unsupported"),
+    # so `_restart_pending` returns None for one. The test suite runs FROM a
+    # checkout, so without this the described situation is unreachable.
+    monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
     _mark(tmp_path, monkeypatch, version="0.1.7", pid=1)
     monkeypatch.setattr(research, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(research, "_sr_version", lambda: "0.1.8")
     assert research._restart_pending() == ("0.1.7", "0.1.8")
+
+
+def test_a_source_checkout_is_never_pending_a_restart(tmp_path, monkeypatch):
+    """⛔ The other half, which the guard above would otherwise hide. Before
+    2026-09-19 the guard was `installed.startswith("(")` — a near-dead branch,
+    because an editable install leaves real discoverable metadata and answers
+    with a number. A dev tree therefore reported a permanent phantom
+    "restart pending" the moment the running label stopped matching dist-info."""
+    monkeypatch.setattr(research, "_is_source_checkout", lambda: True)
+    _mark(tmp_path, monkeypatch, version="0.1.7", pid=1)
+    monkeypatch.setattr(research, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(research, "_sr_version", lambda: "0.1.8")
+    assert research._restart_pending() is None
 
 
 def test_no_restart_pending_when_versions_match(tmp_path, monkeypatch):

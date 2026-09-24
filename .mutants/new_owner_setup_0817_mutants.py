@@ -122,8 +122,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_YN]),
     ("Y13", "over", "EOF is swallowed into the default, taking the choice away "
      "from callers that handle a non-interactive stdin themselves",
-     [("        raw = input(prompt)",
-       "        try:\n            raw = input(prompt)\n        except EOFError:\n            return default")],
+     # ⚠ 2026-09-19 re-anchored: the read sits inside `with _console_quiet_for_prompt():`
+     # now, so the mutant has to keep that block intact or it will not parse.
+     [("            raw = input(prompt)",
+       "            try:\n                raw = input(prompt)\n            except EOFError:\n                return default")],
      [T_YN, T_PAIR]),
 
     # ══ the add-loops ══════════════════════════════════════════════════
@@ -190,8 +192,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ the outage clock ═══════════════════════════════════════════════
     ("F1", "under", "⭐⭐ _mark_firestore_down RE-STAMPS on every call, so the "
      "elapsed time resets every 5s and the alarm can NEVER fire",
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). Deleting the `if` line left its body
+     # indented under nothing, so this never parsed. The guard is now made
+     # always-true, which is the same defect: it re-stamps on every call.
      [("    global _firestore_down_since_ts\n    if _firestore_down_since_ts is None:\n        _firestore_down_since_ts = float(now if now is not None else time.time())",
-       "    global _firestore_down_since_ts\n    _firestore_down_since_ts = float(now if now is not None else time.time())")],
+       "    global _firestore_down_since_ts\n    if True:\n        _firestore_down_since_ts = float(now if now is not None else time.time())")],
      [T_OUT]),
     # ⛔ RE-ANCHORED 2026-09-06 (7.9-0). This carried the three consecutive lines
     # `_firebase_down_reason = None` / `_clear_firestore_down()` / the log — and
@@ -275,8 +280,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_OUT]),
     ("F15", "under", "the lines are joined into one string, so every line after "
      "the first loses its timestamp and level",
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): the join is closed now too — it
+     # never was, so the mutant did not parse.
      [("    return [\n        f\"[firestore] This machine cannot reach {host} — \"",
-       "    return [\"\\n\".join([\n        f\"[firestore] This machine cannot reach {host} — \"")],
+       "    return [\"\\n\".join([\n        f\"[firestore] This machine cannot reach {host} — \""),
+      ("        f\"on this machine. {_doctor_share_logs_line()}\",\n    ]",
+       "        f\"on this machine. {_doctor_share_logs_line()}\",\n    ])]")],
      [T_OUT]),
 
     # ══ the aegis pulse ════════════════════════════════════════════════

@@ -29,21 +29,63 @@ def test_ranker_rejects_siblings_before_parsing_the_version():
         "the ranker must reject lite/deep-think/pro BEFORE parsing the version."
     )
     # Highest-version-wins with shortest-text tie-break (prefer leaf over wrapper).
-    assert "rank[1] > bestRank[1]" in js and "t.length < bestLen" in js
+    # Version ORDER, not a float compare, since 2026-09-23 — executed in
+    # test_model_selection_precision.py (test_the_gemini_ranker_takes_3_10_over_3_8).
+    assert "cmpVer(rank[1], bestRank[1])" in js and "t.length < bestLen" in js
 
 
 def test_reject_list_and_family_come_from_policy_not_the_js():
     """They used to be `t.includes('lite') || … || /\\bpro\\b/` hardcoded in the
     JS, and the family was the bare word 'flash' in two regexes. Both are policy
-    now, so a family rename or a new sibling to exclude is one dict edit."""
-    js = research._GEMINI_FLASH_RANK_JS
+    now, so a family rename or a new sibling to exclude is one dict edit.
+
+    ⛔ EXECUTED since wave 10.10, and that is the fix for the one failure in ten.
+    This used to read the caller's source through `inspect.getsource`, which
+    takes the line numbers from import time and re-reads the FILE — so any edit
+    above the function after import (a harness, another builder's tree) shifted
+    the slice and the assertions read the wrong lines. Reproduced by inserting
+    three lines above it after import: FAIL; fifty quiet runs alone: 50/50.
+    Now the real caller runs against a page double, with policy answers no
+    literal could equal, and the ranker's own arguments are what is judged.
+    (Imports are local so this edit stays inside this test's own lines.)"""
+    import asyncio
+
+    import pytest
+    js =research._GEMINI_FLASH_RANK_JS
     assert "includes('lite')" not in js and "deep think" not in js, (
         "the reject list must be passed in, not baked into the ranker"
     )
-    src = code_only(inspect.getsource(research._gemini_select_flash_model))
-    assert 'p2_family("gemini")' in src or "p2_family('gemini')" in src
-    assert 'reject_terms("gemini")' in src
-    assert '"fam": _gm_family' in src and '"reject": _gm_reject' in src
+    fam, rej = "sentinelfamily", ["sentinel-sibling*", "sentinelpro"]
+    seen = {}
+
+    class _Keyboard:
+        async def press(self, key):
+            seen.setdefault("keys", []).append(key)
+
+    class _Page:
+        keyboard = _Keyboard()
+
+        async def evaluate(self, src, arg=None):
+            if src == js:
+                seen["ranker"] = arg
+                return {}                   # no row: the proceed-on-default path
+            if arg is None:
+                return True                 # the dropdown opens
+            seen["trigger"] = arg
+            return ""                       # the trigger's own text
+
+    async def _no_sleep(*_a, **_k):
+        return None
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(research, "p2_family", lambda p: fam if p == "gemini" else "wrong")
+        mp.setattr(research, "reject_terms", lambda p: rej if p == "gemini" else [])
+        mp.setattr(research.asyncio, "sleep", _no_sleep)
+        picked = asyncio.run(research._gemini_select_flash_model(_Page()))
+    assert picked is False and seen.get("keys") == ["Escape"], seen
+    assert seen["ranker"]["fam"] == fam, seen["ranker"]
+    assert seen["ranker"]["reject"] == rej, seen["ranker"]
+    assert seen["trigger"] == fam, "the trigger read must look for the same family"
 
 
 def test_reject_semantics_are_per_term_not_a_blanket_substring():

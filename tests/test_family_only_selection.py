@@ -226,8 +226,12 @@ _JS_MARKERS = ("=>", "document.", "querySelector", "getBoundingClientRect", "win
 # Every float the selection JS is allowed to contain, with what it is for. A
 # model version is a float; so is an epsilon. Only an explicit list tells them
 # apart, and adding to it is meant to be a decision someone makes on purpose.
+#
+# ⛔ "0.001" WAS ON THIS LIST until 2026-09-23 — the epsilon for comparing
+# versions as floats. Versions are compared as whole-number parts now
+# (`_VERSION_ORDER_JS`), so no selection script has any business holding it, and
+# one coming back means a float comparison came back with it.
 _ALLOWED_FLOATS = {
-    "0.001": "float-compare epsilon for an exact pin (Math.abs(v - pin) <= 0.001)",
     "0.95":  "viewport fraction in a Gemini on-screen test "
              "(r.top < window.innerHeight * 0.95) — read off the JS, not guessed",
 }
@@ -262,7 +266,13 @@ def _js_payloads(fn) -> dict:
             continue
         if not any(m in node.value for m in _JS_MARKERS):
             continue
-        out[f"{fn.__name__}:{node.lineno}"] = js_code_only(node.value)
+        # ⛔ KEYED ON LINE **AND COLUMN** (2026-09-23). The pickers are now
+        # composed — `"""(…) => {""" + _VERSION_ORDER_JS + """ …body… """` — and
+        # the body's literal starts on the SAME LINE as the head. Keyed on the
+        # line alone, the three-character head overwrote the whole body, so the
+        # float and version-comparison scans below silently stopped reading the
+        # Claude picker, trigger read and probe.
+        out[f"{fn.__name__}:{node.lineno}:{node.col_offset}"] = js_code_only(node.value)
     return out
 
 
@@ -272,6 +282,8 @@ def _all_selection_js() -> dict:
                research.ensure_deep_mode_active, research._chatgpt_extended_pro_confirm):
         out.update(_js_payloads(fn))
     out["_GEMINI_FLASH_RANK_JS"] = js_code_only(research._GEMINI_FLASH_RANK_JS)
+    # The one shared definition of version ORDER, spliced into all four readers.
+    out["_VERSION_ORDER_JS"] = js_code_only(research._VERSION_ORDER_JS)
     return out
 
 
@@ -349,6 +361,27 @@ def test_the_float_check_would_catch_a_version_written_as_a_float():
         assert _unexplained_floats(f"Math.abs(v - pin) <= {allowed}") == [], (
             f"{allowed} is on the allowlist and must not be reported")
     assert _unexplained_floats("t.slice(0, 40)") == [], "an integer is not a version"
+    # The float-version epsilon is no longer allowed (see _ALLOWED_FLOATS).
+    assert _unexplained_floats("if (Math.abs(v - pin) <= 0.001) {") == ["0.001"]
+
+
+def test_every_version_reader_uses_the_shared_order_not_parsefloat():
+    """⛔ 2026-09-23. All four page scripts that read a model version ended in
+    `parseFloat(m[1])`, so "5.10" was 5.1. Their ORDER is now `_VERSION_ORDER_JS`,
+    spliced into each; this checks every one of them actually carries it (the
+    behaviour is executed in test_model_selection_precision.py) and that no
+    selection script parses a version as a float again."""
+    from _domshim import js_constant
+    readers = {
+        "gemini ranker": research._GEMINI_FLASH_RANK_JS,
+        "claude trigger read": js_constant(research.setup_claude_dr, "_TRIGGER_READ_JS"),
+        "claude picker": js_constant(research.setup_claude_dr, "_pick_opus_js"),
+        "claude probe": js_constant(research.setup_claude_dr, "_probe_opus_js"),
+    }
+    for name, js in readers.items():
+        assert research._VERSION_ORDER_JS in js, f"{name} does not carry the shared order"
+    for name, js in _all_selection_js().items():
+        assert "parseFloat(m[1])" not in js, f"{name} parses a version as a float"
 
 
 def test_the_version_comparison_check_would_catch_a_real_floor():

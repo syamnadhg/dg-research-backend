@@ -330,10 +330,14 @@ MUTANTS = [
     ("K4", "models.py", "under",
      "the sys.modules leg raises out of a best-effort lookup — a half-"
      "initialised module takes the caller's remaining key sources with it",
-     [("        try:\n"
-       "            # ⚠ `getattr` is not safe by itself here. A module caught PARTWAY",
-       "        if True:\n"
-       "            # ⚠ `getattr` is not safe by itself here. A module caught PARTWAY")]),
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). `try:` → `if True:` left the
+     # `except` dangling, so models.py never parsed under this mutant. The
+     # sys.modules leg's guard is NARROWED instead, so what a module-level
+     # `__getattr__` raises escapes the lookup — the same defect, parseable.
+     [("            fn = getattr(sys.modules.get(mod_name), name, None)\n"
+       "        except Exception:",
+       "            fn = getattr(sys.modules.get(mod_name), name, None)\n"
+       "        except ImportError:")]),
     ("K5", "vision.py", "under",
      "vision goes back to importing from `research` — the exact line that "
      "raises in every shipped wheel and is swallowed",

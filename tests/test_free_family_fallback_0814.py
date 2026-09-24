@@ -229,12 +229,13 @@ def test_a_version_learned_on_one_family_is_not_read_back_on_the_other(monkeypat
     assert models.record_known_good("claude", 5.0) is True            # primary
     assert models.record_known_good("claude", 4.6, "sonnet") is True  # fallback
 
-    assert models.p2_known_good("claude") == 5.0
-    assert models.p2_known_good("claude", "opus") == 5.0, (
+    # Read back as dotted text since 2026-09-23 (models.version_text).
+    assert models.p2_known_good("claude") == "5"
+    assert models.p2_known_good("claude", "opus") == "5", (
         "naming the primary family explicitly must read the SAME slot as "
         "omitting it, or existing on-disk state is stranded"
     )
-    assert models.p2_known_good("claude", "sonnet") == 4.6
+    assert models.p2_known_good("claude", "sonnet") == "4.6"
 
 
 def test_recording_the_fallback_never_disturbs_the_primary_slot(monkeypatch, tmp_path):
@@ -244,8 +245,8 @@ def test_recording_the_fallback_never_disturbs_the_primary_slot(monkeypatch, tmp
     models.record_known_good("claude", 5.0)
     models.record_known_good("claude", 4.6, "sonnet")
     models.record_known_good("claude", 4.4, "sonnet")
-    assert models.p2_known_good("claude") == 5.0
-    assert models.p2_known_good("claude", "sonnet") == 4.4
+    assert models.p2_known_good("claude") == "5"
+    assert models.p2_known_good("claude", "sonnet") == "4.4"
 
 
 # ── the detector: three cases, three answers ──────────────────────────────
@@ -774,7 +775,7 @@ def test_a_genuine_pro_menu_reports_no_chip_at_all():
                  el("div", {"role": "menuitem"}, "Opus 4.5 Previous"),
                  el("div", {"role": "menuitem"}, "Sonnet 4.6 Balanced"))
     ret = run_js(spec, _probe_js(), _probe_args())["ret"]
-    assert ret["chipsAny"] is False and ret["n"] == 2 and ret["highest"] == 5
+    assert ret["chipsAny"] is False and ret["n"] == 2 and ret["highest"] == "5"
 
 
 def test_the_row_count_and_the_fact_are_reported_separately():

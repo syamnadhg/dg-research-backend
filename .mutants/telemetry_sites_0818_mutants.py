@@ -133,7 +133,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
 
     # ══ the run lifecycle ═══════════════════════════════════════════════
     ("R1", "under", "a run never reports that it started",
-     [('            tm.tm_emit(tm.Ev.RUN_STARTED,\n                       research_id=self.research_id, worker=WORKER_ID)', '            pass')],
+     [('            tm.tm_emit(tm.Ev.RUN_STARTED,\n'
+       '                       research_id=_tm_research_id(self.research_id),\n'
+       '                       worker=WORKER_ID)', '            pass')],
      [T], SRC),
     ("R2", "under", "a run never reports how it ended, so a machine that fails "
      "every run looks identical to one that succeeds",

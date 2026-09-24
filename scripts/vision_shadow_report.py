@@ -11,8 +11,8 @@ computes the per-hotspot promotion-criterion metrics:
                      ratio of where CUA actually clicked
 
 Per-hotspot decision: PASS iff all three thresholds met. Use this to
-decide which hotspot toggles to flip from `_shadow_observed_cua` →
-`with_vision_fallback` in research.py.
+decide whether the hotspots are ready for the act tier: `_shadow_observed_cua`
+in research.py already hands them to `vision.act_loop` when DG_VISION_TIER=act.
 
 Usage:
   python scripts/vision_shadow_report.py
@@ -248,8 +248,9 @@ def report(records: list[dict], filter_hotspot: str | None,
     if pass_list:
         print()
         print(f"Hotspots passing threshold: {', '.join(pass_list)}")
-        print("Next: flip these from `_shadow_observed_cua` → "
-              "`with_vision_fallback` in research.py (see vision_v3_plan.md).")
+        print("Next: these are ready for the act tier — `_shadow_observed_cua` "
+              "hands them to `vision.act_loop` when DG_VISION_TIER=act "
+              "(see vision_v3_plan.md).")
 
     return 0
 

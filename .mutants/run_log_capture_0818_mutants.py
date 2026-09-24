@@ -424,8 +424,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_CAP]),
     ("S3", "under", "the session header loses its date — the one thing log() "
      "has never stamped and the reason post-hoc splitting is impossible",
-     [('        writer.write_line(\n            f"startedUtc={started} build={_sr_version()} pid={os.getpid()} "',
-       '        writer.write_line(\n            f"build={_sr_version()} pid={os.getpid()} "')],
+     # ⚠ 2026-09-19 — re-anchored: the session header now stamps the RUNNING
+     # build (`_sr_build_label`), not the installed package metadata.
+     [('        writer.write_line(\n            f"startedUtc={started} build={_sr_build_label()} pid={os.getpid()} "',
+       '        writer.write_line(\n            f"build={_sr_build_label()} pid={os.getpid()} "')],
      [T_CAP]),
     ("S4", "under", "only stdout is teed, so everything a command writes to "
      "stderr — which is where failures go — reaches no file",

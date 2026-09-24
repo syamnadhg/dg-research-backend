@@ -669,17 +669,18 @@ def test_the_retry_reads_the_claim_off_the_armed_sink(monkeypatch):
 
 
 def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch, tmp_path):
-    """⛔⛔ THE PIN MOVED FROM THE ROW TO THE ARCHIVE, ON PURPOSE.
-
-    It used to assert `_scan_run_folders` carried no submitter at all. Wave 8
-    needs it on the row — that is where the intersection reads it — so keeping
-    the old assertion would have meant a second meta read per folder for a
-    property nobody wanted. What actually mattered was never the row: it was
-    that a uid must not travel inside a support bundle. index.json is the thing
-    that ships, so index.json is where the pin belongs.
+    """The row carries the submitter; index.json, built from the row, does not.
 
     ⭐ Asserted against the REAL archive, not against `_INDEX_PRIVATE_KEYS`. A
-    constant can be correct while the comprehension that reads it is not."""
+    constant can be correct while the comprehension that reads it is not.
+
+    ⛔⛔ AND THIS IS NO LONGER THE UID PIN (#541b). It used to claim "a uid must
+    not travel inside a support bundle" while reading index.json ONLY — and the
+    same archive shipped the uid twice beside it, in `meta.json` and in the
+    run.log header, so it could not fail against the leak it named. That claim
+    now lives in `test_no_other_members_uid_or_topic_in_any_bundle_member`,
+    which reads the raw bytes of every member. This keeps only what it measures:
+    the index's keys."""
     import zipfile
 
     _captured_meta(monkeypatch, topic="t",
@@ -691,22 +692,157 @@ def test_the_new_keys_do_not_leak_into_the_bundle_index(monkeypatch, tmp_path):
     assert rows[0]["submitterSource"] == "queue"
 
     dest = tmp_path / "b.zip"
-    research._build_log_bundle(dest, support_code="ABCD2345")
+    research._build_log_bundle(dest, support_code="ABCD2345", keep_uid="UID_ALICE")
     with zipfile.ZipFile(dest) as zf:
         index = json.loads(zf.read("index.json").decode("utf-8"))
     assert index, "the archive's index was empty — this proves nothing"
     for entry in index:
         assert "submitterUid" not in entry
         assert "submitterSource" not in entry
-    assert "UID_ALICE" not in zf_index_text(dest), "a uid reached the archive index"
+    assert "UID_ALICE" not in json.dumps(index), "a uid reached the archive index"
 
 
-def zf_index_text(dest) -> str:
-    """index.json as raw text — a key-name check would miss a uid smuggled in
-    as a VALUE under some other key."""
+#: Bob's subject as a person writes it — the form the machine log carries in
+#: prose, next to `bobs_secret_topic`, which is the form a queue path carries.
+BOB_TOPIC = "Bobs secret divorce shortlist"
+
+
+#: The reference the pickup line carries now that it carries no topic. The test
+#: below checks this against `research._log_job_ref`, which is what writes it.
+BOB_REF = "rB123456…"
+
+
+def _machine_log_lines_that_carry_a_topic(topic, research_id, uid):
+    """The `backend.log` lines this program writes with a subject in them.
+
+    ⛔⛔ THESE ARE WHAT A REAL TAIL HOLDS, and none of them has a `topic=` key
+    for a redactor to find — measured on the owner's own `backend*.log`, where 9
+    of 9 `Starting queued job` topics, 1 of 1 orphan claims and 5 of 5 notebook
+    renames came through a bundle unchanged. The source lines no longer write
+    them (see `research._log_job_ref`), and a tail is fourteen days deep, so
+    every bundle sent before they age out still ships them and the redactor has
+    to know the shapes.
+
+    ⛔ NOTHING HERE TOUCHES THE NEW CODE, deliberately: this is the INPUT, and a
+    fixture that imported a symbol only the fix defines would fail against the
+    old tree with an AttributeError instead of with the leak."""
+    return [
+        # as the shipped versions wrote them, and as the tail still holds them
+        f"[00:08:47] [INFO] Starting queued job: {topic}\n",
+        f"[00:08:48] [INFO] [idle-rescan] worker 1: picking up orphan "
+        f"{research_id[:8]}… ({topic}) submittedBy={uid[:8]}\n",
+        f"[00:09:00] [INFO] Renaming notebook to '{topic}'...\n",
+        f"[00:09:01] [INFO] [nlm] DOM rename OK (read-back verified): '{topic}'\n",
+        f"[00:09:02] [INFO] Topic: {topic}\n",
+        # and as the pickup is written now — a reference with no subject in it
+        f"[00:09:03] [INFO] Starting queued job {BOB_REF}\n",
+    ]
+
+
+@pytest.fixture()
+def two_member_machine(tmp_path, monkeypatch):
+    """#539's fixture: alice owns the machine, bob is a member who ran one too.
+
+    Bob is in his run folder (meta.json, and a run.log that names his tree and
+    his queue — whose directory name is his topic), in the raw tail and in a
+    session: every place a real owner bundle was measured carrying him."""
+    root = tmp_path / "logs"
+    for sub in ("runs", "sessions"):
+        (root / sub).mkdir(parents=True)
+    queues = tmp_path / "queues"
+    monkeypatch.setattr(research, "_logs_root", lambda: root)
+    monkeypatch.setattr(research, "_runs_log_root", lambda: root / "runs")
+    monkeypatch.setattr(research, "_sessions_log_root", lambda: root / "sessions")
+    now = time.time()
+    for name, uid, lines in (
+            ("alice_20260920T000001", "U_ALICE",
+             "Firestore bridge active: users/U_ALICE/researches/rA\n"
+             "Queue: /srv/queues/alices_topic_20260920_000001\n"),
+            ("bob_20260920T000847", "U_BOB",
+             "Firestore bridge active: users/U_BOB/researches/rB\n"
+             "Queue: /srv/queues/bobs_secret_topic_20260920_000847\n")):
+        folder = root / "runs" / name
+        folder.mkdir()
+        (folder / "meta.json").write_text(json.dumps({
+            "schema": 1, "status": "complete", "researchId": name.split("_")[0],
+            "startedUtc": "2026-09-20T00:00:01Z", "submitterUid": uid,
+            "submitterSource": "queue"}), encoding="utf-8")
+        (folder / "run.log").write_text(lines, encoding="utf-8")
+        os.utime(folder / "meta.json", (now, now))
+    topic_lines = _machine_log_lines_that_carry_a_topic(
+        BOB_TOPIC, "rB12345678", "U_BOB")
+    both = ("[00:00:01] [INFO] Firestore bridge active: users/U_ALICE/researches/rA\n"
+            "[00:08:47] [INFO] Firestore bridge active: users/U_BOB/researches/rB\n"
+            "[00:08:47] [INFO] Queue: /srv/queues/bobs_secret_topic_20260920_000847\n"
+            + "".join(topic_lines))
+    (root / "backend.log").write_text(both, encoding="utf-8")
+    (root / "sessions" / "serve_20260920T000000.log").write_text(both, encoding="utf-8")
+    # An unattributed run — every fleet run until the attributing wheel ships —
+    # whose log holds the subject as JSON, as a repr and after a plain colon.
+    legacy = root / "runs" / "legacy_20260920T000900"
+    legacy.mkdir()
+    (legacy / "meta.json").write_text(json.dumps({
+        "schema": 1, "status": "complete", "researchId": "legacy",
+        "startedUtc": "2026-09-20T00:09:00Z", "submitterUid": None,
+        "submitterSource": "unclaimed"}), encoding="utf-8")
+    (legacy / "run.log").write_text(
+        json.dumps({"topic": BOB_TOPIC, "uid": "U_BOB"}) + "\n"
+        + repr({"topic": BOB_TOPIC}) + "\n"
+        + f"Topic: {BOB_TOPIC}\n", encoding="utf-8")
+    os.utime(legacy / "meta.json", (now, now))
+    return {"root": root, "queues": queues}
+
+
+def test_no_other_members_uid_or_topic_in_any_bundle_member(two_member_machine,
+                                                            tmp_path):
+    """⛔⛔ #539 + #541b — THE UID PIN, ON EVERY MEMBER'S RAW BYTES.
+
+    Not index.json, not a key name: every file in the archive, byte for byte, so
+    a uid in meta.json, in a run.log header or in a raw tail all fail it alike.
+
+    ⛔⛔ AND IN EVERY SHAPE A TOPIC TRAVELS IN, not only the queue slug. The
+    fixture's tail now carries the lines this program itself wrote with a subject
+    and no `topic=` key — the queued-job pickup, the idle-rescan claim, the two
+    notebook renames, the CLI echo — plus an unattributed run.log holding the
+    subject as JSON, as a Python repr and after a plain colon. Every one of them
+    survived the first #539 pass, because the fixture only ever put the topic in
+    a queue slug, which is the one form the redactor knew.
+
+    ⭐ ACCEPT POLARITY IN THE SAME TEST, because "ship nothing" passes every
+    absence: alice's own run is still there and still names her, and the raw
+    tail is still there. And bob's folder is gone rather than merely rewritten —
+    the redactor alone would scrub his uid and still ship his run. The
+    reference the code writes in place of a topic survives too."""
     import zipfile
+
+    dest = tmp_path / "owner.zip"
+    research._build_log_bundle(dest, support_code="ABCD2345", keep_uid="U_ALICE",
+                               queues_root=two_member_machine["queues"])
     with zipfile.ZipFile(dest) as zf:
-        return zf.read("index.json").decode("utf-8")
+        blobs = {n: zf.read(n) for n in zf.namelist()}
+    for name, data in blobs.items():
+        assert b"U_BOB" not in data, f"another member's uid reached {name}"
+        assert b"bobs_secret_topic" not in data, f"another member's topic reached {name}"
+        assert BOB_TOPIC.encode() not in data, \
+            f"another member's topic reached {name}"
+    # ⭐ The pickup line as the code writes it TODAY, built by the function that
+    # writes it, must come through with its reference intact — a backstop that
+    # ate this one would cost the reader the id and buy nothing.
+    assert research._log_job_ref({"research_id": "rB12345678"}) == BOB_REF
+    assert f"Starting queued job {BOB_REF}".encode() in blobs["system/backend.log"], \
+        "the reference the code writes instead of a topic was redacted away"
+    legacy_log = blobs["runs/legacy_20260920T000900/run.log"]
+    assert json.loads(legacy_log.decode().splitlines()[0])["topic"] == "<topic removed>", \
+        "the unattributed run's JSON topic line no longer parses as JSON"
+    assert not any(n.startswith("runs/bob_") for n in blobs), \
+        "another member's run folder was shipped (rewritten is not left out)"
+    alice_log = blobs.get("runs/alice_20260920T000001/run.log")
+    assert alice_log is not None, "the owner's own run is missing — this proves nothing"
+    assert b"users/U_ALICE/researches/rA" in alice_log
+    assert "system/backend.log" in blobs, "the raw tail is missing — this proves nothing"
+    assert b"users/U_ALICE/researches/rA" in blobs["system/backend.log"], \
+        "the owner's own uid was scrubbed from the machine tail"
+    assert json.loads(blobs["collected.json"])["runsOtherMembers"] == 1
 
 
 def test_a_status_patch_preserves_the_submitter(monkeypatch):
@@ -777,12 +913,27 @@ def test_a_legacy_meta_scans_as_unknown_not_as_queued(tmp_path, monkeypatch):
 def test_the_refusal_decides_and_says_why(caplog):
     """The decision half, driven for real — including that a refusal is never
     silent, because a queue doc that vanishes with no line is indistinguishable
-    from one that was never written."""
+    from one that was never written.
+
+    ⛔⛔ THE UNSIGNED CASE FLIPPED 2026-09-22 (wave 10.9, cross-verify round 2).
+    It used to assert that `{"uid": U1}` — a tree named, no writer — was
+    ADMITTED, on the reasonable-sounding ground that "absent is not disagreeing"
+    and that refusing it would refuse every doc from an older build. Checked
+    rather than assumed: `devices/{id}/queue` has required
+    `submittedBy == request.auth.uid` on CREATE since the collection was made
+    (`8b556c82`, 2026-05-20), and this listener subscribes to nothing else — the
+    tokens-path shape that sentence was written for cannot arrive here. What the
+    shape DOES buy is a paid run inside the tree it names, attributable to
+    nobody. `_start_doc_identity_conflict` still answers "not a disagreement";
+    the refusal is the caller's, and it is about the missing writer."""
     caplog.clear()
     assert research._start_doc_identity_refused(
         {"uid": "U1", "submittedBy": "U2", "researchId": "chat_1_1"},
         "start-listener") is True
-    assert research._start_doc_identity_refused({"uid": "U1"}, "start-listener") is False
+    assert research._start_doc_identity_refused({"uid": "U1"}, "start-listener") is True
+    assert research._start_doc_identity_refused({}, "start-listener") is False
+    assert research._start_doc_identity_refused(
+        {"researchId": "chat_1_1"}, "start-listener") is False
     assert research._start_doc_identity_refused(
         {"uid": "U1", "submittedBy": "U1"}, "start-listener") is False
 

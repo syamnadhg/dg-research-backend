@@ -13,6 +13,7 @@ could be lost to a single network blip, and ran inside a process that would
 `os._exit` itself out from under the run.
 """
 import inspect
+import time
 
 import pytest
 
@@ -162,15 +163,45 @@ def test_the_notice_thread_is_counted_as_in_flight():
     assert "finally:" in after and "_fe_handoff_end()" in after
 
 
-def test_the_p4p5_drive_is_counted_as_a_DRIVE():
+def test_the_p4p5_drive_is_counted_as_a_DRIVE(monkeypatch):
     """⭐⭐ Not a brief handoff. That request is the rest of the run, and the
     route aborts it when the client goes away — SIGTERMing ffmpeg and writing
-    status="stopped". A 90-second bound would land mid-encode."""
-    src = inspect.getsource(research._post_fe_p4p5_trigger)
-    assert "_fe_handoff_begin(drive=True)" in src
-    at = src.index("_fe_handoff_begin(drive=True)")
-    after = src[at:at + 260]
-    assert "finally:" in after and "_fe_handoff_end(drive=True)" in after
+    status="stopped". A 90-second bound would land mid-encode.
+
+    ⛔⛔ EXECUTED, NOT READ (wave 10.9). This used to search the 260 characters
+    after `_fe_handoff_begin(drive=True)` for "finally:", and wave 10.9's retry
+    ladder put a comment in that window — so a test about a RESPAWN BUDGET went
+    red over prose, while an actual unbalanced counter (a `finally` that
+    releases a drive it never took, or one the raising path skips) would have
+    passed it either way. It runs the real dispatch now: the count must rise
+    inside the drive and come back to zero even when the drive throws."""
+    import threading
+    seen = []
+    done = threading.Event()
+
+    def _explode(*_a, **_kw):
+        seen.append((research._fe_handoff_pending(),
+                     research._fe_respawn_wait_budget()))
+        done.set()
+        raise RuntimeError("the drive died mid-flight")
+
+    monkeypatch.setattr(research, "_drive_cloud_phases", _explode)
+    monkeypatch.setattr(research, "_fire_fe_p4_trigger", lambda u, r: True)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+
+    assert research._fe_handoff_pending() == 0
+    assert research._post_fe_p4p5_trigger("uid-1", "rid-abcdef01") is True
+    assert done.wait(5), "the dispatch thread never ran"
+    assert seen == [(1, research._FE_DRIVE_WAIT_SEC)], (
+        "the P4/P5 request was not counted as a DRIVE while it was in flight — "
+        "a respawn would land on top of it and terminalise the research")
+    for _ in range(50):
+        if research._fe_handoff_pending() == 0:
+            break
+        time.sleep(0.02)
+    assert research._fe_handoff_pending() == 0, (
+        "a drive that raised left the counter up — this worker now holds every "
+        "respawn for an hour")
 
 
 def test_the_two_budgets_differ_by_orders_of_magnitude():
@@ -232,8 +263,9 @@ def test_nothing_in_flight_goes_straight_through():
 
 def test_something_in_flight_holds_and_sets_a_deadline():
     """⭐ The respawn would land on top of a POST that hands this run to the web
-    app, and killing the P4/P5 one aborts the request, SIGTERMs ffmpeg and
-    terminalises the research as stopped."""
+    app, and the P4/P5 one IS the rest of the run: the route runs P4 and P5
+    inside that request, so killing it abandons work nothing else is driving.
+    (Until 2026-09-19 a hang-up also made the route stop the run outright.)"""
     action, until = _hold()
     assert action == "hold"
     assert until == NOW + BUDGET

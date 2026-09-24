@@ -89,9 +89,16 @@ _LISTENER_DELETE = """            if _start_doc_identity_refused(data, "start-li
 
 _REFUSE_LOG = """    log(f"[{where}] refusing start — identity fields disagree """
 
+# ⛔ EXTENDED 2026-09-21 TO STAY UNIQUE. `_start_doc_identity_conflict` gained a
+# SECOND legitimate caller — the owner-control guard, which asks the same
+# question and then allows the device owner to answer it differently. The old
+# three-line needle matched both, and the sweep caught it before the harness
+# could report a phantom kill. The log line below belongs to the START guard
+# alone, which is the one this mutant is about.
 _REFUSE_RETURN = """    conflict = _start_doc_identity_conflict(data)
     if conflict is None:
-        return False"""
+        return False
+    log(f"[{where}] refusing start"""
 
 _LISTENER_ENQ = """                         "submitted_by": sb},"""
 
@@ -195,13 +202,17 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("O1c", "under", "⛔ the refusal goes SILENT — a queue doc that vanishes with "
      "no line is indistinguishable from one that was never written, which is the "
      "exact shape this repo keeps finding",
-     [(_REFUSE_LOG, "    if False: log(f\"[{where}] refusing start — identity fields disagree \"")],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): the replacement carried a closing
+     # quote the anchor does not, so the f-string was left unterminated and the
+     # mutant never parsed.
+     [(_REFUSE_LOG, "    if False: log(f\"[{where}] refusing start — identity fields disagree ")],
      [T_CAP]),
     ("O1d", "over", "the guard refuses EVERY start doc, not just a divergent one "
      "— the machine stops running research at all",
      [(_REFUSE_RETURN,
        "    conflict = _start_doc_identity_conflict(data)\n"
-       "    if False:\n        return False")],
+       "    if False:\n        return False\n"
+       "    log(f\"[{where}] refusing start")],
      [T_CAP]),
     ("O3", "over", "⛔⛔ ABSENT IS TREATED AS DISAGREEING. Every legacy start doc "
      "— and every doc written by a build older than this one — is refused, so "

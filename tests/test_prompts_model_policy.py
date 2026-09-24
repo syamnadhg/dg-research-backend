@@ -14,6 +14,8 @@ The one thing every test here enforces: a digit next to a model name is a bug.
 import inspect
 import re
 
+import pytest
+
 import models
 import prompts
 import research
@@ -209,3 +211,41 @@ def test_select_pro_matches_the_word_and_takes_the_highest():
         "when several Pro options exist the newest is the right one"
     )
     assert "sales prompt, not the model" in p, "an upgrade CTA is not the picker"
+
+
+# ── 2026-09-23: "highest" is read by version ORDER, in every mission that says it ──
+# Read as decimals, the release after nine-after-the-dot is OLDER than it (".10" <
+# ".9"); the DOM rankers made that mistake until this wave. The setup directive
+# learned the rule first. These hold every other mission that asks an agent for the
+# highest-numbered model to the SAME sentence.
+
+def test_the_version_order_rule_names_no_version():
+    rule = models.VERSION_ORDER_RULE
+    assert not any(ch.isdigit() for ch in rule), rule
+    assert "never as decimals" in rule
+    assert "ten after the dot is NEWER than nine after the dot" in rule
+
+
+@pytest.mark.parametrize("family", ["", "sonnet"])
+def test_the_claude_system_prompt_reads_highest_as_its_directive_does(family):
+    """⭐ The system prompt and the setup directive go to the SAME computer-use
+    call. With only the directive carrying the rule, the agent held two readings of
+    "highest" at once — the contradiction test_claude_dr_prompt_agrees_with_the_
+    directive_it_ships_with exists to prevent, one clause further on."""
+    sys_p = prompts.claude_deep_research_prompt(family)
+    step = sys_p[sys_p.index("2. MODEL:"):sys_p.index("\n3. ")]
+    assert models.VERSION_ORDER_RULE in step, "said where HIGHEST is asked for"
+    assert models.VERSION_ORDER_RULE in models.p2_claude_setup_directive(family)
+
+
+@pytest.mark.parametrize("effort_ok", [True, False])
+def test_the_validator_reads_highest_the_same_way(effort_ok):
+    """It picks the highest only when the button names no family at all — rare,
+    and exactly when a wrong reading would pick an older model."""
+    p = prompts.claude_validate_setup_prompt("", effort_ok=effort_ok)
+    step = p[p.index("1. MODEL:"):p.index("\n2. ")]
+    assert models.VERSION_ORDER_RULE in step
+
+
+def test_the_chatgpt_tier_mission_reads_highest_the_same_way():
+    assert models.VERSION_ORDER_RULE in prompts.PROMPT_SELECT_PRO

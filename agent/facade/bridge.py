@@ -1590,6 +1590,24 @@ _ATTENTION_STATUSES = (
 )
 
 
+def _could_be_meant(status: Any, card: Any) -> bool:
+    """Could a bare stop / pause / resume / retry / skip in chat mean this run?
+
+    Yes while it is still going, or while it is waiting on the person — a
+    decision card on it, or a status that asks for them. ⭐ ONE TEST FOR BOTH
+    SIDES: the chat is told a run it cannot show is going by this test
+    (`hiddenLiveRun` on /updates), and it offers the runs it CAN show that pass
+    this same test (`live` on each row), so the two can never describe
+    different situations.
+
+    ⛔ WHEN IN DOUBT, YES. A status that is missing or not a string counts as
+    going. Too many yeses cost the person one more message naming the run; one
+    wrong no lets a bare stop land on a run they did not mean, and a stop cannot
+    be undone."""
+    s = status if isinstance(status, str) else ""
+    return bool(card) or s in _ATTENTION_STATUSES or not runview.is_terminal(s)
+
+
 def _sr_links(doc: dict) -> dict:
     """Permanent superresearch.io share links for a run, from the ``srShares``
     map the FE mints at Phase-5 delivery (#741): docType→shareId for the brief +
@@ -2324,7 +2342,18 @@ def _completed_phases(doc: dict) -> dict:
                     out.setdefault(pn, st)
     cur = doc.get("phase")
     if isinstance(cur, int):
-        for p in range(cur):
+        # ⛔⛔ ONLY THE MACHINE-OWNED PHASES CAN BE INFERRED FROM THIS FIELD
+        # (2026-09-20). "Advanced past it" is sound while the pointer is the
+        # machine's own progress marker, and the machine writes 0-3 and hands
+        # off. From today the WEB advances it to 4 at the upload's start and 5
+        # at delivery's — so a bare `range(cur)` reads a run that merely
+        # REACHED phase 5 as proof that phase 4 completed, and prints
+        # "Phase 4 (Video) complete" for a video that failed or was skipped.
+        #
+        # ⭐ Phases 4 and 5 leave explicit `phases[]` entries when they finish
+        # — including "errored" ones, as of the same wave — so they are read
+        # from evidence above rather than inferred from a pointer here.
+        for p in range(min(cur, 4)):
             out.setdefault(p, "complete")  # advanced past it
         if doc.get("status") == "completed":
             out.setdefault(cur, "complete")  # clean end → current phase done
@@ -5769,8 +5798,25 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "attentionAction": _act,
                     "attentionDetails": _det,
                     "attentionOffers": _offers,
+                    # Still one a bare verb could mean — the runs sr.py offers
+                    # when it will not guess (see `hiddenLiveRun` below).
+                    "live": _could_be_meant(status, isinstance(r.get("pendingDecision"), dict)
+                                            and bool(r.get("pendingDecision"))),
                 })
             out: dict[str, Any] = {"runs": runs}
+            # ⛔⛔ A RUN THE CHAT CANNOT SHOW IS STILL THE PERSON'S RUN. An
+            # incognito research is left out of every list, and a bare "stop"
+            # then stopped the newest run the chat COULD see — their ordinary one
+            # — while the incognito run they had just started kept going. This
+            # says only that such a run exists and is still going: never which,
+            # never how many, never what about. sr.py refuses to guess on it.
+            # ⭐ Read off the same answer as the rows (`ResearchList.unshown`; a
+            # plain list carries none), so it costs no second request. Absent on
+            # the wire (an older bridge) means "not known", and sr.py then acts
+            # as it always did.
+            out["hiddenLiveRun"] = any(
+                _could_be_meant(u.get("status"), u.get("card"))
+                for u in getattr(rows, "unshown", ()))
             # ⛔⛔ WHAT MAY ONLY BE FORGOTTEN ONCE THE PERSON HAS BEEN TOLD. Each
             # proactive note clears its own "still outstanding" state, and doing
             # that BEFORE the response is written destroys the announce on any

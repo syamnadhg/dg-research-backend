@@ -115,8 +115,11 @@ _CAP_STORE = """        self.submitted_by = submitted_by"""
 
 _BIND = """                bound.arguments.get("uid") or None)"""
 
-_WRAP = """    with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                        submitted_by=_submitter, claimed_by=_claimed):"""
+# ⛔ RE-INDENTED, wave 10.9: the wrapper's `with` now sits inside a `try` whose
+# `finally` takes an incognito run's folders off this disk. Same statement, one
+# level deeper.
+_WRAP = """        with _RunLogCapture(research_id=_rid, attempt=_attempt,
+                            submitted_by=_submitter, claimed_by=_claimed):"""
 
 _DOC_NOCALLER = """    ⚠ NO PRODUCTION CALLER — selection happens in the browser. This is the"""
 
@@ -228,7 +231,7 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      [(_BIND, "                None)")],
      [T_NEW, T_CAP]),
     ("A4", SRC, "under", "the wrapper never forwards the submitter it just bound",
-     [(_WRAP, "    with _RunLogCapture(research_id=_rid, attempt=_attempt):")],
+     [(_WRAP, "        with _RunLogCapture(research_id=_rid, attempt=_attempt):")],
      [T_NEW, T_CAP]),
     ("A5", SRC, "over", "`submitterSource` is hardcoded, so a local run claims "
      "to have come from the queue and a null reads as a lost value rather than "
@@ -305,8 +308,12 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
     ("U3", SRC, "over", "⛔ a brace enters the unit f-string. It is evaluated "
      "BEFORE the try that would catch it, on the --resurrect path, so this is a "
      "hard crash rather than a bad unit file",
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). `{such as ~/.local/bin}` is not an
+     # expression, so the f-string failed to COMPILE — the whole module, not
+     # the unit — and the mutant never parsed. `{such}` is an expression that
+     # fails only when the unit is RENDERED, which is the crash described.
      [("# first, so a binary in a user-writable dir such as ~/.local/bin resolves ahead",
-       "# first, so a binary in a user-writable dir {such as ~/.local/bin} resolves ahead")],
+       "# first, so a binary in a user-writable dir {such} as ~/.local/bin resolves ahead")],
      [T_NEW]),
     ("U4", SRC, "over", "⛔ the word the macOS relocation pin greps this "
      "function's raw source for is reintroduced by a comment",

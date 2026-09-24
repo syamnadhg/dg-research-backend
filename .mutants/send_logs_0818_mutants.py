@@ -233,9 +233,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [('        body.setdefault("expireAt",\n                        datetime.now(timezone.utc) + timedelta(days=BUNDLE_MAX_AGE_DAYS))',
        '        pass')],
      [T_SEND]),
+    # ⚠ RE-ANCHORED 2026-09-21 (wave 10.9): the except block now retries a denied
+    # write without the left-out counts first. Same claim on the final give-up.
     ("R5", "over", "a status-write failure aborts an upload that was working",
-     [('    except Exception as exc:\n        log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "\n            f"continues; the row will look stale", "WARN")\n        return False',
-       '    except Exception as exc:\n        raise')],
+     [('        log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "\n            f"continues; the row will look stale", "WARN")\n        return False',
+       '        raise')],
      [T_SEND]),
     ("R6", "under", "the request nonce is dropped, so the app cannot tell a "
      "stale row from the one it just asked for",
@@ -310,8 +312,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "was honoured",
      [('                "runsApplied": int(summary["maxRunsApplied"]),\n            })',
        '                "runsApplied": int(runs),\n            })'),
-      ('                    "runsApplied": int(summary["maxRunsApplied"]),\n                })',
-       '                    "runsApplied": int(runs),\n                })')],
+      # ⚠ RE-ANCHORED 2026-09-21 (wave 10.9): the `done` write gained the
+      # left-out counts after this line.
+      ('                    "runsApplied": int(summary["maxRunsApplied"]),\n                    # On',
+       '                    "runsApplied": int(runs),\n                    # On')],
      [T_SEND]),
     ("N8", "under", "the builder stops reporting the bound it used at all",
      [('        "maxRunsApplied": int(max_runs),\n', '')],

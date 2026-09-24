@@ -740,7 +740,7 @@ def test_the_probe_does_not_report_a_chip_as_the_highest_offered():
     arg = {"fam": "opus", "verbs": list(models.UPSELL_VERBS),
            "upsellWindow": models.UPSELL_WINDOW}
     out = run_js(_menu("Upgrade to Opus 5.2", "Opus 5"), js, arg)
-    assert out["ret"]["highest"] == 5.0
+    assert out["ret"]["highest"] == "5"      # the matched text, since 2026-09-23
 
 
 # Only the family-bearing rows: a label that does not name the family is refused
@@ -1233,7 +1233,7 @@ def test_a_real_menu_reports_no_chips():
     """⛔ Over-correction: a chip count that fires on an ordinary menu would send
     a PRO account down the plan-limited path."""
     out = _probe(_menu("Opus 5", "Opus 4.5", "Sonnet 4.6"))
-    assert out["chips"] == 0 and out["n"] == 2 and out["highest"] == 5.0
+    assert out["chips"] == 0 and out["n"] == 2 and out["highest"] == "5"
 
 
 @pytestmark_node

@@ -294,8 +294,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
        '    return f"===== {day} ====="')], [T], RES),
     ("G5", "under", "the marker is printed but not written through, so an armed "
      "run folder gets the undated half only",
-     [("    if marker:\n        print(marker)\n        _log_write_through(marker, \"INFO\")",
-       "    if marker:\n        print(marker)")], [T], RES),
+     # ⚠ 2026-09-19 re-anchored: `log()` prints through `_console_print` now, so
+     # the console can be held while an interactive prompt is on screen.
+     [("    if marker:\n        _console_print(marker)\n        _log_write_through(marker, \"INFO\")",
+       "    if marker:\n        _console_print(marker)")], [T], RES),
     ("G6", "under", "⛔ the printed line's own format changes, and every parser "
      "and pinned test that shares `[%H:%M:%S] [LEVEL] msg` moves with it",
      [('    line = f"[{ts}] [{level}] {msg}"',

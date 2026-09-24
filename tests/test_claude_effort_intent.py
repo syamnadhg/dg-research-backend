@@ -96,9 +96,17 @@ def test_every_confirming_path_sets_the_via():
 
 
 def test_the_miss_detail_says_what_was_wanted_and_what_it_costs():
-    src = code_only(research.setup_claude_dr)
-    assert "tier left as it was" in src
-    assert "weaker than the run reports" in src
+    # 2026-09-23 — the wording lives in `_claude_effort_report` now (it also names
+    # the tier the run GOT when the Effort row showed one), so it is CALLED here
+    # rather than looked for in setup_claude_dr's source. That setup hands this
+    # detail to the ledger is driven end to end in test_claude_popover_skip.py
+    # (test_a_run_left_at_low_says_low).
+    unread = research._claude_effort_report("max", None)["detail"]
+    assert "tier left as it was" in unread and "wanted 'max'" in unread
+    assert "weaker than the run reports" in unread
+    read = research._claude_effort_report("max", "low")["detail"]
+    assert "'low'" in read and "'max'" in read
+    assert "weaker than the run reports" in read
 
 
 def test_the_record_is_filed_under_phase_two():

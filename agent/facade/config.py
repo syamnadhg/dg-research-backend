@@ -42,9 +42,20 @@ PROJECT_ID: str = os.environ.get("SUPER_AGENT_PROJECT_ID", "super-research-49281
 WEB_API_KEY: str = os.environ.get(
     "SUPER_AGENT_WEB_API_KEY", "AIzaSyDTjXwU_uOwGrsuf7nuJTfQAZg4dTjSAMk"
 )
-AUTH_DOMAIN: str = os.environ.get(
-    "SUPER_AGENT_AUTH_DOMAIN", "super-research-492814.firebaseapp.com"
-)
+# The host the local sign-in page's Google window opens on
+# (https://<this>/__/auth/handler), and so the name Google's account picker shows.
+# It matches the web app's own value (apphosting.yaml), so the picker names
+# superresearch.io rather than the project's firebaseapp.com host. That works
+# only because the web app proxies the whole /__/auth/ prefix to the Firebase
+# helper (next.config.ts) and the Google OAuth web client lists
+# https://superresearch.io/__/auth/handler as a redirect URI. Firebase's
+# authorized-domains check reads the PAGE's origin, which stays localhost.
+# ⛔ THE TRADE-OFF: the window is now served by the web app itself, so
+# `agent login --local` no longer works while superresearch.io is down. That is
+# accepted, not retried on a second host; `cli._local_signin_needs` says so wherever
+# --local is offered. ⛔ Never remove the firebaseapp.com redirect URI while an
+# agent older than this default is installed: those still sign in through it.
+AUTH_DOMAIN: str = os.environ.get("SUPER_AGENT_AUTH_DOMAIN", "superresearch.io")
 APP_ID: str = os.environ.get(
     "SUPER_AGENT_APP_ID", "1:441214203201:web:40d757e9d940d70fb71dc0"
 )

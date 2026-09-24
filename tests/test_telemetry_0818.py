@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import code_only_deep
+from conftest import code_only_deep, web_file
 
 import telemetry as tm
 
@@ -150,9 +150,8 @@ def test_the_catalogue_file_matches_the_module():
 
 def test_the_app_repo_carries_a_byte_identical_copy():
     here = Path("telemetry_catalogue.json")
-    there = Path(__file__).resolve().parents[2] / "dg-research" / "src" / "lib" / "telemetry-catalogue.json"
-    if not there.exists():
-        pytest.skip("sibling app repo not checked out")
+    there = web_file("the app's copy of the telemetry catalogue",
+                     "src/lib/telemetry-catalogue.json")
     assert json.loads(there.read_text(encoding="utf-8")) == json.loads(
         here.read_text(encoding="utf-8"))
 

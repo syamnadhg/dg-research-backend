@@ -101,7 +101,9 @@ class TestBothRefusalsStillHeal:
     def test_neither_refusal_writes_a_title(self):
         src = inspect.getsource(research._refresh_research_title_async)
         i = src.index("title_refusal_verdict(")
-        branch = src[i:src.index('_update_firestore_research({"title"')]
+        # ⚠ 2026-09-23 re-anchored: the write names the research captured at
+        # dispatch, not the pipeline globals.
+        branch = src[i:src.index('_update_research_doc(_uid, _rid, {"title"')]
         # One assignment, outside both arms, so a future edit cannot heal on one
         # path and not the other.
         assert branch.count('text = ""') == 1, branch
@@ -124,12 +126,18 @@ class TestTheAlertOnlyFiresOnTheLoudVerdict:
         monkeypatch.setattr(research, "_shape_title", lambda t: t)
         monkeypatch.setattr(research, "_firebase_db", None)
         writes = []
-        monkeypatch.setattr(research, "_update_firestore_research",
-                            lambda d: writes.append(d))
+        # ⚠ 2026-09-23: the worker writes the research it was dispatched for,
+        # through the explicit-target seam — not the globals' wrapper.
+        monkeypatch.setattr(research, "_update_research_doc",
+                            lambda _uid, _rid, d: writes.append(d))
         started = []
+        # ⚠ Honours `args`/`kwargs` the way a real Thread does: the worker is
+        # started as `copy_context().run(_worker)`, so a double that called
+        # `target()` bare would run nothing.
         monkeypatch.setattr(research._threading, "Thread",
-                            lambda target, **kw: type("T", (), {
-                                "start": lambda _s: started.append(target()),
+                            lambda target, args=(), kwargs=None, **kw: type("T", (), {
+                                "start": lambda _s: started.append(
+                                    target(*args, **(kwargs or {}))),
                             })())
         research._refresh_research_title_async(TOPIC, "brief", ON_TOPIC_CORPUS)
         return recorded, logged, writes

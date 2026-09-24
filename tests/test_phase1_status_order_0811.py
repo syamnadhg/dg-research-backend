@@ -41,7 +41,9 @@ def test_the_phase_status_is_recorded_before_the_file_that_reads_it():
     recorded value — it was written to disk and never rewritten, while
     Firestore (written afterwards) said complete."""
     src = code_only(inspect.getsource(research.run_pipeline))
-    marker = 'save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())'
+    # ⚠ No closing paren: since wave 10.10 both saves also pass `started_ms`
+    # (when phase 1 began, which closes phase 0) on the next line.
+    marker = 'save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),'
     record = '_write_phase_terminal_status(1, "complete")'
     # ⭐ EVERY phase-1 save_meta, not the first one found. The first version of
     # this test checked only `src.index(marker)` and so tested one of the two

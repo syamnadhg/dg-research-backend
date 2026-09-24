@@ -783,6 +783,7 @@ native extensions with Nuitka:
 | `_sr_core` | the pipeline itself — `research.py` compiled |
 | `models`, `prompts`, `vision`, `narrate`, `selfheal`, `telemetry`, `logquiet` | compiled extensions |
 | `auth/`, `scripts/` | **source, deliberately** |
+| `_sr_build.json` | the provenance stamp — see "Every platform wheel of a release publishes together" below |
 
 **Eight** compiled modules. A wheel showing six or seven was built from a stale
 checkout. A `py3-none-any` wheel means the build fell back to source mode and
@@ -825,6 +826,26 @@ its guard and its drift check on a variable that is empty in exactly that case.
 Stage all of a release's wheels into one directory and publish in a single
 command; `uv publish` does not recurse into subdirectories, so publishing from a
 tree that keeps one platform in a subfolder silently ships a partial release.
+
+**Before that command, run `python tools/check_release.py <staging-dir>`.** Each
+wheel carries `_sr_build.json`, written by the build BEFORE it compiles: a
+fingerprint of the first-party `.py` sources with CRLF read as LF — so a Windows
+autocrlf checkout, an rsync copy and a zip of the same code all agree — plus the
+git commit and dirty flag where the build tree could say. The check prints every
+wheel's stamp side by side and exits 1 if any wheel has none or the fingerprints
+differ. Commits are shown, never compared. **It also counts the platforms** —
+macOS, Windows and Linux — and names the one that is missing: agreeing about the
+source says nothing about whether the release is whole, and a single staged wheel
+agrees with itself, so this printed `OK: every wheel (1)` and exited 0 on exactly
+the partial release the paragraph above is about. A wheel's platform is read from
+its tag as a fragment (`macosx`, `win_amd64`, `manylinux`), so the Mac deployment
+target and the glibc version can move without failing the check. An agent wheel
+(`superresearch_agent-*`) staged in the same folder is named and skipped: it is a
+separate, pure-Python package built once for every platform, so there is no
+cross-machine build for it to disagree with. `tools/bump_version.py --check`
+covers it before the publish, and `--post-publish VERSION` after it — that step
+confirms the version on PyPI, moves the web repo's published version and
+agent-log gate, and syncs the hosted skill.
 
 **This is a code-execution supply chain, and it is worth being explicit about
 the surface.** The agent self-update resolves from the configured index —
@@ -918,20 +939,39 @@ Stored in `{queue_dir}/config.json`:
 
 ## API Endpoints
 
-> ⛔⛔ **LOOPBACK ONLY, SINCE 2026-09-05 — and it is exposure reduction, not
-> authentication.** `uvicorn` binds `127.0.0.1`, and CORS allows only
-> `http://localhost:{port}` / `http://127.0.0.1:{port}`. Before that it bound
-> `0.0.0.0` with `allow_origins=["*"]` and no authentication of any kind, so
-> anything on the same network — a coffee-shop wifi, an office LAN, a shared
-> house — could list every run on the machine **for every account that shares
-> it**, read the brief / the agent markdown / the podcast, start a run (`POST
-> /api/runs` takes `uid` from the request body), or stop somebody else's.
-> ⭐ Nothing broke, because nothing had ever used the network: the web app
-> reaches the machine through Firestore and contains zero references to this
-> API, the health probe asks `http://localhost:{port}`, and the `--serve`
-> banner advertises the same. ⚠ A process or a page **on this machine** still
-> reaches every route unauthenticated; a token is the real answer and is a
-> bigger change.
+> ⛔⛔ **TWO LAYERS: A LOOPBACK BIND (2026-09-05) AND A TOKEN (2026-09-20,
+> wave 10.5).** `uvicorn` binds `127.0.0.1`, CORS allows only
+> `http://localhost:{port}` / `http://127.0.0.1:{port}`, and **every route in
+> the table below except `GET /api/health` requires a shared secret**:
+>
+> ```
+> X-Super-Research-Token: <value of ~/.super-research/serve-api.token>
+> ```
+>
+> The file is 0600, minted at `--serve` boot, and both the boot banner and
+> `--help` print its path (never its value). The header is the ONLY accepted
+> form — a `?token=` query parameter does **not** authenticate, deliberately,
+> because a URL-borne secret lands in the access log and in shell history.
+> Without a valid token every route answers `401`; with no readable token file
+> the gate fails **closed**.
+>
+> ⛔ `POST /api/runs` no longer takes `uid` from the request body. The identity
+> is the machine's pairing (`load_paired_uid()`), and a body that names a
+> *different* uid is refused with `403` rather than quietly rewritten.
+>
+> ⭐ **Why `/api/health` is exempt:** four callers probe it and the supervisor
+> watchdog force-respawns a worker whose health goes unreachable, so a liveness
+> probe that can fail for an authentication reason would kill healthy workers.
+> It answers process counters and nothing about anybody's research.
+>
+> **What it was, for the record.** Before 09-05 it bound `0.0.0.0` with
+> `allow_origins=["*"]` and no authentication of any kind, so anything on the
+> same network could list every run on the machine **for every account that
+> shares it**, read the brief / the agent markdown / the podcast, start a run
+> billing a uid it supplied, or stop somebody else's. The bind fixed the
+> network half and said so in its own tests; the gate is the other half.
+> ⚠ The bind is **not** redundant now — the two are layers, and neither has to
+> be perfect alone.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1633,10 +1673,13 @@ its own section above; what is here is the shape and where to look.*
   both, OLD NAME FIRST, and writes only the old one. 7.7E stopped the device
   document — which every sharer reads whole — from carrying anybody's topic, and
   scoped the sharer-tree rehydration scan to this machine.*
-- ***The local API left the network (2026-09-05).*** *It bound every interface,
-  with a wildcard CORS origin and no authentication of any kind, for the whole of
-  its life. Loopback now; the block above the endpoint table says what that does
-  and, more importantly, what it does not.*
+- ***The local API left the network (2026-09-05), then learned to ask who is
+  calling (2026-09-20).*** *It bound every interface, with a wildcard CORS
+  origin and no authentication of any kind, for the whole of its life. Loopback
+  closed the network half and was honest that it was only half — in a test, so
+  it could not be forgotten. Wave 10.5 closed the rest with ONE ASGI gate under
+  all fourteen routes, so route fifteen is covered by existing rather than by
+  somebody remembering to decorate it.*
 - ***The heartbeat gained a twin no clock can be wrong about.*** *`heartbeatAt`,
   server-stamped, in the SAME atomic update as `lastHeartbeat` — which is also why
   the rules must deploy and be verified in production BEFORE this wheel publishes.*

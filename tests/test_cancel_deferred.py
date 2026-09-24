@@ -18,6 +18,7 @@ The fix has two layers — this test file covers both:
 
   Layer 1 — `_do_cancel` removed=False branch:
     - Scan Firestore queue for the deferred start doc by researchId
+      (and, as of wave 10.9, by the start doc's own uid)
     - Delete it
     - Flip research status="stopped" + clear queuePosition / behind*
 
@@ -27,8 +28,20 @@ The fix has two layers — this test file covers both:
       doc. Closes the cross-worker race where worker A claimed +
       scheduled enqueue before the cancel handler fired.
 
-These are integration-shaped tests — the fakes mirror enough Firestore
-shape to drive the actual code paths.
+⛔⛔ LAYER 1 USED TO TEST A COPY OF THE CODE (found 2026-09-21, wave 10.9).
+Every Layer-1 test called `_inline_do_cancel`, a function in THIS file that
+"replicated" the branch, and none of them called into research.py at all — so
+any change to the production scan, including a member's cancel deleting
+another member's queued run, left all five green. They now drive the REAL
+listener callback through `_queue_listener.Listener`: a fake Firestore, one
+cancel document, and a record of what the listener deleted and wrote.
+
+⛔⛔ AND SO WAS LAYER 2, disclosed when Layer 1 was repaired and left standing
+because it was out of that item's scope. Round two of cross-verify came back
+for it: its ten parametrised tests called a copy of the terminal-status tuple
+kept in this file, so no change to research.py could turn them red. They drive
+the real start branch now, and the gate reads the module's one
+`TERMINAL_RESEARCH_STATUSES` instead of keeping a second copy of the words.
 
 Run via:
     pytest tests/test_cancel_deferred.py -v
@@ -36,241 +49,179 @@ Run via:
 from __future__ import annotations
 
 import pytest
+from google.cloud.firestore import DELETE_FIELD
+
+from _queue_listener import Listener
+
+SHARER = "sharer-uid"
+OWNER = "owner-uid"
 
 
-# ── Fakes shared by both layers ────────────────────────────────────────
-
-class _FakeRef:
-    def __init__(self, doc_id, store):
-        self.id = doc_id
-        self._store = store
-
-    def delete(self):
-        if self.id in self._store:
-            del self._store[self.id]
-
-    def update(self, patch):
-        if self.id not in self._store:
-            raise RuntimeError(f"doc {self.id} disappeared")
-        from google.cloud.firestore import DELETE_FIELD as _DF
-        cur = self._store[self.id]
-        for k, v in patch.items():
-            if v is _DF:
-                cur.pop(k, None)
-            else:
-                cur[k] = v
-
-    def get(self):
-        if self.id not in self._store:
-            return _FakeSnap(self.id, None, store=None, exists=False)
-        return _FakeSnap(self.id, dict(self._store[self.id]), self._store, exists=True)
+def _start(rid, uid, topic):
+    return {"researchId": rid, "action": "start", "topic": topic,
+            "uid": uid, "submittedBy": uid}
 
 
-class _FakeSnap:
-    def __init__(self, doc_id, payload, store=None, exists=True):
-        self.id = doc_id
-        self._payload = payload
-        self.exists = exists
-        if store is not None and exists:
-            self.reference = _FakeRef(doc_id, store)
-
-    def to_dict(self):
-        return dict(self._payload or {})
-
-
-class _FakeQueueQuery:
-    def __init__(self, snaps):
-        self._snaps = snaps
-
-    def stream(self):
-        return iter(self._snaps)
-
-
-class _FakeQueueCol:
-    def __init__(self, store):
-        self._store = store
-
-    def limit(self, _n):
-        snaps = [
-            _FakeSnap(did, dict(p), self._store)
-            for did, p in self._store.items()
-        ]
-        return _FakeQueueQuery(snaps)
-
-    def document(self, doc_id):
-        return _FakeRef(doc_id, self._store)
+def _cancel(rid, uid):
+    return {"action": "cancel", "researchId": rid, "uid": uid, "submittedBy": uid}
 
 
 # ── Layer 1: _do_cancel removed=False scan + delete + status flip ──────
+#
+# Every test below EXECUTES `start_firestore_start_listener`'s cancel branch.
 
-def _inline_do_cancel(col_ref, queue_store, research_store,
-                      rid, removed):
-    """Replicates the new removed=False branch from research.py's
-    `_do_cancel` callback (research.py ~4148-4220). Kept inline so the
-    test doesn't have to monkey-patch the whole listener closure.
-
-    Mirrors:
-      - If !removed: scan queue for start doc matching rid → delete
-      - Always: flip research status="stopped" + clear queue fields
-      - When removed: also run recompute (but we skip the recompute_fn
-        side-effect here — it's tested separately)
-    """
-    if not removed:
-        start_doc_id = None
-        for qsnap in col_ref.limit(50).stream():
-            qd = qsnap.to_dict() or {}
-            if (qd.get("researchId") == rid
-                    and (qd.get("action") or "start") == "start"):
-                start_doc_id = qsnap.id
-                break
-        if start_doc_id is not None:
-            col_ref.document(start_doc_id).delete()
-    # Always flip status (the convergence the fix introduces).
-    # Direct write into the fake research store keyed by rid — caller
-    # supplies the store so we don't have to mock _update_research_doc.
-    if rid in research_store:
-        cur = research_store[rid]
-        cur["status"] = "stopped"
-        cur["phase"] = 0
-        cur["summary"] = (
-            "Cancelled before starting" if removed else "Cancelled while queued"
-        )
-        cur["cancelled"] = True
-        cur.pop("queuePosition", None)
-        cur.pop("queuedBehindRunId", None)
-        cur.pop("queuedBehindTitle", None)
-
-
-def test_deferred_cancel_deletes_start_doc_and_flips_status():
+def test_deferred_cancel_deletes_start_doc_and_flips_status(tmp_path, monkeypatch):
     """The 2026-05-22 repro. Bull Dog deferred, never claimed. Cancel
     handler scans Firestore queue, finds the start doc, deletes it,
     and flips research status to stopped."""
-    queue_store = {
-        "qd-bulldog": {
-            "researchId": "rid-bulldog", "action": "start",
-            "topic": "Bull Dog", "submittedBy": "sharer-uid",
-        },
-    }
-    research_store = {
-        "rid-bulldog": {"status": "queued", "queuePosition": 2,
-                        "queuedBehindRunId": "rid-husky",
-                        "queuedBehindTitle": "Husky"},
-    }
-    col = _FakeQueueCol(queue_store)
-    _inline_do_cancel(col, queue_store, research_store,
-                      "rid-bulldog", removed=False)
-    assert "qd-bulldog" not in queue_store, "start doc should be deleted"
-    assert research_store["rid-bulldog"]["status"] == "stopped"
-    assert research_store["rid-bulldog"]["cancelled"] is True
-    assert research_store["rid-bulldog"]["summary"] == "Cancelled while queued"
-    assert "queuePosition" not in research_store["rid-bulldog"]
-    assert "queuedBehindRunId" not in research_store["rid-bulldog"]
-    assert "queuedBehindTitle" not in research_store["rid-bulldog"]
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, queue_docs={
+        "qd-bulldog": _start("rid-bulldog", SHARER, "Bull Dog"),
+    }).feed(**_cancel("rid-bulldog", SHARER))
+    assert lis.deleted_queue_ids == ["qd-bulldog"], "start doc should be deleted"
+    [(uid, rid, patch)] = lis.writes
+    assert (uid, rid) == (SHARER, "rid-bulldog")
+    assert patch["status"] == "stopped"
+    assert patch["cancelled"] is True
+    assert patch["summary"] == "Cancelled while queued"
+    assert patch["queuePosition"] is DELETE_FIELD
+    assert patch["queuedBehindRunId"] is DELETE_FIELD
+    assert patch["queuedBehindTitle"] is DELETE_FIELD
+    assert lis.incoming == ["incoming"], "the cancel doc itself is consumed"
 
 
-def test_cancel_when_start_doc_already_gone_still_flips_status():
+def test_cancel_when_start_doc_already_gone_still_flips_status(tmp_path, monkeypatch):
     """Idempotency: another worker already deleted the start doc.
     Status flip must still happen so the FE banner clears even when
     the queue-scan finds nothing."""
-    queue_store = {}  # sibling already deleted
-    research_store = {
-        "rid-bulldog": {"status": "queued", "queuePosition": 2},
-    }
-    col = _FakeQueueCol(queue_store)
-    _inline_do_cancel(col, queue_store, research_store,
-                      "rid-bulldog", removed=False)
-    assert research_store["rid-bulldog"]["status"] == "stopped"
-    assert research_store["rid-bulldog"]["cancelled"] is True
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, queue_docs={}).feed(
+        **_cancel("rid-bulldog", SHARER))
+    assert lis.deleted_queue_ids == []
+    [(uid, rid, patch)] = lis.writes
+    assert (uid, rid) == (SHARER, "rid-bulldog")
+    assert patch["status"] == "stopped"
+    assert patch["cancelled"] is True
 
 
-def test_cancel_skips_cancel_action_docs():
+def test_cancel_skips_cancel_action_docs(tmp_path, monkeypatch):
     """A cancel queue doc for the same rid sitting in the collection
     must NOT be deleted by the start-doc scan (we only target action ==
     'start'). The cancel handler deletes the cancel doc itself elsewhere."""
-    queue_store = {
-        "qd-cancel": {
-            "researchId": "rid-bulldog", "action": "cancel",
-            "submittedBy": "sharer-uid",
-        },
-    }
-    research_store = {
-        "rid-bulldog": {"status": "queued"},
-    }
-    col = _FakeQueueCol(queue_store)
-    _inline_do_cancel(col, queue_store, research_store,
-                      "rid-bulldog", removed=False)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, queue_docs={
+        "qd-cancel": _cancel("rid-bulldog", SHARER),
+    }).feed(**_cancel("rid-bulldog", SHARER))
     # Cancel doc untouched
-    assert "qd-cancel" in queue_store
+    assert "qd-cancel" in lis.db.queue.docs
+    assert lis.deleted_queue_ids == []
     # Status still flipped
-    assert research_store["rid-bulldog"]["status"] == "stopped"
+    assert lis.writes[0][2]["status"] == "stopped"
 
 
-def test_removed_true_path_preserves_pre_fix_summary():
+def test_removed_true_path_preserves_pre_fix_summary(tmp_path, monkeypatch):
     """The pre-existing removed=True case used to say 'Cancelled before
     starting'. Don't regress its summary phrasing — only the
     removed=False path uses the new 'Cancelled while queued'."""
-    research_store = {
-        "rid-mine": {"status": "queued"},
-    }
-    _inline_do_cancel(_FakeQueueCol({}), {}, research_store,
-                      "rid-mine", removed=True)
-    assert research_store["rid-mine"]["summary"] == "Cancelled before starting"
+    mine = {"research_id": "rid-mine", "uid": SHARER, "run_id": "Mine_run"}
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, deque_jobs=[mine],
+                   queue_docs={"qd-mine": _start("rid-mine", SHARER, "Mine")}).feed(
+        **_cancel("rid-mine", SHARER))
+    assert list(lis.jobs._queue) == [], "the job was not taken off the local queue"
+    assert lis.writes[0][2]["summary"] == "Cancelled before starting"
+    # removed=True skips the Firestore scan entirely
+    assert lis.deleted_queue_ids == []
 
 
-def test_multiple_deferred_only_targeted_rid_deleted():
+def test_multiple_deferred_only_targeted_rid_deleted(tmp_path, monkeypatch):
     """Several deferred docs in the queue from different sharers — only
     the cancel target's start doc is deleted; others persist for their
     own claim path."""
-    queue_store = {
-        "qd-bulldog": {
-            "researchId": "rid-bulldog", "action": "start",
-            "topic": "Bull Dog", "submittedBy": "sharer-uid",
-        },
-        "qd-stbernard": {
-            "researchId": "rid-stbernard", "action": "start",
-            "topic": "St Bernard", "submittedBy": "owner-uid",
-        },
-    }
-    research_store = {
-        "rid-bulldog": {"status": "queued"},
-        "rid-stbernard": {"status": "queued"},
-    }
-    col = _FakeQueueCol(queue_store)
-    _inline_do_cancel(col, queue_store, research_store,
-                      "rid-bulldog", removed=False)
-    assert "qd-bulldog" not in queue_store
-    assert "qd-stbernard" in queue_store
-    assert research_store["rid-stbernard"]["status"] == "queued"  # untouched
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, queue_docs={
+        "qd-bulldog": _start("rid-bulldog", SHARER, "Bull Dog"),
+        "qd-stbernard": _start("rid-stbernard", OWNER, "St Bernard"),
+    }).feed(**_cancel("rid-bulldog", SHARER))
+    assert lis.deleted_queue_ids == ["qd-bulldog"]
+    assert "qd-stbernard" in lis.db.queue.docs
+    assert [w[1] for w in lis.writes] == ["rid-bulldog"]  # St Bernard untouched
+
+
+def test_a_cancel_naming_another_persons_deferred_run_leaves_it(tmp_path, monkeypatch):
+    """⛔⛔ wave 10.9, and the reason these tests had to stop testing a copy.
+    The owner's St Bernard is deferred; a sharer signs a cancel honestly as
+    themselves and names St Bernard's research id, which `queueOwners`
+    publishes. The scan used to match on researchId alone and delete it."""
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, queue_docs={
+        "qd-stbernard": _start("rid-stbernard", OWNER, "St Bernard"),
+    }).feed(**_cancel("rid-stbernard", SHARER))
+    assert lis.deleted_queue_ids == [], "a sharer's cancel deleted the owner's queued run"
+    assert "qd-stbernard" in lis.db.queue.docs
+    assert all(w[0] != OWNER for w in lis.writes)
 
 
 # ── Layer 2: pre-claim status re-check ─────────────────────────────────
+#
+# ⛔⛔ LAYER 2 WAS A REPLICA TOO (found 2026-09-21 by wave 10.9's second
+# cross-verify). `_inline_pre_claim_status_check` was a copy of the terminal
+# tuple living in this file, and all ten parametrised tests called only that
+# copy — so dropping `stopped_by_watchdog` from the real gate, or adding
+# `paused` to it, left every one of them green. The Layer-1 repair in this wave
+# did not reach them, and the commit that made it said so.
+#
+# ⭐ They drive the real start branch now — one start document, one research
+# document carrying the status under test — and the gate itself was changed to
+# read the module's single `TERMINAL_RESEARCH_STATUSES` instead of keeping a
+# second copy of the words. `_research_is_terminal` is NOT stubbed here; this
+# file's subject is exactly whether a run counts as over.
 
-def _inline_pre_claim_status_check(research_doc_status):
-    """Replicates the new pre-claim status re-check from
-    research.py:~4411. Returns True if the listener should SKIP the
-    claim (terminal status), False if it should proceed."""
-    return research_doc_status in (
-        "stopped", "completed", "archived",
-        "terminated_by_user_discard", "stopped_by_watchdog",
-    )
+BULLDOG = "rid-bulldog"
+
+
+def _start_with_status(tmp_path, monkeypatch, status):
+    return Listener(monkeypatch, tmp_path, owner=OWNER, real_terminal_check=True,
+                    research_docs={(SHARER, BULLDOG): {"status": status}}).feed(
+        **_start(BULLDOG, SHARER, "Bull Dog"))
 
 
 @pytest.mark.parametrize("terminal_status", [
     "stopped", "completed", "archived",
     "terminated_by_user_discard", "stopped_by_watchdog",
 ])
-def test_pre_claim_skips_terminal_status(terminal_status):
+def test_pre_claim_skips_terminal_status(terminal_status, tmp_path, monkeypatch):
     """The cross-worker race window: worker A claimed + scheduled
     enqueue; cancel handler flipped research to terminal; worker A's
     listener now picks up the queue doc again on replay and must drop
-    it instead of running the cancelled job."""
-    assert _inline_pre_claim_status_check(terminal_status) is True
+    it instead of running the cancelled job.
+
+    ⛔ THE WRITE IS THE MEASUREMENT, not the empty queue. `_safe_enqueue` keeps
+    a whitelist of its own that refuses these statuses as well, so "nothing was
+    enqueued" would stay true with this gate deleted. Only the gate stops the
+    run BEFORE the branch stamps `backendRunId` on a finished run's document."""
+    lis = _start_with_status(tmp_path, monkeypatch, terminal_status)
+    assert lis.writes == [], f"a {terminal_status} run's document was written to"
+    assert lis.enqueued == [], f"a {terminal_status} run was enqueued anyway"
+    assert lis.incoming == ["incoming"], (
+        "the queue doc was left to replay on the next listener attach")
 
 
 @pytest.mark.parametrize("active_status", [
     "queued", "ongoing", "paused_backend_restart", "paused", None,
 ])
-def test_pre_claim_proceeds_for_active_status(active_status):
-    """Live and recovery states must still allow the claim. The
-    pre-claim re-check is a narrow drop, not a broad gate."""
-    assert _inline_pre_claim_status_check(active_status) is False
+def test_pre_claim_proceeds_for_active_status(active_status, tmp_path, monkeypatch):
+    """⭐ ACCEPT POLARITY, and the whole product: live and recovery states must
+    still get past this gate. It is a narrow drop, not a broad one — widened by
+    one word it would refuse a status the machine sees every day."""
+    lis = _start_with_status(tmp_path, monkeypatch, active_status)
+    assert [w[:2] for w in lis.writes] == [(SHARER, BULLDOG)], (
+        f"a {active_status} run was dropped by the pre-claim gate")
+    assert lis.writes[0][2]["backendRunId"]
+
+
+@pytest.mark.parametrize("enqueueable_status", [
+    "queued", "ongoing", "paused_backend_restart",
+])
+def test_an_active_run_reaches_the_queue(enqueueable_status, tmp_path, monkeypatch):
+    """⭐ AND ALL THE WAY THROUGH, for the three statuses `_safe_enqueue` admits.
+    `paused` and a missing status pass the gate above and are then refused by
+    that whitelist — a distinction the replica these tests replace could not
+    make, because it only ever described the gate's own tuple."""
+    lis = _start_with_status(tmp_path, monkeypatch, enqueueable_status)
+    assert [j["research_id"] for j in lis.enqueued] == [BULLDOG]
+    assert lis.writes[0][2]["status"] == "ongoing"

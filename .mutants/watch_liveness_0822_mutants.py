@@ -151,8 +151,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_WATCH]),
     ("D2", "under", "the start listener is not looked at, so a run submitted "
      "from the web app is never picked up",
-     [('    return [name for name, handle in (("start", _start_listener),',
-       '    return [name for name, handle in ((')],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): it cut the tuple mid-parenthesis
+     # and never parsed. The start pair is now dropped whole.
+     [('    return [name for name, handle in (("start", _start_listener),\n'
+       '                                      ("device-cmds", _device_cmd_watch),',
+       '    return [name for name, handle in (("device-cmds", _device_cmd_watch),')],
      [T_WATCH]),
     ("D3", "under", "the device-command listener is not looked at",
      [('                                      ("device-cmds", _device_cmd_watch),',
@@ -168,8 +171,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_WATCH]),
     ("R2", "under", "a rebinder that raises propagates into the loop that keeps "
      "this machine reachable",
-     [('            try:\n                _watch_rebinder()\n                done.extend',
-       '            if True:\n                _watch_rebinder()\n                done.extend')],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): `try:` → `if True:` left the
+     # `except` dangling. The guard is NARROWED instead, so a rebinder's
+     # RuntimeError escapes into the loop.
+     [('            except Exception as _e:\n'
+       '                log(f"[watch] re-arming the start/device listeners failed: {_e}", "WARN")',
+       '            except ImportError as _e:\n'
+       '                log(f"[watch] re-arming the start/device listeners failed: {_e}", "WARN")')],
      [T_WATCH]),
     ("R3", "under", "the stale command handle is left in place while the new "
      "one attaches, so a failure part way through leaves a dead handle held",
@@ -188,10 +196,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_WATCH]),
     ("R6", "over", "an unsubscribe that raises aborts the re-arm — and a stream "
      "torn down by the fault raising there is the ORDINARY case",
-     [('            try:\n                if _old is not None:\n                    _old.unsubscribe()\n'
-       '            except Exception as _e:',
-       '            if True:\n                if _old is not None:\n                    _old.unsubscribe()\n'
-       '            except Exception as _e:')],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): same dangling `except`. Narrowed.
+     [('            except Exception as _e:\n'
+       '                log(f"[watch] command-listener unsubscribe raised (continuing): {_e}", "DEBUG")',
+       '            except ImportError as _e:\n'
+       '                log(f"[watch] command-listener unsubscribe raised (continuing): {_e}", "DEBUG")')],
      [T_WATCH]),
     ("R7", "under", "a failed command attach is reported as re-attached",
      [('                _start_command_listener(_uid, _rid, loop)\n                done.append("commands")',
@@ -227,8 +236,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_WATCH]),
     ("P5", "under", "a re-arm that raises takes down the loop that keeps this "
      "machine reachable",
-     [('    try:\n        back = await asyncio.to_thread(_rearm_dead_watches, dead,',
-       '    if True:\n        back = await asyncio.to_thread(_rearm_dead_watches, dead,')],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10): same dangling `except`. Narrowed.
+     [('    except Exception as _e:\n'
+       '        log(f"[watch] re-arm failed ({_e}) — retrying on the next pass", "WARN")',
+       '    except ImportError as _e:\n'
+       '        log(f"[watch] re-arm failed ({_e}) — retrying on the next pass", "WARN")')],
      [T_WATCH]),
     ("P6", "under", "⛔⛔ the check is dropped from the branch that runs while "
      "Firestore is HEALTHY — which is the only case with no other cover",

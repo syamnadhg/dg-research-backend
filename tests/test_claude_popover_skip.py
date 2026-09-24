@@ -68,6 +68,33 @@ _EFFORT_SET_MARK = "isWanted"                    # Step 1C': selects the tier
 _TRIGGER_READ_MARK = "trigger_text"              # Step 1: reads model + effort
 
 
+def _vk(x):
+    """The DOUBLE's own reading of a version's order: whole numbers split at the
+    dot, trailing zeros dropped, a number read through its shortest text.
+
+    ⛔ Deliberately NOT `models.version_key`. The double stands in for the PAGE,
+    and the code under test compares with `version_key`; if the page borrowed it,
+    a broken comparator would break both halves identically and every test here
+    would still agree with itself."""
+    if x is None or isinstance(x, bool):
+        return None
+    s = repr(float(x)) if isinstance(x, (int, float)) else str(x)
+    try:
+        parts = [int(p) for p in s.split(".")]
+    except ValueError:
+        return None
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _vt(x):
+    """What the real page scripts RETURN for a row since 2026-09-23: the matched
+    dotted text ("5.10", "5"), never a float. A test may still describe its menu
+    with numbers; the page never answers with one."""
+    return x if isinstance(x, str) else ".".join(str(p) for p in _vk(x))
+
+
 class _Keyboard:
     def __init__(self, log):
         self._log = log
@@ -86,8 +113,19 @@ class ScriptedPage:
 
     def __init__(self, trigger_text, *, chat_tab="chat", research_on=True,
                  offered=5.0, menu_mounts=True, rows=None, trigger_is_model_ctl=True,
-                 popover_opens=True):
+                 popover_opens=True, row_label=None, effort_row_shows="effort max",
+                 wanted_row=True, wanted_already=True):
         self.trigger_text = trigger_text
+        # The Effort row read gap-aware (the script's `shows`), e.g. "effort low".
+        self.effort_row_shows = effort_row_shows
+        # Does the submenu offer the wanted tier's row at all (False = the 09-20
+        # page: no 'max' row), and is it already the selected one?
+        self.wanted_row = wanted_row
+        self.wanted_already = wanted_already
+        # How a picked row's LABEL reads (the real picker returns the row's
+        # first 60 characters). Default "Opus <version>"; a test can hand in a
+        # row whose version sits past the slice, so the label carries none.
+        self.row_label = row_label or (lambda v: f"Opus {_vt(v)}")
         self.chat_tab = chat_tab
         self.research_on = research_on
         self.offered = offered          # highest version the open menu lists
@@ -107,9 +145,10 @@ class ScriptedPage:
         self._picked = None
 
     def _trigger_version(self):
+        """The trigger's version as the double's own ORDER key (see `_vk`)."""
         import re
         m = re.search(r"opus[^0-9]*([0-9]+(?:\.[0-9]+)?)", self.trigger_text, re.I)
-        return float(m.group(1)) if m else None
+        return _vk(m.group(1)) if m else None
 
     # -- helpers the tests assert on -------------------------------------
     def evaluated(self, mark):
@@ -154,7 +193,8 @@ class ScriptedPage:
             effort_word = (arg or {}).get("effortWord")
             has_fam = re.search(fam, self.trigger_text, re.I) is not None
             m = re.search(fam + r"[^0-9]*([0-9]+(?:\.[0-9]+)?)", self.trigger_text, re.I)
-            ver = float(m.group(1)) if m else None
+            # The matched TEXT, as the real script returns it since 2026-09-23.
+            ver = m.group(1) if m else None
             # Mirror the JS: a version-LESS family word only counts when it sits
             # on something that looks like a model control.
             if ver is None and has_fam and not self.trigger_is_model_ctl:
@@ -170,30 +210,34 @@ class ScriptedPage:
         if _PROBE_MARK in script:
             if not self.menu_mounts:
                 return {"menu": False, "n": 0, "highest": None}
-            return {"menu": True, "n": 1, "highest": self.offered}
+            return {"menu": True, "n": 1, "highest": _vt(self.offered)}
         if _PICK_OPUS_MARK in script:
             # ⚠ HONOUR THE ARGS. This used to return a canned hit regardless of
             # pin/below/triggerText, so the picker's exact-pin, strictly-older
             # and never-click-the-trigger filters were only ever checked by
             # source-substring assertions — inverting a comparison inside the JS
             # left every behavioural test green. Mirror the JS contract instead.
+            # ⭐ 2026-09-23 — by version ORDER, and a pin/below may arrive as the
+            # dotted text production now sends ("5.10") or as a legacy number;
+            # the answer is always text, as the real script's is.
             a = arg or {}
             rows = list(self.rows if self.rows is not None else [self.offered])
-            trig_v = self._trigger_version()
-            pin, below = a.get("pin"), a.get("below")
-            if a.get("triggerText") and trig_v is not None:
-                rows = [v for v in rows if v != trig_v]   # never click the trigger
-            if pin is not None and any(abs(v - pin) <= 0.001 for v in rows):
-                self._picked = pin
-                return {"label": f"Opus {pin}", "version": pin}
-            if pin is not None or below is not None:
-                bound = below if below is not None else pin
-                rows = [v for v in rows if v < bound - 0.001]
+            trig_k = self._trigger_version()
+            pin_k, below_k = _vk(a.get("pin")), _vk(a.get("below"))
+            if a.get("triggerText") and trig_k is not None:
+                rows = [v for v in rows if _vk(v) != trig_k]   # never click the trigger
+            hit = next((v for v in rows if pin_k is not None and _vk(v) == pin_k), None)
+            if hit is not None:
+                self._picked = hit
+                return {"label": self.row_label(hit), "version": _vt(hit)}
+            if pin_k is not None or below_k is not None:
+                bound = below_k if below_k is not None else pin_k
+                rows = [v for v in rows if _vk(v) < bound]
             if not rows:
                 return None
-            best = max(rows)
+            best = max(rows, key=_vk)
             self._picked = best
-            return {"label": f"Opus {best}", "version": best}
+            return {"label": self.row_label(best), "version": _vt(best)}
         if _EFFORT_SUBMENU_MARK in script:
             # Did it MARK the row, or click it from in here? The distinction is
             # the whole fix, and the double has to feel it: an element that was
@@ -207,7 +251,7 @@ class ScriptedPage:
             # test_drift_review_0805.py; here the double only has to answer in the
             # right SHAPE.
             return {"marked": self.effort_marked, "text": "effort max",
-                    "rejected": []}
+                    "shows": self.effort_row_shows, "rejected": []}
         if _SUBMENU_ROWS_MARK in script:
             # 2026-08-04: the submenu now has to be SEEN, not assumed. Marking
             # the Effort row and pressing it is not evidence that a nested menu
@@ -235,6 +279,12 @@ class ScriptedPage:
             # picker started reporting which row it chose. The bare string used
             # to make `_eff_set.get(...)` raise straight into Step 1C's own
             # `except`, so these tests could only ever see that the script RAN.
+            if not self.wanted_row:                  # the 09-20 page: no 'max' row
+                return {"set": None, "scoped": True, "menus": 2, "cands": 1,
+                        "saw": ["opus 5for complex tasks", "effortlow", "more models"]}
+            if not self.wanted_already:              # there, but not selected: marked
+                return {"set": "marked", "already": False, "via": "testid",
+                        "picked": "max", "scoped": True, "menus": 2, "cands": 1}
             return {"set": "max (already)", "already": True, "via": "text",
                     "picked": "max", "scoped": True, "menus": 2, "cands": 1}
         if "cowork" in script.lower():
@@ -724,3 +774,151 @@ def test_a_previous_runs_model_version_does_not_leak_into_the_next():
         "the stale value from a previous run must be cleared at ENTRY — every "
         "early return skips the write, so clearing at the end cannot work"
     )
+
+
+# ── 2026-09-23: versions reach .10 — the REAL page scripts, the real gate ────
+# The double above models the page's contract in Python, so it cannot see the
+# page scripts reading "5.10" as 5.1. `RealMenuPage` runs the actual trigger
+# read, offered-probe and picker through tests/_domshim.py against a menu, and
+# lets `setup_claude_dr`'s own Step 1B* gate decide — the whole consumer, end to
+# end. Everything else (Step 1C, the tools menu) stays scripted.
+
+class RealMenuPage(ScriptedPage):
+    def __init__(self, trigger_text, menu_rows, **kw):
+        super().__init__(trigger_text, **kw)
+        from _domshim import el
+        self.spec = el("body", {}, "", [
+            el("button", {"aria-label": "Model selector"}, trigger_text),
+            el("div", {"role": "menu"}, "", [
+                el("div", {"role": "menuitemradio"}, r) for r in menu_rows]),
+        ])
+        self.real_clicks = []       # what the REAL picker clicked
+
+    async def evaluate(self, script, arg=None):
+        if (_TRIGGER_READ_MARK in script or _PROBE_MARK in script
+                or _PICK_OPUS_MARK in script):
+            from _domshim import run_js
+            self.scripts.append(script)
+            out = run_js(self.spec, script, arg)
+            if _PICK_OPUS_MARK in script:
+                self.real_clicks += out["clicks"]
+            return out["ret"]
+        return await ScriptedPage.evaluate(self, script, arg)
+
+
+_needs_node = pytest.mark.skipif(
+    __import__("shutil").which("node") is None, reason="node runs the page scripts")
+
+
+@_needs_node
+def test_a_computer_already_on_5_10_is_not_moved_back_to_5_5():
+    """⛔ THE MEASURED DOWNGRADE. With floats the trigger 'Opus 5.10 Max' read
+    5.1, the probe of {5.5, 5.10} reported 5.5 as the highest, 5.5 > 5.1 fired
+    Step 1B*, and the picker — pinned to 5.5 — clicked Opus 5.5. The log called
+    that an UPGRADE, every probe interval, on the newest model there is."""
+    page = RealMenuPage("Opus 5.10 Max",
+                        ["Opus 5.5 For complex tasks", "Opus 5.10 For complex tasks"])
+    _run(page, allow_probe=True)
+    assert page.evaluated(_PROBE_MARK), "precondition: the periodic check ran"
+    assert page.real_clicks == [], (
+        f"the picker clicked {page.real_clicks} — an account on 5.10 was moved to "
+        "an older model and the run logged it as an upgrade")
+    assert not page.evaluated(_PICK_OPUS_MARK)
+
+
+@_needs_node
+def test_a_computer_on_5_9_is_upgraded_to_5_10_and_learns_5_10():
+    """The other direction, through the same gate. With floats the probe's
+    highest was max(5.9, 5.1) = 5.9, nothing looked newer, and the account sat
+    on 5.9 through the whole 5.10 release. And what is learned is the TEXT: a
+    numbers-only gate on the recorded pick would have thrown "5.10" away."""
+    page = RealMenuPage("Opus 5.9 Max",
+                        ["Opus 5.9 For complex tasks", "Opus 5.10 For complex tasks"])
+    _run(page, allow_probe=True)
+    assert page.real_clicks == ["Opus 5.10 For complex tasks"], (
+        f"the upgrade clicked {page.real_clicks}")
+    assert research._P2_PICKED_VERSION.get("claude") == "5.10"
+
+
+def test_the_learned_version_is_the_one_the_picker_reported():
+    """⚠ PREFER THE PICK, by version — not by type. The picker now reports TEXT;
+    the old gate let only numbers through and fell back to re-reading the LABEL,
+    which is the row's first 60 characters and need not carry the version at all
+    (a row whose name sits after its description)."""
+    page = ScriptedPage("Sonnet 4.6", rows=["5.10"],
+                        row_label=lambda v: "For complex, multi-step work and long-form")
+    _run(page)
+    assert page.picked() == "5.10", "precondition: the picker selected 5.10"
+    assert research._P2_PICKED_VERSION.get("claude") == "5.10", (
+        f"learned {research._P2_PICKED_VERSION.get('claude')!r} — the version the "
+        "picker actually clicked was thrown away")
+
+
+# ── 2026-09-23: the run says which effort it actually got ─────────────────
+# The 09-20 run: the trigger read "Opus 5 Low", the Effort row showed Low, the
+# submenu had no 'max' row, and the run went out at Low with a log that said only
+# "NOT confirmed". These drive the real coroutine and read what it SAYS.
+
+def _speaking(monkeypatch):
+    said = {"log": [], "events": []}
+    monkeypatch.setattr(research, "log",
+                        lambda msg, level="INFO", *a, **k: said["log"].append((level, msg)))
+    monkeypatch.setattr(research, "emit_event",
+                        lambda *a, **k: said["events"].append((a, k)))
+    return said
+
+
+def _captions(said):
+    return [k.get("progress") for a, k in said["events"]
+            if a and a[0] == "agent_progress" and k.get("agent") == "claude"]
+
+
+def _ledger(said):
+    return [m for _, m in said["log"] if "claude.select_effort_tier" in m]
+
+
+def test_a_run_left_at_low_says_low(monkeypatch):
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low", wanted_row=False)
+    _run(page, allow_probe=True)
+    assert any("effort in effect: 'low'" in m for _, m in said["log"]), said["log"]
+    # Recorded for the pre-send check, which puts the caption on the tile once
+    # the computer-use pass has had its turn (test_claude_real_popover_0923).
+    assert _captions(said) == []
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] == "low"
+    assert _ledger(said) and "tier is 'low'" in _ledger(said)[-1], _ledger(said)
+
+
+def test_the_caption_is_never_said_from_setup(monkeypatch):
+    """The pre-send re-activation and the step-back call this function too, and
+    no call of it posts the caption: the computer-use pass that runs after the
+    initial setup may still set the tier. The log still says it."""
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low", wanted_row=False)
+    _run(page)                                  # not the initial setup
+    assert any("effort in effect: 'low'" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == []
+
+
+def test_a_press_that_did_not_verify_claims_no_tier(monkeypatch):
+    """The Max row was there and a press landed, but it never read back as
+    selected. The row was read BEFORE the press, so 'low' may be stale and 'max'
+    is unproven: the run says unknown, and shows nothing."""
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Low", effort_row_shows="effort low",
+                        wanted_row=True, wanted_already=False)
+    _run(page, allow_probe=True)
+    assert any("claude-effort-option" in p for p in page.presses), (
+        "precondition: the Max row was pressed")
+    assert any("effort in effect: unknown" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == []
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] is None
+
+
+def test_a_run_at_max_says_max_and_shows_nothing(monkeypatch):
+    said = _speaking(monkeypatch)
+    page = ScriptedPage("Opus 5 Max")           # read off the trigger
+    _run(page, allow_probe=True)
+    assert any("effort in effect: 'max'" in m for _, m in said["log"]), said["log"]
+    assert _captions(said) == []
+    assert research._P2_THINKING_STATE["claude"]["effort_got"] == "max"

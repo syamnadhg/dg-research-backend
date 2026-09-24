@@ -166,13 +166,21 @@ def machine(tmp_path, monkeypatch):
 
     import time as _t
     now = _t.time()
+    # ⛔⛔ THE START TIME IS RELATIVE TO NOW, AND THAT IS NOT COSMETIC. It was the
+    # literal "2026-08-24T00:00:01Z", and `_scan_run_folders` prefers that stamp
+    # over the folder's mtime — so on 2026-09-23T00:00:01Z, thirty days later to
+    # the second, both runs fell outside `BUNDLE_MAX_AGE_DAYS` and the two
+    # age-bound pins below started failing on the clock alone, for everybody,
+    # with nothing in the tree having changed. A fixture that describes "a run
+    # this machine did recently" has to say so in terms of now.
+    started_utc = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(now - 3600))
     for name, uid in (("alice_20260824T000001", "U_ALICE"),
                       ("bob_20260824T000002", "U_BOB")):
         folder = root / "runs" / name
         folder.mkdir()
         (folder / "meta.json").write_text(json.dumps({
             "schema": 1, "status": "complete", "researchId": name.split("_")[0],
-            "startedUtc": "2026-08-24T00:00:01Z", "submitterUid": uid,
+            "startedUtc": started_utc, "submitterUid": uid,
             "submitterSource": "queue",
         }), encoding="utf-8")
         (folder / "run.log").write_text(f"log for {name}\n", encoding="utf-8")
@@ -207,22 +215,34 @@ def test_a_sharer_bundle_carries_only_their_own_run(machine, tmp_path):
 
 def test_the_owner_bundle_still_carries_the_machine(machine, tmp_path):
     """⭐ THE ACCEPT-POLARITY PIN. An omission that omits everything ships a
-    bundle with no evidence in it, and every assertion above still passes."""
+    bundle with no evidence in it, and every assertion above still passes.
+
+    ⛔⛔ FLIPPED 2026-09-21 (#539): it asserted `runs/bob_` WAS in alice's
+    bundle, which was the leak itself — bob's folder is his uid and his topic,
+    and it reached support on alice's consent. The owner's machine material and
+    the owner's own run still ship; another member's run does not."""
     dest = tmp_path / "owner.zip"
-    research._build_log_bundle(dest, support_code="ABCD2345")
+    research._build_log_bundle(dest, support_code="ABCD2345", keep_uid="U_ALICE")
     names = _members(dest)
     assert any(n.startswith("sessions/") for n in names)
     assert any(n.startswith("system/") for n in names)
     assert any(n.startswith("runs/alice_") for n in names)
-    assert any(n.startswith("runs/bob_") for n in names)
+    assert not any(n.startswith("runs/bob_") for n in names), \
+        "another member's run folder reached the owner's bundle"
 
 
 def test_an_owner_who_ticks_nothing_still_gets_the_machine(machine, tmp_path):
     """⭐ THE PAIRING-FAILURE CASE, and the founding incident's shape: no run was
-    ever produced, so the whole evidence is a session and a tail."""
+    ever produced, so the whole evidence is a session and a tail.
+
+    ⛔ IT NAMES THE OWNER (#539), and that is what keeps it measuring. With no
+    `keep_uid` every attributed run is left out anyway, so "an empty pick means
+    everything" (wave8 selection S1) would ship nothing and pass here — the
+    selection harness found exactly that after #539 landed."""
     dest = tmp_path / "none.zip"
     summary = research._build_log_bundle(
-        dest, support_code="ABCD2345", only_runs=[], include_machine=True)
+        dest, support_code="ABCD2345", only_runs=[], include_machine=True,
+        keep_uid="U_ALICE")
     names = _members(dest)
     assert not any(n.startswith("runs/") for n in names)
     assert any(n.startswith("sessions/") for n in names)
@@ -279,12 +299,24 @@ def test_a_bogus_folder_name_reaches_no_path(machine, tmp_path):
     assert not any(n.startswith("runs/") for n in _members(dest))
 
 
-def test_the_default_call_is_byte_for_byte_the_old_behaviour(machine, tmp_path):
-    """⛔ EVERY PRE-WAVE-8 CALLER STILL GOES THROUGH THIS FUNCTION. If the new
-    keywords changed what they get, the terminal command and the device handler
-    would both quietly start shipping something else."""
+def test_a_call_that_names_no_owner_keeps_no_attributed_run(machine, tmp_path):
+    """⛔ EVERY PRE-WAVE-8 CALLER STILL GOES THROUGH THIS FUNCTION, so what the
+    bare call does is a decision, not a leftover.
+
+    ⛔⛔ FLIPPED 2026-09-21 (#539). This was `..._is_byte_for_byte_the_old_
+    behaviour` and asserted `runCount == 2` — both members' runs in a bundle
+    that named no owner at all. The bare call now keeps NOBODY: a caller that
+    forgets `keep_uid` (or an unpaired terminal) collects less, never more. The
+    machine material still ships, redacted, so the pairing-failure case keeps
+    its evidence; both real callers pass the owner."""
     dest = tmp_path / "d.zip"
     summary = research._build_log_bundle(dest, support_code="ABCD2345")
-    assert summary["runCount"] == 2
+    assert summary["runCount"] == 0
+    assert summary["runsOtherMembers"] == 2
     assert summary["sessionCount"] == 1
     assert summary["machineIncluded"] is True
+
+    owner = research._build_log_bundle(tmp_path / "o.zip", support_code="ABCD2345",
+                                       keep_uid="U_ALICE")
+    assert owner["runCount"] == 1
+    assert owner["runsOtherMembers"] == 1

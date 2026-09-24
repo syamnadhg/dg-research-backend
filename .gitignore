@@ -9,6 +9,9 @@ build/
 release/
 .env
 .dg-supervisor.env
+# The key writer's temp (`.dg-supervisor.env.<random>.tmp`, and the older
+# fixed `.dg-supervisor.env.tmp`) holds the keys if a save dies mid-rename.
+.dg-supervisor.env.*
 
 # Firebase Admin SDK key — NEVER commit. Sammy emails this personally.
 # Drop it at: research-automate/firebase-service-account.json

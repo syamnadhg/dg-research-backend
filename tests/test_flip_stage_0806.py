@@ -54,6 +54,36 @@ def _stage_fn():
 STAGE = _stage_fn()
 
 
+class _OneRecord:
+    """`users/{uid}/researches/{rid}` for the worker's fallback read: a dict is
+    the record, None is no record, an exception is a read that fails."""
+
+    def __init__(self, record):
+        self._record = record
+
+    def collection(self, _name):
+        return self
+
+    document = collection
+
+    def get(self):
+        if isinstance(self._record, Exception):
+            raise self._record
+        rec = self._record
+        return type("Snap", (), {"exists": rec is not None,
+                                 "to_dict": lambda _s: dict(rec or {})})()
+
+
+def _worker(monkeypatch, tmp_path, flip, record):
+    """Run the real dequeue over one job; the pipelines it started."""
+    from _run_server_closure import run_worker_once
+    job = {"topic": "t", "email": "", "run_id": "T_20260806_101500",
+           "uid": "uid-a", "research_id": "chat_1754400000000_1"}
+    return run_worker_once(monkeypatch, tmp_path, job, flip=flip,
+                           db=_OneRecord(record),
+                           update_research=lambda *a, **k: True)
+
+
 class _Tx:
     def __init__(self, tid=None):
         self._id = tid
@@ -109,31 +139,38 @@ class TestTheFailurePathNoLongerReadsAsSuccess:
         )
         assert "return None" not in body
 
-    def test_the_caller_re_asks_instead_of_assuming(self):
-        src = inspect.getsource(research)
-        i = src.index("flip_outcome = _flip_queued_to_ongoing(")
-        block = src[i:i + 2600]
-        assert 'if flip_outcome == "error":' in block
-        assert "a plain read says" in block
+    # ⛔⛔ THE THREE PINS BELOW READ THE WORKER'S SOURCE UNTIL WAVE 10.10, and
+    # the third held a defect in place: it required "proceeding, as before" to
+    # appear TWICE in the fallback, and one of the two was the arm a record that
+    # had been DELETED fell into — so the worker ran a job whose research was
+    # gone, and the pin said so was correct. A read that finds no record is an
+    # answer, not a failure. The worker loop is a `run_server` closure; it is
+    # now lifted out and RUN (`_run_server_closure`), which the character
+    # windows these used could never do.
 
-    def test_the_bail_statuses_are_still_consulted_after_the_fallback_read(self):
-        src = inspect.getsource(research)
-        i = src.index("flip_outcome = _flip_queued_to_ongoing(")
-        block = src[i:i + 3200]
+    def test_the_caller_re_asks_instead_of_assuming(self, monkeypatch, tmp_path):
+        """The flip was refused; a plain read says `stopped` — so it bails."""
+        assert _worker(monkeypatch, tmp_path, "error", {"status": "stopped"}) == []
+
+    def test_the_bail_statuses_are_still_consulted_after_the_fallback_read(
+            self, monkeypatch, tmp_path):
         # Order matters: the fallback must REWRITE flip_outcome before the
-        # skipped() branch reads it, or the bail still never runs.
-        assert block.index('if flip_outcome == "error":') < block.index(
-            'if flip_outcome and flip_outcome.startswith("skipped(")')
+        # skipped() branch reads it, or the bail still never runs — and an
+        # active status read the same way still runs.
+        for status in ("completed", "stopped_by_watchdog", "cancelled"):
+            assert _worker(monkeypatch, tmp_path, "error", {"status": status}) == [], status
+        assert len(_worker(monkeypatch, tmp_path, "error", {"status": "ongoing"})) == 1
 
-    def test_an_unreadable_document_still_proceeds(self):
-        # Failing closed here would wedge every run behind a Firestore outage.
-        # Both arms of the fallback — doc missing, and read raised — must say so.
-        src = inspect.getsource(research)
-        i = src.index('if flip_outcome == "error":')
-        # Whitespace collapsed: the two messages are wrapped differently across
-        # source lines, and a raw count would find only the unwrapped one.
-        block = " ".join(src[i:i + 1400].split())
-        assert block.count("proceeding, as before") == 2, block
+    def test_an_unreadable_document_still_proceeds(self, monkeypatch, tmp_path):
+        # Failing closed here would wedge every run behind a Firestore outage:
+        # a read that RAISES, and a record with no status, both still run.
+        assert len(_worker(monkeypatch, tmp_path, "error", RuntimeError("503"))) == 1
+        assert len(_worker(monkeypatch, tmp_path, "error", {})) == 1
+
+    def test_a_record_that_is_gone_is_not_an_unreadable_one(self, monkeypatch, tmp_path):
+        """⛔⛔ Wave 10.10: the read succeeded and found nothing — the research
+        was deleted — and that must never run."""
+        assert _worker(monkeypatch, tmp_path, "error", None) == []
 
 
 class TestTheDiagnosisIsRecordedWhereTheNextReaderWillLookFirst:

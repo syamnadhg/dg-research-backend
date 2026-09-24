@@ -1,0 +1,120 @@
+{
+  "overlays": [
+    {
+      "box": {
+        "tag": "DIV",
+        "role": "menu",
+        "id": "_r_3d_",
+        "cls": [
+          "cds-reset",
+          "draggable-none",
+          "group/menu-popup",
+          "relative"
+        ],
+        "testid": "",
+        "radix": []
+      },
+      "rows": 10,
+      "labels": [
+        "EffortMax",
+        "More models"
+      ],
+      "html_len": 7699
+    }
+  ],
+  "effort_rows": [
+    {
+      "text": "Effort",
+      "ancestors": [
+        {
+          "tag": "SPAN",
+          "role": "",
+          "id": "",
+          "cls": [
+            "min-w-0",
+            "flex-1",
+            "truncate"
+          ],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "menuitem",
+          "id": "base-ui-_r_56_",
+          "cls": [
+            "cds-reset",
+            "flex",
+            "w-full",
+            "items-center"
+          ],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "",
+          "id": "",
+          "cls": [
+            "min-h-0",
+            "overflow-y-auto",
+            "scroll-fade-y",
+            "rounded-[inherit]"
+          ],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "menu",
+          "id": "_r_3d_",
+          "cls": [
+            "cds-reset",
+            "draggable-none",
+            "group/menu-popup",
+            "relative"
+          ],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "presentation",
+          "id": "",
+          "cls": [],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "",
+          "id": "",
+          "cls": [
+            "cds-root",
+            "pointer-events-auto",
+            "[&>*]:z-[var(--cds-portal-z)]"
+          ],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "",
+          "id": "_r_4j_",
+          "cls": [],
+          "testid": "",
+          "radix": []
+        },
+        {
+          "tag": "DIV",
+          "role": "",
+          "id": "portal-root",
+          "cls": [],
+          "testid": "",
+          "radix": []
+        }
+      ],
+      "kids": 0
+    }
+  ]
+}

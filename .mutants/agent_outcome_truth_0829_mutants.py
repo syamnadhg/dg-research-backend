@@ -268,7 +268,9 @@ MUTANTS = [
     ("S6", "over",
      "⛔ THE SOURCE FALLBACK RUNS BEFORE THE STATUS RE-STAMP, so it decides which "
      "agents are 'missing' from a map the re-stamp has not filled in yet",
-     [('        _astat = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get(platform) \\\n'
+     # ⚠ 2026-09-23 re-anchored: `save_meta` keys the map by the research it was
+     # handed (`_rid`), which is the pipeline's own id for every in-run caller.
+     [('        _astat = (_agent_status_by_rid.get(_rid, {}) or {}).get(platform) \\\n'
        "            or _prior_agent_status.get(platform)\n"
        "        if _astat:\n"
        '            agents.setdefault(platform, {})["status"] = _astat\n',

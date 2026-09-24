@@ -1,17 +1,21 @@
-"""Mutation harness for the queue gate's false wait and the truncated vision read.
+"""Mutation harness for the truncated vision read.
 
-Two log lines lied on 2026-08-11. One announced a 70-minute wait and ended it in
-the same second; the other called an exhausted token budget a parse error and
-threw away every source in the panel.
+⛔⛔ THE QUEUE-GATE HALF OF THIS HARNESS IS GONE (wave 10.9, N8). Thirteen
+mutants (G1-G4, X1-X9) aimed at `_wait_for_prior_fe_completion` — its deadline,
+its branch order and its six separately root-caused release paths. The function
+has been DELETED: it held the next run's start behind the PREVIOUS run's cloud
+tail, and phases 4 and 5 run on Cloud Run, so the contention it existed for was
+with a machine that is idle. Its guards were all guards against itself.
 
-The over-corrections are the ones to fear. The gate is the last thing standing
-between a finishing run and the next one starting on top of it, and every
-release path in it was root-caused separately after a real hang. A "fix" that
-removes the deadline, or reads before checking for a stop, trades a wrong
-sentence for a wedged worker. On the vision side the danger is the salvage
-letting a HALF-read URL into the report — a truncated link is worse than a
-missing one, and the prompt already tells the model the same thing about
-truncated text on screen.
+⭐ AN ANCHOR THAT CANNOT APPLY IS A GUARD THAT HAS SILENTLY STOPPED GUARDING,
+which is why they are removed rather than left to go stale. What replaces them
+is `.mutants/wave109_handoff_mutants.py`, aimed at the rule that took the gate's
+place: after `beDone` the run is the cloud's, and the machine re-kicks rather
+than stamps.
+
+On the vision side the danger is the salvage letting a HALF-read URL into the
+report — a truncated link is worse than a missing one, and the prompt already
+tells the model the same thing about truncated text on screen.
 
 Safety, learned from an earlier harness on this repo that adopted a mutant as its
 own baseline: refuses to start on a dirty tree, holds originals in memory only,
@@ -31,67 +35,6 @@ RESEARCH = "research.py"
 SUITES = "tests/test_queue_gate_and_vision_urls_0811.py"
 
 MUTANTS = [
-    # ── the gate's false claims, restored ───────────────────────────────────
-    ("G1", "under", "the deadline test goes back above the read — the gate gives up unread",
-     [("            now_ms = int(time.time() * 1000)\n            try:",
-       "            now_ms = int(time.time() * 1000)\n"
-       "            if now_ms >= deadline:\n"
-       "                _QUEUE_STATE.pop(\"gate_pending_job\", None)\n"
-       "                return\n            try:")]),
-    ("G2", "under", "the entry line quotes the constant again instead of what is left",
-     [("                f\"(fallback in {int(_gate_left_ms / 1000)}s)\")",
-       "                f\"(fallback in {BE_PHASES_TIMEOUT_SEC}s)\")")]),
-    ("G3", "under", "an already-expired window is announced as a fresh wait",
-     [("        if _gate_left_ms > 0:", "        if True:")]),
-    ("G4", "under", "the give-up line asserts what it never checked",
-     [('                log(f"[queue-gate] prior run {_prid[:8]}… is "\n'
-       '                    f"{int((now_ms - _pdone) / 1000)}s past its backend finish with no "\n'
-       '                    f"terminal status seen (FE-P5 window {BE_PHASES_TIMEOUT_SEC}s) — "\n'
-       '                    f"force-dequeueing")',
-       '                log(f"[queue-gate] FE never reported completed in {BE_PHASES_TIMEOUT_SEC}s — force-dequeueing")')]),
-
-    # ── ⛔ over-corrections: the gate must still let go ──────────────────────
-    ("X1", "over", "the deadline is deleted — a stuck prior run wedges the queue forever",
-     [("            if now_ms >= deadline:\n"
-       '                log(f"[queue-gate] prior run {_prid[:8]}… is "',
-       "            if False:\n"
-       '                log(f"[queue-gate] prior run {_prid[:8]}… is "')]),
-    ("X2", "over", "a failed read skips the deadline test, so the gate spins forever",
-     [('                log(f"[queue-gate] Firestore read failed: {e}", "WARN")',
-       '                log(f"[queue-gate] Firestore read failed: {e}", "WARN")\n'
-       "                await asyncio.sleep(2)\n                continue")]),
-    ("X3", "over", "the terminal-status release is gone",
-     [('                        log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")\n'
-       '                        _QUEUE_STATE.pop("gate_pending_job", None)\n'
-       '                        return\n', "")]),
-    ("X4", "over", "the deleted-prior-doc release is gone",
-     [('                    log(f"[queue-gate] prior run {_prid[:8]}… doc missing — dequeueing")\n'
-       '                    _QUEUE_STATE.pop("gate_pending_job", None)\n'
-       '                    return\n', "")]),
-    ("X5", "over", "the FE-P5-failed fast release is gone",
-     [('                    if fe_p5_state == "failed":', "                    if False:")]),
-    ("X6", "over", "the 5-minute ghosted-FE self-heal is gone",
-     [("                            f\"FE-P5 ghosted, force-dequeueing\"\n"
-       "                        )\n"
-       '                        _QUEUE_STATE.pop("gate_pending_job", None)\n'
-       "                        return\n", "")]),
-    ("X7", "over", "the synth-user 403 release is gone — a 2s poll loop spams denials",
-     [('                    log("[queue-gate] read denied (synth user) — releasing gate (Track D)", "DEBUG")\n'
-       '                    _QUEUE_STATE.pop("gate_pending_job", None)\n'
-       "                    return\n", "")]),
-    # NOTE the context: `if _controls.is_stop():` occurs dozens of times in this
-    # file and the first is ~40k lines above the gate. A bare anchor mutated a
-    # completely different function and this mutant "survived" without ever
-    # touching the code under test.
-    ("X8", "over", "a cancel during the gate wait is ignored again",
-     [("                if _controls.is_stop():\n"
-       '                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")',
-       "                if False:\n"
-       '                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")')]),
-    ("X9", "over", "the resume-path short-circuit is gone — the gate waits on itself",
-     [('        if _current_job and (_current_job.get("research_id") or "") == _prid:',
-       "        if False:")]),
-
     # ── the vision read ─────────────────────────────────────────────────────
     # Re-anchored 2026-08-12: the call site's literal became a named constant when
     # the read timeout was bound to it, so this mutant stopped applying at all —

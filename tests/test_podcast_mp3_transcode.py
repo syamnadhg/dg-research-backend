@@ -194,15 +194,19 @@ def test_run_phase3_audio_transcode_is_guarded():
 
 
 def test_transcode_precedes_storage_upload_and_probe():
+    """⛔ Wave 10.9: the upload and the probe moved into `_p3_publish_audio`, so
+    the ordering is now across the seam — the transcode runs before the phase
+    hands the file to the publisher, and inside the publisher the probe runs
+    before the upload. Same sequence, two functions."""
     src = inspect.getsource(research.run_phase3_audio)
     t = src.index("_transcode_audio_to_mp3")
-    assert t < src.index("upload_audio_to_storage"), (
+    assert t < src.index("_p3_publish_audio(audio_path"), (
         "transcode must run before the Storage upload so the mp3 (not the "
         "m4a) is what the FE/agents stream"
     )
-    assert t < src.index("_audio_duration_sec"), (
-        "transcode must run before the duration probe so durationSec is "
-        "measured on the delivered mp3"
+    publish = inspect.getsource(research._p3_publish_audio)
+    assert publish.index("_audio_duration_sec") < publish.index("upload_audio_to_storage"), (
+        "the duration probe must run before the upload, on the delivered mp3"
     )
 
 

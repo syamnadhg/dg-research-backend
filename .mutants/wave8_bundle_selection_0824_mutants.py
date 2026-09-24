@@ -72,10 +72,10 @@ _CAP = """    cap = max(0, int(max_runs))
 
 _REFUSED_REPORT = """        "runsNotAttributed": len(refused),"""
 
+# Re-anchored 2026-09-21 (#539): the whole-machine branch now drops other
+# members' runs before the count bound, so S1 flips only the condition.
 _BRANCH = """    if only_runs is None:
-        selected = _select_bundle_runs(rows, max_runs=max_runs,
-                                       max_age_days=max_age_days, now=now)
-        selection_report = {}"""
+        # Other members' runs leave BEFORE the count bound"""
 
 _SESSIONS = """    sessions = (_select_bundle_sessions(max_age_days=max_age_days, now=now)
                 if include_machine else [])"""
@@ -145,9 +145,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "nothing — the pairing-failure case — gets all thirty runs instead of the "
      "machine-level bundle they asked for",
      [(_BRANCH, "    if not only_runs:\n"
-                "        selected = _select_bundle_runs(rows, max_runs=max_runs,\n"
-                "                                       max_age_days=max_age_days, now=now)\n"
-                "        selection_report = {}")],
+                "        # Other members' runs leave BEFORE the count bound")],
      [T_NEW]),
     ("S2", "over", "a name that is not on disk is dropped without a word, so a "
      "stale page's pick produces a quietly shorter bundle",

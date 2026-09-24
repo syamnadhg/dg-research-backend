@@ -84,7 +84,12 @@ def test_the_real_effort_row_is_still_found():
 def test_a_sidebar_thread_titled_effort_is_refused():
     """The document-order trap. The sidebar precedes the popover, so the old
     `els.find(...)` took the thread — and `_sr_real_click` presses for real, which on a
-    link means navigation. Exactly the 11:08 chain, on the other platform."""
+    link means navigation. Exactly the 11:08 chain, on the other platform.
+
+    ⚠ RE-ANCHORED 2026-09-23, to something STRICTLY STRONGER. The 09-23 capture put
+    the Effort row inside the `role="menu"` popover, and the search is now scoped to
+    open menus — so the sidebar thread is not refused, it is never a candidate at all.
+    The link arms are still measured, INSIDE a menu, in the three tests below."""
     spec = el("body", {}, "", [
         el("nav", {}, "", [_sidebar_thread("Effort estimates")]),
         _popover([_effort_row()]),
@@ -92,33 +97,41 @@ def test_a_sidebar_thread_titled_effort_is_refused():
     ret = _mark(spec)
     assert ret["marked"] is True
     assert ret["text"] == "effort max", "the menu row must win over the sidebar link"
-    assert ["link", "effort estimates"] in ret["rejected"], ret["rejected"]
+    assert ret["rejected"] == [], "nothing outside the menu is even looked at"
 
+
+# ⚠ RE-ANCHORED 2026-09-23: the link candidates below sit INSIDE the popover, ahead
+# of the real row. Outside a menu they are no longer candidates (see above), so left
+# there these tests would pass with the link arms deleted — measuring nothing.
 
 def test_a_bare_anchor_row_is_refused():
     """Arm 1 on its own: the candidate IS the link."""
-    spec = el("body", {}, "", [
+    spec = el("body", {}, "", [_popover([
         el("a", {"href": "/chat/1", "role": "menuitem"}, "Effort estimates"),
-        _popover([_effort_row()]),
-    ])
-    assert _mark(spec)["text"] == "effort max"
+        _effort_row(),
+    ])])
+    ret = _mark(spec)
+    assert ret["text"] == "effort max"
+    assert ["link", "effort estimates"] in ret["rejected"], ret["rejected"]
 
 
 def test_a_row_nested_inside_a_link_is_refused():
     """Arm 2: the candidate sits INSIDE the link, so pressing it still navigates."""
-    spec = el("body", {}, "", [
+    spec = el("body", {}, "", [_popover([
         el("a", {"href": "/chat/1"}, "", [el("div", {"role": "menuitem"}, "Effort notes")]),
-        _popover([_effort_row()]),
-    ])
-    assert _mark(spec)["text"] == "effort max"
+        _effort_row(),
+    ])])
+    ret = _mark(spec)
+    assert ret["text"] == "effort max"
+    assert ["link", "effort notes"] in ret["rejected"], ret["rejected"]
 
 
 def test_a_row_wrapping_a_link_is_refused():
     """Arm 3, and it is the one the ChatGPT filter does NOT have — that filter's groups
     are the rows themselves, while this candidate set includes bare `li`, which is how
     claude.ai wraps a conversation anchor. `closest` cannot see a DESCENDANT."""
-    spec = el("body", {}, "", [_sidebar_thread("Effort planning"),
-                               _popover([_effort_row()])])
+    spec = el("body", {}, "", [_popover([_sidebar_thread("Effort planning"),
+                                         _effort_row()])])
     ret = _mark(spec)
     assert ret["text"] == "effort max"
     assert any(r[0] == "link" for r in ret["rejected"]), ret["rejected"]
@@ -127,13 +140,25 @@ def test_a_row_wrapping_a_link_is_refused():
 def test_claudes_own_reply_is_not_mistaken_for_the_effort_row():
     """A markdown bullet in the transcript is an `li` too. This is a plausible reading
     of this step's corpus — nine "'Max' effort not found in submenu" WARNs against one
-    success, i.e. presses that landed on something that was never a menu."""
+    success, i.e. presses that landed on something that was never a menu.
+
+    ⚠ RE-ANCHORED 2026-09-23: the transcript is outside every menu, so the bullet is
+    no longer a candidate at all; the length bound is measured inside a menu below."""
     prose = ("Effort should be set to Max here because the research tool benefits from "
              "the longer reasoning budget on multi-source questions")
     spec = el("body", {}, "", [
         el("ul", {}, "", [el("li", {}, prose)]),
         _popover([_effort_row()]),
     ])
+    ret = _mark(spec)
+    assert ret["text"] == "effort max"
+    assert ret["rejected"] == [], ret["rejected"]
+
+
+def test_a_long_effort_row_inside_the_menu_is_refused_as_prose():
+    """The length bound, where it still matters: a menu can carry a description row."""
+    prose = "Effort controls how long Claude thinks before it answers your question"
+    spec = el("body", {}, "", [_popover([el("li", {}, prose), _effort_row()])])
     ret = _mark(spec)
     assert ret["text"] == "effort max"
     assert any(r[0] == "long" for r in ret["rejected"]), ret["rejected"]
@@ -156,10 +181,19 @@ def test_an_offscreen_effort_row_is_still_skipped():
 def test_nothing_to_mark_reports_what_it_saw():
     """`_eff_marked` false plus an empty log used to be indistinguishable from "the
     popover never opened". The rejected list is what the next capture will be read
-    against — container-scoping is the stronger fix and needs one."""
+    against — container-scoping is the stronger fix and needs one.
+
+    ⚠ RE-ANCHORED 2026-09-23: the capture came and container-scoping landed. With no
+    menu open, what it SAW is "no menu" — `menus: 0` is what the caller logs — and
+    the sidebar thread is not a candidate to refuse."""
     spec = el("body", {}, "", [_sidebar_thread("Effort estimates")])
     ret = _mark(spec)
     assert ret["marked"] is False
+    assert ret["menus"] == 0
+    assert ret["rejected"] == []
+    # …and a menu that is open but holds only a link reports the refusal.
+    ret = _mark(el("body", {}, "", [_popover([_sidebar_thread("Effort estimates")])]))
+    assert ret["marked"] is False and ret["menus"] == 1
     assert ret["rejected"] == [["link", "effort estimates"]]
 
 
@@ -180,8 +214,10 @@ def test_stale_marks_are_cleared_before_a_new_one_is_written():
 def test_the_effort_marker_is_bounded_and_reports_at_most_five_rejections():
     """A page with a hundred "Effort…" threads must not put a hundred titles in a log
     line — and titles are user content."""
+    # ⚠ RE-ANCHORED 2026-09-23: the threads sit in an open MENU (a sidebar overflow
+    # menu, say) — outside every menu they are no longer candidates to count.
     spec = el("body", {}, "", [
-        el("nav", {}, "", [_sidebar_thread("Effort thread") for _ in range(30)]),
+        _popover([_sidebar_thread("Effort thread") for _ in range(30)]),
         _popover([_effort_row()]),
     ])
     ret = _mark(spec)

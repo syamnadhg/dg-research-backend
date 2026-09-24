@@ -43,18 +43,24 @@ SUITES = "tests/test_phase1_status_order_0811.py"
 MUTANTS = [
     # ── the phase that succeeded but was recorded errored ───────────────────
     ("P1", "under", "save_meta runs before the status again (extract branch)",
+     # ⚠ Re-anchored in wave 10.10: the save now also says when phase 1 began
+     # (`started_ms`, which closes phase 0), so it spans two lines.
      [('                _write_phase_terminal_status(1, "complete")\n'
-       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())\n'
+       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),\n'
+       '                          started_ms=int(_p1_start * 1000))\n'
        '                emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),',
-       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())\n'
+       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),\n'
+       '                          started_ms=int(_p1_start * 1000))\n'
        '                _write_phase_terminal_status(1, "complete")\n'
        '                emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),')]),
     ("P2", "under", "save_meta runs before the status again (brief-from-file branch)",
      [('                _write_phase_terminal_status(1, "complete")\n'
-       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())\n'
+       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),\n'
+       '                          started_ms=int(_p1_start * 1000))\n'
        '                emit_event("phase_complete", phase=1,\n'
        '                    durationSec=int(time.time() - _p1_start), links=_p1_links,',
-       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())\n'
+       '                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip(),\n'
+       '                          started_ms=int(_p1_start * 1000))\n'
        '                _write_phase_terminal_status(1, "complete")\n'
        '                emit_event("phase_complete", phase=1,\n'
        '                    durationSec=int(time.time() - _p1_start), links=_p1_links,')]),

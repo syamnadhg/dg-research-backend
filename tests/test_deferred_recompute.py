@@ -5,7 +5,7 @@ of the Firestore queue (claimed by a worker, or cancelled mid-defer).
 Bug context (2026-05-22): the 5-fire scenario showed that when Husky
 got claimed, Bull Dog's queuePosition stayed at 2 and St Bernard's at 3
 even though the actual queue head was now Bull Dog. Local-deque
-`_recompute_queue_positions` (run_server closure ~line 27030) only sees
+`_recompute_queue_positions` (a run_server closure) only sees
 jobs that have already been claimed and put on `_job_queue._queue`; it
 cannot see Firestore-deferred docs.
 
@@ -15,9 +15,9 @@ agree on ordering), and commits a WriteBatch updating every remaining
 deferred doc's research-doc.
 
 Wired into:
-  - Listener claim path (research.py:~4880)
-  - Idle-rescan after claim (research.py:~27620)
-  - _do_cancel deferred-cancel branch (research.py:~4230)
+  - Listener claim path (the start listener's `on_snapshot`)
+  - Idle-rescan after claim (`_rescan_queue_for_unclaimed`)
+  - _do_cancel deferred-cancel branch
 
 Run via:
     pytest tests/test_deferred_recompute.py -v

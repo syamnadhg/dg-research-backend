@@ -25,7 +25,9 @@ def test_step1b_takes_the_highest_offered():
     ranking itself now guarantees it, so #708 cannot recur without the ranking
     being broken outright."""
     src = code_only(inspect.getsource(research.setup_claude_dr))
-    assert "rank[1] > bestRank[1]" in src, (
+    # By version ORDER since 2026-09-23 (a float compare ranked 5.10 under 5.5);
+    # the ranking itself is executed in test_model_selection_precision.py.
+    assert "cmpVer(rank[1], bestRank[1])" in src, (
         "Step 1B must rank by version and take the highest — that IS the "
         "never-downgrade guarantee (#708)."
     )
@@ -203,7 +205,10 @@ def test_upgrade_only_fires_on_a_strictly_higher_version():
     version already showing on the trigger. Strictly-greater is what guarantees
     that structurally, so the comparison must not be a plain >=."""
     src = code_only(inspect.getsource(research.setup_claude_dr))
-    assert "_offered > _cur + 0.001" in src, (
+    # Compared by version ORDER since 2026-09-23 — executed end to end, through
+    # the real page scripts, in test_claude_popover_skip.py
+    # (test_a_computer_already_on_5_10_is_not_moved_back_to_5_5).
+    assert "_off_k > _cur_k" in src, (
         "the upgrade must require a STRICTLY higher version than the trigger "
         "(a >= comparison would re-click the current model and revive #744)."
     )
@@ -220,7 +225,10 @@ def test_upgrade_probe_never_breaks_an_acceptable_run():
     upgrade must never fail the setup."""
     src = code_only(inspect.getsource(research.setup_claude_dr))
     up = src.find("_probe = await page.evaluate(_probe_opus_js")
-    tail = src[up:up + 2900]
+    # Up to the handler, not a byte count: `code_only` blanks comments IN
+    # PLACE, so a fixed window moves every time an explanation above the code
+    # grows (it did on 2026-09-23, and the handler fell out of the window).
+    tail = src[up:src.index("except Exception as _ue:", up) + 30]
     assert "except Exception" in tail, "the upgrade probe must be wrapped"
     assert "return False" not in tail, (
         "an upgrade failure must NOT abort setup — the current model is already "
@@ -253,8 +261,11 @@ def test_the_probe_requires_a_mounted_menu():
     the weekly cadence that answer burns the entire interval's check on a
     popover that simply had not rendered yet."""
     src = code_only_deep(research.setup_claude_dr)
-    probe = src[src.find("_probe_opus_js = "):]
-    probe = probe[:probe.find('"""', probe.find('"""') + 3)]
+    # The probe's VALUE, as the browser receives it — it is composed with the
+    # shared version order since 2026-09-23, so a slice between two triple
+    # quotes would stop at the head and read three characters.
+    from _domshim import js_constant
+    probe = js_constant(research.setup_claude_dr, "_probe_opus_js")
     assert "if (!menus.length) return {menu: false" in probe, (
         "the probe must report 'no menu' rather than falling back to the body"
     )

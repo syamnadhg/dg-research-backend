@@ -580,6 +580,44 @@ def test_completed_phases_from_status_and_advancement():
     assert 3 not in done  # the current ongoing phase isn't done yet
 
 
+def test_completed_phases_does_not_infer_phase_4_from_the_webs_pointer():
+    """⛔⛔ THE WEB ADVANCES `phase` TO 4 AND 5 FROM 2026-09-20, so "advanced
+    past it" stops being proof for those two.
+
+    The machine writes 0-3 and hands off; the upload and the delivery are the
+    web's, and it now claims each phase at its START. A bare `range(cur)`
+    therefore read a run that merely REACHED delivery as proof the video had
+    been made, and the agent printed "Phase 4 (Video) complete" for a run whose
+    upload failed or was skipped.
+
+    Phases 4 and 5 leave explicit `phases[]` entries when they finish — errored
+    ones included — so they are read from evidence, never inferred here.
+    """
+    # Delivery has started; the upload FAILED and says so.
+    done = bridge._completed_phases({
+        "phase": 5, "status": "ongoing",
+        "phases": [{"phase": 4, "status": "errored"}],
+    })
+    assert done.get(4) is None, "a failed phase 4 must not be reported complete"
+    # The machine's own phases are still inferred, exactly as before.
+    assert done.get(0) == "complete" and done.get(3) == "complete"
+
+    # And with no entry at all, phase 4 is simply unknown rather than claimed.
+    bare = bridge._completed_phases({"phase": 5, "status": "ongoing"})
+    assert 4 not in bare
+    assert bare.get(3) == "complete"
+
+
+def test_completed_phases_still_reads_a_real_phase_4_completion():
+    """⭐ The over-correction guard: refusing to INFER phase 4 must not stop us
+    reading a phase 4 that really did complete."""
+    done = bridge._completed_phases({
+        "phase": 5, "status": "ongoing",
+        "phases": [{"phase": 4, "status": "complete"}],
+    })
+    assert done.get(4) == "complete"
+
+
 def test_completed_phases_clean_completion_marks_final():
     done = bridge._completed_phases({"phase": 5, "status": "completed"})
     assert done.get(5) == "complete"
@@ -589,7 +627,15 @@ def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
     # Policy: SR permanent links (🔒) for Brief (P1), the three reports (P2) and the
     # Podcast (P3); the REAL platform links (🔗) for NotebookLM (P3), YouTube (P4)
     # and the final Google Doc (P5) — public / unlisted / shareable, open fine.
+    #
+    # ⛔ THE CLOUD PHASES CARRY THEIR OWN `phases[]` ENTRY, and this fixture used to
+    # leave them out. Since 8e16c0d the pointer alone no longer proves phase 4
+    # finished (the web advances it at the upload's START), so a run whose video
+    # really completed says so in `phases[]` — and this test went red the day that
+    # changed, unseen, because no gate ran the agent suite. The companion below
+    # pins the other half: a run that merely REACHED phase 5 reports no phase 4.
     doc = {"phase": 5, "status": "completed",
+           "phases": [{"phase": 4, "status": "complete"}, {"phase": 5, "status": "complete"}],
            "srShares": {"brief": "B", "chatgpt": "C", "gemini": "G", "claude": "CL", "podcast": "P"},
            "links": {
                "notebooklm": {"url": "https://notebooklm.google.com/n", "phase": 3},
@@ -695,6 +741,20 @@ def test_the_p5_documents_can_never_open_a_mint_gap():
     for platform in ({}, {"summary": "u", "consolidated": "u"}, {"synthesis": "u"},
                      {"synthesis": "u", "summary": "u", "consolidated": "u"}):
         assert bridge._sr_mint_gap(sr, platform, done, agents) is False, platform
+
+
+def test_a_run_that_only_reached_phase_five_reports_no_finished_video():
+    """⛔⛔ A POINTER IS NOT EVIDENCE FOR THE CLOUD PHASES. The web moves `phase` to
+    4 when the upload STARTS and to 5 when delivery starts, so inferring "every
+    phase below the pointer is complete" printed "Phase 4 (Video) complete" for a
+    video that failed or was skipped. Phases 4 and 5 leave their own `phases[]`
+    entry when they truly finish; nothing else may stand in for it."""
+    doc = {"phase": 5, "status": "ongoing",
+           "phases": [{"phase": 3, "status": "complete"}],
+           "links": {"youtube": {"url": "https://youtu.be/x", "phase": 4}}}
+    pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, bridge._sr_links(doc))}
+    assert 4 not in pus and 5 not in pus
+    assert pus[3]["status"] == "complete"
 
 
 def test_sr_mint_gap_detects_unminted_complete_phase():

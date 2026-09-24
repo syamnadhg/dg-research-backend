@@ -445,14 +445,18 @@ def test_the_generated_title_is_checked_against_the_topic():
     )
 
 
+# ⚠ 2026-09-23 re-anchored: the write names the research captured at dispatch
+# (`_update_research_doc(_uid, _rid, …)`), not the pipeline globals.
+_TITLE_WRITE = '_update_research_doc(_uid, _rid, {"title"'
+
+
 def test_the_check_runs_before_the_firestore_write():
-    assert TITLE_SRC.index("title_refusal_verdict(") < TITLE_SRC.index(
-        '_update_firestore_research({"title"')
+    assert TITLE_SRC.index("title_refusal_verdict(") < TITLE_SRC.index(_TITLE_WRITE)
 
 
 def test_a_drifted_title_is_refused_not_merely_logged():
     tail = TITLE_SRC[TITLE_SRC.index("title_refusal_verdict("):]
-    branch = tail[:tail.index('_update_firestore_research({"title"')]
+    branch = tail[:tail.index(_TITLE_WRITE)]
     assert 'text = ""' in branch, (
         "refusing the write keeps the title derived from the user's own input"
     )

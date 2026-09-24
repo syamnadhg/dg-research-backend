@@ -88,8 +88,17 @@ REGEN_BIND = ('                        _regen_in_app_url = in_app_document_url("
               '                        brief_url = _regen_in_app_url\n'
               '                        _record_brief_in_aggregate(_regen_in_app_url)')
 
-HANDOFF_PUBLISH = '            p3_links[_name] = in_app_document_url(_name.lower().replace(" ", ""))'
-HANDOFF_GATE = '        if _url:\n            # \u26d4\u26d4 2026-09-02, stretch 7.5 step 5 \u2014 WHAT IS PUBLISHED IS NO LONGER'
+# \u2b50 Wave 10.9 (repair round 2) moved the hand-off's decision into
+# `_p2_to_p3_link_for`, because a KEPT agent \u2014 one carried across a crash retry \u2014
+# has no conversation address and still owns a report, which an inline `if _url:`
+# could not express. Same two mutations, at the site that now makes the call.
+HANDOFF_PUBLISH = '    return in_app_document_url(name.lower().replace(" ", ""))'
+HANDOFF_GATE = '    if not conversation_url and not r.get("_restored"):\n        return ""'
+#: …and the sweep's veto now lives there too, because a KEPT agent has no
+#: address for the inline drop below to blank. H4 removes BOTH: with either one
+#: standing the refused leg is still dropped, so mutating one alone proves
+#: nothing about the other.
+DECISION_VETO = '    if r.get("off_topic_rejected"):\n        return ""'
 OFF_TOPIC_DROP = '        if _url and _r.get("off_topic_rejected"):'
 FOREIGN_DROP = ('        if _url and normalize_agent_key(_name) == "chatgpt" '
                 'and _chatgpt_tab_is_foreign(_url):')
@@ -157,22 +166,22 @@ MUTANTS = [
     ("H1", "under",
      "\u26d4\u26d4 the hand-off publishes the conversation address again \u2014 into links.json, "
      "the delivery mirror and the run log, exactly as before",
-     [(HANDOFF_PUBLISH, '            p3_links[_name] = _url')]),
+     [(HANDOFF_PUBLISH, '    return conversation_url')]),
     ("H2", "under",
      "the published page is keyed by the DISPLAY name, so `ChatGPT` becomes the "
      "anchor instead of `chatgpt` and every row points at a document id that does "
      "not exist",
-     [(HANDOFF_PUBLISH, '            p3_links[_name] = in_app_document_url(_name)')]),
+     [(HANDOFF_PUBLISH, '    return in_app_document_url(name)')]),
     ("H3", "over",
      "the address gate goes, so a leg that never reached a page still publishes a "
      "row \u2014 and both drop guards are skipped with it, because they read the same "
      "value",
-     [(HANDOFF_GATE,
-       '        if True:\n            # \u26d4\u26d4 2026-09-02, stretch 7.5 step 5 \u2014 WHAT IS PUBLISHED IS NO LONGER')]),
+     [(HANDOFF_GATE, '    if False:\n        return ""')]),
     ("H4", "under",
      "the off-topic drop goes, so a leg the sweep refused still publishes a row "
      "\u2014 the 2026-08-05 incident, one value later",
-     [(OFF_TOPIC_DROP, '        if False and _r.get("off_topic_rejected"):')]),
+     [(OFF_TOPIC_DROP, '        if False and _r.get("off_topic_rejected"):'),
+      (DECISION_VETO, '    if False:\n        return ""')]),
     ("H5", "under",
      "the foreign-conversation belt goes \u2014 the guard that catches a tab that is "
      "provably not this run's when the topic sweep cannot judge",

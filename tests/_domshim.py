@@ -612,6 +612,19 @@ globalThis.__run = (spec, fn, arg) => {
   const ret = arg === undefined ? fn() : fn(arg);
   return { ret, clicks: CLICKS };
 };
+// ⭐ 2026-09-23 — THE DOCUMENT AS THE SCRIPT LEFT IT. Every run rebuilds the
+// tree from its spec, so a mark one script writes (the element a real press is
+// aimed at, the row Step 1C tells the next script about) was gone before the
+// next script ran — and the only way to test two scripts that talk through the
+// page was a double that ANSWERED for one of them. `run_js(..., keep_dom=True)`
+// returns the tree after the run as a spec, so a page double can hand it to the
+// next evaluate() exactly as a browser would still be holding it.
+const toSpec = (e) => ({ tag: e.tagName.toLowerCase(), attrs: { ...e._attrs },
+                         text: e._text, kids: e.children.map(toSpec) });
+globalThis.__runKeep = (spec, fn, arg) => {
+  const out = __run(spec, fn, arg);
+  return { ret: out.ret, clicks: out.clicks, dom: toSpec(ROOT) };
+};
 """
 
 
@@ -660,10 +673,11 @@ def el(tag, attrs=None, text="", kids=None, repeat=1):
     return spec
 
 
-def run_js(spec, fn_src: str, arg=None) -> dict:
+def run_js(spec, fn_src: str, arg=None, *, keep_dom: bool = False) -> dict:
     """Run `fn_src` (a JS arrow/function expression) against `spec`.
 
-    Returns {"ret": <return value>, "clicks": [labels...]}.
+    Returns {"ret": <return value>, "clicks": [labels...]}, plus "dom" — the tree
+    after the run, as a spec — when `keep_dom` is set (see `__runKeep`).
 
     ⚠⚠ 2026-08-06 — THE SCRIPT GOES IN A FILE, NOT IN `node -e`. It used to be
     passed as a single command-line argument, and Linux caps ONE argument at
@@ -681,7 +695,8 @@ def run_js(spec, fn_src: str, arg=None) -> dict:
         raise RuntimeError("node is required to run page JS")
     payload = json.dumps(spec)
     argjs = "undefined" if arg is None else json.dumps(arg)
-    js = (SHIM + "\nconsole.log(JSON.stringify(__run("
+    js = (SHIM + "\nconsole.log(JSON.stringify("
+          + ("__runKeep(" if keep_dom else "__run(")
           + payload + ", " + fn_src.strip() + ", " + argjs + ")));\n")
     with tempfile.TemporaryDirectory(prefix="sr_domshim_") as _d:
         script = os.path.join(_d, "run.mjs" if "import " in js else "run.js")

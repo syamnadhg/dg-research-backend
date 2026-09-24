@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import research
+from conftest import require_web_repo, web_file, web_repo
 
 
 class _FakeDoc:
@@ -41,14 +42,18 @@ class _FakeDoc:
 # failure mode one release later, so the constraints are PARSED out of
 # firestore.rules: add a key there and this follows; write a key here that is not
 # there and this refuses, exactly as production would.
-_RULES_PATH = (Path(__file__).resolve().parents[2] / "dg-research" / "firestore.rules")
-
-
+#
+# ⛔ FOUND THROUGH conftest's ONE finder, at CALL time. A module-level
+# `parents[2] / "dg-research"` found nothing in a worktree, and this fake then
+# enforced NOTHING — every writer test still passed, against a store that
+# accepted any key. `test_the_fake_store_enforces_the_web_rules` makes that
+# state a visible skip instead of a quiet pass.
 def _rules_contract():
     """(allowed keys, the status a CREATE must carry) read from firestore.rules."""
-    if not _RULES_PATH.exists():
+    web = web_repo()
+    if web is None:
         return None, None
-    text = _RULES_PATH.read_text(encoding="utf-8")
+    text = (web / "firestore.rules").read_text(encoding="utf-8")
     block = text[text.index("match /logBundles/{code}"):]
     block = block[:block.index("// Researches")] if "// Researches" in block else block
     keys = re.search(r"hasOnly\(\[(.*?)\]\)", block, re.S)
@@ -57,6 +62,18 @@ def _rules_contract():
         set(re.findall(r"'([A-Za-z]+)'", keys.group(1))) if keys else None,
         status.group(1) if status else None,
     )
+
+
+def test_the_fake_store_enforces_the_web_rules():
+    """⛔ THE QUIET PASS, MADE A LOUD SKIP. With no web checkout the fake below
+    accepts any key, so every writer test in this file certifies a store that
+    refuses nothing. That is allowed only where there is genuinely no web repo
+    on this disk — and then this says so, by name, in the skip list."""
+    require_web_repo("the logBundles keys this file's fake store enforces")
+    allowed, create_status = _rules_contract()
+    assert allowed, ("firestore.rules has no logBundles hasOnly list this can "
+                     "read — re-anchor _rules_contract")
+    assert create_status, "firestore.rules no longer pins a logBundles create status"
 
 
 class _RulesDenied(RuntimeError):
@@ -683,7 +700,12 @@ def test_the_row_carries_an_expiry_and_a_build(db, monkeypatch):
     research._handle_send_logs_command(_cmd(), "d-1")
     row = db[f"users/user-rocky/logBundles/{CODE}"]
     assert row["expireAt"] is not None
-    assert row["buildId"] == research._sr_version()
+    # ⛔ 2026-09-19 — THE RUNNING BUILD, NOT THE INSTALLED PACKAGE. This row
+    # names the build whose logs are inside the bundle, and `_sr_version()` is
+    # `importlib.metadata`, which answers from whatever dist-info is on disk. On
+    # 2026-09-19 that sent a reader of support bundle K6N8WMXZ to revision
+    # 0.1.13 for logs produced by 0.1.14 source, and cost the whole diagnosis.
+    assert row["buildId"] == research._sr_build_label()
     assert row["status"] == "failed" and row["errorClass"] == "UploadFailed"
 
 
@@ -760,10 +782,7 @@ def test_an_oversized_bundle_is_refused_locally_not_by_a_403(rest, monkeypatch):
 def test_the_upload_ceiling_matches_the_storage_rule():
     """⛔ The local pre-check only makes a cap-403 unreachable if it is the SAME
     number the rule enforces. Cross-repo, a test is the only mechanism."""
-    from pathlib import Path as _P
-    rules = _P(__file__).resolve().parents[2] / "dg-research" / "storage.rules"
-    if not rules.exists():
-        pytest.skip("sibling app repo not checked out")
+    rules = web_file("the log upload's size cap", "storage.rules")
     text = rules.read_text(encoding="utf-8")
     block = text[text.index("match /logs/{userId}"):]
     block = block[:block.index("match /{allPaths")]
@@ -774,10 +793,7 @@ def test_the_upload_ceiling_matches_the_storage_rule():
 
 
 def test_the_content_type_matches_the_storage_rule_too():
-    from pathlib import Path as _P
-    rules = _P(__file__).resolve().parents[2] / "dg-research" / "storage.rules"
-    if not rules.exists():
-        pytest.skip("sibling app repo not checked out")
+    rules = web_file("the log upload's content type", "storage.rules")
     text = rules.read_text(encoding="utf-8")
     block = text[text.index("match /logs/{userId}"):]
     block = block[:block.index("match /{allPaths")]
@@ -971,14 +987,12 @@ class TestRunCount:
         number, the control's default states one thing and the machine does
         another, and nothing anywhere fails."""
         mine = json.loads(Path("bundle-contract.json").read_text(encoding="utf-8"))
-        theirs_path = (Path(__file__).resolve().parents[2] / "dg-research"
-                       / "src" / "lib" / "bundle-contract.json")
         assert mine["maxRuns"] == research.BUNDLE_MAX_RUNS
         assert mine["minRuns"] == research.BUNDLE_MIN_RUNS
         assert mine["actions"]["full"] == research.SEND_LOGS_ACTION
         assert mine["actions"]["limited"] == research.SEND_LOGS_LIMITED_ACTION
-        if not theirs_path.exists():
-            pytest.skip("sibling app repo not checked out")
+        theirs_path = web_file("the send-logs cap and action names",
+                               "src/lib/bundle-contract.json")
         assert json.loads(theirs_path.read_text(encoding="utf-8")) == mine
 
 

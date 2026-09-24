@@ -293,7 +293,7 @@ class TestVersionNotice:
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: "0.1.5")
         assert research._device_version_fields() == {
             "version": "0.1.4", "updateAvailable": "0.1.5", "sourceCheckout": False,
-            "servingVersion": "0.1.4"}
+            "servingVersion": "0.1.4", "incognitoRuns": 1}
 
     def test_device_version_fields_current(self, monkeypatch):
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
@@ -302,7 +302,7 @@ class TestVersionNotice:
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
         assert research._device_version_fields() == {
             "version": "0.1.5", "updateAvailable": None, "sourceCheckout": False,
-            "servingVersion": "0.1.5"}
+            "servingVersion": "0.1.5", "incognitoRuns": 1}
 
     def test_device_version_fields_report_disk_and_running_separately(self, monkeypatch):
         """⭐⭐ THE WHOLE POINT OF THE SECOND NUMBER. `_sr_version()` re-reads the
@@ -348,7 +348,7 @@ class TestVersionNotice:
         assert research._check_newer_version() is None
         assert research._device_version_fields() == {
             "version": None, "updateAvailable": None, "sourceCheckout": True,
-            "servingVersion": None}
+            "servingVersion": None, "incognitoRuns": 1}
 
 
 class TestSelfUpdateIdempotent:

@@ -139,7 +139,7 @@ LINKS_BRANCH = ('    if (queue_dir / "links.json").exists():\n'
 MARKER_BRANCH = ('    if marker.exists():\n'
                  '        return 3, "Phase 2 complete marker present — resuming from Phase 3"')
 PARTIAL_BRANCH = ('    if has_partial_research:\n'
-                  '        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"')
+                  '        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (unfinished agents)"')
 PAUSE_HEAD = ('async def pause_and_close_browser(browser, queue_dir, phase, extra_kwargs=None):\n'
               '    """Save pause checkpoint → close browser → block until resume or stop."""\n'
               '    _runtime.phase = phase\n')
@@ -147,8 +147,16 @@ YT_BRANCH = ('    if cp and cp.get("youtube_url"):\n'
              '        return 5, "YouTube done — Phase 4 complete, FE will pick up Phase 5"')
 AUDIO_BRANCH = ('    if audio_dir.exists() and any(audio_dir.glob("*.*")):\n'
                 '        return 4, "Audio exists — Phase 3 done, resuming from Phase 4 (YouTube)"')
-DELIVERY_BRANCH = ('            if delivery.get("status") == "completed":\n'
-                   '                return 6, "Pipeline already complete"')
+# ⛔ RE-ANCHORED (wave 10.9, 542-4). The delivery read moved into
+# `_handed_off_to_cloud`, the one definition every reader of that file now asks
+# — and its verdict stopped being "the run is complete": `delivery.json` is
+# written at the END OF PHASE 3, so six means HANDED OFF, and the resume branch
+# re-fires the cloud kick instead of sitting down. The mutant is unchanged in
+# spirit: the terminal branch stops firing, and a run already handed to the
+# cloud is resumable and can be delivered twice.
+DELIVERY_BRANCH = ('    if _handed_off_to_cloud(queue_dir):\n'
+                   '        return 6, "Already handed off to the cloud '
+                   '— nothing left for this machine to run"')
 
 # (id, direction, why, [(from, to), ...])
 MUTANTS = [
@@ -345,18 +353,19 @@ MUTANTS = [
        '    if cp and cp.get("youtube_url"):\n'
        '        return 3, "YouTube done — Phase 4 complete, FE will pick up Phase 5"')]),
     ("D7", "over",
-     "a completed delivery stops being terminal, so a finished run is resumable "
-     "and can be delivered twice",
+     "a recorded hand-off stops being terminal for this machine, so a run the "
+     "cloud already owns is resumed from the checkpoint and delivered twice",
      [(DELIVERY_BRANCH,
-       '            if delivery.get("status") == "never":\n'
-       '                return 6, "Pipeline already complete"')]),
+       '    if False:\n'
+       '        return 6, "Already handed off to the cloud '
+       '— nothing left for this machine to run"')]),
     ("D8", "over",
      "⛔ partial research with NO completion marker is treated as finished, so "
      "the run hands over to the podcast phase carrying only the agents that "
      "happened to have written a file — the coarse-marker bug, restored",
      [(PARTIAL_BRANCH,
        '    if has_partial_research:\n'
-       '        return 3, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"')]),
+       '        return 3, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (unfinished agents)"')]),
 
     # ═════════ P11 — the pause's own early exit ═════════════════════════════
     ("P11", "over",

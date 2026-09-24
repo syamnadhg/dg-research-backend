@@ -7,7 +7,8 @@ then parked it in `_controls.skipped_agents` (an internal marker whose only
 job is keeping the dead agent out of the poll/scrape). The round-robin's skip
 consumer treats every member of that set as a USER tap: it stamped
 status="skipped_by_user", emitted agent_skipped(reason=user_skip_after_leaving_poll)
-— which the FE renders literally as "Skipped by user" (pipeline-errors.ts:153)
+— which the FE renders literally as "Skipped by user" (`skipReasonProgress` in
+pipeline-errors.ts)
 — and the emit auto-retracted the honest Retry/Skip card via the emit_event
 pending-decision clear seam (card raised 02:50:13, phantom-cleared 02:50:17,
 zero user interaction). ChatGPT (2A) and Claude (2B) setup-fail paths had the

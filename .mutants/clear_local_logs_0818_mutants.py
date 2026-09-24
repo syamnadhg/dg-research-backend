@@ -140,8 +140,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("C16", "over", "the handler stops guarding against a raise, so one OSError "
      "queues every later device command behind it",
-     [("                    try:\n                        cleared = _clear_local_logs()",
-       "                    if True:\n                        cleared = _clear_local_logs()")],
+     # ⛔ RE-AIMED 2026-09-23 (wave 10.10). `try:` → `if True:` left its
+     # `except` dangling, so the mutant never parsed and banked a kill by exit
+     # code. The guard is now NARROWED instead: an OSError from the clear — the
+     # ordinary failure — escapes into the snapshot callback.
+     [("                    except Exception as _cl_err:\n"
+       "                        log(f\"[device-cmds] CLEAR_LOGS failed: {_cl_err}\", \"WARN\")",
+       "                    except ImportError as _cl_err:\n"
+       "                        log(f\"[device-cmds] CLEAR_LOGS failed: {_cl_err}\", \"WARN\")")],
      [T_NEW]),
 ]
 

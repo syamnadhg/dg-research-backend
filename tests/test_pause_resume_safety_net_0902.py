@@ -6,16 +6,18 @@ The conversation URL that stretch 7.5 is removing from every DISPLAY and DELIVER
 *also*, quietly, the **pause/resume reattachment key**. On pause every still-running agent's live
 URL is written into `checkpoint_pause.json`; on resume the tab is re-opened AT THAT URL. Take the
 URL away and you do not lose a link — **you lose an AGENT**, because the round-robin's per-tick
-browser-crash sweep classifies a `None` page as a crashed tab (`research.py:38584`,
-`page is None or page.is_closed()`), and the user is told the browser crashed.
+browser-crash sweep (in `poll_all_agents_round_robin`) classifies a `None` page as a
+crashed tab (`page is None or page.is_closed()`), and the user is told the browser
+crashed.
 
 Before this file, `pause_and_close_browser`, `resume_browser_from_checkpoint`,
 `save_pause_checkpoint` and `load_pause_checkpoint` had **ZERO test references anywhere in the
 repo** — measured 2026-09-02, backend + agent + tests. So that break would have stayed green.
 
 ⚠ HONEST LIMIT OF THIS NET. The crash-sweep tick itself lives inside `poll_all_agents_round_robin`,
-which the codebase says a test cannot drive (see the docstring of `_autoskip_reason_for_status`,
-`research.py:50206`). This file therefore pins the reattachment chain up to and including
+which the codebase says a test cannot drive (see the docstring of
+`autoskip_reason_for_status`). This file therefore pins the reattachment chain up to and
+including
 "the agent came back with no page and nothing told anyone" — the *input* the sweep then reads. It
 does not execute the sweep. That linkage gets its cover when step 5 edits that loop.
 
@@ -25,7 +27,7 @@ WHAT IS PINNED HERE — all by EXECUTION, none by reading source as text:
   C  the reattachment both ways round — from the live dict (the path production
      actually runs) AND from disk alone once memory is cleared. ⭐ Measured while
      writing this: `resume_browser_from_checkpoint` has exactly ONE caller
-     (research.py:38701), in the same coroutine that paused, so the live
+     (in `poll_all_agents_round_robin`), in the same coroutine that paused, so the live
      `_runtime.agent_chat_urls` is the primary key and the file is the belt.
   D  ⛔⛔ an agent with NO url is silently NOT reattached — the headline break
   E  one bad leg does not take the others: session expiry fails just that agent, loudly
@@ -48,8 +50,8 @@ import research
 
 
 # ── Doubles that match the real browser's contract ──────────────────────
-# Real shapes: `Browser.start()` research.py:33091 · `new_tab(url=None)` :33613 ·
-# `close()` :33660 · `.context` truthy while a session is live.
+# Real shapes: `Browser.start()` · `Browser.new_tab(url=None)` ·
+# `Browser.close()` · `.context` truthy while a session is live.
 
 class _FakePage:
     def __init__(self, url):
@@ -101,13 +103,13 @@ def _clean_runtime_and_controls(monkeypatch):
     # `asyncio.wait` would return instantly — a pause that never paused, which
     # would fake a pass. Rebinding here reproduces what a fresh process gets.
     # ⭐ Measured, so it is not a lurking product defect: `--serve` runs ONE
-    # `asyncio.run` for the whole process (research.py:75947) and the CLI one
+    # `asyncio.run` for the whole process (`main`'s --serve branch) and the CLI one
     # per process, so production never has a second loop to be bound to.
     research._controls.stop_event = asyncio.Event()
     research._controls.pause_event = asyncio.Event()
     research._controls.resume_event = asyncio.Event()
     monkeypatch.setattr(research, "_cli_mode", False)
-    # The resume path sleeps 3s per reopened tab (research.py:19969).
+    # The resume path sleeps 3s per reopened tab (`resume_browser_from_checkpoint`).
     _real_sleep = asyncio.sleep
 
     async def _fast_sleep(_secs, *a, **kw):
@@ -147,7 +149,8 @@ def authed(monkeypatch):
 
 
 def _two_live_agents_and_one_done():
-    """The state a real phase-2 pause leaves behind (research.py:38668-38679)."""
+    """The state a real phase-2 pause leaves behind (the pause branch of
+    `poll_all_agents_round_robin`)."""
     research._runtime.phase = 2
     research._runtime.sub_state = "2_parallel_polling"
     research._runtime.agent_chat_urls = {
@@ -273,7 +276,8 @@ async def test_the_checkpoint_keeps_what_the_event_dropped(tmp_path, events):
 
 @pytest.mark.asyncio
 async def test_pause_with_no_queue_dir_writes_nothing_but_still_closes_the_browser(tmp_path, events):
-    """The silent bug the comment at research.py:38681-38687 describes: the
+    """The silent bug the comment beside the phase-2 pause's checkpoint save
+    describes ("Passing `_tracks_dir` here was a silent bug"): the
     phase-2 site once passed a run NAME instead of the queue dir, so the write
     landed relative to cwd. `save_pause_checkpoint` no-ops on a falsy dir —
     pin that the BROWSER still closes, so a bad dir costs the checkpoint and
@@ -351,7 +355,7 @@ async def test_a_stop_during_the_pause_reports_stopped_not_resumed(tmp_path, eve
 
 # ── C · THE REATTACHMENT, BOTH WAYS ROUND ──────────────────────────────
 # ⭐ MEASURED, because it changes what "the reconnect key" means:
-# `resume_browser_from_checkpoint` has exactly ONE caller — research.py:38701,
+# `resume_browser_from_checkpoint` has exactly ONE caller — in `poll_all_agents_round_robin`,
 # inside the same coroutine that paused. So in production the LIVE dict
 # `_runtime.agent_chat_urls` is the primary key and `checkpoint_pause.json` is
 # the belt. Both are pinned here: the same-memory path because it is the one
@@ -422,7 +426,7 @@ async def test_a_second_pause_wins_so_a_resume_never_reattaches_to_a_stale_url(
     """⛔⛔ A conversation URL captured EARLIER can be the wrong one now — both
     ChatGPT and Gemini rewrite the address once the first answer lands, and the
     mid-poll pause branch re-reads `page.url` every time it pauses
-    (research.py:38670-38676). So the newest pause has to win outright. If the
+    (in `poll_all_agents_round_robin`). So the newest pause has to win outright. If the
     checkpoint were ever reused instead of rebuilt, a resume would reopen the
     address the agent had at the FIRST pause — a stale conversation, which is
     the exact class of failure this whole stretch is about."""
@@ -503,7 +507,7 @@ async def test_an_agent_with_no_saved_url_is_not_reattached_at_all(tmp_path, eve
     happens: the leg is still `generating`, so the run still expects a report
     from it — but resume opens no tab for it, registers no page, and says
     nothing to anybody. The next poll tick reads its `None` page as a crashed
-    tab (research.py:38584) and the user is told the browser crashed.
+    tab (the crash sweep) and the user is told the browser crashed.
     """
     _two_live_agents_and_one_done()
     research._runtime.agent_chat_urls["gemini"] = ""      # the URL never got captured
