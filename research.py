@@ -17129,25 +17129,26 @@ def _retry_after_restart(coro) -> bool:
     return True
 
 
-def _unread_restores_to_carry(jobs, current_job) -> "list[dict]":
+def _unread_restores_to_carry(jobs) -> "list[dict]":
     """The held boot entries a snapshot rewrite must write back: those not
-    already among `jobs` or the running job, and never a run that keeps nothing.
+    already among `jobs`, and never a run that keeps nothing.
 
     ⛔⛔ EVERY REWRITE BUILT THE FILE FROM THE LIVE QUEUE, and a held entry is
     not in it — it is the one job this process holds that the queue cannot see.
     So the first worker boundary after boot erased the only description of the
     run left anywhere: the claim deleted its queue document before the crash.
 
-    ⛔ ONE ENTRY PER RESEARCH. A held job is enqueued by its re-offer a moment
-    before it leaves the held list, and a rewrite in between sees it twice; two
-    entries for one research in the file are two runs of it at the next boot,
-    because the restore dedupes against the queue, not against the file.
+    ⛔ ONE ENTRY PER RESEARCH. The boot restore's own rewrite hands its refused
+    entries in as well, and a held one is among them; two entries for one
+    research in the file are two runs of it at the next boot, because the
+    restore dedupes against the queue, not against the file. (Never the running
+    job: a re-offer takes a job off the held list in the same loop step that
+    queues it, so no worker can have dequeued it in between.)
 
     ⛔ A RUN THAT KEEPS NOTHING STAYS IN MEMORY ONLY — the rule
     `_forget_pending_queue_snapshot` already applies to a refused one. It is
     still offered again in this process; it is just never written down."""
     seen = {(j or {}).get("research_id") for j in list(jobs or ())}
-    seen.add((current_job or {}).get("research_id"))
     out = []
     for j in list(_UNREAD_RESTORES):
         rid = (j or {}).get("research_id")
@@ -17248,7 +17249,7 @@ def _write_pending_queue_snapshot(path, current_job, pending_jobs) -> None:
     `_unread_restores_to_carry`. Every caller hands this the live queue, and a
     held entry is exactly the job the live queue does not have."""
     pending_jobs = (list(pending_jobs or [])
-                    + _unread_restores_to_carry(pending_jobs, current_job))
+                    + _unread_restores_to_carry(pending_jobs))
     payload = {
         "ts_ms": int(time.time() * 1000),
         "current": _snapshot_job_view(current_job),
@@ -17307,7 +17308,7 @@ def _forget_pending_queue_snapshot(path, job_queue, unrestored=()) -> None:
     # ⛔ Counted HERE as well as written by the writer: with nothing queued and
     # nothing running, the entries boot is still holding are all the file has
     # left to say, and taking the file away would take them with it.
-    live += _unread_restores_to_carry(live, current)
+    live += _unread_restores_to_carry(live)
     try:
         if live or current:
             _write_pending_queue_snapshot(path, current, live)
