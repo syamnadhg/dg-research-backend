@@ -668,12 +668,15 @@ def _is_stream_job(job: object) -> bool:
     teardown edit the same file — and `test_remove_stream_cron_drops_per_chat_jobs`
     pins a renamed job carrying one of our shims as ours to remove.
 
-    ⚠ AND IT IS STILL HOST-WIDE, WHICH IS AN OWNER QUESTION AND NOT A BUG THIS
-    FUNCTION CAN SETTLE. On a fleet-shaped machine a shared `HERMES_HOME` holds
-    every chat's cron entries, so one chat's `disconnect` sweeps every chat's
-    watchdog — by NAME (`sr-stream-<other-slug>`) exactly as much as by script.
-    Narrowing either one would leave orphaned jobs firing "Script not found" every
-    tick, which is the failure the sweep exists for. Raised rather than changed.
+    ⭐⭐ AND IT IS HOST-WIDE, ON PURPOSE (owner decision, 2026-09-23). On a
+    fleet-shaped machine a shared `HERMES_HOME` holds every chat's cron entries, so
+    one chat's `disconnect` removes every chat's watcher — by NAME
+    (`sr-stream-<other-slug>`) exactly as much as by script. That is the rule, not a
+    leak: `disconnect` tears down the whole connection on this computer — the
+    skill, the session and the bridge — so no other chat's watcher could work
+    afterwards anyway. Narrowing the sweep would only leave orphaned jobs firing
+    "Script not found" on every tick, which is the failure the sweep exists for.
+    Pinned by `test_disconnect_removes_every_chats_watcher_on_this_computer`.
     """
     if not isinstance(job, dict):
         return False

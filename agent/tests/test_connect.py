@@ -273,6 +273,9 @@ def test_uninstall_sweeps_per_chat_shims_and_state(tmp_path):
 def test_remove_stream_cron_drops_per_chat_jobs(tmp_path):
     # Both the shared `sr-stream` job and per-chat `sr-stream-<slug>` jobs (and a
     # job pointing at a generated sr_poll_<slug>.py shim) must be removed.
+    # ⭐ HOST-WIDE BY DECISION, not by accident (owner, 2026-09-23): disconnect is
+    # a full teardown of this computer's connection, so every chat's watcher goes
+    # with it. See `test_disconnect_removes_every_chats_watcher_on_this_computer`.
     import json
     cron = tmp_path / ".hermes" / "cron"
     cron.mkdir(parents=True)

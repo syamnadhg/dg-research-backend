@@ -7260,8 +7260,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # 5. Session + maintenance.
     if re.search(r"\b(uninstall|tear ?down)\b", low) or \
             re.search(r"\b(remove|disconnect)\b.*\b(entirely|completely|fully|everything)\b", low):
-        return None, ["Just sign out, or fully remove the skill + bridge from this "
-                      "machine? (Sign-out keeps everything installed.)"]
+        # ⛔ THE SAME QUESTION SKILL.md ASKS, AND IT HAS TO SAY THE SAME THING: a
+        # full removal takes EVERY chat's watcher on this computer, not only the
+        # one asking (owner decision, 2026-09-23 — see `_is_stream_job`). A person
+        # who runs several chats off one computer must hear that before they say
+        # yes, and must not hear two different answers depending on the door.
+        return None, ["Just sign out, or fully remove Super Research from this "
+                      "computer — the skill, the bridge and every chat’s watcher? "
+                      "(Sign-out keeps everything installed.)"]
     if re.search(r"\b(sign|log)\s?(me\s)?out\b|\blogout\b", low):
         return None, [_NL_CONFIRMS["logout"]]
     if re.search(r"\b(sign|log)\s?(me\s)?in\b|\blogin\b|\bauthenticate\b", low):
