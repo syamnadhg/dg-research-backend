@@ -3100,8 +3100,9 @@ def _resume_run_id(data, uid: str, research_id: str) -> "tuple[str, dict | None]
         absent or refused.
     Returns ("", doc) when neither survives — the caller then asks the disk,
     by owner, in `_run_dir_owning_research` — and ("", None) when the research
-    document does not exist. A failed read RAISES; that exit is transient and
-    the caller keeps it silent.
+    document does not exist. A failed read RAISES; the caller then asks the
+    disk, by owner, as it would for a document with no run id, and says
+    nothing to the person when the disk has nothing either.
 
     ⛔⛔ THE DOCUMENT IS A CLAIM TOO, and checking only the payload would have
     moved the hole rather than closed it. The document sits in the sender's own
@@ -12246,6 +12247,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             log(f"[device-cmds] HARD_RESET: deque pop failed mid-drain: {_drain_pop_err}", "WARN")
                     else:
                         log("[device-cmds] HARD_RESET: no in-memory queue_ref yet (boot race) — skipping deque drain", "DEBUG")
+                    # ⛔⛔ AND THE ENTRIES BOOT IS STILL HOLDING (wave 10.10
+                    # leftovers). They wait outside the deque for their record
+                    # to become readable, and every snapshot rewrite carries
+                    # them — the post-drain one below included — so left here
+                    # they would come back after the reset, and run once a read
+                    # saw "queued". They are this computer's waiting work like
+                    # any other, and go the same way.
+                    _drained_jobs.extend(_UNREAD_RESTORES)
+                    del _UNREAD_RESTORES[:]
                     log(f"[device-cmds] HARD_RESET: drain found {len(_drained_jobs)} queued job(s)")
                     if _drained_jobs and _firebase_db:
                         try:
@@ -15859,8 +15869,34 @@ def start_firestore_start_listener(job_queue, loop):
                 try:
                     backend_run_id, rd = _resume_run_id(data, target_uid, target_rid)
                 except Exception as ex:
+                    # ⛔⛔ A READ THAT FAILS ASKS THE DISK, IT DOES NOT END THE
+                    # RESUME (wave 10.10 leftovers). This exit deleted the queue
+                    # doc and wrote nothing, so a Resume pressed during a blip
+                    # did nothing at all while its card stayed up. What the read
+                    # was for is already known: the web copies the record's
+                    # `backendRunId` into this payload at the press, so a
+                    # payload with no usable one means the record had none
+                    # either — and a record with none sends the branch below to
+                    # the disk. The disk is asked here, by owner, with the same
+                    # lookup, and nothing is written back to a record nobody
+                    # could read. A job taken this way meets the worker's
+                    # dequeue read before anything runs, which stands a deleted
+                    # research down, as for every other job taken on a failed
+                    # read.
+                    #
+                    # ⛔ NOTHING ON THE DISK STILL DROPS THE DOC, SILENTLY. Left
+                    # in place it would replay at the next listener attach —
+                    # possibly after this run finished — and this path writes
+                    # "ongoing" unconditionally; and a failed read is not the
+                    # machine's to call a failed run. The card stays, and the
+                    # web's own wait tells the person to press Resume again.
                     err_str = str(ex)
-                    if (
+                    _on_disk = _run_dir_owning_research(target_rid, target_uid)
+                    if _on_disk is not None:
+                        log(f"Resume: research doc unreadable ({type(ex).__name__}) — "
+                            f"{_on_disk.name} on disk is this person's run for it, "
+                            f"resuming from that", "WARN")
+                    elif (
                         "403" in err_str
                         or "PERMISSION_DENIED" in err_str
                         or "Missing or insufficient permissions" in err_str
@@ -15871,9 +15907,11 @@ def start_firestore_start_listener(job_queue, loop):
                         )
                     else:
                         log(f"Resume: failed to read research doc: {ex}", "WARN")
-                    try: doc.reference.delete()
-                    except Exception: pass
-                    continue
+                    if _on_disk is None:
+                        try: doc.reference.delete()
+                        except Exception: pass
+                        continue
+                    backend_run_id, rd = _on_disk.name, {}
                 if rd is None:
                     log(f"Resume: research {target_rid[:8]}... not found", "WARN")
                     try: doc.reference.delete()
@@ -16897,7 +16935,8 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
 
 def _safe_enqueue(job_queue, job, source: str,
                   allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart"),
-                  *, take_unreadable: bool = False) -> bool:
+                  *, take_unreadable: bool = False,
+                  hold_unreadable: "list | None" = None) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -16936,13 +16975,23 @@ def _safe_enqueue(job_queue, job, source: str,
       · the BOOT RESTORE, which leans on it on purpose. Its snapshot is a stale
         local copy, and this read is the only thing between it and relaunching
         a run worker 1's rehydration has just parked for its person's Resume
-        (#728) — so it must not act on a status it could not see. It keeps a
-        refused entry for the next boot instead.
+        (#728) — so it must not act on a status it could not see. It HOLDS the
+        job instead (below) and offers it again once the read can answer.
       · the supervised AUTO-RESUME at rehydrate, which falls through to the
         `paused_backend_restart` mark when refused: the person gets a Resume
         card, which is a slower run, not a lost one.
     A read that SUCCEEDED and said no — the record gone, a status outside the
     whitelist — is an answer, and refuses for every caller.
+
+    ⛔⛔ AND A REFUSAL ON A READ THAT FAILED IS NOT AN ANSWER, SO A CALLER THAT
+    CAN COME BACK FOR THE JOB SAYS WHERE TO PUT IT — `hold_unreadable` (wave
+    10.10 leftovers). The boot restore "kept" such a refusal by leaving its
+    entry in the snapshot file, and the next worker boundary rewrote that file
+    from the live queue: the entry was gone, the claim had long since deleted
+    its queue document, and its record said "queued" for ever. A list passed
+    here receives the job instead — still refused, so nothing runs on a status
+    nobody saw — and only the job this read could not see: a refusal that WAS
+    an answer never reaches the list. `take_unreadable` wins if both are given.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -17026,6 +17075,11 @@ def _safe_enqueue(job_queue, job, source: str,
                 unreadable = f"Firestore check failed ({type(e).__name__}: {e})"
     if unreadable is not None:
         if not take_unreadable:
+            if hold_unreadable is not None:
+                hold_unreadable.append(job)
+                log(f"[safe_enqueue:{source}] {unreadable} for {rid[:24]}… — held, "
+                    f"to be offered again once the record can be read", "WARN")
+                return False
             log(f"[safe_enqueue:{source}] skipped — {unreadable} for {rid[:24]}…", "WARN")
             return False
         log(f"[safe_enqueue:{source}] {unreadable} for {rid[:24]}… — taking the "
@@ -17037,6 +17091,107 @@ def _safe_enqueue(job_queue, job, source: str,
     except Exception as e:
         log(f"[safe_enqueue:{source}] put_nowait failed: {e}", "WARN")
         return False
+
+
+#: Seconds between the tries a restart's recovery makes again, in this process,
+#: at what a Firestore blip stopped it doing at boot: re-offering a snapshot
+#: entry whose record could not be read (`_reoffer_unread_restores`), and
+#: writing the recovery mark over a run left "ongoing"
+#: (`_remark_after_restart`).
+#:
+#: ⭐ ONE SCHEDULE FOR BOTH, AND IT ENDS. About eighteen minutes covers a boot
+#: that came up before the network, a token mid-refresh and a Firestore hiccup —
+#: the blips these exist for. Past that the fault is an outage, and each keeps
+#: what it has for the next boot: the snapshot carries the held entry, and boot
+#: rehydration finds the record still "ongoing". Nothing is said to anybody on
+#: the way; a write that cannot reach Firestore could not tell them anyway.
+_RESTART_RETRY_DELAYS_S = (15, 45, 120, 300, 600)
+
+#: The retries in flight. The loop keeps only a weak reference to a task, so a
+#: task nothing else holds can be collected before it has finished.
+_RESTART_RETRIES: "set" = set()
+
+#: Snapshot entries the boot restore could not check — the funnel's read failed
+#: — waiting to be offered again. See `_reoffer_unread_restores`.
+_UNREAD_RESTORES: "list[dict]" = []
+
+
+def _retry_after_restart(coro) -> bool:
+    """Run `coro` on the running loop, held until it ends. False, with the
+    coroutine closed, when no loop is running to take it."""
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+        return False
+    _RESTART_RETRIES.add(task)
+    task.add_done_callback(_RESTART_RETRIES.discard)
+    return True
+
+
+def _unread_restores_to_carry(jobs, current_job) -> "list[dict]":
+    """The held boot entries a snapshot rewrite must write back: those not
+    already among `jobs` or the running job, and never a run that keeps nothing.
+
+    ⛔⛔ EVERY REWRITE BUILT THE FILE FROM THE LIVE QUEUE, and a held entry is
+    not in it — it is the one job this process holds that the queue cannot see.
+    So the first worker boundary after boot erased the only description of the
+    run left anywhere: the claim deleted its queue document before the crash.
+
+    ⛔ ONE ENTRY PER RESEARCH. A held job is enqueued by its re-offer a moment
+    before it leaves the held list, and a rewrite in between sees it twice; two
+    entries for one research in the file are two runs of it at the next boot,
+    because the restore dedupes against the queue, not against the file.
+
+    ⛔ A RUN THAT KEEPS NOTHING STAYS IN MEMORY ONLY — the rule
+    `_forget_pending_queue_snapshot` already applies to a refused one. It is
+    still offered again in this process; it is just never written down."""
+    seen = {(j or {}).get("research_id") for j in list(jobs or ())}
+    seen.add((current_job or {}).get("research_id"))
+    out = []
+    for j in list(_UNREAD_RESTORES):
+        rid = (j or {}).get("research_id")
+        if rid in seen or _is_incognito_research(rid):
+            continue
+        seen.add(rid)
+        out.append(j)
+    return out
+
+
+async def _reoffer_unread_restores(job_queue) -> None:
+    """Offer the boot's held entries again, through the same funnel and the same
+    whitelist, until each one's record answers or the schedule runs out.
+
+    ⛔⛔ THE BOOT RESTORE'S REASON IS KEPT WHOLE (#728). An entry is started
+    only when a read has SEEN "queued" or "ongoing"; a run rehydration parked
+    for its person's Resume answers `paused_backend_restart` and is let go, as
+    is one that is gone, archived, stopped or over. Asking later is, if
+    anything, safer than asking at boot: a sibling worker has had time to park
+    what it owns.
+
+    ⭐ AN ENTRY LEAVES THE HELD LIST ONLY ON AN ANSWER. Still unreadable, it
+    stays — held, and carried by every snapshot rewrite — and whatever is left
+    when the schedule ends waits for the next boot, which is what "kept for the
+    next boot" always promised and never did."""
+    for delay in _RESTART_RETRY_DELAYS_S:
+        await asyncio.sleep(delay)
+        for job in list(_UNREAD_RESTORES):
+            still_unread: "list[dict]" = []
+            if _safe_enqueue(job_queue, job, source="disk-restore-retry",
+                             allowed_statuses=("queued", "ongoing"),
+                             hold_unreadable=still_unread):
+                log(f"[pending_queue] {str((job or {}).get('research_id') or '')[:24]}… "
+                    f"restored — its record could be read this time", "INFO")
+            if not still_unread:
+                try:
+                    _UNREAD_RESTORES.remove(job)
+                except ValueError:
+                    pass
+        if not _UNREAD_RESTORES:
+            return
+    log(f"[pending_queue] held snapshot entries still unreadable after every "
+        f"retry: {len(_UNREAD_RESTORES)} — kept in the snapshot for the next boot",
+        "WARN")
 
 
 def _snapshot_job_view(job):
@@ -17087,7 +17242,13 @@ def _write_pending_queue_snapshot(path, current_job, pending_jobs) -> None:
     `_schedule_server_exit`'s timer can race `os._exit(0)` past a slow
     in-progress write, leaving the snapshot truncated. On respawn a truncated
     file fails json.loads and disk-restore silently skips, losing pending
-    in-memory jobs not yet visible in Firestore."""
+    in-memory jobs not yet visible in Firestore.
+
+    ⛔⛔ AND WHAT BOOT COULD NOT CHECK GOES BACK IN — see
+    `_unread_restores_to_carry`. Every caller hands this the live queue, and a
+    held entry is exactly the job the live queue does not have."""
+    pending_jobs = (list(pending_jobs or [])
+                    + _unread_restores_to_carry(pending_jobs, current_job))
     payload = {
         "ts_ms": int(time.time() * 1000),
         "current": _snapshot_job_view(current_job),
@@ -17143,6 +17304,10 @@ def _forget_pending_queue_snapshot(path, job_queue, unrestored=()) -> None:
         live = []
     live += [j for j in (unrestored or ())
              if not _is_incognito_research((j or {}).get("research_id"))]
+    # ⛔ Counted HERE as well as written by the writer: with nothing queued and
+    # nothing running, the entries boot is still holding are all the file has
+    # left to say, and taking the file away would take them with it.
+    live += _unread_restores_to_carry(live, current)
     try:
         if live or current:
             _write_pending_queue_snapshot(path, current, live)
@@ -17207,7 +17372,13 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
 
     ⭐ EXTRACTED FROM `run_server`'s boot block, which is a closure and cannot be
     called from a test. Everything it touches is a parameter, so the pin runs
-    the real thing against a real file."""
+    the real thing against a real file.
+
+    ⛔ EXCEPT ONE THING, ON PURPOSE: an entry whose record could not be read is
+    HELD in `_UNREAD_RESTORES`, which every snapshot rewrite carries, and is
+    offered again by a retry this starts on the running loop — boot calls it
+    on the loop. With no loop running the entry is still held and carried; it
+    is just not asked about again before the next boot."""
     path = Path(path)
     if not path.exists():
         return (0, 0)
@@ -17273,7 +17444,8 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
             withdrew = True
             continue
         if _safe_enqueue(job_queue, j, source="disk-restore",
-                         allowed_statuses=("queued", "ongoing")):
+                         allowed_statuses=("queued", "ongoing"),
+                         hold_unreadable=_UNREAD_RESTORES):
             restored += 1
         else:
             skipped += 1
@@ -17288,6 +17460,12 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # The same rewrite, for the same reason: what restored is in the queue
         # and what the funnel refused is kept; only the withdrawn entry goes.
         _forget_pending_queue_snapshot(path, job_queue, refused)
+    # ⛔⛔ A HELD ENTRY IS ASKED ABOUT AGAIN, IN THIS PROCESS (wave 10.10
+    # leftovers). Kept for the next boot and nothing more, it waited for a
+    # restart that might be days away while its person watched a tile that
+    # said queued — for a read that failed once, at boot, when blips cluster.
+    if _UNREAD_RESTORES:
+        _retry_after_restart(_reoffer_unread_restores(job_queue))
     return (restored, skipped)
 
 
@@ -75619,6 +75797,47 @@ def _run_sink_note_event(event_type, phase=None, agent=None) -> None:
 
 # ── Server Mode (Web App API) ────────────────────────────────────────────────
 
+async def _remark_after_restart(tree_uid: str, research_id: str) -> bool:
+    """Write the recovery mark boot rehydration could not, on the schedule in
+    `_RESTART_RETRY_DELAYS_S`. True once it lands.
+
+    ⭐ THE SAME PATCH, and the same pickup rule asked before each try — see
+    `_restart_recovery_patch` and `_pickup_withdrawn`. A record that is gone or
+    archived is left alone, and one that cannot be read is marked anyway, as
+    the scan itself did.
+
+    ⛔⛔ BUT ONLY WHILE THE RUN IS STILL WHAT THE SCAN SAW. Minutes pass between
+    tries, and the mark is only true of a run that is "ongoing" with nothing
+    running it: a record the person has stopped since would be moved back to
+    an offer of a Resume, and a run this process has picked up again — a
+    crash card's Retry lands on the Resume path — would get a Resume card over
+    a live run. Either one ends the retry."""
+    for delay in _RESTART_RETRY_DELAYS_S:
+        await asyncio.sleep(delay)
+        withdrawn, record = await asyncio.to_thread(
+            _pickup_withdrawn, tree_uid, research_id, "rehydrate-retry")
+        if withdrawn:
+            return False
+        status = (record or {}).get("status")
+        if record is not None and status != "ongoing":
+            log(f"[rehydrate] {research_id[:24]}… is {status} now — the "
+                f"recovery mark is no longer this machine's to write", "INFO")
+            return False
+        if any((j or {}).get("research_id") == research_id
+               for j in _jobs_held_locally(_QUEUE_STATE.get("queue_ref"))):
+            log(f"[rehydrate] {research_id[:24]}… is running here again — "
+                f"no recovery mark", "INFO")
+            return False
+        if await asyncio.to_thread(_update_research_doc, tree_uid, research_id,
+                                   _restart_recovery_patch(research_id)):
+            log(f"[rehydrate] {research_id[:24]}… marked for recovery on a "
+                f"later try", "INFO")
+            return True
+    log(f"[rehydrate] {research_id[:24]}… still could not be marked — it stays "
+        f"\"ongoing\" until the next restart recovers it", "WARN")
+    return False
+
+
 async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_rids: "set[str]") -> "tuple[int, int]":
     """Scan users/{tree_uid}/researches for status=="ongoing" runs left mid-
     flight by a previous daemon session and recover each: auto-resume on a
@@ -75908,7 +76127,9 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                             "stopped rather than parked for a Resume nobody "
                             "can reach", "INFO")
                     else:
-                        log(f"Rehydrate: stop-mark failed for {research_id[:24]}…", "WARN")
+                        log(f"Rehydrate: stop-mark failed for {research_id[:24]}… — "
+                            "trying again shortly", "WARN")
+                        _retry_after_restart(_remark_after_restart(tree_uid, research_id))
                     continue
                 is_supervised = False
                 if _i_own:
@@ -76031,7 +76252,14 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                             _restart_recovery_patch(research_id)):
                         orphaned += 1
                     else:
-                        log(f"Rehydrate: mark paused_backend_restart failed for {research_id}", "WARN")
+                        # ⛔⛔ AND A FAILED MARK IS TRIED AGAIN (wave 10.10
+                        # leftovers). This scan runs once per boot, so a mark
+                        # lost to the same blip that failed the auto-resume's
+                        # read left the run "ongoing" with nothing running it
+                        # and no Resume card, until the next restart.
+                        log(f"Rehydrate: mark paused_backend_restart failed for {research_id} — "
+                            "trying again shortly", "WARN")
+                        _retry_after_restart(_remark_after_restart(tree_uid, research_id))
             # queued-status branch removed 2026-05-22 — the on_snapshot
             # listener handles queued docs.
     return (rehydrated, orphaned)

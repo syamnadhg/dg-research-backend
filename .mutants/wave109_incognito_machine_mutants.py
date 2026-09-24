@@ -266,8 +266,10 @@ RESTORE_FORGET = ("    if held_a_run_that_keeps_nothing:\n"
                   "        _forget_pending_queue_snapshot(path, job_queue, refused)")
 RESTORE_REFUSED = ("            skipped += 1\n"
                    "            refused.append(j)")
+# ⚠ RE-ANCHORED in the wave 10.10 leftovers: the call gained `hold_unreadable`.
 RESTORE_WHITELIST = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
-                     '                         allowed_statuses=("queued", "ongoing")):')
+                     '                         allowed_statuses=("queued", "ongoing"),\n'
+                     '                         hold_unreadable=_UNREAD_RESTORES):')
 FORGET_KEEP = ("    live += [j for j in (unrestored or ())\n"
                '             if not _is_incognito_research((j or {}).get("research_id"))]')
 # ── anchors: a cancel sheds a waiting run that keeps nothing (repair) ───────
@@ -781,7 +783,8 @@ MUTANTS = [
     ("S15", "under", "⛔⛔ #728 comes back: boot hands the funnel its DEFAULT "
      "whitelist, and a run parked for its person's Resume is relaunched from a "
      "sibling's stale snapshot",
-     [(RESTORE_WHITELIST, '        if _safe_enqueue(job_queue, j, source="disk-restore"):')]),
+     [(RESTORE_WHITELIST, '        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
+                          '                         hold_unreadable=_UNREAD_RESTORES):')]),
     ("S16", "under", "⛔⛔ a cancel leaves the snapshot alone — the waiting run "
      "that keeps nothing stays on the disk, whole, until the run in front of it "
      "ends, after its person was told nothing is kept",

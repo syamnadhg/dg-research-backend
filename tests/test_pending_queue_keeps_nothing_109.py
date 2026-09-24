@@ -165,7 +165,9 @@ def _enqueue_recorder(monkeypatch, *, accept=True, running=None):
     explicitly because the rewrite writes around whatever is running now."""
     offered = []
 
-    def _fake(job_queue, job, source, allowed_statuses=None):
+    # ⭐ `**_kw` takes the boot restore's `hold_unreadable` (wave 10.10
+    # leftovers). This fake refuses without saying why, so it never holds.
+    def _fake(job_queue, job, source, allowed_statuses=None, **_kw):
         offered.append(job)
         if accept:
             job_queue.put_nowait(job)

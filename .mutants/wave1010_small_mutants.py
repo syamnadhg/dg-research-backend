@@ -65,7 +65,10 @@ COMPARE = "    return origin != armed"
 START_PASSES = "                        take_unreadable=True):"
 RESCAN_PASSES = ("# failed read would drop the run for good. See `_safe_enqueue`.\n"
                  "                take_unreadable=True)")
-DEFAULT = "                  *, take_unreadable: bool = False) -> bool:"
+# ⚠ RE-ANCHORED in the wave 10.10 leftovers: the signature gained a
+# `hold_unreadable` keyword on the next line, and the boot restore's call
+# passes it, so both anchors stop before it.
+DEFAULT = "                  *, take_unreadable: bool = False,"
 NO_CLIENT = '        unreadable = "Firestore unavailable"'
 EXC_UNREADABLE = '                unreadable = f"Firestore check failed ({type(e).__name__}: {e})"'
 GATE = "        if not take_unreadable:"
@@ -75,7 +78,8 @@ EXISTS = ("            if not snap.exists:\n"
           'no longer exists in Firestore", "INFO")')
 STATUS = "            if status not in allowed_statuses:"
 RESTORE_CALL = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
-                '                         allowed_statuses=("queued", "ongoing")):')
+                '                         allowed_statuses=("queued", "ongoing"),\n'
+                '                         hold_unreadable=_UNREAD_RESTORES):')
 REHYDRATE_CALL = '}, source="rehydrate-supervised-auto-resume"):'
 
 MUTANTS = [
@@ -135,11 +139,12 @@ MUTANTS = [
      [(STATUS, "            if status not in allowed_statuses and not take_unreadable:")]),
     ("T7", "over", "⛔⛔ the default flips to taking — the boot restore relaunches "
      "a run whose status it could not see (#728)",
-     [(DEFAULT, "                  *, take_unreadable: bool = True) -> bool:")]),
+     [(DEFAULT, "                  *, take_unreadable: bool = True,")]),
     ("T8", "over", "⛔⛔ the boot restore takes a job it could not check",
      [(RESTORE_CALL, '        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
                      '                         allowed_statuses=("queued", "ongoing"),\n'
-                     "                         take_unreadable=True):")]),
+                     "                         take_unreadable=True,\n"
+                     '                         hold_unreadable=_UNREAD_RESTORES):')]),
     ("T9", "over", "⛔ the rehydrate auto-resumes a run it could not check "
      "instead of offering a Resume",
      [(REHYDRATE_CALL, '}, source="rehydrate-supervised-auto-resume", take_unreadable=True):')]),

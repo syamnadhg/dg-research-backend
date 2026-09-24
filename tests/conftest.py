@@ -444,6 +444,19 @@ def _alert_ai_copy_off_by_default():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_boot_entry_is_held_from_another_test(monkeypatch):
+    """⛔⛔ The boot restore's held entries live in a module list that EVERY
+    snapshot rewrite carries (`research._UNREAD_RESTORES`). One test that holds
+    an entry would otherwise write it into the next test's snapshot file — an
+    order-dependent failure in whichever queue test ran after it, the shape the
+    fixtures above exist to rule out. A fresh list per test; a test that holds
+    one patches after this and wins. raising=True, so a rename breaks here."""
+    import research
+    monkeypatch.setattr(research, "_UNREAD_RESTORES", [], raising=True)
+    yield
+
+
 @pytest.fixture(scope="session")
 def _serve_token_dir(tmp_path_factory):
     """One scratch directory for the whole session — see the fixture below."""
