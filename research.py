@@ -16048,6 +16048,15 @@ def start_firestore_start_listener(job_queue, loop):
                 # suppressing "Your PC was fine throughout" — the sentence a
                 # 2026-09-01 measurement exists to protect. A resume that WORKED
                 # is the one moment we know the refusal is spent.
+                #
+                # ⛔⛔ AND A RESTART'S RETRIES LET GO OF IT — BEFORE THE WRITE
+                # (wave 10.10 leftovers). Boot may still hold this research, or
+                # be retrying its recovery mark, and both act on a record that
+                # says "ongoing" — which this write is about to say, while the
+                # job itself reaches the queue only after the delete below. A
+                # retry reading in between would start it a second time, or put
+                # a Resume card over it. See `_run_taken_since_boot`.
+                _RESUMED_HERE.add(target_rid)
                 from google.cloud.firestore import DELETE_FIELD as _DF_RESUME
                 _update_research_doc(target_uid, target_rid,
                                      {"status": "ongoing", "assignedWorker": WORKER_ID,
@@ -16938,7 +16947,8 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
 def _safe_enqueue(job_queue, job, source: str,
                   allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart"),
                   *, take_unreadable: bool = False,
-                  hold_unreadable: "list | None" = None) -> bool:
+                  hold_unreadable: "list | None" = None,
+                  record_seen: "dict | None" = None) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -16994,6 +17004,11 @@ def _safe_enqueue(job_queue, job, source: str,
     here receives the job instead — still refused, so nothing runs on a status
     nobody saw — and only the job this read could not see: a refusal that WAS
     an answer never reaches the list. `take_unreadable` wins if both are given.
+
+    ⭐ `record_seen`, when given, receives the record this read saw — only a read
+    that succeeded and found one. The held entry's re-offer needs more of the
+    record than its status to tell a run it may start from one a Resume has
+    already started elsewhere; see `_run_taken_since_boot`.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -17050,7 +17065,10 @@ def _safe_enqueue(job_queue, job, source: str,
             if not snap.exists:
                 log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
                 return False
-            status = (snap.to_dict() or {}).get("status")
+            _record = snap.to_dict() or {}
+            if record_seen is not None:
+                record_seen.update(_record)
+            status = _record.get("status")
             if status not in allowed_statuses:
                 log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not in {allowed_statuses})", "INFO")
                 return False
@@ -17117,6 +17135,58 @@ _RESTART_RETRIES: "set" = set()
 #: — waiting to be offered again. See `_reoffer_unread_restores`.
 _UNREAD_RESTORES: "list[dict]" = []
 
+#: Researches a Resume has started in THIS process. The start listener's Resume
+#: branch adds one just before it writes "ongoing"; the restart retries read it.
+#: See `_run_taken_since_boot`.
+_RESUMED_HERE: "set[str]" = set()
+
+#: Seconds one of the re-offer's record reads may take before its round counts
+#: the entry as still unread. The read runs off the loop, so a slow one never
+#: stalls the loop; this bound is what stops a read that never returns from
+#: holding up every other held entry, and every later round, behind it.
+_RESTART_RETRY_READ_TIMEOUT_S = 15.0
+
+
+def _run_taken_since_boot(research_id, record, job_queue) -> "str | None":
+    """Why a run a restart's retry is about to start or mark belongs to somebody
+    else now — or None when it is still the retry's to act on.
+
+    ⛔⛔ "ONGOING" IS ALSO WHAT A RESUME WRITES, so the status cannot tell the
+    retries whether a run is still what boot left behind. Both act minutes after
+    boot: the held entry's re-offer starts a run whose record says "queued" or
+    "ongoing", and the recovery mark writes a Resume card over one that says
+    "ongoing". By then a Resume may have started the run — here, or on a sibling
+    worker — and the re-offer would run a second copy of it while the mark put a
+    Resume card over a live run. So each asks what the boot rehydration scan
+    asks, and one question more:
+      · a Resume in this process took it (`_RESUMED_HERE`). This is the one that
+        closes the race: the Resume queues its job only after its "ongoing"
+        write and a queue-document delete, so a read can see "ongoing" before
+        the job is anywhere below;
+      · this process holds it, running or waiting;
+      · a sibling worker's live lock names it;
+      · its record says "ongoing" and names another worker inside the fleet —
+        the scan's own ownership rule, `_owner_worker_of`, which is also the
+        stamp a Resume won by a sibling writes. A worker outside the fleet is
+        no live worker's, as the scan treats it."""
+    rid = str(research_id or "")
+    if rid in _RESUMED_HERE:
+        return "a Resume on this computer has started it"
+    if any((j or {}).get("research_id") == rid for j in _jobs_held_locally(job_queue)):
+        return "this process already holds it"
+    holders = _scan_sibling_locks_for_research(rid, WORKER_ID)
+    if holders:
+        return f"sibling worker {holders[0].get('worker_id')} is running it"
+    if (record or {}).get("status") == "ongoing":
+        owner = _owner_worker_of(record.get("assignedWorker"))
+        try:
+            fleet = load_worker_count()
+        except Exception:
+            fleet = 1
+        if owner != WORKER_ID and 1 <= owner <= fleet:
+            return f"worker {owner} owns it"
+    return None
+
 
 def _retry_after_restart(coro) -> bool:
     """Run `coro` on the running loop, held until it ends. False, with the
@@ -17131,9 +17201,9 @@ def _retry_after_restart(coro) -> bool:
     return True
 
 
-def _unread_restores_to_carry(jobs) -> "list[dict]":
+def _unread_restores_to_carry(jobs, current_job=None) -> "list[dict]":
     """The held boot entries a snapshot rewrite must write back: those not
-    already among `jobs`, and never a run that keeps nothing.
+    already among `jobs` or the running job, and never a run that keeps nothing.
 
     ⛔⛔ EVERY REWRITE BUILT THE FILE FROM THE LIVE QUEUE, and a held entry is
     not in it — it is the one job this process holds that the queue cannot see.
@@ -17143,14 +17213,18 @@ def _unread_restores_to_carry(jobs) -> "list[dict]":
     ⛔ ONE ENTRY PER RESEARCH. The boot restore's own rewrite hands its refused
     entries in as well, and a held one is among them; two entries for one
     research in the file are two runs of it at the next boot, because the
-    restore dedupes against the queue, not against the file. (Never the running
-    job: a re-offer takes a job off the held list in the same loop step that
-    queues it, so no worker can have dequeued it in between.)
+    restore dedupes against the queue, not against the file.
+
+    ⛔ AND THE RUNNING JOB COUNTS. A re-offer never queues what this process
+    already holds, but a held research can still reach the worker another way —
+    a Resume queues its own job — and until the next round lets the held entry
+    go, the file would name that research as `current` and again in `pending`.
 
     ⛔ A RUN THAT KEEPS NOTHING STAYS IN MEMORY ONLY — the rule
     `_forget_pending_queue_snapshot` already applies to a refused one. It is
     still offered again in this process; it is just never written down."""
     seen = {(j or {}).get("research_id") for j in list(jobs or ())}
+    seen.add((current_job or {}).get("research_id"))
     out = []
     for j in list(_UNREAD_RESTORES):
         rid = (j or {}).get("research_id")
@@ -17161,6 +17235,65 @@ def _unread_restores_to_carry(jobs) -> "list[dict]":
     return out
 
 
+class _StagedQueue:
+    """Where the re-offer's funnel call puts a job it would take. The call runs
+    off the loop, so it is never handed the real queue; see
+    `_reoffer_unread_restores`."""
+
+    def __init__(self):
+        self.jobs: "list[dict]" = []
+
+    def put_nowait(self, job):
+        self.jobs.append(job)
+
+
+def _ask_about_held_entry(job) -> "tuple[str, dict]":
+    """The funnel's verdict on one held entry — "take", "no" or "unread" — and
+    the record its read saw. Runs OFF the loop, because it reads Firestore, and
+    changes nothing outside its own locals: what the verdict does is decided back
+    on the loop, in `_settle_held_entry`."""
+    staged, unread, record = _StagedQueue(), [], {}
+    took = _safe_enqueue(staged, job, source="disk-restore-retry",
+                         allowed_statuses=("queued", "ongoing"),
+                         hold_unreadable=unread, record_seen=record)
+    if unread:
+        return "unread", {}
+    return ("take" if took else "no"), record
+
+
+def _settle_held_entry(job_queue, job, answer: str, record: dict) -> None:
+    """Act on one held entry's verdict. ON THE LOOP, AND NOTHING HERE AWAITS:
+    the checks, the queueing and the release happen in one loop step, so no
+    worker can dequeue the job, and no snapshot rewrite can see it, in between.
+
+    ⭐ AN ENTRY LEAVES THE HELD LIST ONLY ON AN ANSWER, and an entry that is no
+    longer held — Reset Backend drained it while its read was out — is left
+    alone. A "take" is then asked `_run_taken_since_boot`: a run somebody has
+    started since boot is let go, not started a second time."""
+    if not any(h is job for h in list(_UNREAD_RESTORES)):
+        return
+    if answer == "unread":
+        return
+    try:
+        _UNREAD_RESTORES.remove(job)
+    except ValueError:
+        pass
+    if answer != "take":
+        return
+    rid = str((job or {}).get("research_id") or "")
+    why = _run_taken_since_boot(rid, record, job_queue)
+    if why is not None:
+        log(f"[pending_queue] {rid[:24]}… not restored — {why}", "INFO")
+        return
+    try:
+        job_queue.put_nowait(job)
+    except Exception as e:
+        log(f"[pending_queue] {rid[:24]}… could not be queued: {e}", "WARN")
+        return
+    log(f"[pending_queue] {rid[:24]}… restored — its record could be read this time",
+        "INFO")
+
+
 async def _reoffer_unread_restores(job_queue) -> None:
     """Offer the boot's held entries again, through the same funnel and the same
     whitelist, until each one's record answers or the schedule runs out.
@@ -17168,28 +17301,40 @@ async def _reoffer_unread_restores(job_queue) -> None:
     ⛔⛔ THE BOOT RESTORE'S REASON IS KEPT WHOLE (#728). An entry is started
     only when a read has SEEN "queued" or "ongoing"; a run rehydration parked
     for its person's Resume answers `paused_backend_restart` and is let go, as
-    is one that is gone, archived, stopped or over. Asking later is, if
-    anything, safer than asking at boot: a sibling worker has had time to park
-    what it owns.
+    is one that is gone, archived, stopped or over.
 
-    ⭐ AN ENTRY LEAVES THE HELD LIST ONLY ON AN ANSWER. Still unreadable, it
-    stays — held, and carried by every snapshot rewrite — and whatever is left
-    when the schedule ends waits for the next boot, which is what "kept for the
-    next boot" always promised and never did."""
+    ⛔⛔ AND ASKING LATER IS NOT SAFER THAN ASKING AT BOOT — it is asking after
+    a Resume may have happened, and a Resume writes "ongoing". A held run its
+    person resumed here or on a sibling worker read as one to start, and ran
+    twice. `_settle_held_entry` asks `_run_taken_since_boot` before it queues.
+
+    ⛔ THE READ RUNS OFF THE LOOP, BOUNDED. This retry exists for a Firestore
+    that is slow or failing, and the loop also runs the pipeline, the local API
+    and the listeners' callbacks: read on the loop, each held entry froze all of
+    them for as long as its read took, every round. A read that does not answer
+    within `_RESTART_RETRY_READ_TIMEOUT_S` counts as unread.
+
+    ⚠ #728 HOLDS ONLY FOR A RECORD THAT CAN BE READ. The funnel trusts a 403
+    ("the FE-side queue write"), so a held entry whose read is denied is started
+    — here as at boot, where the restore does the same. Holding on a 403 instead
+    would stop every restore on a machine whose reads of the record are denied.
+
+    ⭐ Still unreadable, an entry stays held and carried by every snapshot
+    rewrite, and whatever is left when the schedule ends waits for the next
+    boot, which is what "kept for the next boot" always promised and never did."""
     for delay in _RESTART_RETRY_DELAYS_S:
         await asyncio.sleep(delay)
         for job in list(_UNREAD_RESTORES):
-            still_unread: "list[dict]" = []
-            if _safe_enqueue(job_queue, job, source="disk-restore-retry",
-                             allowed_statuses=("queued", "ongoing"),
-                             hold_unreadable=still_unread):
+            try:
+                answer, record = await asyncio.wait_for(
+                    asyncio.to_thread(_ask_about_held_entry, job),
+                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)
+            except asyncio.TimeoutError:
                 log(f"[pending_queue] {str((job or {}).get('research_id') or '')[:24]}… "
-                    f"restored — its record could be read this time", "INFO")
-            if not still_unread:
-                try:
-                    _UNREAD_RESTORES.remove(job)
-                except ValueError:
-                    pass
+                    f"record read did not answer in {_RESTART_RETRY_READ_TIMEOUT_S:g}s "
+                    f"— still held", "WARN")
+                continue
+            _settle_held_entry(job_queue, job, answer, record)
         if not _UNREAD_RESTORES:
             return
     log(f"[pending_queue] held snapshot entries still unreadable after every "
@@ -17251,7 +17396,7 @@ def _write_pending_queue_snapshot(path, current_job, pending_jobs) -> None:
     `_unread_restores_to_carry`. Every caller hands this the live queue, and a
     held entry is exactly the job the live queue does not have."""
     pending_jobs = (list(pending_jobs or [])
-                    + _unread_restores_to_carry(pending_jobs))
+                    + _unread_restores_to_carry(pending_jobs, current_job))
     payload = {
         "ts_ms": int(time.time() * 1000),
         "current": _snapshot_job_view(current_job),
@@ -17310,7 +17455,7 @@ def _forget_pending_queue_snapshot(path, job_queue, unrestored=()) -> None:
     # ⛔ Counted HERE as well as written by the writer: with nothing queued and
     # nothing running, the entries boot is still holding are all the file has
     # left to say, and taking the file away would take them with it.
-    live += _unread_restores_to_carry(live)
+    live += _unread_restores_to_carry(live, current)
     try:
         if live or current:
             _write_pending_queue_snapshot(path, current, live)
@@ -75806,30 +75951,38 @@ async def _remark_after_restart(tree_uid: str, research_id: str) -> bool:
 
     ⭐ THE SAME PATCH, and the same pickup rule asked before each try — see
     `_restart_recovery_patch` and `_pickup_withdrawn`. A record that is gone or
-    archived is left alone, and one that cannot be read is marked anyway, as
-    the scan itself did.
+    archived is left alone.
 
     ⛔⛔ BUT ONLY WHILE THE RUN IS STILL WHAT THE SCAN SAW. Minutes pass between
     tries, and the mark is only true of a run that is "ongoing" with nothing
     running it: a record the person has stopped since would be moved back to
-    an offer of a Resume, and a run this process has picked up again — a
-    crash card's Retry lands on the Resume path — would get a Resume card over
-    a live run. Either one ends the retry."""
+    an offer of a Resume, and a run picked up again since — by a Resume here or
+    on a sibling worker — would get a Resume card over a live run. Either one
+    ends the retry; `_run_taken_since_boot` asks what the scan asked about
+    sibling workers, and whether anybody has started the run since.
+
+    ⛔⛔ SO A RECORD THE RETRY CANNOT READ IS NOT WRITTEN. The scan may mark an
+    unreadable record — its query said "ongoing" a moment before — but this try
+    comes a quarter of a minute to eighteen minutes later, and the write is a
+    plain update with no precondition: written blind, it moved a run that had
+    finished, or that its person had stopped, back to an offer of a Resume. It
+    waits for a round whose read answers."""
     for delay in _RESTART_RETRY_DELAYS_S:
         await asyncio.sleep(delay)
         withdrawn, record = await asyncio.to_thread(
             _pickup_withdrawn, tree_uid, research_id, "rehydrate-retry")
         if withdrawn:
             return False
-        status = (record or {}).get("status")
-        if record is not None and status != "ongoing":
+        if record is None:
+            continue
+        status = record.get("status")
+        if status != "ongoing":
             log(f"[rehydrate] {research_id[:24]}… is {status} now — the "
                 f"recovery mark is no longer this machine's to write", "INFO")
             return False
-        if any((j or {}).get("research_id") == research_id
-               for j in _jobs_held_locally(_QUEUE_STATE.get("queue_ref"))):
-            log(f"[rehydrate] {research_id[:24]}… is running here again — "
-                f"no recovery mark", "INFO")
+        why = _run_taken_since_boot(research_id, record, _QUEUE_STATE.get("queue_ref"))
+        if why is not None:
+            log(f"[rehydrate] {research_id[:24]}… {why} — no recovery mark", "INFO")
             return False
         if await asyncio.to_thread(_update_research_doc, tree_uid, research_id,
                                    _restart_recovery_patch(research_id)):

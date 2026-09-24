@@ -451,9 +451,14 @@ def _no_boot_entry_is_held_from_another_test(monkeypatch):
     an entry would otherwise write it into the next test's snapshot file — an
     order-dependent failure in whichever queue test ran after it, the shape the
     fixtures above exist to rule out. A fresh list per test; a test that holds
-    one patches after this and wins. raising=True, so a rename breaks here."""
+    one patches after this and wins. raising=True, so a rename breaks here.
+
+    ⛔ The same for the researches a Resume has started in this process
+    (`research._RESUMED_HERE`): every test that feeds the start listener a
+    Resume adds one, and the restart retries refuse to act on it."""
     import research
     monkeypatch.setattr(research, "_UNREAD_RESTORES", [], raising=True)
+    monkeypatch.setattr(research, "_RESUMED_HERE", set(), raising=True)
     yield
 
 

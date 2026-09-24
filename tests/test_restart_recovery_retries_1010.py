@@ -35,7 +35,9 @@ Run:  pytest tests/test_restart_recovery_retries_1010.py -v
 import asyncio
 import collections
 import json
+import os
 import threading
+import time
 import types
 
 import pytest
@@ -125,14 +127,27 @@ def _rids(jobs):
     return [j["research_id"] for j in jobs]
 
 
+def _sibling_lock(tmp_path, worker_id=2, rid=RID):
+    """A sibling worker's REAL claim lock for `rid`, the way a worker writes it
+    when it starts a run: a live pid (this test's own) and a fresh start."""
+    d = tmp_path / "queues"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f".worker.{worker_id}.lock").write_text(json.dumps({
+        "worker_id": worker_id, "pid": os.getpid(), "research_id": rid,
+        "started_at": int(time.time() * 1000)}), encoding="utf-8")
+
+
 # ══ (a) the boot restore ══════════════════════════════════════════════════
 
-def _machine(monkeypatch, tmp_path, answers):
-    """A machine just booted: `answers` is its Firestore (None: no client)."""
+def _machine(monkeypatch, tmp_path, answers, fleet=1):
+    """A machine just booted, as worker 1 of `fleet`: `answers` is its
+    Firestore (None: no client)."""
     monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
     monkeypatch.setattr(research, "_firebase_db",
                         None if answers is None else _RecordDb(answers))
     monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0, 0, 0))
+    monkeypatch.setattr(research, "WORKER_ID", 1)
+    monkeypatch.setattr(research, "load_worker_count", lambda: fleet)
     monkeypatch.setitem(research._QUEUE_STATE, "current_job", None)
     monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_lock", None)
     monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_in_progress", False)
@@ -292,6 +307,328 @@ def test_a_rewrite_with_nothing_queued_keeps_the_file_for_a_held_entry(monkeypat
         "an empty queue's rewrite took the held entry away with the file")
 
 
+@pytest.mark.parametrize("rewrite", ["worker-boundary", "empty-queue-rewrite"])
+def test_a_held_research_that_is_also_the_running_job_is_written_once(
+        monkeypatch, tmp_path, rewrite):
+    """⛔ ONE ENTRY PER RESEARCH, THE RUNNING JOB INCLUDED. A held research can
+    reach the worker another way — a Resume queues its own job — and until the
+    next round lets the held entry go, a rewrite named it as `current` and again
+    in `pending`: two runs of it at the next boot."""
+    _machine(monkeypatch, tmp_path, _Answers(ONGOING))
+    path = tmp_path / "queues" / "_pending_queue.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    research._UNREAD_RESTORES.append(_job())
+    q = _Q()
+
+    if rewrite == "worker-boundary":
+        _worker_boundary(monkeypatch, path, q, running=_job())
+    else:
+        research._QUEUE_STATE["current_job"] = _job()
+        research._shed_from_pending_snapshot(q)
+
+    snap = json.loads(path.read_text(encoding="utf-8"))
+    assert (snap["current"] or {}).get("research_id") == RID
+    assert _rids(snap["pending"]) == [], (
+        "the running research was written into the snapshot a second time")
+    monkeypatch.setattr(research, "_UNREAD_RESTORES", [])      # the next boot
+    research._QUEUE_STATE["current_job"] = None
+    q2 = _Q()
+    research._restore_pending_queue_snapshot(path, q2, set())
+    assert _rids(q2._queue) == [RID], "one research was restored twice from one snapshot"
+
+
+def test_a_held_mid_flight_run_is_restored_when_its_record_says_ongoing(monkeypatch, tmp_path):
+    """⭐ THE BOOT RESTORE TAKES "ongoing" AS WELL AS "queued" — the snapshot's
+    running job was mid-flight and nothing parked it — and its retry must too.
+    Answered "ongoing", owned by this worker and running nowhere, a held run is
+    restored; let go as a refusal, the next rewrite would erase it."""
+    answers = _Answers(BLIP, BLIP, ONGOING)
+    _machine(monkeypatch, tmp_path, answers)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+
+    _boot_and_retry(path, q)
+
+    assert _rids(q._queue) == [RID], "a held mid-flight run was let go"
+    assert research._UNREAD_RESTORES == []
+
+
+class _PerResearchDb:
+    """Firestore answering each research's record separately — an exception
+    raises — and failing every read while `down`."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.rid = None
+        self.down = True
+
+    def collection(self, _name):
+        return self
+
+    def document(self, name):
+        if name in self.answers:
+            self.rid = name
+        return self
+
+    def get(self):
+        if self.down:
+            raise BLIP
+        answer = self.answers[self.rid]
+        if isinstance(answer, BaseException):
+            raise answer
+        return _Snap(answer)
+
+
+def test_two_held_entries_each_get_their_own_answer(monkeypatch, tmp_path):
+    """⛔ ONE ENTRY'S ANSWER IS NOT ANOTHER'S. Two held entries, one still
+    unreadable and one answering "queued": the answered one is started once and
+    let go, the unreadable one stays held. Answers shared across a round queued
+    the answered one again every round, or kept it held for ever."""
+    rid_a, rid_b = "chat_a_1", "chat_b_2"
+    db = _PerResearchDb({rid_a: BLIP, rid_b: QUEUED})
+    _machine(monkeypatch, tmp_path, _Answers(BLIP))
+    monkeypatch.setattr(research, "_firebase_db", db)
+    path = _snapshot(tmp_path, [_job(rid_a, "A_run"), _job(rid_b, "B_run")])
+    q = _Q()
+
+    _boot_and_retry(path, q, lambda: setattr(db, "down", False))
+
+    assert _rids(q._queue) == [rid_b], "an answered entry was not started exactly once"
+    assert _rids(research._UNREAD_RESTORES) == [rid_a], (
+        "the entry that never answered was let go, or the answered one kept")
+
+
+# ── a run somebody started since boot is never started a second time ──────
+
+@pytest.mark.parametrize("where", ["waiting", "running"])
+def test_the_retry_never_queues_a_research_this_process_already_holds(
+        monkeypatch, tmp_path, where):
+    """⛔⛔ ONE RESEARCH RAN TWICE. The boot restore dedupes against the queue;
+    its retry did not. A Resume here writes "ongoing" and queues its own job, so
+    the retry's read answered "ongoing" and a second, fresh copy went in behind
+    the resumed one — or behind the run already going. It is let go instead."""
+    answers = _Answers(BLIP, BLIP, ONGOING)
+    _machine(monkeypatch, tmp_path, answers)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+    resumed = dict(_job(), resume_dir=str(tmp_path / "queues" / RUN))
+
+    def _picked_up():
+        if where == "running":
+            research._QUEUE_STATE["current_job"] = resumed
+        else:
+            q._queue.append(resumed)
+
+    _boot_and_retry(path, q, _picked_up)
+
+    copies = [j for j in research._jobs_held_locally(q) if j.get("research_id") == RID]
+    assert copies == [resumed], f"this process holds {len(copies)} copies of one research"
+    assert answers.reads == 3, "the retry never asked"
+    assert research._UNREAD_RESTORES == [], "a held entry for a run held here was kept"
+
+
+def test_a_resume_here_takes_a_held_run_before_its_job_reaches_the_queue(
+        monkeypatch, tmp_path):
+    """⛔⛔ THE RACE THE QUEUE CANNOT SEE. The REAL start listener takes a Resume
+    for a run boot is holding: it writes "ongoing", deletes the queue document
+    and only then hands its job to the loop. A retry whose read lands between
+    the write and the hand-off finds "ongoing" and nothing held here — so the
+    Resume lets go of the research before it writes."""
+    _run_on_disk(tmp_path, UID)
+    lis = Listener(monkeypatch, tmp_path, owner=UID,
+                   research_docs={(UID, RID): dict(PARKED, backendRunId=RUN)})
+    monkeypatch.setattr(research, "WORKER_ID", 1)
+    research._UNREAD_RESTORES.append(_job())                 # boot held it
+
+    lis.feed(action="resume", uid=UID, submittedBy=UID, researchId=RID,
+             email="alice@example.com", backendRunId=RUN)
+    assert _rids(lis.enqueued) == [RID], "the Resume did not go through (premise)"
+    # The Resume's write has landed; its job has not reached the deque yet.
+    lis.db.research_docs[(UID, RID)] = dict(ONGOING)
+    reads_before = len(lis.db.reads)
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0,))
+    asyncio.run(research._reoffer_unread_restores(lis.jobs))
+
+    assert len(lis.db.reads) > reads_before, "the retry never asked"
+    assert _rids(lis.enqueued) == [RID], (
+        "the retry started a second copy of a run a Resume here had just started")
+    assert research._UNREAD_RESTORES == []
+
+
+def test_a_held_run_a_sibling_worker_resumed_is_let_go(monkeypatch, tmp_path):
+    """⛔⛔ THE #728 RUN, ACROSS TWO CRASHES. Boot 1 reads the run parked for its
+    person's Resume and refuses it — an answered refusal stays in the file.
+    Crash 2 comes before any rewrite, and boot 2's read blips, so it is held.
+    The person presses Resume and worker 2 wins it: "ongoing", stamped worker 2.
+    The retry used to read that "ongoing" and start a fresh copy here."""
+    path = _snapshot(tmp_path, [_job()])
+    _machine(monkeypatch, tmp_path, _Answers(PARKED), fleet=2)
+    research._restore_pending_queue_snapshot(path, _Q(), set())
+    assert _in_file(path) == [RID], "boot 1 rewrote the file (premise)"
+
+    monkeypatch.setattr(research, "_UNREAD_RESTORES", [])     # crash 2: a new process
+    answers = _Answers(BLIP, BLIP, dict(ONGOING, assignedWorker=2))
+    _machine(monkeypatch, tmp_path, answers, fleet=2)
+    q = _Q()
+    _boot_and_retry(path, q)
+
+    assert list(q._queue) == [], "a run a sibling worker resumed was started here as well"
+    assert answers.reads == 3, "the retry never asked"
+    assert research._UNREAD_RESTORES == [], "a run a sibling took is still held"
+
+
+@pytest.mark.parametrize("answer", [QUEUED, ONGOING], ids=["queued", "ongoing-here"])
+def test_a_held_run_a_sibling_worker_is_running_is_let_go(monkeypatch, tmp_path, answer):
+    """⛔ A LIVE SIBLING LOCK IS THE SCAN'S FIRST QUESTION, and the retry asks it
+    too, whatever the record says: a sibling that holds the research's lock is
+    running it, and a copy here would run it twice in the same folder."""
+    answers = _Answers(BLIP, BLIP, answer)
+    _machine(monkeypatch, tmp_path, answers, fleet=2)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+
+    _boot_and_retry(path, q, lambda: _sibling_lock(tmp_path))
+
+    assert list(q._queue) == [], "a run a sibling worker holds the lock for was started here"
+    assert answers.reads == 3, "the retry never asked"
+    assert research._UNREAD_RESTORES == []
+
+
+@pytest.mark.parametrize("owner", [None, 3], ids=["no-stamp", "out-of-fleet"])
+def test_a_held_run_no_live_worker_owns_is_restored(monkeypatch, tmp_path, owner):
+    """⭐ OTHER POLARITY: THE SCAN'S OWN RULE, NOT A WIDER ONE. A record with no
+    worker stamp is worker 1's, and a stamp outside the fleet is no live
+    worker's; neither is a sibling's run, and treating them as one would let go
+    of a run nobody else will ever pick up."""
+    record = {k: v for k, v in ONGOING.items() if k != "assignedWorker"}
+    if owner is not None:
+        record["assignedWorker"] = owner
+    _machine(monkeypatch, tmp_path, _Answers(BLIP, BLIP, record), fleet=2)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+
+    _boot_and_retry(path, q)
+
+    assert _rids(q._queue) == [RID], "a run no live worker owns was let go"
+
+
+# ── the retry's read never holds up the loop ──────────────────────────────
+
+def test_the_retry_reads_its_record_off_the_loop(monkeypatch, tmp_path):
+    """⛔ THE LOOP RUNS THE PIPELINE, THE LOCAL API AND THE LISTENERS' CALLBACKS,
+    and this retry exists for a Firestore that is slow. Read on the loop, each
+    held entry froze all of them for as long as its read took, every round. A
+    ticker on the same loop measures the longest stall."""
+    slow_s = 3.0
+
+    class _SlowDb:
+        def collection(self, _name):
+            return self
+
+        def document(self, _name):
+            return self
+
+        def get(self):
+            time.sleep(slow_s)
+            return _Snap(QUEUED)
+
+    _machine(monkeypatch, tmp_path, None)                    # boot: no client, held
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0,))
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+    gaps: list = []
+
+    async def _go():
+        research._restore_pending_queue_snapshot(path, q, set())
+        monkeypatch.setattr(research, "_firebase_db", _SlowDb())
+        stop = asyncio.Event()
+
+        async def _ticker():
+            last = time.monotonic()
+            while not stop.is_set():
+                await asyncio.sleep(0.02)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        tick = asyncio.ensure_future(_ticker())
+        await asyncio.gather(*list(research._RESTART_RETRIES))
+        stop.set()
+        await tick
+
+    asyncio.run(_go())
+
+    assert _rids(q._queue) == [RID], "the slow read's answer was not acted on (premise)"
+    assert max(gaps) < slow_s / 2, (
+        f"the loop stalled {max(gaps):.2f}s while the retry read Firestore")
+
+
+def test_a_read_that_never_answers_counts_as_unread(monkeypatch, tmp_path):
+    """⛔ BOUNDED, SO ONE READ CANNOT HOLD UP THE REST. A read that never
+    returns would stall every other held entry and every later round behind it;
+    past the bound it counts as unread — the entry stays held — and an answer
+    that arrives after the round has moved on starts nothing."""
+    release = threading.Event()
+
+    class _HungDb:
+        def collection(self, _name):
+            return self
+
+        def document(self, _name):
+            return self
+
+        def get(self):
+            release.wait(30)
+            return _Snap(QUEUED)
+
+    _machine(monkeypatch, tmp_path, None)
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0, 0))
+    monkeypatch.setattr(research, "_RESTART_RETRY_READ_TIMEOUT_S", 0.3)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+
+    async def _go():
+        research._restore_pending_queue_snapshot(path, q, set())
+        monkeypatch.setattr(research, "_firebase_db", _HungDb())
+        try:
+            await asyncio.wait_for(asyncio.gather(*list(research._RESTART_RETRIES)), 10)
+        finally:
+            release.set()
+
+    asyncio.run(_go())
+
+    assert list(q._queue) == [], "a run was started on a read that never answered in time"
+    assert _rids(research._UNREAD_RESTORES) == [RID], "an entry that never answered was let go"
+
+
+def test_an_entry_reset_backend_drained_while_its_read_was_out_is_not_started(
+        monkeypatch, tmp_path):
+    """⛔ THE READ IS OFF THE LOOP NOW, SO THE HELD LIST CAN CHANGE UNDER IT.
+    Reset Backend drains the held entries on the command listener's thread; a
+    read that was already out and then answered "queued" must not start what
+    the reset just stopped."""
+    class _DrainingDb:
+        def collection(self, _name):
+            return self
+
+        def document(self, _name):
+            return self
+
+        def get(self):
+            # Reset Backend's own drain statement, on another thread, mid-read.
+            del research._UNREAD_RESTORES[:]
+            return _Snap(QUEUED)
+
+    _machine(monkeypatch, tmp_path, None)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+
+    _boot_and_retry(path, q,
+                    lambda: monkeypatch.setattr(research, "_firebase_db", _DrainingDb()))
+
+    assert list(q._queue) == [], "a run Reset Backend drained was started by the retry"
+
+
 def _hard_reset(monkeypatch, tmp_path, held):
     """Drive the REAL Reset Backend through the device-command listener, on a
     foreground serve, with `held` entries boot could not check."""
@@ -368,13 +705,14 @@ def test_reset_backend_drains_what_boot_is_holding(monkeypatch, tmp_path):
 
 class _TreeDb:
     """A machine whose run was mid-flight when it restarted. The rehydrate query
-    finds `rid` ongoing and owned by this worker; every read of the record
-    answers from `answers`, in order."""
+    finds `rid` as `listed` — ongoing, and owned by this worker unless a test
+    says otherwise; every read of the record answers from `answers`, in order."""
 
-    def __init__(self, rid, answers, supervised):
+    def __init__(self, rid, answers, supervised, listed=ONGOING):
         self.rid = rid
         self.answers = answers
         self.supervised = supervised
+        self.listed = listed
 
     def collection(self, name):
         return _TreeNode(self, (name,))
@@ -395,7 +733,7 @@ class _TreeNode:
     def get(self):
         p = self._parts
         if p == ("users", UID, "researches"):                       # the query
-            snap = _Snap(ONGOING)
+            snap = _Snap(self._db.listed)
             snap.id = self._db.rid
             return [snap]
         if len(p) == 4 and p[0] == "users" and p[2] == "researches":
@@ -422,16 +760,19 @@ class _Writes:
 
 
 def _rehydrate(monkeypatch, tmp_path, answers, writes, *, rid=RID, supervised=True,
-               before_retry=None):
-    """Boot rehydration over one run, then every retry it started, to the end."""
+               before_retry=None, fleet=1, listed=ONGOING):
+    """Boot rehydration over one run, then every retry it started, to the end.
+
+    ⭐ The sibling-lock scan is the REAL one, over this machine's own `queues/`
+    — empty unless a test writes a worker's lock into it (`_sibling_lock`)."""
     (tmp_path / "queues" / RUN).mkdir(parents=True, exist_ok=True)
     q = _Q()
     monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
-    monkeypatch.setattr(research, "_firebase_db", _TreeDb(rid, answers, supervised))
+    monkeypatch.setattr(research, "_firebase_db", _TreeDb(rid, answers, supervised, listed))
     monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0, 0, 0))
-    monkeypatch.setattr(research, "load_worker_count", lambda: 1)
+    monkeypatch.setattr(research, "load_worker_count", lambda: fleet)
+    monkeypatch.setattr(research, "WORKER_ID", 1)
     monkeypatch.setattr(research, "load_device_id", lambda: "dev-abcdef")
-    monkeypatch.setattr(research, "_scan_sibling_locks_for_research", lambda *a: [])
     monkeypatch.setattr(research, "_corroborated_run_id", lambda *a, **k: RUN)
     monkeypatch.setattr(research, "load_checkpoint", lambda _qd: {"topic": TOPIC})
     monkeypatch.setattr(research, "_update_research_doc", writes)
@@ -472,13 +813,109 @@ def test_a_private_runs_stop_mark_is_written_on_a_later_try(monkeypatch, tmp_pat
         "as an offer of a Resume nobody can reach")
 
 
-def test_the_retry_marks_a_record_it_still_cannot_read(monkeypatch, tmp_path):
-    """⭐ THE SCAN'S OWN RULE: unreadable is taken. A read that keeps failing
-    while writes get through must not keep the run unmarked."""
+def test_the_retry_never_writes_a_record_it_cannot_read(monkeypatch, tmp_path):
+    """⛔⛔ NOT THE SCAN'S RULE. The scan may mark an unreadable record — its
+    query said "ongoing" a moment before — but a retry comes minutes later, and
+    its write is a plain update with no precondition. Every round asks; none
+    writes over a status nobody saw."""
+    answers = _Answers(BLIP)
     writes = _Writes(False, True)
-    _rehydrate(monkeypatch, tmp_path, _Answers(BLIP), writes)
+    _rehydrate(monkeypatch, tmp_path, answers, writes)
 
-    assert writes.statuses == ["paused_backend_restart", "paused_backend_restart"]
+    assert len(writes.attempts) == 1, "the retry wrote over a record it could not read"
+    assert answers.reads == 2 + len(research._RESTART_RETRY_DELAYS_S), (
+        "the retry stopped asking before its schedule ran out")
+
+
+class _LiveRecord:
+    """One research record whose reads fail and whose writes land, merged."""
+
+    def __init__(self, status):
+        self.data = {"status": status}
+
+    def update(self, _uid, _rid, patch):
+        self.data.update(patch)
+        return True
+
+
+class _DownDb:
+    def collection(self, _name):
+        return self
+
+    def document(self, _name):
+        return self
+
+    def get(self):
+        raise BLIP
+
+
+@pytest.mark.parametrize("status", ["completed", "stopped"])
+def test_the_retry_never_moves_a_run_that_ended_back_to_a_resume_offer(
+        monkeypatch, tmp_path, status):
+    """⛔⛔ WHAT THE BLIND WRITE DID. The run finished, or its person stopped it,
+    after the scan; the retry's read failed, its write landed, and the record
+    offered a Resume on a run that was over. Through the REAL pickup read."""
+    rec = _LiveRecord(status)
+    monkeypatch.setattr(research, "_firebase_db", _DownDb())
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0,))
+    monkeypatch.setattr(research, "_update_research_doc", rec.update)
+    monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", _Q())
+    monkeypatch.setitem(research._QUEUE_STATE, "current_job", None)
+
+    asyncio.run(research._remark_after_restart(UID, RID))
+
+    assert rec.data["status"] == status, "a run that was over was offered as a Resume"
+
+
+def test_the_retry_leaves_a_run_a_sibling_worker_resumed(monkeypatch, tmp_path):
+    """⛔⛔ THE SCAN LEAVES ANOTHER WORKER'S RUN ALONE, AND THE RETRY DID NOT. A
+    Resume won by worker 2 stamps the record with it; worker 1's retry read
+    "ongoing", found nothing held here, and put a Resume card over worker 2's
+    live run — which a Resume won here would then run a second time."""
+    answers = _Answers(BLIP, BLIP, dict(ONGOING, assignedWorker=2))
+    writes = _Writes(False, True)
+    _rehydrate(monkeypatch, tmp_path, answers, writes, fleet=2)
+
+    assert answers.reads == 3, "the retry never asked, or kept asking once it knew"
+    assert len(writes.attempts) == 1, "a Resume card was written over a sibling worker's run"
+
+
+def test_the_retry_leaves_a_run_a_sibling_worker_holds_the_lock_for(monkeypatch, tmp_path):
+    """⛔ AND THE SCAN'S FIRST QUESTION: a sibling holding the research's live
+    lock is running it, whatever the record's stamp says."""
+    answers = _Answers(BLIP, BLIP, ONGOING)
+    writes = _Writes(False, True)
+    _rehydrate(monkeypatch, tmp_path, answers, writes, fleet=2,
+               before_retry=lambda _q: _sibling_lock(tmp_path))
+
+    assert answers.reads == 3, "the retry never asked, or kept asking once it knew"
+    assert len(writes.attempts) == 1, "a Resume card was written over a run a sibling holds"
+
+
+def test_the_retry_leaves_a_run_a_resume_here_has_started(monkeypatch, tmp_path):
+    """⛔ THE SAME RACE AS THE RE-OFFER'S. A Resume here writes "ongoing" before
+    its job reaches the queue, so the queue cannot say it; what the Resume
+    records before it writes can."""
+    answers = _Answers(BLIP, BLIP, ONGOING)
+    writes = _Writes(False, True)
+    _rehydrate(monkeypatch, tmp_path, answers, writes,
+               before_retry=lambda _q: research._RESUMED_HERE.add(RID))
+
+    assert answers.reads == 3, "the retry never asked, or kept asking once it knew"
+    assert len(writes.attempts) == 1, "a Resume card was written over a run resumed here"
+
+
+def test_the_retry_still_marks_an_orphan_no_live_worker_owns(monkeypatch, tmp_path):
+    """⭐ OTHER POLARITY. Worker 1 marks a run whose owner is outside the fleet —
+    the scan's safety net — and its retry must too: a stamp outside the fleet is
+    no sibling's run."""
+    orphan = dict(ONGOING, assignedWorker=3)
+    writes = _Writes(False, True)
+    _rehydrate(monkeypatch, tmp_path, _Answers(BLIP, orphan), writes, fleet=2,
+               listed=orphan)
+
+    assert writes.statuses == ["paused_backend_restart", "paused_backend_restart"], (
+        "an orphan's recovery mark lost to the blip was never written again")
 
 
 @pytest.mark.parametrize("answer", [STOPPED, None], ids=["stopped-since", "deleted-since"])
