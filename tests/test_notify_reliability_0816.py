@@ -263,8 +263,9 @@ def test_nothing_in_flight_goes_straight_through():
 
 def test_something_in_flight_holds_and_sets_a_deadline():
     """⭐ The respawn would land on top of a POST that hands this run to the web
-    app, and killing the P4/P5 one aborts the request, SIGTERMs ffmpeg and
-    terminalises the research as stopped."""
+    app, and the P4/P5 one IS the rest of the run: the route runs P4 and P5
+    inside that request, so killing it abandons work nothing else is driving.
+    (Until 2026-09-19 a hang-up also made the route stop the run outright.)"""
     action, until = _hold()
     assert action == "hold"
     assert until == NOW + BUDGET

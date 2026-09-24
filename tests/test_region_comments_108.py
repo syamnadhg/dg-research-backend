@@ -173,6 +173,18 @@ def test_the_drive_wait_rationale_no_longer_cites_the_removed_abort_handler():
     # text that is present, which is a false alarm, and a reader chasing it
     # concludes the comment is missing when it is merely reflowed.
     assert "CLOSED SOCKET IS NOT A STOP" in SRC
+    # ⛔ AND THE TWO COPIES OF THE OLD REASON ARE GONE (wave 10.10). The
+    # respawn gate's docstring and its call site's comment still said the route
+    # "aborts the request, SIGTERMs ffmpeg and terminalises the research" a
+    # wave after the tombstone above retired that sentence. The tombstone
+    # quotes it in its own words ("SIGTERMs the in-flight ffmpeg child"), so
+    # this needle cannot be satisfied by the tombstone, only by a copy.
+    assert "SIGTERMs ffmpeg" not in SRC, (
+        "a note again says a dropped connection SIGTERMs ffmpeg — untrue since "
+        "2026-09-19; say the route runs P4/P5 inside the request instead")
+    assert "SIGTERMs the in-flight ffmpeg child" in SRC, (
+        "the tombstone that keeps the history is gone — this guard's needle "
+        "was chosen to miss it, so its absence means the text moved")
     assert research._FE_DRIVE_WAIT_SEC == 3600
     # ⛔ AND THE CONSTANT BESIDE IT SURVIVES. Rewriting this block deleted
     # `_FE_HANDOFF_WAIT_SEC` once — `ast.parse` was happy, because its two

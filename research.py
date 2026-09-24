@@ -9861,9 +9861,11 @@ async def _firebase_reconnect_loop():
                     # in the worker's `finally`, which is BEFORE the two POSTs
                     # that hand this run to the web app have returned — the phase
                     # notice, and the P4/P5 trigger that carries the rest of the
-                    # run. Neither has a replay path behind it, and killing the
-                    # second one aborts the request, SIGTERMs ffmpeg and
-                    # terminalises the research as stopped.
+                    # run. Neither has a replay path behind it, and the second
+                    # one IS the rest of the run: the route runs P4 and P5 inside
+                    # that request, so killing it abandons work nothing else is
+                    # driving. (It no longer stops the run outright — the route's
+                    # abort handler went on 2026-09-19; see _FE_DRIVE_WAIT_SEC.)
                     #
                     # ⭐ Only the RESPAWN can do that. The in-place rebind that a
                     # foreground serve takes is non-destructive — it swaps two
@@ -17613,9 +17615,10 @@ def _decide_respawn_hold(pending, wait_until, now, budget, supervised):
                 takes: the in-place rebind swaps two Firestore watches and
                 touches no outbound request, so there is nothing to wait for.
       "hold"    a respawn would land on top of a POST that hands this run to the
-                web app. The P4/P5 one is the dangerous one — the route aborts
-                when its client goes away, SIGTERMs ffmpeg and terminalises the
-                research as stopped.
+                web app. The P4/P5 one is the dangerous one — the route runs P4
+                and P5 inside that request, so a respawn abandons work nothing
+                else is driving. (A disconnect no longer stops the run — the
+                route's abort handler went on 2026-09-19; see _FE_DRIVE_WAIT_SEC.)
       "go_late" the deadline passed with something still in flight. ⛔ BOUNDED ON
                 PURPOSE: one wedged thread must not leave this worker
                 permanently deaf, which is the condition the respawn exists to
@@ -73182,9 +73185,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # VALUE IS GONE, AND IT IS THE TWIN OF THE ONE STEP 5 REMOVED IN
                 # PHASE 2. Nothing in this repository ever read
                 # `delivery.json["brief_url"]`, and that file is returned
-                # verbatim by `GET /api/runs/{id}` on a local server that binds
-                # every interface with no auth — so an unread copy there is
-                # exposure with no upside. Step 5 took the phase-2 mirror for
+                # verbatim by `GET /api/runs/{id}` on the local server — which,
+                # when this was written, listened on every interface with no
+                # auth (it binds 127.0.0.1 behind `ServeTokenMiddleware` now) —
+                # so an unread copy there was exposure with no upside. Step 5 took the phase-2 mirror for
                 # exactly this reason and left the phase-1 one behind.
                 # ⭐ THE CHECKPOINT WRITE ABOVE IS THE LIVE ONE and stays: a
                 # resume at phase 5 reads `brief_url` back off it and renders the
@@ -73826,9 +73830,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             #
             # ⛔ "Nothing reads the field" was true and was not the whole story.
             # `GET /api/runs/{id}` on the local server returns `delivery.json`
-            # verbatim, and that server binds every interface with no auth and no
-            # origin restriction — so the field had no reader in this repo and one
-            # on the network.
+            # verbatim, and when this was written that server listened on every
+            # interface with no auth and no origin restriction (it binds
+            # 127.0.0.1 behind `ServeTokenMiddleware` now) — so the field had no
+            # reader in this repo and one on the network.
             #
             # ▶ Removed rather than filtered. The one thing it fed is the file the
             # hand-off writes forty lines later, from a map that IS guarded and
