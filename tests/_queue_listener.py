@@ -92,8 +92,9 @@ class _Chain:
     def document(self, name):
         return self._db._route(self._path + (name,))
 
-    def get(self):
-        # users/{uid}/researches/{rid}
+    def get(self, **_options):
+        # users/{uid}/researches/{rid} — a restart retry's read passes the
+        # client's `retry`/`timeout` options, taken here and answered at once.
         if len(self._path) == 4 and self._path[0] == "users" and self._path[2] == "researches":
             key = (self._path[1], self._path[3])
             self._db.reads.append(key)

@@ -101,7 +101,9 @@ class _Snap:
 
 class _RecordDb:
     """Just `users/{uid}/researches/{rid}`, the way the funnel and the pickup
-    rule read it."""
+    rule read it. The re-offer's read passes the client's `retry`/`timeout`
+    options; the fakes here take them and answer at once, and `_OutageDb` is
+    the one that models what they do."""
 
     def __init__(self, answers):
         self.answers = answers
@@ -112,7 +114,7 @@ class _RecordDb:
     def document(self, _name):
         return self
 
-    def get(self):
+    def get(self, **_options):
         return _Snap(self.answers.next())
 
 
@@ -376,7 +378,7 @@ class _PerResearchDb:
             self.rid = name
         return self
 
-    def get(self):
+    def get(self, **_options):
         if self.down:
             raise BLIP
         answer = self.answers[self.rid]
@@ -652,7 +654,7 @@ def test_the_retry_reads_its_record_off_the_loop(monkeypatch, tmp_path):
         def document(self, _name):
             return self
 
-        def get(self):
+        def get(self, **_options):
             time.sleep(slow_s)
             return _Snap(QUEUED)
 
@@ -691,7 +693,11 @@ def test_a_read_that_never_answers_counts_as_unread(monkeypatch, tmp_path):
     """⛔ BOUNDED, SO ONE READ CANNOT HOLD UP THE REST. A read that never
     returns would stall every other held entry and every later round behind it;
     past the bound it counts as unread — the entry stays held — and an answer
-    that arrives after the round has moved on starts nothing."""
+    that arrives after the round has moved on starts nothing.
+
+    ⭐ THIS IS THE LOOP'S BACKSTOP, so this read ignores the deadline it is
+    given — a hang the RPC's deadline does not cover. The read's own deadline
+    is pinned below, by `test_a_held_entrys_read_gives_up_at_the_bound_itself`."""
     release = threading.Event()
 
     class _HungDb:
@@ -701,7 +707,7 @@ def test_a_read_that_never_answers_counts_as_unread(monkeypatch, tmp_path):
         def document(self, _name):
             return self
 
-        def get(self):
+        def get(self, **_options):
             release.wait(30)
             return _Snap(QUEUED)
 
@@ -725,6 +731,84 @@ def test_a_read_that_never_answers_counts_as_unread(monkeypatch, tmp_path):
     assert _rids(research._UNREAD_RESTORES) == [RID], "an entry that never answered was let go"
 
 
+class _OutageDb:
+    """Firestore in an outage, answering a record read the way the installed
+    client does. With its DEFAULT retry a `get()` keeps retrying UNAVAILABLE and
+    DeadlineExceeded for up to 300 s — a `timeout` alone only shortens each
+    attempt, and DeadlineExceeded is one of the errors it retries — so here it
+    blocks until the test releases it. Told `retry=None` and a `timeout`, it
+    makes ONE attempt and gives up at that deadline. Counts the reads, and the
+    ones still blocked."""
+
+    _DEFAULT = object()
+
+    def __init__(self):
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self.reads = 0
+        self.in_flight = 0
+
+    def collection(self, _name):
+        return self
+
+    def document(self, _name):
+        return self
+
+    def get(self, field_paths=None, transaction=None, retry=_DEFAULT, timeout=None):
+        with self._lock:
+            self.reads += 1
+            self.in_flight += 1
+        try:
+            if retry is None and timeout is not None:
+                self.release.wait(timeout)
+                raise TimeoutError("504 Deadline Exceeded")
+            self.release.wait(30)
+            raise ConnectionError("503 UNAVAILABLE: failed to connect to all addresses")
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+def test_a_held_entrys_read_gives_up_at_the_bound_itself(monkeypatch, tmp_path):
+    """⛔ THE BOUND FREED THE LOOP, NOT THE THREAD (re-verify of this wave). The
+    loop stopped waiting for a read past the bound, but the read went on in the
+    default executor, retrying for up to 300 s — one more blocked thread per
+    held entry every round, in the executor every other off-loop call shares.
+    Three held entries through an outage: when the schedule ends, no read may
+    still be blocked beyond a moment past its deadline."""
+    db = _OutageDb()
+    _machine(monkeypatch, tmp_path, None)                    # boot: no client, held
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0, 0, 0))
+    monkeypatch.setattr(research, "_RESTART_RETRY_READ_TIMEOUT_S", 0.3)
+    path = _snapshot(tmp_path, [_job("chat_a_1", "A"), _job("chat_b_2", "B"),
+                                _job("chat_c_3", "C")])
+    q = _Q()
+    left: dict = {}
+
+    async def _go():
+        research._restore_pending_queue_snapshot(path, q, set())
+        monkeypatch.setattr(research, "_firebase_db", db)
+        try:
+            await asyncio.wait_for(asyncio.gather(*list(research._RESTART_RETRIES)), 60)
+            # The loop's backstop and the read's deadline are the same bound, so
+            # the last read may end a moment after its round has moved on.
+            settle_by = time.monotonic() + 3
+            while db.in_flight and time.monotonic() < settle_by:
+                await asyncio.sleep(0.05)
+            left["blocked"] = db.in_flight
+        finally:
+            db.release.set()
+
+    asyncio.run(_go())
+
+    assert db.reads == 3 * 3, "the retry did not read every held entry every round"
+    assert left["blocked"] == 0, (
+        f"{left['blocked']} record reads were still blocked in the shared executor "
+        f"after the retry's schedule ended")
+    assert list(q._queue) == [], "a run was started on a read that never answered"
+    assert sorted(_rids(research._UNREAD_RESTORES)) == ["chat_a_1", "chat_b_2", "chat_c_3"]
+
+
 def test_an_entry_reset_backend_drained_while_its_read_was_out_is_not_started(
         monkeypatch, tmp_path):
     """⛔ THE READ IS OFF THE LOOP NOW, SO THE HELD LIST CAN CHANGE UNDER IT.
@@ -738,7 +822,7 @@ def test_an_entry_reset_backend_drained_while_its_read_was_out_is_not_started(
         def document(self, _name):
             return self
 
-        def get(self):
+        def get(self, **_options):
             # Reset Backend's own drain statement, on another thread, mid-read.
             del research._UNREAD_RESTORES[:]
             return _Snap(QUEUED)

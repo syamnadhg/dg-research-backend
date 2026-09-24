@@ -16948,7 +16948,8 @@ def _safe_enqueue(job_queue, job, source: str,
                   allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart"),
                   *, take_unreadable: bool = False,
                   hold_unreadable: "list | None" = None,
-                  record_seen: "dict | None" = None) -> bool:
+                  record_seen: "dict | None" = None,
+                  read_options: "dict | None" = None) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -17009,6 +17010,10 @@ def _safe_enqueue(job_queue, job, source: str,
     that succeeded and found one. The held entry's re-offer needs more of the
     record than its status to tell a run it may start from one a Resume has
     already started elsewhere; see `_run_taken_since_boot`.
+
+    ⭐ `read_options`, when given, go to the record read's `get()` — the held
+    entry's re-offer bounds its read with them; see `_ask_about_held_entry`.
+    Every other caller reads with the client's defaults, as it always has.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -17061,7 +17066,7 @@ def _safe_enqueue(job_queue, job, source: str,
     else:
         try:
             snap = _firebase_db.collection("users").document(uid_v) \
-                .collection("researches").document(rid).get()
+                .collection("researches").document(rid).get(**(read_options or {}))
             if not snap.exists:
                 log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
                 return False
@@ -17272,11 +17277,22 @@ def _ask_about_held_entry(job) -> "tuple[str, dict]":
     """The funnel's verdict on one held entry — "take", "no" or "unread" — and
     the record its read saw. Runs OFF the loop, because it reads Firestore, and
     changes nothing outside its own locals: what the verdict does is decided back
-    on the loop, in `_settle_held_entry`."""
+    on the loop, in `_settle_held_entry`.
+
+    ⛔ THE READ ITSELF GIVES UP AT THE BOUND (re-verify of this wave). The loop's
+    `wait_for` frees the loop, not this thread: the installed client retries
+    UNAVAILABLE and DeadlineExceeded for up to 300 s by default, so in an outage
+    every round left one more thread blocked per held entry, in the default
+    executor some seventy other off-loop calls share. One attempt with a
+    deadline — `retry=None` and `timeout` — ends the thread with the round, and
+    the loop's own bound stays as a backstop for a hang the deadline does not
+    cover."""
     staged, unread, record = _StagedQueue(), [], {}
     took = _safe_enqueue(staged, job, source="disk-restore-retry",
                          allowed_statuses=("queued", "ongoing"),
-                         hold_unreadable=unread, record_seen=record)
+                         hold_unreadable=unread, record_seen=record,
+                         read_options={"retry": None,
+                                       "timeout": _RESTART_RETRY_READ_TIMEOUT_S})
     if unread:
         return "unread", {}
     return ("take" if took else "no"), record

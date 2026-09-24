@@ -37,6 +37,8 @@ The quiet ones matter most:
         stopped, over a record it could not read, or over a run somebody
         started since boot.
   Q9/Q10 — the re-offer's read runs on the loop, or waits for ever.
+  Q13-Q15 — the loop stops waiting but the read's THREAD goes on, retrying for
+        300 s in the shared executor (re-verify of this wave).
 
 ⛔ A KILL IS A FAILED OR ERRORED TEST, NEVER A SKIP. Fewer passes with more
 skips is counted as a survivor: a pin that stops running looks exactly like one
@@ -70,6 +72,7 @@ GATE = "        if not take_unreadable:"
 STATUS = "            if status not in allowed_statuses:"
 SEEN = ("            if record_seen is not None:\n"
         "                record_seen.update(_record)")
+FUNNEL_READ = '                .collection("researches").document(rid).get(**(read_options or {}))'
 
 # ── anchors: the boot restore and its retry ─────────────────────────────────
 RESTORE_CALL = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
@@ -79,7 +82,12 @@ RESTORE_SPAWN = ("    if _UNREAD_RESTORES:\n"
                  "        _retry_after_restart(_reoffer_unread_restores(job_queue))")
 RETRY_CALL = ('    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
               '                         allowed_statuses=("queued", "ongoing"),\n'
-              '                         hold_unreadable=unread, record_seen=record)')
+              '                         hold_unreadable=unread, record_seen=record,')
+RETRY_READ_OPTIONS = ('                         hold_unreadable=unread, record_seen=record,\n'
+                      '                         read_options={"retry": None,\n'
+                      '                                       "timeout": '
+                      '_RESTART_RETRY_READ_TIMEOUT_S})')
+RETRY_NO_RETRY = '                         read_options={"retry": None,'
 ASK_UNREAD = ('    if unread:\n'
               '        return "unread", {}')
 RETRY_LET_GO = ('    if answer == "unread":\n'
@@ -192,13 +200,13 @@ MUTANTS = [
     ("Q1", "over", "⛔⛔ the retry takes the funnel's DEFAULT whitelist — a run "
      "rehydration parked for its person's Resume is relaunched (#728)",
      [(RETRY_CALL, '    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
-                   '                         hold_unreadable=unread, record_seen=record)')],
+                   '                         hold_unreadable=unread, record_seen=record,')],
      RESEARCH, PICKUP),
     ("Q2", "over", "⛔⛔ the retry takes a job it still cannot check",
      [(RETRY_CALL, '    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
                    '                         allowed_statuses=("queued", "ongoing"),\n'
                    "                         take_unreadable=True,\n"
-                   '                         hold_unreadable=unread, record_seen=record)')],
+                   '                         hold_unreadable=unread, record_seen=record,')],
      RESEARCH, PICKUP),
     ("Q3", "under", "⛔ the retry lets an entry go that never answered — dropped "
      "from memory, and from the file at the next rewrite",
@@ -218,8 +226,8 @@ MUTANTS = [
                       "        pass\n"
                       "    except ValueError:")],
      RESEARCH, PICKUP),
-    ("Q4b", "over", "⛔ an entry Reset Backend drained between the settle's check "
-     "and its remove is queued anyway — a run the reset just stopped starts",
+    ("Q4b", "over", "⛔ an entry Reset Backend drained is queued anyway when the "
+     "settle's remove misses it — a run the reset just stopped starts",
      [(DRAINED_SINCE, "        pass\n"
                       '    if answer != "take":')],
      RESEARCH, PICKUP),
@@ -232,7 +240,7 @@ MUTANTS = [
      "run is answered-refused, let go, and erased at the next rewrite",
      [(RETRY_CALL, '    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
                    '                         allowed_statuses=("queued",),\n'
-                   '                         hold_unreadable=unread, record_seen=record)')],
+                   '                         hold_unreadable=unread, record_seen=record,')],
      RESEARCH, PICKUP),
     ("Q7", "over", "one entry's answer is taken for every entry of the round — an "
      "unreadable first entry keeps an answered one held, or the reverse",
@@ -253,6 +261,20 @@ MUTANTS = [
      "other held entry and every later round",
      [(RETRY_READ, "                answer, record = await asyncio.to_thread("
                    "_ask_about_held_entry, job)")],
+     RESEARCH, PICKUP),
+    ("Q13", "under", "⛔ the re-offer's read is not told to give up — in an outage "
+     "each one retries for 300 s, one more blocked thread per held entry per "
+     "round in the shared executor",
+     [(RETRY_READ_OPTIONS, "                         hold_unreadable=unread, "
+                           "record_seen=record)")],
+     RESEARCH, PICKUP),
+    ("Q14", "under", "the read gets a deadline but keeps the client's retry — "
+     "DeadlineExceeded is one of the errors it retries, for 300 s",
+     [(RETRY_NO_RETRY, "                         read_options={")],
+     RESEARCH, PICKUP),
+    ("Q15", "under", "the funnel drops the read options it was handed — the "
+     "re-offer's bound never reaches the read",
+     [(FUNNEL_READ, '                .collection("researches").document(rid).get()')],
      RESEARCH, PICKUP),
     ("Q11", "over", "⛔⛔ the re-offer never asks whether somebody started the run "
      "since boot — one research runs twice",
