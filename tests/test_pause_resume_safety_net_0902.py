@@ -105,9 +105,14 @@ def _clean_runtime_and_controls(monkeypatch):
     # ⭐ Measured, so it is not a lurking product defect: `--serve` runs ONE
     # `asyncio.run` for the whole process (`main`'s --serve branch) and the CLI one
     # per process, so production never has a second loop to be bound to.
-    research._controls.stop_event = asyncio.Event()
-    research._controls.pause_event = asyncio.Event()
-    research._controls.resume_event = asyncio.Event()
+    # ⛔ THROUGH monkeypatch, SO THE REBINDING ENDS WITH THE TEST. Plain
+    # assignment left this file's last Events on the singleton, bound to a loop
+    # pytest-asyncio had already closed, and whichever test ran next and awaited
+    # one met "bound to a different event loop" — a failure that depended only
+    # on test order. `test_controls_isolation_1010.py` runs that order.
+    monkeypatch.setattr(research._controls, "stop_event", asyncio.Event())
+    monkeypatch.setattr(research._controls, "pause_event", asyncio.Event())
+    monkeypatch.setattr(research._controls, "resume_event", asyncio.Event())
     monkeypatch.setattr(research, "_cli_mode", False)
     # The resume path sleeps 3s per reopened tab (`resume_browser_from_checkpoint`).
     _real_sleep = asyncio.sleep
