@@ -221,14 +221,19 @@ def test_the_retry_never_starts_what_the_record_says_no_to(monkeypatch, tmp_path
     """⛔⛔ THE BOOT RESTORE'S REASON, KEPT (#728). A run rehydration parked for
     its person's Resume answers `paused_backend_restart` on the later read and
     is let go — as is one that is over, archived or gone. An answer ends the
-    hold; it is not asked about again."""
-    _machine(monkeypatch, tmp_path, _Answers(BLIP, BLIP, answer))
+    hold; it is not asked about again.
+
+    ⛔ The read count is what makes this unsatisfiable by a machine that never
+    retries at all: two reads at boot, ONE by the retry, and none after it."""
+    answers = _Answers(BLIP, BLIP, answer)
+    _machine(monkeypatch, tmp_path, answers)
     path = _snapshot(tmp_path, [_job()])
     q = _Q()
 
     _boot_and_retry(path, q)
 
     assert list(q._queue) == [], "the retry relaunched a run its record said no to"
+    assert answers.reads == 3, "the retry never asked, or asked again after an answer"
     assert research._UNREAD_RESTORES == [], "an entry that got its answer is still held"
 
 
@@ -481,9 +486,11 @@ def test_the_retry_leaves_a_run_that_moved_on(monkeypatch, tmp_path, answer):
     """⛔⛔ MINUTES PASS BETWEEN TRIES. A person who pressed Stop in the meantime
     would have their run moved back to an offer of a Resume; a research deleted
     in the meantime is the pickup rule's to stand down."""
+    answers = _Answers(BLIP, BLIP, answer)
     writes = _Writes(False, True)
-    _rehydrate(monkeypatch, tmp_path, _Answers(BLIP, BLIP, answer), writes)
+    _rehydrate(monkeypatch, tmp_path, answers, writes)
 
+    assert answers.reads == 3, "the retry never asked, or kept asking after an answer"
     assert len(writes.attempts) == 1, "the retry wrote over a run that had moved on"
 
 
@@ -499,10 +506,11 @@ def test_the_retry_leaves_a_run_this_process_holds_again(monkeypatch, tmp_path, 
         else:
             q._queue.append(job)
 
+    answers = _Answers(BLIP, BLIP, ONGOING)
     writes = _Writes(False, True)
-    _rehydrate(monkeypatch, tmp_path, _Answers(BLIP, BLIP, ONGOING), writes,
-               before_retry=_picked_up_again)
+    _rehydrate(monkeypatch, tmp_path, answers, writes, before_retry=_picked_up_again)
 
+    assert answers.reads == 3, "the retry never asked, or kept asking once it knew"
     assert len(writes.attempts) == 1, "a Resume card was written over a run this process holds"
 
 
