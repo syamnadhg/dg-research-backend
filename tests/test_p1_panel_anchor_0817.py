@@ -217,13 +217,16 @@ def test_a_clickable_row_whose_text_names_a_known_state_is_still_pressed():
     """The original two-signal rule, preserved — but 2026-08-18 moved WHICH pass
     gets there.
 
-    ⭐ `inter && wordy` is now structurally unreachable as a deciding arm, and
-    that is correct rather than broken: "wordy" is exactly what the global walk
-    matches on, so any row this arm would qualify is a row the pass with 13
-    recorded successes already handles. The arm stays as a last resort for the
-    case where the global walk is somehow blind. What must not change is that
-    this shape still gets PRESSED — so that is what this pins now, instead of
-    the anchor that used to report it."""
+    ⭐ On a page the global walk can scan, `inter && wordy` never decides:
+    "wordy" is what the global walk matches on, so the pass with 13 recorded
+    successes presses this row first. What must not change is that this shape
+    still gets PRESSED — so that is what this pins, instead of the anchor that
+    used to report it.
+
+    ⛔ This used to say the arm was "structurally unreachable". It is not, and
+    because this test cannot tell the arm from its absence, deleting the arm
+    survived mutation. The page where only this arm can press the row is the
+    next test."""
     row = el("section", {"data-testid": "conversation-turn-2", "w": "600",
                          "h": "40", "x": "300", "y": "250"},
              kids=[el("div", {"role": "button", "w": "300", "h": "24",
@@ -232,6 +235,45 @@ def test_a_clickable_row_whose_text_names_a_known_state_is_still_pressed():
     got = _open(_page(row))
     assert got.get("clicked") is True, got
     assert "Searching the web" in (got.get("label") or ""), got
+
+
+def test_the_known_state_row_is_pressed_by_pass_0_when_the_global_walk_gives_up():
+    """⭐ The case the `inter && wordy` arm is kept for, run through the page JS.
+
+    The global walk scans the whole DOCUMENT and abandons it once it passes the
+    node ceiling. PASS 0 scans only `main`. A long sidebar of old conversations
+    sits outside `main`, so a page can be too big for the global walk while the
+    thread is not. Then the global walk sees nothing and PASS 0 is the only pass
+    left that can press the strip.
+
+    The row is the one PASS 0 shape the corpus ever saw fire: a click target
+    reading "Searching the web". It has no shimmer, no gradient and no ChatGPT
+    test id, so `inter && wordy` is the only arm that can qualify it."""
+    js = _panel_js()
+    cap = int(js.split("const NODE_CAP =")[1].split(";")[0].strip())
+    row = el("section", {"data-testid": "conversation-turn-2", "w": "600",
+                         "h": "40", "x": "300", "y": "250"},
+             kids=[el("div", {"role": "button", "w": "300", "h": "24",
+                              "x": "300", "y": "250"},
+                      text="Searching the web")])
+    sidebar = el("nav", {"w": "260", "h": "900", "x": "0", "y": "0"},
+                 kids=[el("i", {}, "", repeat=cap + 50)])
+    page = el("body", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+        sidebar,
+        el("main", {"w": "1440", "h": "900", "x": "0", "y": "0"},
+           kids=[_user_bubble(), row, _disclaimer(), _model_chip()]),
+    ])
+    # The control: with PASS 0 told to stand down, nothing on this page is
+    # pressed, and the reason is the ceiling. So the press below can only have
+    # come from PASS 0.
+    skipped = _open(page, skip_structural=True)
+    assert skipped.get("found") is False, skipped
+    assert skipped.get("reason") == "node_cap", skipped
+    got = _open(page)
+    assert got.get("anchor") == "structural", got
+    assert got.get("clicked") is True, got
+    assert "Searching the web" in (got.get("label") or ""), got
+    assert "+inter+wordy" in (got.get("why") or ""), got
 
 
 def test_the_composer_subtree_is_still_excluded():
@@ -327,6 +369,31 @@ def test_the_named_row_outranks_a_bare_shimmer():
                       _strip("Some other animated line", y=250, named=False,
                              button=False)))
     assert "Developed the security scope" in (got.get("label") or ""), got
+
+
+def test_the_row_nearest_the_message_wins_when_the_evidence_ties():
+    """⭐ Nearest-wins is the RANKING, and it has to decide something.
+
+    Two rows in the newest turn carry the same evidence: a shimmer on an inner
+    span, inside the turn, no click target, no ChatGPT test id. Their scores
+    then differ only by distance from the last user message. The live strip is
+    the first row under the message; the other sits further down the same turn.
+    Take the score out of the sort and the tie falls to the shorter text, which
+    here is the wrong row.
+
+    ⛔ The source pin on `- offTop / 1000` could not see this: the penalty stays
+    in the score whether or not the sort reads the score."""
+    live = _strip("Developed the security scope", y=242, named=False,
+                  button=False, in_turn=False)
+    lower = _strip("Compared vendors", y=520, named=False, button=False,
+                   in_turn=False)
+    turn = el("section", {"data-testid": "conversation-turn-2", "w": "600",
+                          "h": "1800", "x": "300", "y": "242"},
+              kids=[live, lower])
+    got = _open(_page(turn))
+    assert got.get("anchor") == "structural", got
+    assert "Developed the security scope" in (got.get("label") or ""), got
+    assert "Compared vendors" not in (got.get("label") or ""), got
 
 
 def test_the_pick_reports_why_it_qualified():
