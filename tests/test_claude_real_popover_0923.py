@@ -732,3 +732,108 @@ def test_the_pre_send_check_hands_the_button_read_back(monkeypatch):
     state = asyncio.run(research.ensure_deep_mode_active(page, "claude", "2B",
                                                          reactivate=False))
     assert state.get("effortOk") is False, state
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The caption names the tier the pre-send read SEES, not the tier setup read
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# ⛔ The gap: setup read Low, the computer-use pass then moved the tier to a THIRD
+# one, and the tile said "researching at Low effort — Max could not be set" about
+# a run at High. The model button shows the tier in effect — on the 09-20 run it
+# read "Opus 5 Low" (the computer-use pass's own words in that run's log) while
+# the plan chip read "Boss · Max" — so the pre-send read names what it sees on
+# the button, and setup's read stands only when the button shows no tier.
+#
+# Each test runs the REAL pre-send check through the shim, then the telemetry
+# block of `start_agent_no_gemini_wait` on what that check handed back.
+
+_SETUP_READ_LOW = {"effort": False, "thinking": False, "effort_got": "low"}
+
+
+def _plan_chip():
+    """This account's plan chip. It reads "Max", and it comes BEFORE the model
+    button in document order, so a page-wide read meets it first."""
+    return el("nav", {}, "", [el("button", {"aria-label": "DECOY-plan"}, "Boss · Max")])
+
+
+def _presend(trigger):
+    """The real pre-send check against a composer whose button reads `trigger`,
+    with the plan chip on the page and the popover shut, as at send time."""
+    page = DomPage(el("body", {}, "", [_plan_chip(), _trigger(trigger)]))
+    return asyncio.run(research.ensure_deep_mode_active(page, "claude", "2B",
+                                                        reactivate=False))
+
+
+def _after_presend(trigger, setup=_SETUP_READ_LOW):
+    """(telemetry lines, tile captions) once the pre-send read of `trigger` ran."""
+    return _run_telemetry(dict(setup), _presend(trigger), with_captions=True)
+
+
+def _unconfirmed(lines):
+    return [m for _, m in lines if "thinking config unconfirmed" in m]
+
+
+def test_a_button_showing_the_wanted_tier_puts_up_no_caption():
+    lines, captions = _after_presend("Opus 5.5 Max")
+    assert captions == [], captions
+    assert not _unconfirmed(lines), lines
+
+
+def test_a_third_tier_on_the_button_is_the_tier_the_caption_names():
+    """⭐ The verifier's case: wanted Max, setup read Low, the computer-use pass
+    moved it to High. The tile and the log both say High."""
+    lines, captions = _after_presend("Opus 5.5 High")
+    assert captions == ["Claude is researching at High effort — Max could not be set"]
+    hit = _unconfirmed(lines)
+    assert hit and "(effort is 'high', not the 'max' wanted)" in hit[0], lines
+
+
+def test_a_button_showing_no_tier_leaves_the_tier_setup_read():
+    lines, captions = _after_presend("Opus 5.5")
+    assert captions == ["Claude is researching at Low effort — Max could not be set"]
+    hit = _unconfirmed(lines)
+    assert hit and "(effort is 'low', not the 'max' wanted)" in hit[0], lines
+
+
+def test_the_plan_chip_saying_max_is_never_the_tier_read():
+    """⛔ The chip says Max and the button shows no tier. A page-wide read would
+    name Max, which is the tier wanted, and the tile would say nothing about a run
+    setup read at Low."""
+    state = _presend("Opus 5.5")
+    assert state["hasExtended"] is True, "precondition: the button was found"
+    assert not state.get("effortShown"), state
+    _lines_, captions = _after_presend("Opus 5.5")
+    assert captions and "Low effort" in captions[0], captions
+
+
+def test_a_tier_setup_never_read_is_named_once_the_button_shows_one():
+    """Setup read no tier (a press that did not verify leaves it unknown); the
+    pre-send read then SEES High on the button. That is a tier read, so it is
+    named — silence here would hide a run that is not at the tier wanted."""
+    lines, captions = _after_presend(
+        "Opus 5.5 High", setup={"effort": False, "thinking": False, "effort_got": None})
+    assert captions == ["Claude is researching at High effort — Max could not be set"]
+    hit = _unconfirmed(lines)
+    assert hit and "(effort is 'high', not the 'max' wanted)" in hit[0], lines
+
+
+def test_the_model_refresh_report_counts_the_tier_the_button_shows():
+    """The consumer of the telemetry line reads its list up to the first ')', so
+    the clause naming the button's tier must parse as its own row."""
+    from scripts import model_refresh_report as report
+    lines, _captions_ = _after_presend("Opus 5.5 High")
+    s = report.summarize([m for _, m in lines])
+    assert s["thinking_misses"] == {"effort is 'high', not the 'max' wanted": 1}
+
+
+def test_e2e_a_pass_that_moves_low_to_high_is_captioned_high(said):
+    """End to end on today's markup: setup reads Low off the real Effort row and
+    records it; the computer-use pass then moves the button to High; the pre-send
+    read sees High, and the tile names it."""
+    _run(DomPage(_page(trigger="Opus 5.5 Low", effort="Low")), allow_probe=True)
+    setup = research._P2_THINKING_STATE["claude"]
+    assert setup["effort"] is False and setup["effort_got"] == "low", setup
+    lines, captions = _after_presend("Opus 5.5 High", setup=setup)
+    assert captions == ["Claude is researching at High effort — Max could not be set"]
+    assert "(effort is 'high', not the 'max' wanted)" in _unconfirmed(lines)[0], lines

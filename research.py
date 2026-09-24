@@ -55706,6 +55706,15 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
     // opening seconds before the brief is submitted. One detector, two policies;
     // a second detector is how the two drifted the first time.
     let effortOk = false;
+    // ⭐⭐ 2026-09-23 — AND WHICH TIER THE TRIGGER SHOWS, when it shows one. The
+    // caption on Claude's tile goes up at the PRE-SEND check, after the
+    // computer-use pass has had its turn at the tier, so it must name the tier
+    // THIS read sees — not the one setup read before that pass. A pass that moved
+    // Low to High left the tile saying "Low" while the run was at High. The real
+    // button does carry a tier that is not the wanted one: on the 09-20 run it
+    // read "Opus 5 Low" while the account's plan chip read "Boss · Max".
+    // Undefined when the label names no tier; the caller then names setup's read.
+    let effortShown;
     const ew = String(P.effortWord || '').toLowerCase();
     if (trigger && ew) {
         const label = (trigger.getAttribute('aria-label') || '') + ' '
@@ -55724,7 +55733,15 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
         // other stood — and this file's own rule applies: a line that cannot change
         // an answer gets read as load-bearing by the next person and tested by
         // nobody. One guard, with a test that fails if it goes.
-        effortOk = label.toLowerCase().split(/[^a-z0-9.]+/).indexOf(ew) !== -1;
+        const toks = label.toLowerCase().split(/[^a-z0-9.]+/);
+        effortOk = toks.indexOf(ew) !== -1;
+        // Only the words the Effort submenu LABELS its rungs with count as a tier
+        // (the 08-17 capture: Low / Medium / HighDefault / Extra / Max) — nothing
+        // else on this label is one. `xhigh` is a test id, never a label a person
+        // or this button shows, so it is not here. None of these words holds a
+        // ')', which the telemetry clause that names it depends on.
+        const TIERS = ['low', 'medium', 'high', 'extra', 'max'];
+        effortShown = toks.find(t => TIERS.indexOf(t) !== -1);
     }
     // Research tool shows as a magnifying-glass icon / label near composer.
     const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
@@ -55737,7 +55754,7 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
                     b.classList.contains('active') ||
                     b.classList.contains('selected'));
         });
-    return { hasExtended, researchOn, effortOk };
+    return { hasExtended, researchOn, effortOk, effortShown };
 }"""
 
 
@@ -55892,7 +55909,11 @@ def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict
       * `button_shows_wanted`   — the pre-send read of the model button (taken
                                   AFTER the computer-use pass) shows the wanted
                                   tier: it was set after setup. A note, no miss.
-      * `state["effort_got"]`   — the tier setup read and could not change: named.
+      * `state["effort_got"]`   — the tier last READ and not the one wanted: named.
+                                  The caller passes the tier the pre-send read
+                                  saw on the model button when it saw one, and
+                                  the tier setup read only when it saw none —
+                                  the computer-use pass may have moved it since.
       * otherwise               — unknown, worded exactly as before, so the model
                                   refresh report keeps counting it.
 
@@ -59955,9 +59976,12 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             # `effortOk` is REPORTED, never gated on (see the detector): it is the
             # only read of the effort taken AFTER the computer-use pass, and the
             # post-setup telemetry line uses it to say what that pass left.
+            # `effortShown` is the tier that same read SAW on the button, which
+            # the telemetry line and the tile's caption name.
             return {"platform": "claude", "active": ok,
                     "hasExtended": bool(state.get("hasExtended")),
                     "researchOn": bool(state.get("researchOn")),
+                    "effortShown": state.get("effortShown"),
                     "effortOk": bool(state.get("effortOk"))}
     except Exception as e:
         log(f"[{label}] ensure_deep_mode_active error: {e}", "WARN")
@@ -62502,8 +62526,16 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # the tier it read (`effort_got`), and the pre-send check just
                 # read the model button again — AFTER the computer-use pass. Say
                 # what those found; "max effort" alone is left for "unknown".
+                # ⭐ The tier NAMED is the one that later read SEES on the button
+                # when it sees one, and setup's only when it sees none: the pass
+                # may have moved the tier to a third one, and a tile saying "Low"
+                # about a run at High is as false as one saying Low about Max.
+                # ONE value feeds the telemetry clause and the caption, so the log
+                # and the tile cannot name two different tiers.
+                _eff_now = ((mode_state or {}).get("effortShown")
+                            or _tstate.get("effort_got"))
                 _eff_after = _claude_effort_after_setup(
-                    _pol.get("effort"), _tstate,
+                    _pol.get("effort"), {**_tstate, "effort_got": _eff_now},
                     bool((mode_state or {}).get("effortOk")))
                 if _eff_after["note"]:
                     log(f"[{label}] Phoenix: {_eff_after['note']}", "INFO")
@@ -62515,7 +62547,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # the person reads it. Only a tier that was READ
                 # (`_claude_effort_report` gives no caption for an unknown one).
                 _eff_caption = (_claude_effort_report(
-                    _pol.get("effort"), _tstate.get("effort_got"))["notice"]
+                    _pol.get("effort"), _eff_now)["notice"]
                     if _eff_after["missing"] else None)
                 if _eff_caption:
                     try:

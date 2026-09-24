@@ -122,8 +122,14 @@ def test_the_detector_reports_all_THREE_halves():
     ⚠ RE-ANCHORED 2026-08-17: effort was the missing third. Its absence is why a
     run could log `select_effort_tier: missed` and, one line later, `outcome
     satisfied at 'builtin' — skipping vision_cua, cua_validate`.
+
+    ⚠ EXECUTED since 2026-09-23. This read the detector's `return` line as text,
+    so the fourth answer (`effortShown`, the tier the button shows) broke it
+    without anything having been dropped. Running the detector asks the question
+    this test is about: are all three halves in what it hands back?
     """
-    assert "return { hasExtended, researchOn, effortOk };" in DETECTOR
+    out = _detect("Opus 5 Max")
+    assert {"hasExtended", "researchOn", "effortOk"} <= set(out), out
 
 
 def _detect(trigger_label, *, elsewhere=(), effort_word="max", fam="opus"):
@@ -211,6 +217,34 @@ def test_the_glyph_does_not_break_a_REAL_effort_word_either():
     # The control: stripping the empty token must not cost a genuine match.
     out = _detect("Opus 5 Max ", effort_word="max")
     assert out["effortOk"] is True
+
+
+# ── 2026-09-23: WHICH tier the button shows, for the caption ───────────────
+# The tile's caption is decided at the pre-send check, after the computer-use
+# pass, so it names the tier THIS detector sees on the button — see
+# test_claude_real_popover_0923 for the caption itself.
+
+@pytest.mark.parametrize("label,effort_word,shown", [
+    ("Opus 5 Low", "max", "low"),              # the 09-20 run's button
+    ("Opus 5 Medium", "max", "medium"),
+    ("Opus 5.5 High", "max", "high"),
+    ("Opus 5.5 Extra", "max", "extra"),
+    ("Opus 5 Max", "high", "max"),             # a policy that asks for less
+    # the icon glyph the live label ends in splits like a space
+    ("Opus 5.5 High" + chr(0xE08F), "max", "high"),
+])
+def test_the_detector_names_the_tier_the_button_shows(label, effort_word, shown):
+    out = _detect(label, effort_word=effort_word, elsewhere=["Boss · Max"])
+    assert out.get("effortShown") == shown, out
+
+
+def test_a_button_with_no_tier_names_none_whatever_else_the_page_says():
+    """⛔ This account's plan chip says "Max". The tier shown is read off the
+    button or not at all: a page-wide read would name Max here, and the caption
+    would stay silent about a run that is not at Max."""
+    out = _detect("Opus 5.5", elsewhere=["Boss · Max", "Max effort"])
+    assert out["hasExtended"] is True, "precondition: the button was found"
+    assert not out.get("effortShown"), out
 
 
 def test_the_effort_term_is_reported_not_self_gated():
