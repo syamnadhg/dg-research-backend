@@ -121,22 +121,39 @@ def test_the_guard_read_the_repository_and_not_nothing():
     assert len(notes) > 5000, f"only {len(notes)} notes found in research.py"
 
 
+def _stale_exemptions(hits) -> "list[tuple[str, str]]":
+    used = {_exemption_for(h) for h in hits} - {None}
+    return [e[:2] for e in EXEMPTIONS if e not in used]
+
+
 def test_every_exemption_is_still_needed():
     """An entry that matches nothing is a stale licence for the next pointer
     written in its file. Delete it."""
-    used = {_exemption_for(h) for h in _all_hits()} - {None}
-    stale = [e[:2] for e in EXEMPTIONS if e not in used]
+    stale = _stale_exemptions(_all_hits())
     assert not stale, f"exemptions that match nothing any more — delete them: {stale}"
 
 
-def test_an_exemption_covers_its_own_file_only():
+def test_a_stale_exemption_is_reported():
+    """⭐ ACCEPT POLARITY for the test above, which can only go red on a tree
+    that has let an exemption go stale — so the reporting is driven here."""
+    path, text, _why = EXEMPTIONS[0]
+    only_first = [lp.Hit(path, 1, "file:N", text, "quoted: " + text)]
+    assert _stale_exemptions(only_first) == [e[:2] for e in EXEMPTIONS[1:]]
+    assert _stale_exemptions([]) == [e[:2] for e in EXEMPTIONS]
+
+
+def test_an_exemption_covers_its_own_file_and_text_only():
     """⛔ The text of an exemption is not a licence anywhere else: the same
-    quoted pointer written into another file is a new pointer."""
+    quoted pointer written into another file is a new pointer, and so is a
+    second pointer written into the very note the exemption covers."""
     path, text, _why = EXEMPTIONS[0]
     here = lp.Hit(path, 1, "file:N", text, "quoted: " + text)
     elsewhere = lp.Hit("README.md", 1, "file:N", text, "quoted: " + text)
+    other = "vision.py:" + "269"
+    beside = lp.Hit(path, 1, "file:N", other, "quoted: " + text + " and " + other)
     assert _exemption_for(here) is not None
     assert _exemption_for(elsewhere) is None
+    assert _exemption_for(beside) is None
 
 
 def test_the_exemption_list_only_shrinks():
@@ -196,6 +213,7 @@ LOOK_ALIKES = [
     "0.0.0.0:8000 LISTENING",
     "Expecting value: line 1 column 1 (char 0)",
     "Expecting property name enclosed in double quotes: line 7 column 1",
+    "Expecting ',' delimiter: line 120 column 5 (char 4410)",
     'File "/x/firestore_v1/watch.py", line 572, in push',
     "Observable in BE log line 37642 at 09:08:58",
     "backend.log 49728 shows it",
