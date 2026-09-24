@@ -112,6 +112,12 @@ MINE = (
     "doctors_could_not_look or unknown_not_stuck or "
     "TIME_WAIT_socket_still_clears or identifiable_holder_is_unaffected or "
     "serve_refuses_with_its_own_words or "
+    # ⛔ Wave 10.9 (09-21, the Windows netstat fix) added thirteen guards to this
+    # file after the harness was written: the parse on four languages of
+    # Windows, the real probe against a netstat stand-in, and the German
+    # `_free_port`. Every one of them runs the probe this harness mutates.
+    "windows_parse or translated_state_column or windows_probe or "
+    "translated_windows or windows_netstat or german_windows or "
     # tests/test_serve_port_reclaim_0810.py — the 08-10 reclaim suite, which
     # this wave re-pointed at `_listening_pids`, plus the two pins added with
     # this harness.
