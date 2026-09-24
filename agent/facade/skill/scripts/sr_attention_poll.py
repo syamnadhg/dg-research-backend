@@ -602,7 +602,7 @@ def _signed_in_line(signed_in: dict) -> str:
             f"Starting {quoted}{on_dev} now — I'll post progress here as each phase finishes."
         )
     if signed_in.get("needsDevice"):
-        # ⭐⭐ TWO NAMED, NUMBERED SECTIONS, OWN FIRST — THE SAME TWO NOUNS AND THE
+        # ⭐⭐ TWO NAMED SECTIONS, OWN FIRST — THE SAME TWO NOUNS AND THE
         # SAME ORDER AS `sr.py._no_device_lines` AND `cli.py._print_no_devices`.
         # This surface runs with `no_agent`, so it is the ONLY one of the three
         # whose structure is guaranteed: nothing relays it, nothing reflows it.
@@ -620,13 +620,21 @@ def _signed_in_line(signed_in: dict) -> str:
         # has never set a display name would otherwise be told a stranger sees
         # their NAME at the moment the product hands over their EMAIL — see
         # `test_the_watcher_carries_the_whole_disclosure_not_half_of_it`.
+        # ⭐⭐ NO `superresearch --pair` HERE, AND THE INSTALL ROUTE IS THE PAGE
+        # (owner, 2026-09-23). This line reaches the person WORD FOR WORD — no
+        # model can trim it — so it is where a lead with `--pair` did the most
+        # harm: a brand-new person with no computer was told to run a command on
+        # a machine they may not have. The code route and the install link now
+        # read as the chat screen does.
+        # ⛔ `/sr device-add YOUR-CODE` AND THE WEB-APP PATH STAY. They are how to
+        # HAND OVER a code, not how to make one, and the one-message chat form is
+        # the shape the gateway routes reliably.
         return (
             f"✓ Signed in as {who}.\n\n"
             f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
-            f"Add a computer. On any computer running Super Research — your own, "
-            f"or one whose owner hands you the code — run:\n"
-            f"      superresearch --pair\n"
-            f"It shows an 8-char code — send it to me here, in ONE message:\n"
+            f"Add a computer: send me the access code from any computer running "
+            f"Super Research — your own, or one whose owner hands you the code — "
+            f"in ONE message:\n"
             f"      /sr device-add YOUR-CODE\n"
             f"(or in the web app: superresearch.io → Account → Pipeline Connection "
             f"→ Add Device)\n\n"
@@ -634,9 +642,9 @@ def _signed_in_line(signed_in: dict) -> str:
             f"public computers and I'll list the ones on offer, and tell me which "
             f"one to ask for; they see your name — or your email, if you have not "
             f"set one.\n\n"
-            f"No Super Research on any computer yet? Install it first:\n"
-            f"  • Windows:      irm https://superresearch.io/install.ps1 | iex\n"
-            f"  • macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh"
+            f"Don't have your own Research Computer yet? Set one up: "
+            f"https://superresearch.io/install\n"
+            f"It gives you an 8-char access code — send it to me and I'll connect it."
         )
     if signed_in.get("needsDeviceChoice"):
         # Several usable computers and none obvious. NAME them and ask — the one

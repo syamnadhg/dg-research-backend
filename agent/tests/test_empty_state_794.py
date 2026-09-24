@@ -184,7 +184,9 @@ def test_the_pair_code_sentence_is_its_own_line_and_not_the_install_block(chat):
             "— and I’ll connect it.") in out
     # ⛔ AND THE PROOF THAT IT IS NOT THE INSTALL BLOCK SPEAKING: that block is
     # present too, and says the phrase in its own words.
-    assert "It installs Super Research and prints an 8-char access code" in out
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert "It gives you an 8-char access code" in out
 
 
 def test_the_public_half_is_a_named_section_on_every_surface(chat, term, monkeypatch):
@@ -278,7 +280,9 @@ def test_a_renderer_that_returns_nothing_still_leaves_a_whole_screen(chat, monke
     lines = sr._no_device_lines()
     blob = "\n".join(lines)
     assert "Add a computer:" in blob
-    assert any("full walkthrough" in ln for ln in lines), lines
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert any("superresearch.io/install" in ln for ln in lines), lines
 
 
 def test_the_three_things_come_before_the_install_walkthrough(chat):
@@ -291,7 +295,9 @@ def test_the_three_things_come_before_the_install_walkthrough(chat):
     said = next(i for i, ln in enumerate(lines) if THING_NONE in ln)
     own = next(i for i, ln in enumerate(lines) if THING_OWN in ln)
     ask = next(i for i, ln in enumerate(lines) if THING_ASK in ln)
-    walkthrough = next(i for i, ln in enumerate(lines) if "full walkthrough" in ln)
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    walkthrough = next(i for i, ln in enumerate(lines) if "superresearch.io/install" in ln)
     assert said < own < ask < walkthrough, (said, own, ask, walkthrough)
 
 
@@ -553,8 +559,10 @@ def test_the_terminal_carries_the_route_for_somebody_with_no_machine_at_all(term
     which is advice you cannot act on."""
     cli.cmd_device(argparse.Namespace(device_command=None))
     out = term.out()
-    assert "install.sh" in out and "install.ps1" in out
-    assert "superresearch --pair" in out
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert "superresearch.io/install" in out
+    assert "superresearch --pair" not in out and "install.ps1" not in out
 
 
 def test_the_device_list_never_hands_a_slash_command_to_a_chat(chat):
@@ -683,7 +691,10 @@ def test_the_watcher_names_both_ways_out(monkeypatch):
                                  "topic": "Golden Retrievers", "pendingTopic": ""})
     low = line.lower()
     assert "no research computer on your account yet" in low
-    assert "superresearch --pair" in line
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert "superresearch.io/install" in line
+    assert "superresearch --pair" not in line
     assert "public computers" in low, line
 
 

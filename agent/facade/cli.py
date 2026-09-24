@@ -1701,10 +1701,12 @@ def _print_install_block_t() -> None:
     and the two things you can do about it. Moving it last means the early
     returns have to call it rather than fall past it, so it is a function.
     """
-    print("\n  No Super Research on any computer yet? Install it there first:")
-    print("    Windows:      irm https://superresearch.io/install.ps1 | iex")
-    print("    macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh")
-    print("                  superresearch --pair")
+    # ⭐ THE PAGE, NOT THE COMMANDS (owner, 2026-09-23) — the same install route
+    # the chat screen and the sign-in announce give, in this file's voice. The
+    # page carries the per-OS commands and stays current; a printed copy does not.
+    print("\n  Don't have your own Research Computer yet? Set one up: "
+          "https://superresearch.io/install")
+    print("  It gives you an 8-char access code — add it with:  agent device add <code>")
 
 
 def _public_row(i: int, d: dict) -> str:

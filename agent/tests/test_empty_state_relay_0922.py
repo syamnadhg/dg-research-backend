@@ -108,8 +108,10 @@ def test_the_rule_is_last_and_hides_nothing_the_person_needs(empty_account, monk
     fn, ns = SITES[name](monkeypatch)
     above, _, below = _run(fn, ns).partition(M)
     for must_see in ("Add a computer:", sr._PUBLIC_HEAD, "Macbook",
-                     "full walkthrough", "superresearch --pair"):
+                     "superresearch.io/install", "It gives you an 8-char access code"):
         assert must_see in above, f"{name}: {must_see!r} fell below the marker"
+    # ⛔ and the screen itself never hands the person `--pair` (owner, 2026-09-23)
+    assert "superresearch --pair" not in above, name
     assert below.strip().startswith("⛔ Relay the screen above"), below[:120]
 
 
@@ -134,7 +136,9 @@ def test_the_rules_order_matches_what_status_account_prints():
     assert "LAST" not in r
     assert "update notice" in r and "held topic" in r
     assert "“Alternatively…”" in r
-    assert "code block of your own" in r
+    # the install part is ONE link — the rule forbids adding commands to it
+    assert "install link" in r and "install commands" in r
+    assert "`superresearch --pair` of your own" in r
     assert "keeping every line any copy printed" in r
     assert f"“{sr._PUBLIC_HEAD}”" in r
 

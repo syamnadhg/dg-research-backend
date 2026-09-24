@@ -430,7 +430,12 @@ def test_devices_empty_guides_pairing(bridge_port, capsys):
     FakeFS.devices = []
     assert sr.main(["devices"]) == 0
     out = capsys.readouterr().out
-    assert "access code" in out and "superresearch --pair" in out
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert "access code" in out and "superresearch.io/install" in out
+    # ⛔ ONLY WHAT THE PERSON SEES. The relay rule below the marker names
+    # `superresearch --pair` precisely to FORBID it, and is never shown.
+    assert "superresearch --pair" not in out.split(sr._AGENT_ONLY_MARKER)[0]
 
 
 def test_device_use_by_name(bridge_port, capsys):
@@ -567,7 +572,9 @@ def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
     assert sr.main(["research", "Pitbull"]) != 0
     out = capsys.readouterr().out
     assert "No research computer on this account yet." in out
-    assert "access code" in out and "install.ps1" in out
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert "access code" in out and "superresearch.io/install" in out
     # ⛔ AND THE THIRD THING IS A LIST, NOT ADVICE. "or ask for a public one" with
     # nothing named is the dead end this wave exists to remove.
     assert "ask to use somebody else" in out.lower()
@@ -594,7 +601,11 @@ def test_research_multi_device_asks_which_not_pair(monkeypatch, capsys):
     assert "which should run this" in out
     assert "Research Computer" in out and "MacBook" in out
     assert "use “Research Computer”" in out            # steer to device-use
-    assert "install.ps1" not in out and "Paste the access code" not in out  # NOT the pair prompt
+    # ⛔⛔ RE-KEYED, NOT JUST REPINNED. This NEGATIVE proves the which-computer
+    # screen is not the empty state. It keyed on `install.ps1`, which no screen
+    # prints any more — so left alone it would pass whatever this path rendered.
+    # The install PAGE is what the empty state carries now, so that is the key.
+    assert "superresearch.io/install" not in out and "Paste the access code" not in out  # NOT the empty state
 
 
 def test_research_older_bridge_infers_pair_prompt_from_text(monkeypatch, capsys):
@@ -748,9 +759,14 @@ def test_setup_lines_have_no_code_fences():
     # SMS / plain-text relays can't render Markdown — a ``` fence shows literal
     # backticks. The install commands are 6-space-indented instead (matching
     # sr_attention_poll._signed_in_line's style).
-    assert "```" not in sr._SETUP_NODE_LINES
-    assert any(ln.startswith("      irm ") for ln in sr._SETUP_NODE_LINES)
-    assert any(ln.startswith("      curl ") for ln in sr._SETUP_NODE_LINES)
+    assert "```" not in "\n".join(sr._SETUP_NODE_LINES)
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    # No command of any kind now — a link, and where to bring the code back.
+    joined = "\n".join(sr._SETUP_NODE_LINES)
+    assert "superresearch.io/install" in joined
+    for gone in ("irm ", "curl ", "superresearch --pair"):
+        assert gone not in joined, gone
 
 
 def test_install_backend_output_has_no_code_fences(bridge_port, monkeypatch, capsys):

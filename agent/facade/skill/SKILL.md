@@ -173,7 +173,7 @@ back into `do`.
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | see **After a sign-in link** (NOT `retry`) |
 | "skip it", "skip this step" / "skip the video and the report" / "skip Claude (in P2)", "drop ChatGPT from the research" | `sr.py skip [phases\|agents] [--run "<title>"]` — phases (brief/podcast/video/report) AND the P2 research agents (chatgpt/gemini/claude), same as the app's per-agent toggles |
 | an **8-char access code** ("7F4V-6W7D"), "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
-| "add a device" — **no code in the message** | `sr.py devices` — relay it as printed (with no computer that IS the answer: access code, public computers, walkthrough). Never ask for the code yourself first |
+| "add a device" — **no code in the message** | `sr.py devices` — relay it as printed (with no computer that IS the answer: access code, public computers, install link). Never ask for the code yourself first |
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
@@ -365,7 +365,7 @@ to publish, so read the intent before choosing between them.
 
 If the user wants to add a Research Computer but hasn't given a code, run `sr.py devices`
 and relay it as printed — with no computer linked that IS the whole answer (access
-code, public computers, walkthrough); with one linked, it names the code route. Only
+code, public computers, install link); with one linked, it names the code route. Only
 if they explicitly ask how to set up a machine, show these one-liners:
 
 ```

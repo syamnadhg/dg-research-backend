@@ -399,7 +399,12 @@ def test_signed_in_line_prompts_to_pair_a_node_when_none():
     })
     assert "no research computer" in line.lower()  # #894 terminology
     # Points at the reliable web-app path + the exact one-message chat form.
-    assert "superresearch --pair" in line
+    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
+    # (owner) — the one-liners and `superresearch --pair` left this screen.
+    assert "superresearch.io/install" in line
+    assert "superresearch --pair" not in line
+    # ⛔ KEPT: how to HAND OVER a code — the reliable one-message chat form and
+    # the web-app path. Only how to MAKE one moved to the page.
     assert "Add Device" in line and "/sr device-add" in line
     assert "reply" not in line.lower()
     # Multi-line / readable (the user complained the old one was a wall of text).

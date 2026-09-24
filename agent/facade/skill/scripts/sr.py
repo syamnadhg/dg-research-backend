@@ -92,26 +92,27 @@ _INSTALL_PAGE_URL = "https://superresearch.io/install"
 # paste their access code (reason=no_devices = no *paired* device, which includes an
 # installed-but-unpaired machine — that user pairs, they don't reinstall).
 _INSTALL_PAGE_LINE = (
-    f"Don't have your own Research Computer yet? Set one up — full walkthrough: {_INSTALL_PAGE_URL}"
+    f"Don't have your own Research Computer yet? Set one up: {_INSTALL_PAGE_URL}"
 )
 
-# How to install Super Research on a fresh Research Computer (no backend yet):
-# the SAME one-line installer the web app's "Set up your own Research Computer"
-# tile uses (auto-installs Python + pipx + superresearch), then `--pair`. Kept in
-# ONE place so the `devices`-empty and `research`-no-device prompts stay identical
-# + in sync with the web app. (Older builds said `pipx install superresearch`.)
+# ⭐⭐ THE INSTALL ROUTE IS THE PAGE, AND ONLY THE PAGE (owner, 2026-09-23). This
+# block used to carry a "Quick start" of three shell lines ending in
+# `superresearch --pair`. In chat that was the part a relay mangled — promoted
+# to the top, fenced, and offered as THE answer to "add a device" — and the one
+# time the owner saw the screen relayed the way he wanted, the assistant had
+# trimmed it to this link on its own. The page carries the commands, per OS, and
+# stays current when they change; a chat message cannot.
+#
+# ⛔ THE SECOND LINE IS THE ONE THING THE PAGE CANNOT SAY: bring the code back
+# HERE. Without it, somebody finishes the install and has no idea this chat is
+# waiting for the code it printed.
+#
+# ⛔ NOT `--pair` ANYWHERE ON THIS SCREEN. It remains the right instruction when
+# a machine that is ALREADY set up needs a fresh code (device-add errors, unlink,
+# `sr.py install`) — those sites keep it deliberately.
 _SETUP_NODE_LINES = [
     _INSTALL_PAGE_LINE,
-    "It runs the research on a machine of yours (your PC / Mac / Linux box).",
-    "",
-    "Quick start — run one line there (pick your OS):",
-    # Indent (not ``` fences) so the commands stay readable on plain-text
-    # channels too — an SMS/relay that can't render Markdown would otherwise show
-    # literal backticks. Matches sr_attention_poll._signed_in_line's 6-space style.
-    "      irm https://superresearch.io/install.ps1 | iex      # Windows",
-    "      curl -fsSL https://superresearch.io/install.sh | sh  # macOS / Linux",
-    "      superresearch --pair",
-    "It installs Super Research and prints an 8-char access code — read it to me.",
+    "It gives you an 8-char access code — send it to me and I’ll connect it.",
 ]
 
 # ⛔⛔ THE SAME CLAIM ON EVERY SCREEN THAT MAKES IT. The consent question was
@@ -240,8 +241,8 @@ def _public_offer_lines() -> list[str]:
 # designed — state of play, "Add a computer:", the public computers as a named
 # section with its list, the walkthrough last — and the reply the person got
 # dropped the section heading, demoted the list to an "Alternatively…" aside,
-# led with `superresearch --pair` in a fenced block, and lost the walkthrough
-# link. The client was right; the relay was not.
+# led with `superresearch --pair` in a fenced block, and lost the install link.
+# The client was right; the relay was not.
 #
 # ⛔⛔ AND THAT FENCED BLOCK WAS NOT IMPROVISED — SKILL.md PRESCRIBED IT. Its
 # "wants to add a computer but hasn't given a code" recipe said to ask for the code
@@ -268,11 +269,11 @@ _EMPTY_STATE_RELAY = (
     "⛔ Relay the screen above as ONE message, exactly as printed and in its "
     "order: any line before it (who is signed in, a held topic) first, then "
     "whether this account has a computer, “Add a computer:”, the "
-    f"“{_PUBLIC_HEAD}” section with every row, then the install "
-    "walkthrough, then any line after it (an update notice) as printed. Keep "
-    "every heading and the walkthrough link; keep the install lines where and how "
-    "they are printed, never in a code block of your own. Do NOT lead with "
-    "`superresearch --pair`, and do NOT turn the public computers into an "
+    f"“{_PUBLIC_HEAD}” section with every row, then the install link, "
+    "then any line after it (an update notice) as printed. Keep every heading and "
+    "the install link. The install part is that ONE link: do NOT add install "
+    "commands, a code block or `superresearch --pair` of your own, and do NOT "
+    "turn the public computers into an "
     "“Alternatively…” line or any other aside. If more than one command "
     "printed this screen, relay it once, keeping every line any copy printed.")
 
