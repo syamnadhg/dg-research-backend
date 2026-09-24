@@ -780,6 +780,28 @@ def test_a_button_showing_the_wanted_tier_puts_up_no_caption():
     assert not _unconfirmed(lines), lines
 
 
+_SETUP_CONFIRMED_MAX = {"effort": True, "thinking": True, "effort_got": "max"}
+
+
+def test_the_everyday_run_says_nothing_about_the_effort():
+    """⛔ The everyday path: setup CONFIRMED Max, and the button still reads Max
+    at the pre-send check. Nothing happened to the tier, so the run says nothing
+    about it — no note, no clause, no caption.
+
+    The consumer hands the helper setup's whole record with only the tier it
+    names swapped in. Built from the tier alone, setup's confirmation is lost,
+    and every such run logs "effort 'max' now shows on the model button — set
+    after setup, by the computer-use pass", which the pass never did. The
+    helper's own table cannot see that; only the consumer, run for real, can."""
+    state = _presend("Opus 5.5 Max")
+    # Preconditions: the button read the wanted tier. Without them a broken read
+    # would make this test pass on silence for the wrong reason.
+    assert state.get("effortOk") is True and state.get("effortShown") == "max", state
+    lines, captions = _after_presend("Opus 5.5 Max", setup=_SETUP_CONFIRMED_MAX)
+    assert not [m for _, m in lines if "effort" in m.lower()], lines
+    assert captions == [], captions
+
+
 def test_a_third_tier_on_the_button_is_the_tier_the_caption_names():
     """⭐ The verifier's case: wanted Max, setup read Low, the computer-use pass
     moved it to High. The tile and the log both say High."""
