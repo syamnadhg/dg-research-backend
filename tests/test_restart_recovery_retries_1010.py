@@ -22,11 +22,17 @@ cluster: the network is coming up and the token is minutes old.
 ⭐ WHAT EACH DOES NOW — silently, in the same process, on one short schedule:
   (a) the entry is HELD, carried by every snapshot rewrite, and offered again
       through the same funnel and the same whitelist until its record answers;
-  (b) the mark is written again while the run is still "ongoing" and not
-      running here;
+      the read runs off the loop, bounded;
+  (b) the mark is written again after a read that answered "ongoing";
   (c) the disk is asked, by owner, and a run found there is resumed — the
       dequeue's own read stands a deleted research down, as
       `test_deleted_research_never_runs_1010` pins for every job.
+
+⛔⛔ AND NEITHER RETRY ACTS ON A RUN SOMEBODY STARTED SINCE BOOT (cross-verify
+of this wave). "ongoing" is also what a Resume writes, so the re-offer ran a
+research twice and the mark put a Resume card over a live run. Both now ask
+`_run_taken_since_boot`: a Resume here, this process, a sibling's lock, and
+another worker's stamp on an "ongoing" record.
 
 Every pin injects the failing read or write on the real path.
 
@@ -510,6 +516,23 @@ def test_a_held_run_no_live_worker_owns_is_restored(monkeypatch, tmp_path, owner
     _boot_and_retry(path, q)
 
     assert _rids(q._queue) == [RID], "a run no live worker owns was let go"
+
+
+def test_a_held_queued_run_is_restored_whatever_worker_stamp_it_carries(
+        monkeypatch, tmp_path):
+    """⭐ ONLY "ongoing" IS ASKED WHOSE IT IS. The stamp is written when a run
+    starts and nothing clears it, so on a record that says "queued" it is left
+    from an earlier start and says nobody is running it now — the boot restore
+    never looks at it either. Read as a sibling's, a run still waiting for its
+    turn would be let go, and its tile would say queued for ever."""
+    answers = _Answers(BLIP, BLIP, dict(QUEUED, assignedWorker=2))
+    _machine(monkeypatch, tmp_path, answers, fleet=2)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+
+    _boot_and_retry(path, q)
+
+    assert _rids(q._queue) == [RID], "a queued run was let go on a stale worker stamp"
 
 
 # ── the retry's read never holds up the loop ──────────────────────────────

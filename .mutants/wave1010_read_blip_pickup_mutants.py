@@ -8,8 +8,12 @@ boot. Each now retries silently, in the same process, on one short schedule:
         HELD by the funnel (`hold_unreadable`), carried by every snapshot
         rewrite, offered again through the same funnel and the same #728
         whitelist, and drained by Reset Backend like any waiting job.
-  M     — the REHYDRATE. A recovery mark that failed is written again while the
-        run is still "ongoing" and not held by this process.
+  M     — the REHYDRATE. A recovery mark that failed is written again, only
+        after a read that answered "ongoing", and never over a run somebody
+        started since boot.
+  T     — the one question both retries ask before they act on "ongoing": has
+        a Resume here, this process, a sibling's lock or another worker's
+        stamp taken the run since boot (`_run_taken_since_boot`).
   C     — the RESUME. A failed record read asks the disk, by owner, instead of
         dropping the request; nothing on the disk still drops it silently.
   S     — the one spawner both retries go through.
@@ -21,8 +25,12 @@ The quiet ones matter most:
   K1    — the writer stops carrying held entries: the first worker boundary
         erases the only description of the run, which is the defect itself.
   X1    — Reset Backend leaves a held entry, and it runs after the reset.
-  M4/M6 — the mark retry writes a Resume offer over a run the person stopped,
-        or over a run this process is running again.
+  T1-T4/R3 — the re-offer starts a second copy of a run a Resume started here
+        or on a sibling worker, or one a sibling holds the lock for.
+  M4/M5/M6 — the mark retry writes a Resume offer over a run the person
+        stopped, over a record it could not read, or over a run somebody
+        started since boot.
+  Q9/Q10 — the re-offer's read runs on the loop, or waits for ever.
 
 ⛔ A KILL IS A FAILED OR ERRORED TEST, NEVER A SKIP. Fewer passes with more
 skips is counted as a survivor: a pin that stops running looks exactly like one
@@ -54,6 +62,8 @@ HOLD = ("            if hold_unreadable is not None:\n"
         "                hold_unreadable.append(job)")
 GATE = "        if not take_unreadable:"
 STATUS = "            if status not in allowed_statuses:"
+SEEN = ("            if record_seen is not None:\n"
+        "                record_seen.update(_record)")
 
 # ── anchors: the boot restore and its retry ─────────────────────────────────
 RESTORE_CALL = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
@@ -61,19 +71,45 @@ RESTORE_CALL = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n
                 '                         hold_unreadable=_UNREAD_RESTORES):')
 RESTORE_SPAWN = ("    if _UNREAD_RESTORES:\n"
                  "        _retry_after_restart(_reoffer_unread_restores(job_queue))")
-RETRY_CALL = ('            if _safe_enqueue(job_queue, job, source="disk-restore-retry",\n'
-              '                             allowed_statuses=("queued", "ongoing"),\n'
-              '                             hold_unreadable=still_unread):')
-RETRY_LET_GO = "            if not still_unread:"
+RETRY_CALL = ('    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
+              '                         allowed_statuses=("queued", "ongoing"),\n'
+              '                         hold_unreadable=unread, record_seen=record)')
+ASK_UNREAD = ('    if unread:\n'
+              '        return "unread", {}')
+RETRY_LET_GO = ('    if answer == "unread":\n'
+                '        return\n'
+                '    try:\n'
+                '        _UNREAD_RESTORES.remove(job)')
+RETRY_RELEASE = ("    try:\n"
+                 "        _UNREAD_RESTORES.remove(job)\n"
+                 "    except ValueError:\n"
+                 "        pass\n"
+                 '    if answer != "take":')
+STILL_HELD = ("    if not any(h is job for h in list(_UNREAD_RESTORES)):\n"
+              "        return")
 RETRY_ROUNDS = ("    for delay in _RESTART_RETRY_DELAYS_S:\n"
                 "        await asyncio.sleep(delay)\n"
                 "        for job in list(_UNREAD_RESTORES):")
+RETRY_READ = ("                answer, record = await asyncio.wait_for(\n"
+              "                    asyncio.to_thread(_ask_about_held_entry, job),\n"
+              "                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)")
+SETTLE_ASKS = "    why = _run_taken_since_boot(rid, record, job_queue)"
+
+# ── anchors: the one question both retries ask ─────────────────────────────
+TAKEN_RESUMED = "    if rid in _RESUMED_HERE:"
+TAKEN_HELD = ('    if any((j or {}).get("research_id") == rid for j in '
+              '_jobs_held_locally(job_queue)):')
+TAKEN_LOCK = "    holders = _scan_sibling_locks_for_research(rid, WORKER_ID)"
+TAKEN_ONGOING = '    if (record or {}).get("status") == "ongoing":'
+TAKEN_OWNER = "        if owner != WORKER_ID and 1 <= owner <= fleet:"
+RESUME_RECORDS = "                _RESUMED_HERE.add(target_rid)"
 
 # ── anchors: the carry ──────────────────────────────────────────────────────
 WRITER_CARRY = ("    pending_jobs = (list(pending_jobs or [])\n"
-                "                    + _unread_restores_to_carry(pending_jobs))")
-FORGET_CARRY = "    live += _unread_restores_to_carry(live)"
+                "                    + _unread_restores_to_carry(pending_jobs, current_job))")
+FORGET_CARRY = "    live += _unread_restores_to_carry(live, current)"
 CARRY_SKIP = "        if rid in seen or _is_incognito_research(rid):"
+CARRY_CURRENT = '    seen.add((current_job or {}).get("research_id"))'
 
 # ── anchors: Reset Backend ──────────────────────────────────────────────────
 RESET_DRAIN = ("                    _drained_jobs.extend(_UNREAD_RESTORES)\n"
@@ -93,9 +129,13 @@ MARK_ROUNDS = ("    for delay in _RESTART_RETRY_DELAYS_S:\n"
 MARK_WITHDRAWN = ('            _pickup_withdrawn, tree_uid, research_id, "rehydrate-retry")\n'
                   "        if withdrawn:\n"
                   "            return False")
-MARK_STATUS = '        if record is not None and status != "ongoing":'
-MARK_HELD = ('        if any((j or {}).get("research_id") == research_id\n'
-             '               for j in _jobs_held_locally(_QUEUE_STATE.get("queue_ref"))):')
+MARK_UNREAD = ("        if record is None:\n"
+               "            continue\n"
+               '        status = record.get("status")')
+MARK_STATUS = ('        status = record.get("status")\n'
+               '        if status != "ongoing":')
+MARK_TAKEN = ('        why = _run_taken_since_boot(research_id, record, '
+              '_QUEUE_STATE.get("queue_ref"))')
 MARK_PATCH = ("        if await asyncio.to_thread(_update_research_doc, tree_uid, research_id,\n"
               "                                   _restart_recovery_patch(research_id)):")
 
@@ -143,33 +183,123 @@ MUTANTS = [
     # ══ 3. the retry keeps #728 and ends on an answer ═══════════════════════
     ("Q1", "over", "⛔⛔ the retry takes the funnel's DEFAULT whitelist — a run "
      "rehydration parked for its person's Resume is relaunched (#728)",
-     [(RETRY_CALL, '            if _safe_enqueue(job_queue, job, source="disk-restore-retry",\n'
-                   '                             hold_unreadable=still_unread):')],
+     [(RETRY_CALL, '    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
+                   '                         hold_unreadable=unread, record_seen=record)')],
      RESEARCH, PICKUP),
     ("Q2", "over", "⛔⛔ the retry takes a job it still cannot check",
-     [(RETRY_CALL, '            if _safe_enqueue(job_queue, job, source="disk-restore-retry",\n'
-                   '                             allowed_statuses=("queued", "ongoing"),\n'
-                   "                             take_unreadable=True,\n"
-                   '                             hold_unreadable=still_unread):')],
+     [(RETRY_CALL, '    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
+                   '                         allowed_statuses=("queued", "ongoing"),\n'
+                   "                         take_unreadable=True,\n"
+                   '                         hold_unreadable=unread, record_seen=record)')],
      RESEARCH, PICKUP),
     ("Q3", "under", "⛔ the retry lets an entry go that never answered — dropped "
      "from memory, and from the file at the next rewrite",
-     [(RETRY_LET_GO, "            if True:")],
+     [(RETRY_LET_GO, '    if answer == "unread":\n'
+                     '        pass\n'
+                     '    try:\n'
+                     '        _UNREAD_RESTORES.remove(job)')],
+     RESEARCH, PICKUP),
+    ("Q3b", "under", "the funnel's hold is read as a refusal — an unreadable "
+     "entry is answered 'no' and let go",
+     [(ASK_UNREAD, '    if False:\n'
+                   '        return "unread", {}')],
      RESEARCH, PICKUP),
     ("Q4", "over", "an entry that got its answer stays held — re-offered every "
      "round and carried to every boot",
-     [(RETRY_LET_GO, "            if False:")],
+     [(RETRY_RELEASE, "    try:\n"
+                      "        pass\n"
+                      "    except ValueError:\n"
+                      "        pass\n"
+                      '    if answer != "take":')],
      RESEARCH, PICKUP),
     ("Q5", "under", "the retry asks once and gives up — the schedule is one round",
      [(RETRY_ROUNDS, "    for delay in _RESTART_RETRY_DELAYS_S[:1]:\n"
                      "        await asyncio.sleep(delay)\n"
                      "        for job in list(_UNREAD_RESTORES):")],
      RESEARCH, PICKUP),
+    ("Q6", "under", "⛔ the retry's whitelist drops 'ongoing' — a held mid-flight "
+     "run is answered-refused, let go, and erased at the next rewrite",
+     [(RETRY_CALL, '    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
+                   '                         allowed_statuses=("queued",),\n'
+                   '                         hold_unreadable=unread, record_seen=record)')],
+     RESEARCH, PICKUP),
+    ("Q7", "over", "one entry's answer is taken for every entry of the round — an "
+     "unreadable first entry keeps an answered one held, or the reverse",
+     [(RETRY_READ, "                answer, record = await asyncio.wait_for(\n"
+                   "                    asyncio.to_thread(_ask_about_held_entry, "
+                   "_UNREAD_RESTORES[0]),\n"
+                   "                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)")],
+     RESEARCH, PICKUP),
+    ("Q8", "over", "⛔ an entry Reset Backend drained while its read was out is "
+     "started anyway when the read answers",
+     [(STILL_HELD, "    if False:\n"
+                   "        return")],
+     RESEARCH, PICKUP),
+    ("Q9", "over", "⛔ the read runs ON the loop — every held entry freezes the "
+     "pipeline, the local API and the listeners for as long as it takes",
+     [(RETRY_READ, "                answer, record = _ask_about_held_entry(job)")],
+     RESEARCH, PICKUP),
+    ("Q10", "under", "the read is unbounded — one that never returns holds up every "
+     "other held entry and every later round",
+     [(RETRY_READ, "                answer, record = await asyncio.to_thread("
+                   "_ask_about_held_entry, job)")],
+     RESEARCH, PICKUP),
+    ("Q11", "over", "⛔⛔ the re-offer never asks whether somebody started the run "
+     "since boot — one research runs twice",
+     [(SETTLE_ASKS, "    why = None")],
+     RESEARCH, PICKUP),
+    ("Q12", "under", "the funnel stops handing back the record it read — the "
+     "worker stamp is never seen, and a sibling's resumed run is started here",
+     [(SEEN, "            if record_seen is not None:\n"
+             "                pass")],
+     RESEARCH, PICKUP),
+
+    # ══ 3b. has somebody started the run since boot? ═══════════════════════
+    ("T1", "over", "⛔⛔ a Resume on this computer is not asked about — a read "
+     "landing before the Resume's job reaches the queue starts a second copy, or "
+     "puts a Resume card over it",
+     [(TAKEN_RESUMED, "    if False:")],
+     RESEARCH, PICKUP),
+    ("T2", "over", "⛔⛔ what this process holds is not asked about — a fresh copy "
+     "is queued behind the resumed run, or behind the run already going",
+     [(TAKEN_HELD, "    if False:")],
+     RESEARCH, PICKUP),
+    ("T3", "over", "⛔ a sibling's live lock is not asked about — a run a sibling "
+     "is running is run here too, in the same folder",
+     [(TAKEN_LOCK, "    holders = []")],
+     RESEARCH, PICKUP),
+    ("T4", "over", "⛔⛔ another worker's stamp is not asked about — a run a "
+     "sibling resumed is started here, or marked for a Resume over its live run",
+     [(TAKEN_OWNER, "        if False:")],
+     RESEARCH, PICKUP),
+    ("T5", "under", "the stamp rule loses the fleet bound — an orphan no live "
+     "worker owns is let go, and its recovery mark never written",
+     [(TAKEN_OWNER, "        if owner != WORKER_ID:")],
+     RESEARCH, PICKUP),
+    ("T6", "under", "⛔ the stamp is asked of a 'queued' record too — a stale stamp "
+     "from an earlier start lets go of a run still waiting for its turn",
+     [(TAKEN_ONGOING, "    if True:")],
+     RESEARCH, PICKUP),
+    ("R3", "over", "⛔⛔ the Resume branch stops recording what it started — the "
+     "retries cannot see a Resume whose job has not reached the queue yet",
+     [(RESUME_RECORDS, "                pass")],
+     RESEARCH, PICKUP),
 
     # ══ 4. every rewrite carries a held entry, once, and never a private one ═
     ("K1", "under", "⛔⛔ THE DEFECT: the writer stops carrying held entries — the "
      "first worker boundary erases the only description of the run",
      [(WRITER_CARRY, "    pending_jobs = list(pending_jobs or [])")],
+     RESEARCH, PICKUP),
+    ("K5", "over", "⛔ the carry ignores the running job — a held research that "
+     "is running is written as current AND pending, two runs at the next boot",
+     [(CARRY_CURRENT, "    pass")],
+     RESEARCH, PICKUP),
+    ("K6", "over", "the writer does not tell the carry what is running",
+     [(WRITER_CARRY, "    pending_jobs = (list(pending_jobs or [])\n"
+                     "                    + _unread_restores_to_carry(pending_jobs))")],
+     RESEARCH, PICKUP),
+    ("K7", "over", "the empty-queue rewrite does not tell the carry what is running",
+     [(FORGET_CARRY, "    live += _unread_restores_to_carry(live)")],
      RESEARCH, PICKUP),
     ("K2", "under", "⛔ a rewrite with nothing queued deletes the file, held entry "
      "and all",
@@ -214,15 +344,24 @@ MUTANTS = [
      RESEARCH, PICKUP),
     ("M4", "over", "⛔⛔ the retry marks a run the person stopped since — a stopped "
      "run is moved back to an offer of a Resume",
-     [(MARK_STATUS, "        if False:")],
+     [(MARK_STATUS, '        status = record.get("status")\n'
+                    "        if False:")],
      RESEARCH, PICKUP),
-    ("M5", "under", "a record the retry cannot read is left unmarked — the scan's "
-     "own rule is 'unreadable is taken'",
-     [(MARK_STATUS, '        if record is None or status != "ongoing":')],
+    ("M5", "over", "⛔⛔ a record the retry cannot read is written blind — a run "
+     "that finished or was stopped since is moved back to a Resume offer",
+     [(MARK_UNREAD, "        if record is None:\n"
+                    '            record = {"status": "ongoing"}\n'
+                    '        status = record.get("status")')],
      RESEARCH, PICKUP),
-    ("M6", "over", "⛔⛔ the retry marks a run this process is running again — a "
-     "Resume card over a live run",
-     [(MARK_HELD, "        if False:")],
+    ("M5b", "under", "an unreadable round ends the retry — one more blip and the "
+     "run stays unmarked until the next restart",
+     [(MARK_UNREAD, "        if record is None:\n"
+                    "            return False\n"
+                    '        status = record.get("status")')],
+     RESEARCH, PICKUP),
+    ("M6", "over", "⛔⛔ the mark retry never asks whether somebody started the run "
+     "since boot — a Resume card over a live run, here or on a sibling",
+     [(MARK_TAKEN, "        why = None")],
      RESEARCH, PICKUP),
     ("M7", "under", "the mark retry tries once and gives up",
      [(MARK_ROUNDS, "    for delay in _RESTART_RETRY_DELAYS_S[:1]:\n"
