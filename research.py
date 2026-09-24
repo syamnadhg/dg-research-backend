@@ -16056,7 +16056,7 @@ def start_firestore_start_listener(job_queue, loop):
                 # job itself reaches the queue only after the delete below. A
                 # retry reading in between would start it a second time, or put
                 # a Resume card over it. See `_run_taken_since_boot`.
-                _RESUMED_HERE.add(target_rid)
+                _RESUMED_HERE.add((target_uid, target_rid))
                 from google.cloud.firestore import DELETE_FIELD as _DF_RESUME
                 _update_research_doc(target_uid, target_rid,
                                      {"status": "ongoing", "assignedWorker": WORKER_ID,
@@ -17135,10 +17135,15 @@ _RESTART_RETRIES: "set" = set()
 #: — waiting to be offered again. See `_reoffer_unread_restores`.
 _UNREAD_RESTORES: "list[dict]" = []
 
-#: Researches a Resume has started in THIS process. The start listener's Resume
-#: branch adds one just before it writes "ongoing"; the restart retries read it.
-#: See `_run_taken_since_boot`.
-_RESUMED_HERE: "set[str]" = set()
+#: Researches a Resume has started in THIS process, as (owner uid, research id).
+#: The start listener's Resume branch adds one just before it writes "ongoing";
+#: the restart retries read it. See `_run_taken_since_boot`.
+#:
+#: ⛔ KEYED BY OWNER TOO (re-verify of this wave). Research ids are minted by the
+#: web and published to every member of the device, so another member's Resume
+#: of HER research with the same id let go of this person's held run, and ended
+#: this person's mark retry.
+_RESUMED_HERE: "set[tuple[str, str]]" = set()
 
 #: Seconds one of the re-offer's record reads may take before its round counts
 #: the entry as still unread. The read runs off the loop, so a slow one never
@@ -17147,7 +17152,7 @@ _RESUMED_HERE: "set[str]" = set()
 _RESTART_RETRY_READ_TIMEOUT_S = 15.0
 
 
-def _run_taken_since_boot(research_id, record, job_queue, *,
+def _run_taken_since_boot(uid, research_id, record, job_queue, *,
                           unstamped_is_worker_1: bool) -> "str | None":
     """Why a run a restart's retry is about to start or mark belongs to somebody
     else now — or None when it is still the retry's to act on.
@@ -17164,7 +17169,9 @@ def _run_taken_since_boot(research_id, record, job_queue, *,
         closes the race: the Resume queues its job only after its "ongoing"
         write and a queue-document delete, so a read can see "ongoing" before
         the job is anywhere below;
-      · this process holds it, running or waiting;
+      · this process holds it, running or waiting — this and the one above
+        asked by OWNER as well as research id (`uid` is the person whose tree
+        holds the record): another member's research can carry the same id;
       · a sibling worker's live lock names it;
       · its record says "ongoing" and names another worker inside the fleet —
         the scan's own ownership rule, `_owner_worker_of`, which is also the
@@ -17179,10 +17186,11 @@ def _run_taken_since_boot(research_id, record, job_queue, *,
     routine (the idle-rescan pickup and the dequeue's queued-to-ongoing flip
     write none). Read as worker 1's, worker 2's own mid-flight run was let go,
     and nothing else would ever start it."""
-    rid = str(research_id or "")
-    if rid in _RESUMED_HERE:
+    uid, rid = str(uid or ""), str(research_id or "")
+    if (uid, rid) in _RESUMED_HERE:
         return "a Resume on this computer has started it"
-    if any((j or {}).get("research_id") == rid for j in _jobs_held_locally(job_queue)):
+    if any(((j or {}).get("uid"), (j or {}).get("research_id")) == (uid, rid)
+           for j in _jobs_held_locally(job_queue)):
         return "this process already holds it"
     holders = _scan_sibling_locks_for_research(rid, WORKER_ID)
     if holders:
@@ -17294,7 +17302,8 @@ def _settle_held_entry(job_queue, job, answer: str, record: dict) -> None:
     if answer != "take":
         return
     rid = str((job or {}).get("research_id") or "")
-    why = _run_taken_since_boot(rid, record, job_queue, unstamped_is_worker_1=False)
+    why = _run_taken_since_boot((job or {}).get("uid"), rid, record, job_queue,
+                                unstamped_is_worker_1=False)
     if why is not None:
         log(f"[pending_queue] {rid[:24]}… not restored — {why}", "INFO")
         return
@@ -75993,7 +76002,8 @@ async def _remark_after_restart(tree_uid: str, research_id: str) -> bool:
             log(f"[rehydrate] {research_id[:24]}… is {status} now — the "
                 f"recovery mark is no longer this machine's to write", "INFO")
             return False
-        why = _run_taken_since_boot(research_id, record, _QUEUE_STATE.get("queue_ref"),
+        why = _run_taken_since_boot(tree_uid, research_id, record,
+                                    _QUEUE_STATE.get("queue_ref"),
                                     unstamped_is_worker_1=True)
         if why is not None:
             log(f"[rehydrate] {research_id[:24]}… {why} — no recovery mark", "INFO")

@@ -461,6 +461,75 @@ def test_a_resume_here_takes_a_held_run_before_its_job_reaches_the_queue(
     assert research._UNREAD_RESTORES == []
 
 
+MALLORY = "uid-mallory"
+MALLORY_RUN = "Mallory_topic_20260923_101500"
+
+
+def _mallorys_resume(monkeypatch, tmp_path):
+    """Mallory, a member of this computer, resumes HER research — which carries
+    the same id as Alice's — through the REAL start listener. Her run has ended
+    by the time the caller looks."""
+    d = tmp_path / "queues" / MALLORY_RUN
+    d.mkdir(parents=True)
+    (d / "owner.json").write_text(json.dumps({"uid": MALLORY, "researchId": RID}),
+                                  encoding="utf-8")
+    lis = Listener(monkeypatch, tmp_path, owner=UID,
+                   research_docs={(MALLORY, RID): dict(PARKED, backendRunId=MALLORY_RUN)})
+    monkeypatch.setattr(research, "WORKER_ID", 1)
+    lis.feed(action="resume", uid=MALLORY, submittedBy=MALLORY, researchId=RID,
+             email="m@example.com", backendRunId=MALLORY_RUN)
+    assert [(j["uid"], j["run_id"]) for j in lis.enqueued] == [(MALLORY, MALLORY_RUN)], (
+        "Mallory's own Resume did not go through (premise)")
+    lis.jobs.put.clear()
+    return lis
+
+
+def test_another_members_resume_of_the_same_research_id_leaves_a_held_run(
+        monkeypatch, tmp_path):
+    """⛔ OTHER POLARITY, BY OWNER (re-verify of this wave). Research ids are
+    minted by the web and published to every member — the reason the disk is
+    asked by owner. After Mallory's Resume of her research with the same id,
+    Alice's record answers "queued": her run is still waiting for its turn, and
+    Mallory's Resume is no reason to let it go."""
+    research._UNREAD_RESTORES.append(_job())                 # Alice's, held at boot
+    lis = _mallorys_resume(monkeypatch, tmp_path)
+    lis.db.research_docs[(UID, RID)] = dict(QUEUED)          # Alice's, readable now
+    monkeypatch.setattr(research, "_RESTART_RETRY_DELAYS_S", (0,))
+    asyncio.run(research._reoffer_unread_restores(lis.jobs))
+
+    assert [(j["uid"], j["run_id"]) for j in lis.enqueued] == [(UID, RUN)], (
+        "another member's Resume of a research with the same id let go of "
+        "Alice's held run")
+    assert research._UNREAD_RESTORES == []
+
+
+@pytest.mark.parametrize("where", ["waiting", "running"])
+def test_another_members_job_for_the_same_research_id_leaves_a_held_run(
+        monkeypatch, tmp_path, where):
+    """⛔ THE SAME, FOR WHAT THIS PROCESS HOLDS. A job of Mallory's for her
+    research with the same id — waiting in the queue, or the one running — is
+    not Alice's run, and let go on it, Alice's held run was lost."""
+    answers = _Answers(BLIP, BLIP, QUEUED)
+    _machine(monkeypatch, tmp_path, answers)
+    path = _snapshot(tmp_path, [_job()])
+    q = _Q()
+    hers = dict(_job(), uid=MALLORY, run_id=MALLORY_RUN)
+
+    def _hers_is_here():
+        if where == "running":
+            research._QUEUE_STATE["current_job"] = hers
+        else:
+            q._queue.append(hers)
+
+    _boot_and_retry(path, q, _hers_is_here)
+
+    assert answers.reads == 3, "the retry never asked"
+    alices = [j for j in research._jobs_held_locally(q) if j.get("uid") == UID]
+    assert _rids(alices) == [RID], (
+        "another member's job for a research with the same id let go of Alice's "
+        "held run")
+
+
 def test_a_held_run_a_sibling_worker_resumed_is_let_go(monkeypatch, tmp_path):
     """⛔⛔ THE #728 RUN, ACROSS TWO CRASHES. Boot 1 reads the run parked for its
     person's Resume and refuses it — an answered refusal stays in the file.
@@ -954,10 +1023,29 @@ def test_the_retry_leaves_a_run_a_resume_here_has_started(monkeypatch, tmp_path)
     answers = _Answers(BLIP, BLIP, ONGOING)
     writes = _Writes(False, True)
     _rehydrate(monkeypatch, tmp_path, answers, writes,
-               before_retry=lambda _q: research._RESUMED_HERE.add(RID))
+               before_retry=lambda _q: research._RESUMED_HERE.add((UID, RID)))
 
     assert answers.reads == 3, "the retry never asked, or kept asking once it knew"
     assert len(writes.attempts) == 1, "a Resume card was written over a run resumed here"
+
+
+def test_another_members_resume_of_the_same_research_id_leaves_the_mark_retry(
+        monkeypatch, tmp_path):
+    """⛔ OTHER POLARITY, BY OWNER. Research ids are published to every member,
+    so another member's Resume of HER research with the same id is not this
+    person's run picked up again; it ended this person's mark retry, and the
+    run sat "ongoing" with no Resume card until the next restart. Her Resume
+    goes through the REAL start listener; the scan does not ask what a Resume
+    here started, so it coming first changes nothing but where the fakes are."""
+    _mallorys_resume(monkeypatch, tmp_path)
+    answers = _Answers(BLIP, BLIP, ONGOING)
+    writes = _Writes(False, True)
+    _rehydrate(monkeypatch, tmp_path, answers, writes)
+
+    assert answers.reads == 3, "the retry never asked"
+    assert writes.statuses == ["paused_backend_restart", "paused_backend_restart"], (
+        "another member's Resume of a research with the same id cancelled this "
+        "person's recovery mark")
 
 
 def test_the_retry_still_marks_an_orphan_no_live_worker_owns(monkeypatch, tmp_path):

@@ -29,6 +29,8 @@ The quiet ones matter most:
         or on a sibling worker, or one a sibling holds the lock for.
   T7/T8 — the re-offer reads a missing worker stamp as worker 1's, and worker 2
         lets go of its own mid-flight run (re-verify of this wave).
+  T9/T10 — another member's Resume, or job, for a research with the same id
+        lets go of this person's held run (ids are published to every member).
   M4/M5/M6 — the mark retry writes a Resume offer over a run the person
         stopped, over a record it could not read, or over a run somebody
         started since boot.
@@ -95,18 +97,19 @@ RETRY_ROUNDS = ("    for delay in _RESTART_RETRY_DELAYS_S:\n"
 RETRY_READ = ("                answer, record = await asyncio.wait_for(\n"
               "                    asyncio.to_thread(_ask_about_held_entry, job),\n"
               "                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)")
-SETTLE_ASKS = "    why = _run_taken_since_boot(rid, record, job_queue, unstamped_is_worker_1=False)"
+SETTLE_ASKS = ('    why = _run_taken_since_boot((job or {}).get("uid"), rid, record, job_queue,\n'
+               "                                unstamped_is_worker_1=False)")
 
 # ── anchors: the one question both retries ask ─────────────────────────────
-TAKEN_RESUMED = "    if rid in _RESUMED_HERE:"
-TAKEN_HELD = ('    if any((j or {}).get("research_id") == rid for j in '
-              '_jobs_held_locally(job_queue)):')
+TAKEN_RESUMED = "    if (uid, rid) in _RESUMED_HERE:"
+TAKEN_HELD = ('    if any(((j or {}).get("uid"), (j or {}).get("research_id")) == (uid, rid)\n'
+              "           for j in _jobs_held_locally(job_queue)):")
 TAKEN_LOCK = "    holders = _scan_sibling_locks_for_research(rid, WORKER_ID)"
 TAKEN_ONGOING = '    if (record or {}).get("status") == "ongoing":'
 TAKEN_OWNER = "        if owner != WORKER_ID and 1 <= owner <= fleet:"
 TAKEN_STAMP = ("        if not isinstance(stamp, int) and not unstamped_is_worker_1:\n"
                "            return None")
-RESUME_RECORDS = "                _RESUMED_HERE.add(target_rid)"
+RESUME_RECORDS = "                _RESUMED_HERE.add((target_uid, target_rid))"
 
 # ── anchors: the carry ──────────────────────────────────────────────────────
 WRITER_CARRY = ("    pending_jobs = (list(pending_jobs or [])\n"
@@ -138,9 +141,9 @@ MARK_UNREAD = ("        if record is None:\n"
                '        status = record.get("status")')
 MARK_STATUS = ('        status = record.get("status")\n'
                '        if status != "ongoing":')
-MARK_TAKEN = ('        why = _run_taken_since_boot(research_id, record, '
-              '_QUEUE_STATE.get("queue_ref"),\n'
-              '                                    unstamped_is_worker_1=True)')
+MARK_TAKEN = ("        why = _run_taken_since_boot(tree_uid, research_id, record,\n"
+              '                                    _QUEUE_STATE.get("queue_ref"),\n'
+              "                                    unstamped_is_worker_1=True)")
 MARK_PATCH = ("        if await asyncio.to_thread(_update_research_doc, tree_uid, research_id,\n"
               "                                   _restart_recovery_patch(research_id)):")
 
@@ -287,8 +290,25 @@ MUTANTS = [
      RESEARCH, PICKUP),
     ("T7", "under", "⛔⛔ the re-offer reads a missing stamp as worker 1 again — "
      "worker 2 lets go of its own mid-flight run, and nothing ever starts it",
-     [(SETTLE_ASKS, "    why = _run_taken_since_boot(rid, record, job_queue, "
-                    "unstamped_is_worker_1=True)")],
+     [(SETTLE_ASKS, '    why = _run_taken_since_boot((job or {}).get("uid"), rid, record, '
+                    "job_queue,\n"
+                    "                                unstamped_is_worker_1=True)")],
+     RESEARCH, PICKUP),
+    ("T9", "under", "⛔ what a Resume here started is matched on research id alone — "
+     "another member's Resume of a research with the same id lets go of this "
+     "person's held run, and ends this person's mark retry",
+     [(TAKEN_RESUMED, "    if rid in {r for _u, r in _RESUMED_HERE}:")],
+     RESEARCH, PICKUP),
+    ("T10", "under", "⛔ what this process holds is matched on research id alone — "
+     "another member's job for a research with the same id lets go of this "
+     "person's held run",
+     [(TAKEN_HELD, '    if any((j or {}).get("research_id") == rid\n'
+                   "           for j in _jobs_held_locally(job_queue)):")],
+     RESEARCH, PICKUP),
+    ("T11", "over", "⛔⛔ the re-offer asks about nobody's run — a Resume here is "
+     "never matched, and a held run it started is started a second time",
+     [(SETTLE_ASKS, "    why = _run_taken_since_boot(None, rid, record, job_queue,\n"
+                    "                                unstamped_is_worker_1=False)")],
      RESEARCH, PICKUP),
     ("T8", "under", "⛔ the stamp rule stops asking whether a stamp is there — the "
      "same let-go of worker 2's own unstamped run",
