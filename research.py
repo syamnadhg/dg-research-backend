@@ -265,7 +265,7 @@ def _prog_name() -> str:
 # matches the actual invocation (drop-in `superresearch …` vs `python research.py …`).
 _PROG = _prog_name()
 
-# Stamped by argparse dispatch in __main__ (research.py:~31320). Worker 1 is
+# Stamped by the argparse dispatch in `main()`. Worker 1 is
 # the primary serve (FE-facing port 8000, heartbeats, currentRunId writes,
 # orphan-sweeps, hard_reset orchestration). Workers ≥2 are silent siblings
 # that share the same deviceId but run pipelines from their own profile dirs.
@@ -358,8 +358,8 @@ def _profile_matches_cmdline(profile: str, cmdline: str) -> bool:
 # worker dequeues — same code path as the queue_dir creation — and is
 # discoverable by sibling rehydration without knowing the run_id.
 #
-# Why not a Firestore signal: both claim paths (start-listener at
-# research.py:4138-4141 and idle-rescan at 26895-26899) delete the
+# Why not a Firestore signal: both claim paths (the start listener's
+# `on_snapshot` and `_rescan_queue_for_unclaimed`) delete the
 # device-queue doc immediately after a successful claim. By the time a
 # rebooting sibling's rehydration runs (4s later in the repro), no
 # Firestore doc exists to query.
@@ -6921,13 +6921,12 @@ _QUEUE_STATE = {
     "running": False, "current_job": None, "queue_ref": None, "recompute_fn": None,
     # 2026-05-15: persist_fn exposes the run_server closure
     # `_persist_pending_queue` to the module-scope device-cmd listener
-    # (research.py:1766) so hard_reset can flush a clean snapshot to disk
+    # (`_start_device_command_listener`) so hard_reset can flush a clean snapshot to disk
     # before os._exit. _hard_reset_lock makes the gate-state clear+persist
     # atomic w.r.t. the worker's `finally` writes — without it, a worker
     # finishing between the device-cmd's clear (memory) and persist (disk)
     # would resurrect the wedged values to disk. Both initialised inside
-    # run_server (research.py:24049-24051) before the device-cmd listener
-    # starts at research.py:24898.
+    # run_server before it starts the device-cmd listener.
     "persist_fn": None, "_hard_reset_lock": None,
     # ⛔⛔ THE PRIOR-RUN POINTER IS GONE (wave 10.9, N8). Three keys lived here
     # — last_completed_uid / last_completed_rid / last_be_done_at — so the next
@@ -6945,7 +6944,7 @@ _QUEUE_STATE = {
     # callback thread; the actual asyncio.Queue.put happens via
     # `loop.call_soon_threadsafe(...)`, which is asynchronous. Between
     # the listener's claim+schedule of doc A and its next iteration
-    # processing doc B, the gate at research.py:4106 reads
+    # processing doc B, the busy gate in the start listener's on_snapshot reads
     # `job_queue.qsize()` — but A's put hasn't landed on the event loop
     # yet, so qsize() is still 0. Gate passes, B is also claimed,
     # dual-spawn for back-to-back submissions (the 2026-05-22 St Bernard
@@ -6962,7 +6961,7 @@ _QUEUE_STATE = {
 def _pending_enq_inc():
     """Listener-thread increment. Idempotent on first-call when the
     `_pending_enq_lock` hasn't been initialised yet (run_server
-    initialises it during startup at research.py:~26686). The pre-init
+    initialises it during startup). The pre-init
     case only matters in tests; in prod the lock is always set before
     the listener attaches."""
     lock = _QUEUE_STATE.get("_pending_enq_lock")
@@ -7013,7 +7012,7 @@ def _sweep_stuck_research_docs_for_device(
     would be invisible to a Reset).
 
     Firestore rules path: synth-device-user reads/writes user-tree
-    research docs via `deviceMemberOf(userId)` (firestore.rules:45-49),
+    research docs via `deviceMemberOf(userId)` in firestore.rules,
     which checks `deviceOwnership(deviceId, userId)` — true when this
     device's `ownerUid == userId` OR `userId in sharedWith`. So the
     sweep can iterate any uid the device's sharedWith[] lists, same
@@ -7183,7 +7182,7 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
         # phase events) that the user should see in their listing as
         # "Stopped" — not silently disappear. The FE's chat-close
         # cascade-delete fires only on cancelled=true (see
-        # ChatContainer.tsx cancelledRef cleanup ~line 596), so
+        # the `cancelledRef` cleanup in ChatContainer.tsx), so
         # leaving cancelled unset preserves these runs in the
         # listing as historical Stopped entries.
         if status == "queued":
@@ -7265,7 +7264,7 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
         `device.currentRunTitle`" — that field is no longer written or
         mapped either, for the same reason.
 
-    Filter rules mirror the existing FIFO pre-query at research.py:4226:
+    Filter rules mirror the FIFO pre-query in the start listener's on_snapshot:
       - skip `processed: true` (already-claimed-and-finished)
       - skip `assignedWorker: <not me>` (sibling has it)
       - include `assignedWorker == self` (post-claim-pre-delete window
@@ -7360,7 +7359,7 @@ def _phase_estimate_ms(phase: int) -> int:
     keyed by phase int; convert to ms here.
 
     Forward-reference safe — `_phase_averages` is defined at module
-    line ~4001 (post-helper-definition) but Python resolves globals
+    further down (after this helper) but Python resolves globals
     at call time so this works as long as `load_analytics()` has run
     before any `_estimate_queue_eta_ms` call (it runs in server
     startup, well before listeners fire)."""
@@ -7599,7 +7598,7 @@ def _read_eta_inputs_and_compute(position: int) -> "tuple[int, int]":
 # fresh when it started.
 #
 # 2026-05-25 P0 fix: local `import threading` here — the module-level
-# `import threading as _threading` at line ~4050 is AFTER this code,
+# `import threading as _threading` further down the module is AFTER this code,
 # so the original `_threading.Lock()` raised NameError at module load
 # (worker crashed on startup, daemon-loop respawned tightly = 67+
 # restarts in <5min on the affected E2E). stdlib `threading` is
@@ -7673,7 +7672,7 @@ def _recompute_deferred_queue_positions() -> None:
     skip rather than queue. See lock's defining comment for rationale.
 
     Why this exists separately from `_recompute_queue_positions`:
-      - `_recompute_queue_positions` (run_server closure, ~line 27030)
+      - `_recompute_queue_positions` (a run_server closure)
         reads only `_job_queue._queue` — the LOCAL asyncio deque of
         jobs that have already been claimed (queue doc deleted, status
         flipped to ongoing/queued). It cannot see Firestore-deferred
@@ -8424,8 +8423,8 @@ _GRPC_HEAL_STRUCTURAL_AFTER = 3
 _grpc_heal_last_ts = 0.0
 _grpc_heal_consec_fail = 0
 _grpc_heal_structural = False
-# The module-level `import threading as _threading` lives further down (~line
-# 4633); import here too so this lock resolves at import time (re-import is a
+# The module-level `import threading as _threading` lives further down the
+# module; import here too so this lock resolves at import time (re-import is a
 # harmless rebind of the same module object).
 import threading as _threading  # noqa: E402
 _grpc_heal_lock = _threading.Lock()
@@ -8617,7 +8616,8 @@ def _grpc_write_with_heal(op, *, what: str):
         # user-tree write the freshly-minted/cached synth token lags the
         # deviceId-claim propagation (most often the `queued→ongoing` flip's
         # transactional READ racing deviceMemberOf on a fresh doc; see
-        # firestore.rules:175-203 #723), the force-refresh re-mints, and the
+        # the #723 deviceId read fast-path on /researches in firestore.rules), the
+        # force-refresh re-mints, and the
         # retry below succeeds. Logging it at WARN every time was misleading
         # noise (it reads as a problem when it self-heals). Log the heal ATTEMPT
         # at INFO; a genuinely UNHEALED denial still surfaces — the retry-failed
@@ -10076,7 +10076,8 @@ async def _revoked_recovery_loop():
     expired) so a stuck recovery doesn't spin.
 
     2026-05-22: wall-clock cap at MAX_RECOVERY_WALLCLOCK_SEC (1hr). After
-    the device doc TTL-deletes at 15 min (reset-pair-code/route.ts:269),
+    the device doc TTL-deletes at 15 min (the web reset-pair-code route's
+    `expireAt`, RESET_TTL_MS),
     the pending subdoc path becomes unreachable — polling forever wastes
     CPU + log volume. At the cap we log + os._exit(0) so the supervisor
     sees a clean exit code (and stops respawning a worker that will just
@@ -10205,7 +10206,7 @@ async def _revoked_recovery_loop():
                 #   target) → every Storage/Firestore cross-tree call 403s
                 #   → audio upload broken, source download broken, queue
                 #   writes rejected by the FE-side `isDeviceMember` rule.
-                # cmd_pair_v2 Stage 1 (research.py:~26931) does this eager
+                # `cmd_pair_v2`'s Stage 1 does this eager
                 # patch already; the recovery path was missed when Track D
                 # shipped. _pair_patch_device uses REST PATCH so it works
                 # with just the freshly-minted ID token (no gRPC client
@@ -11922,7 +11923,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
     col_ref = _firebase_db.collection("devices").document(device_id) \
         .collection("commands")
 
-    # Startup sweep — same rationale as _start_command_listener (line ~2127).
+    # Startup sweep — same rationale as `_start_command_listener`'s startup sweep.
     try:
         for d in _fs_where(col_ref, "processed", "==", True).stream():
             try:
@@ -11981,7 +11982,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             log(f"[device-cmds] received action={action!r} doc={doc.id}")
 
             # 2026-05-26: HARD_RESET defers the cmd-doc DELETE until AFTER
-            # the sweep completes. The route at reset-pair-code/route.ts:140
+            # the sweep completes. The web's reset-pair-code route
             # polls for cmd-doc deletion as the ack signal, then proceeds
             # to clear sharedWith[] on the device doc (step 5). Pre-fix the
             # early-delete acked the route IMMEDIATELY, and route step 5
@@ -11997,7 +11998,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             # Mark processed=true upfront so SDK-reconnect mid-handler
             # re-fires skip via the processed check at the top of on_snap.
             # The actual delete happens at the END of the hard_reset
-            # branch (just before the `continue` at line ~4017), so the
+            # branch (just before that branch's final `continue`), so the
             # route's ack lands only after sharedWith-dependent writes are
             # done. Other actions keep the original tail-delete-first
             # semantics.
@@ -12056,7 +12057,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 #   1. Touch the active run's .stop sentinel so the new
                 #      --serve doesn't auto-resume it after respawn
                 #      (matches how the research-scoped stop action
-                #      writes the sentinel at line ~2278). Best-effort:
+                #      in `_start_command_listener` writes the sentinel).
+                #      Best-effort:
                 #      if no run is active, skip silently.
                 #   2. Wait up to 5s for any in-flight Storage upload
                 #      to drain — see _wait_for_uploads_to_settle.
@@ -12164,8 +12166,8 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # hard-reset lock so the worker's `finally` block can't
                 # race us and write a job back into it. _persist_pending_queue
                 # is a closure inside run_server, so we look it up via
-                # _QUEUE_STATE["persist_fn"] (set at the function-def
-                # tail, research.py:~24153). The atomic .tmp + os.replace
+                # _QUEUE_STATE["persist_fn"] (set in run_server right after
+                # the closure's def). The atomic .tmp + os.replace
                 # write inside that helper means a mid-write os._exit
                 # can't corrupt _pending_queue.json — either the OLD file
                 # (replace not committed) or NEW (clean) survives.
@@ -12213,15 +12215,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     # the listener thread can ValueError "called too many
                     # times". The deque popleft is thread-safe in CPython
                     # (single C-level operation), matches how the queue-
-                    # position recompute at research.py:24700 already
+                    # position recompute (`_recompute_queue_positions`) already
                     # snapshots `_job_queue._queue`, and bypasses the
                     # counter entirely. The drained jobs are about to be
                     # cancelled anyway, so the counter mismatch doesn't
                     # matter — the process will exit + respawn fresh.
                     _drained_jobs: list[dict] = []
                     # 2026-05-26 FIX: reach the in-memory queue via
-                    # _QUEUE_STATE["queue_ref"] (set in --serve at
-                    # research.py:~28894). The bare name `_job_queue` is a
+                    # _QUEUE_STATE["queue_ref"] (set in run_server right
+                    # after `_job_queue` is created). The bare name `_job_queue` is a
                     # LOCAL of the serve function — NOT in scope in this
                     # Firestore-listener callback thread — so referencing it
                     # raised NameError on every reset ("name '_job_queue' is
@@ -15304,7 +15306,7 @@ def start_firestore_start_listener(job_queue, loop):
             #                  fall through to normal claim path
             # Missing-timestamp legacy docs (no _ts and no _ca) fall
             # through, preserving the original code's bug-compatible
-            # behavior. The FIFO pre-query at line 3901 already filters
+            # behavior. The FIFO pre-query further down this handler already filters
             # docs with assignedWorker set, so a claimed-doc passing
             # through the elif chain is harmless either way.
             ZOMBIE_GRACE_MS = 30_000
@@ -15441,8 +15443,8 @@ def start_firestore_start_listener(job_queue, loop):
             # so cancel/skip-action docs (rare but valid path for
             # orchestrator cleanups) are unaffected. Adds one Firestore
             # read per legacy doc, zero overhead for modern (timestamped)
-            # docs. Sync .get() mirrors the existing existence check at
-            # research.py:4647 — same listener thread, same pattern.
+            # docs. Sync .get() mirrors the ABANDONED branch's research-doc
+            # read above — same listener thread, same pattern.
             elif _age_ms == 0 and _aw is None and data.get("action", "start") == "start":
                 try:
                     _rid_legacy = data.get("researchId") or ""
@@ -15829,7 +15831,7 @@ def start_firestore_start_listener(job_queue, loop):
                 # FE now carries backendRunId in the queue payload, so the
                 # research-doc read is a fallback only (legacy Admin-SDK BEs
                 # or installs where the FE somehow forgot to include it).
-                # Initialize `rd` so the topic fallback at line ~2829 is
+                # Initialize `rd` so the topic fallback below (`rd.get("topic")`) is
                 # safe even when we skip the doc-read branch entirely.
                 rd: dict = {}
                 # ⛔⛔ AND A CLIENT-SUPPLIED RUN ID IS A CLAIM, NOT A FACT. The
@@ -16112,7 +16114,7 @@ def start_firestore_start_listener(job_queue, loop):
                 continue
             try:
                 # 2026-05-22 (cancel-stale fix): cross-worker cancel race
-                # mitigation. The cancel handler at research.py:4090 flips
+                # mitigation. The cancel handler (`_do_cancel`, above) flips
                 # research status="stopped" + cancelled=True, but there's
                 # a window where worker A claimed the queue doc + scheduled
                 # call_soon_threadsafe enqueue BEFORE the cancel arrives —
@@ -16532,7 +16534,7 @@ def start_firestore_start_listener(job_queue, loop):
                     # BEFORE call_soon_threadsafe schedules the actual
                     # put. This closes the back-to-back-claim race
                     # exploited by Firestore listener replay (see the
-                    # gate clause at research.py:~4106). Decrement
+                    # busy-gate clause above). Decrement
                     # lands either at the worker's running-flag flip
                     # OR via _enqueue_with_position_refresh on
                     # _safe_enqueue failure (rare cancel-mid-flight).
@@ -16616,7 +16618,8 @@ def start_firestore_start_listener(job_queue, loop):
                 # On a BE restart, worker-1's rehydration uses this to avoid
                 # auto-resuming a run onto the WRONG worker's profile (the
                 # "worker-1 funnel"). The researches update rule has no field
-                # whitelist (firestore.rules:206 deviceUpdatingFor), so it rides
+                # whitelist (firestore.rules' /researches update rule, via
+                # `deviceUpdatingFor`), so it rides
                 # the same write that already sets backendRunId/status.
                 status_payload = {"backendRunId": run_id, "status": "ongoing",
                                   "assignedWorker": WORKER_ID,
@@ -16950,7 +16953,8 @@ def _safe_enqueue(job_queue, job, source: str,
     # FE"). Pre-fix, a reconnect-respawn's disk-restore/rehydrate hit that 403
     # fall-through and re-fired a run the user had already stopped (the
     # German-Shepherd resurrection). The resume HTTP/listener paths already
-    # gate on .stop (research.py:~5415); this closes the same hole in the
+    # gate on .stop (the start listener's resume branch and `resume_run`);
+    # this closes the same hole in the
     # enqueue funnel. Derive the run dir from resume_dir (full path) or run_id.
     _rd = (job or {}).get("resume_dir")
     _stop_path = None
