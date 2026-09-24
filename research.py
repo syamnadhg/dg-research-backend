@@ -6922,10 +6922,11 @@ _QUEUE_STATE = {
     # 2026-05-15: persist_fn exposes the run_server closure
     # `_persist_pending_queue` to the module-scope device-cmd listener
     # (`_start_device_command_listener`) so hard_reset can flush a clean snapshot to disk
-    # before os._exit. _hard_reset_lock makes the gate-state clear+persist
-    # atomic w.r.t. the worker's `finally` writes — without it, a worker
-    # finishing between the device-cmd's clear (memory) and persist (disk)
-    # would resurrect the wedged values to disk. Both initialised inside
+    # before os._exit. _hard_reset_lock serializes that persist with the
+    # worker's `finally` writes — without it, a worker finishing inside the
+    # exit window could write a job back into the snapshot hard_reset just
+    # cleaned. (It also covered a prior-run gate-state clear until wave 10.9
+    # removed that state — see below.) Both initialised inside
     # run_server before it starts the device-cmd listener.
     "persist_fn": None, "_hard_reset_lock": None,
     # ⛔⛔ THE PRIOR-RUN POINTER IS GONE (wave 10.9, N8). Three keys lived here
@@ -45171,7 +45172,7 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
     always `continue`s the round-robin afterwards, so every path here just
     mutates `p` / finalizes into `results` and returns 'continue'."""
     # Gap #1 belt-and-braces (HV never-touch): several resolver branches
-    # interact with the tab (session_expiry reload @~24336, switch_to_page in
+    # interact with the tab (the session_expiry reload, switch_to_page in
     # the extract branches) and are NOT individually hv_blocked-guarded. A
     # verification-walled agent must never reach them — today that state is
     # unreachable (an agent is non-hv_blocked when it parks, and hv_blocked is
@@ -46495,7 +46496,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
             log(f"[{_agent_name}] Hard retry #{_hard_count} — closing tab, re-running setup", "WARN")
             # Resolve the brief from runtime state (populated before Phase 2 kicks
-            # off at line ~10050: `_runtime.original_inputs = {..., 'brief': ...}`).
+            # off, in run_pipeline: `_runtime.original_inputs = {..., 'brief': ...}`).
             _brief_text_hr = _runtime.original_inputs.get("brief") or ""
             _brief_path_hr = None
             if _tracks_dir:
@@ -46503,7 +46504,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if _bp.exists():
                     _brief_path_hr = str(_bp)
             # #953: original_inputs carries 'brief' only on the brief-provided
-            # start path (research.py:~39749); the full-pipeline path (~39230)
+            # start path in run_pipeline; the full-pipeline path
             # stores topic+pdf_paths and P1 WRITES the brief to disk later. The
             # 2026-07-13 hard retry pasted a 0-char brief into Gemini ("Paste
             # verify: 1/0 chars") and manufactured a "couldn't send the brief"
@@ -47114,8 +47115,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         # rendered as <aside> and exceeds any reasonable
                         # bbox lower bound, so a bare-aside check would
                         # always match and the no-panel gate would never
-                        # be true. Tightened gate ports _PANEL_GATE_JS at
-                        # research.py:10639 — must be right-half-of-
+                        # be true. Tightened gate ports _PANEL_GATE_JS (in
+                        # `_read_claude_artifact_panel`) — must be right-half-of-
                         # viewport, ≥400px wide, and innerText must not
                         # read like nav chrome (≥2 nav markers).
                         try:
@@ -47172,8 +47173,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 if sent:
                                     # Reset all wall-clock / growth baselines
                                     # so neither the wall-clock nor the no-
-                                    # growth watchdog (research.py:~14987,
-                                    # requires elapsed>1200 AND no_growth>1200)
+                                    # growth watchdog (gated on STUCK_MIN_ELAPSED_SEC
+                                    # AND STUCK_NO_GROWTH_SEC)
                                     # fires a false-positive snag while Claude
                                     # composes the new response. Without
                                     # last_growth_time reset, no_growth_secs
@@ -47203,7 +47204,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #   - Nudge 2 (yes/no check-in)        at ~225s (180s spacing)
             #   - Nudge 3 (terse, "Done?")         at ~405s (180s spacing)
             # All three fit inside the 600s outer cap, well before the
-            # 20-min general no-growth watchdog at research.py:~17441
+            # general no-growth watchdog (STUCK_NO_GROWTH_SEC, 15 min by default)
             # takes over.
             #
             # Gates (all must hold):
@@ -48261,7 +48262,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # #929: also honor the scraper's separate `phase` field — but ONLY
             # for "planning". Gemini's scraper never returns status="planning"
             # (its plan states read status='generating' with the planning
-            # signal in `phase` — scrape_progress_gemini ~16663), so the
+            # signal in `phase` — scrape_progress_gemini), so the
             # status-only gate never protected a legitimately long plan draft
             # (2026-07-09 false alarm: healthy 10-min plan → stuck card →
             # auto-skip). `phase` values OTHER than planning must NOT gate:
@@ -48304,7 +48305,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 log(f"[{name}] Auto-skip — {_as_why} (elapsed {int(elapsed/60)}m). "
                     "Salvaging partial output, closing tab, continuing other agents.", "WARN")
                 _as_partial = ""
-                # #929 hands-off parity with the user-skip consumer (22555):
+                # #929 hands-off parity with the user-skip consumer:
                 # never run the extraction ladder (DOM walks + CUA fallback)
                 # against a verification-walled tab — those touches are
                 # exactly what the 2026-07-06 Cloudflare directive forbids,
@@ -48625,7 +48626,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # source delta get suppressed and starve the watchdog.
                 "progress_label": (_progress_val or "")[:80],
                 "tool_uses_len": len(progress.get("tool_uses", []) or []),
-                # Same gap as P1 (research.py:~10515) — without these
+                # Same gap as P1 (`poll_until_done`) — without these
                 # entries, a search-only or sectionsDone-only delta is
                 # suppressed and the FE graph series flat-lines through
                 # whole search bursts. Required for real-curve rendering.
@@ -48753,7 +48754,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # panel is scrolled, so the cheap DOM detector below kept returning
                 # not-done on a genuinely-complete report and the run limped along
                 # on the slow 5-min CUA fallback (live E2E 2026-07-10: ~50m flat at
-                # "5 URLs, 15 steps", only CUA — which scrolls first, :24444 — ever
+                # "5 URLs, 15 steps", only CUA — which scrolls first — ever
                 # caught it). Scroll the panel + window to the bottom first so the
                 # marker + full sources render into the DOM before we read them.
                 # Claude-scoped: ChatGPT/Gemini detectors weren't affected and we
@@ -49355,7 +49356,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # The deadline is stamped on the card with `arm_registry=False`:
                 # the FE renders a countdown to the same epoch the park will
                 # expire at, but no registry entry is created — _fire_due_autoskips
-                # deliberately skips parked agents (line ~26141), so an armed
+                # deliberately skips parked agents, so an armed
                 # entry would be dead weight that could still fire if the park
                 # were ever cleared without disarming. One timer, one actor.
                 #
@@ -51747,7 +51748,7 @@ def _doc_img_prose_len(text: str) -> int:
 # Converting to numbered footnotes [1][2][3] was considered + rejected:
 # the turn{N}{view|search|file}{M} indices reference ChatGPT's internal
 # source list, NOT the source URLs we capture via observer-side
-# extraction (research.py:~18261). Without a mapping we'd produce
+# extraction. Without a mapping we'd produce
 # footnotes that point nowhere — strip is the correct choice.
 _CHATGPT_CITE_TOKEN_RE = re.compile('[^]*')
 
@@ -52605,11 +52606,11 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     "T1 = X, T2 = Y, T3 = Z" describes the META-pattern — DOM → CUA →
     clipboard-hijack — not a uniform per-agent mapping):
       - ChatGPT (this fn): CUA download → HTML→MD → CUA copy hijack
-      - Gemini (`extract_gemini_response`, research.py:19575): Share&Export
+      - Gemini (`extract_gemini_response`): Share&Export
         hijack → HTML→MD → Ctrl+A/C hijack (reordered 2026-05-24 — native
         Share & Export menu is Gemini's authoritative export path; DOM
         scrape is the deterministic fallback when CUA can't drive the menu)
-      - Claude (`extract_claude_response`, research.py:16640): two-mode —
+      - Claude (`extract_claude_response`): two-mode —
         3 tiers in Deep Research artifact-aware mode (T1 CUA-download →
         T2 HTML→MD of the open artifact panel → T3 CUA + clipboard hijack;
         publish moved OUT of T2 to the end share-link step on 2026-06-03 so
@@ -53189,8 +53190,8 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         pass
     # E2 / DGOPS-7364 — chat mode early return.
     # Claude in chat mode emits a regular assistant reply, NO artifact.
-    # The artifact-aware Tiers 1-3 below (Research-mode path, line ~16877
-    # onward — CUA download / publish + claude.site / CUA + clipboard
+    # The artifact-aware Tiers 1-3 below (the Research-mode path — CUA
+    # download / HTML→MD of the open artifact panel / CUA + clipboard
     # hijack) all target aside / artifact-panel / [class*="artifact"]
     # selectors that don't exist in chat mode, so they'd all return empty
     # and the function would falsely report "All extraction methods
@@ -53304,7 +53305,8 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
 
         # #777 ROOT FIX: the DOM pre-click (_click_claude_artifact) sometimes
         # reports success but matched a WRONG element (research-tracking card /
-        # context-menu trigger — see the comment at ~23130) so the final-report
+        # context-menu trigger — see the 2026-05-14 comment at the pre-click
+        # above) so the final-report
         # panel never actually opened. The CUA open above only ran on `not
         # clicked`, so a FALSE-success pre-click SKIPPED it → Tier 1's Download
         # menu, Tier 2's Publish button, and Tier 3's Ctrl+A all run against a
@@ -53440,8 +53442,9 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             '[role="complementary"] [class*="markdown"]',
             '[role="complementary"] .prose',
         ], label)
-        # Floor = 2000 to match Gemini's sibling DOM-scrape tier (research.py
-        # ~22824): a DOM panel scrape can catch a sparse PARTIAL render that is
+        # Floor = 2000 to match Gemini's sibling DOM-scrape tier (in
+        # `extract_gemini_response`): a DOM panel scrape can catch a sparse
+        # PARTIAL render that is
         # NEITHER a checklist nor a nav-sidebar (so both reject guards miss it).
         # Genuine Claude DR reports are >5000 chars, so a 2000 floor rejects a
         # truncated panel while accepting every real report; a short-but-real doc
@@ -61931,7 +61934,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     #   /new IS Claude's canonical fresh composer (cheaper than a
                     #   fresh tab + a second authenticated surface).
                     # Gemini: url == https://gemini.google.com — a bare /app load
-                    #   re-triggers Layer 0.6 below (@~34135), which force-New-
+                    #   re-triggers Layer 0.6 below, which force-New-
                     #   chats any /app/<id> so we always land on a clean composer.
                     # Both: a same-tab nav on the warm, challenge-passed tab
                     #   AVOIDS a scored cold top-level navigation.
@@ -63530,7 +63533,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # conversation was started — verify just couldn't read the
             # active state (cross-origin DR iframe). The round-robin
             # poller at poll_all_agents_round_robin already handles the
-            # "verified=False but page exists" case (line ~13515), so we
+            # "verified=False but page exists" case, so we
             # hand off without firing the false-alarm banner that would
             # tempt the user into a hard retry that closes the working
             # tab. The fail_agent path remains for genuinely dead pages
@@ -64037,7 +64040,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # (2026-07-09 live false alarm → card → auto-skip of a working
         # Gemini). While the heartbeat scrape shows the plan actively
         # generating (status='generating': stop button / streaming attr /
-        # running animation — scrape_progress_gemini ~16620), we hold the
+        # running animation — scrape_progress_gemini), we hold the
         # early card and extend the wait, bounded by a hard cap so a
         # misread animation can't dwell forever.
         _stream_max_sec = int(os.environ.get("GEMINI_PLAN_STREAM_MAX_SEC", "900"))
@@ -64655,7 +64658,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # plan" from "running the research", so without a confirmed click it would
         # falsely stamp a not-yet-started run as researching (+ research_started_at).
         # No confirmed click ⇒ not running; the round-robin keeps the tab (it does
-        # NOT drop a not-verified agent — see ~19298) and the wall-clock cap
+        # NOT drop a not-verified agent — see `poll_all_agents_round_robin`)
+        # and the wall-clock cap
         # surfaces an honest fail_agent if the plan never starts.
         if _gemini_2d_skipped:
             # #929: the skip was finalized in place (agent_skipped emitted,
@@ -66663,7 +66667,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
     # 2026-05-06 (Stream 2 D1): single-attempt audio generation. The outer
     # _await_phase_with_active_deadline(3, PHASE_3_AUDIO_MAX_MIN,
-    # soft_warn_only=True) at the call site (:20049) is the sole audio
+    # soft_warn_only=True) at the call site in run_pipeline is the sole audio
     # ceiling. User retry routes through that helper's
     # _PhaseSoftDecision('retry') OR through the post-helper no-audio loop
     # — no inner retry/timeout machinery here.
@@ -66856,7 +66860,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             await stop_narration_ticker(_stop, _task)
 
         # 2026-05-14: capture CUA abort signals. The audio-generate prompt
-        # (prompts.py:674-688) instructs CUA to emit exact "abort: …"
+        # (`make_prompt_audio_generate` in prompts.py) instructs CUA to emit
+        # exact "abort: …"
         # strings when it detects unsafe states (no customize affordance,
         # customize panel never opened, default audio fired by misclick,
         # or audio already present). Previously the caller ignored the
@@ -66976,7 +66981,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             return {"audio_path": None}
 
     # Poll for completion — refresh + CUA check every 3 min. No inner cap;
-    # the outer _await_phase_with_active_deadline at :20049 (soft_warn_only=True)
+    # the outer _await_phase_with_active_deadline in run_pipeline (soft_warn_only=True)
     # is the sole audio ceiling.
     log("Polling for audio completion (every 3 min with refresh; outer soft-warn handles ceiling)...")
     poll_start = time.time()
@@ -67060,7 +67065,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             pass
 
         # Mid-poll duplicate detection (2026-05-14). The post-generate
-        # +5s invariant at :19518 only catches duplicates that render
+        # +5s invariant above only catches duplicates that render
         # immediately. In practice the misclick-fired default audio
         # can take 5-10 min to appear in the Studio panel — long after
         # the post-gen check has passed. Recount every poll cycle so
@@ -68932,7 +68937,8 @@ _DOC_SOURCE_MARK_RE = re.compile(r'\[\\\[\d{1,3}\\\]\]\(')
 #: second identical `Sources` shows in the document, the share and the
 #: delivered Google Doc.
 #: ⛔ THE ALTERNATE STILL BEGINS WITH THE WORD. The web collapses a trailing
-#: sources section on `/^sources\b/i` (`markdown-components.tsx:151`), and it is
+#: sources section on `/^sources\b/i` (`SOURCES_HEADING_RE` in
+#: markdown-components.tsx), and it is
 #: deliberately not widened to References/Citations — "Numbered sources" would
 #: have quietly stopped collapsing.
 _DOC_SOURCES_TITLE = "Sources"
@@ -68970,14 +68976,16 @@ def _doc_sources_heading(title: str) -> str:
     chosen for looks. The same appended heading is read by:
 
       • THE WEB'S SUPER RESEARCH PLANNER, which indexes each agent report by
-        `/^(#{1,4})\\s+(.+?)\\s*$/gm` (`superresearch-doc.ts:228`) and offers
+        `/^(#{1,4})\\s+(.+?)\\s*$/gm` (`HEADING_LINE_RE` in superresearch-doc.ts)
+        and offers
         every match to a section writer as "Your material". At `##` our
         bibliography became a phantom research slice — up to three per run —
         and a section could be written from a list of links. It stops at FOUR.
       • THE WEB'S DOCUMENT VIEWER AND PUBLIC SHARE, which collapse the report's
         LAST heading into a `Sources · n` disclosure when it matches
         `/^ {0,3}(#{1,6})\\s+(.+?)\\s*#*\\s*$/` and `/^sources\\b/i`
-        (`markdown-components.tsx:140,151`). That one goes to SIX — so a setext
+        (`HEADING_RE` and `SOURCES_HEADING_RE` in markdown-components.tsx). That
+        one goes to SIX — so a setext
         heading, which renders byte-identically to `##`, would have silently
         stopped the bibliography collapsing on both surfaces. Level five is the
         only form the viewer still folds and the planner cannot see.
@@ -70601,8 +70609,8 @@ async def _p2_persist_reports(results, queue_dir, topic, brief_text) -> None:
             _agent_md = f"# {name} Deep Research\n\n{r['text']}"
             _agent_lc = name.lower().replace(" ", "")
             # Backstop findings extraction at the P2 finalize re-save
-            # site. The primary site is in extract_and_record_agent
-            # (~research.py:10988), but this resave path can run on
+            # site. The primary site is in extract_and_record_agent,
+            # but this resave path can run on
             # resume / manual re-finalize when the snapshot ring may
             # have been cleared. Reuses findings that already exist.
             #
@@ -70801,7 +70809,7 @@ def _is_browser_close_error(exc) -> bool:
     """True when `exc` is a Chromium/patchright "the page or browser went away"
     failure — the user closed the window, an OOM kill, a profile-lock fight, or
     a driver EPIPE. Reuses the SAME string set the navigate() retry path keys
-    on (see ~research.py:15975). These strings originate in the CDP driver, not
+    on (see `Browser.navigate`). These strings originate in the CDP driver, not
     the OS, so they read identically on Windows / Linux / macOS — the
     classification is fully cross-platform. `TargetClosedError` is matched by
     type name so a future message-wording change still classifies."""
@@ -71240,8 +71248,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # `clear_local_storage` device-command handler treats this dir
         # as protected. Without this, a clear fired during the lengthy
         # checkpoint-restore / config-load block below could rmtree the
-        # dir we're about to resume from. Also re-set at line ~17235
-        # for symmetry with the new-run branch — idempotent.
+        # dir we're about to resume from. Also re-set by the common
+        # `init_tracks` call after both branches — idempotent.
         init_tracks(queue_dir.name)
         # ⛔⛔ BOTH HALVES OF THIS COMMENT WERE FALSE, and the second one is the
         # dangerous kind — it describes a safety property the code does not
@@ -71320,8 +71328,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        summary="Resumed from checkpoint — frontend handles Phase 5")
             log("Resume: P4 already done, re-emitted phase_complete phase=4 to retrigger FE-P5")
             update_delivery(status="completed")
-            # Mirror the success-path handoff (~line 18663): advance both
-            # phase AND currentPhase to 5 so the homepage tile diagram
+            # Advance both phase AND currentPhase to 5 (P4 is already done on
+            # this branch; the normal hand-off, `_record_hand_off`, leaves them
+            # to the cloud, which writes phases 4 and 5) so the homepage tile diagram
             # stops glowing the YouTube node and FE-P5 picks up cleanly.
             # Pre-fix this only wrote phase=4, leaving currentPhase stale
             # at 4 and the diagram painting YouTube as the active node
@@ -71388,8 +71397,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Set the active-run global immediately after mkdir so a
         # `clear_local_storage` device command fired during Flow B
         # source downloads / config write doesn't rmtree this dir
-        # mid-construction. The init_tracks call at line ~17235 is
-        # now redundant on this branch but harmless (idempotent).
+        # mid-construction. The common init_tracks call after both
+        # branches is now redundant on this branch but harmless (idempotent).
         init_tracks(queue_dir.name)
         start_phase = 1
         cp = {}
@@ -71549,8 +71558,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # 2026-05-13: Firestore overlay — read pipelineConfig from research doc
         # and merge restrictively (skip wins, agents-off wins, video/email-off
         # wins, podcastLength latest wins). Catches queued-state toggles that
-        # don't propagate via writeCommand (30s stale-command gate at line
-        # ~3348 discards old writes; the BE command listener also isn't
+        # don't propagate via writeCommand (the 30s stale-command gate,
+        # STALE_COMMAND_AGE_MS, discards old writes; the BE command listener also isn't
         # attached until the run picks up its slot, so writes from the
         # queued window land in Firestore but never reach _config_updates).
         # The research doc's pipelineConfig is the FE's authoritative snapshot,
@@ -71630,7 +71639,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # the skip-brief Settings toggle, and makes downstream phases work.
         # 2026-05-13: also require `2 not in sp` — when the user explicitly
         # toggles all P2 agents off, the FE cascades by adding 2 to
-        # skippedPhases (ChatInput.tsx:312). Honoring that explicit intent
+        # skippedPhases (ChatInput.tsx). Honoring that explicit intent
         # means we must NOT silently re-enable ChatGPT just because ac is
         # all-False; the user wants P2 skipped wholesale. Without this gate
         # the new Firestore overlay would correctly disable all 3 agents,
@@ -71679,9 +71688,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
     links, notebook_url, youtube_url = {}, cp.get("notebook_url", ""), cp.get("youtube_url", "")
-    # CRITICAL: audio_overview_url must be initialized at module scope so
-    # P5 (line ~15272 _effective_audio_url) doesn't NameError when resuming
-    # past P3 (start_phase >= 4). The P3 sub-step normally assigns this
+    # CRITICAL: audio_overview_url must be initialized at function scope so
+    # the reads after Phase 3 (the checkpoint and delivery writes) don't
+    # NameError when resuming past P3 (start_phase >= 4). (The Phase 5 reader
+    # this note first named, `_effective_audio_url`, went when Phase 5 moved
+    # to the web.) The P3 sub-step normally assigns this
     # inside its `elif start_phase <= 3` branch; on resume, we restore it
     # from checkpoint. P4 path also sets `audio_overview_url = ""` so the
     # variable is always defined regardless of which branch P3 takes.
@@ -72120,7 +72131,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         return
                     # Retract the durable pendingDecision the #715 seam mirrored
                     # when fail_phase fired. The central clear keys off
-                    # pipeline_resumed/stopped (research.py:~10591); in the
+                    # pipeline_resumed/stopped (in `emit_event`); in the
                     # skipInitVerify path NO downstream P0 gate emits one (the
                     # platform walk is blanked + env-check passes), so without
                     # this the card re-surfaces on a cold chat-open during a
@@ -72135,7 +72146,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # Retry — re-probe with the (presumably) fixed key. NO Skip
                     # branch here (unlike the login walk): a dead-key infra
                     # failure is fail-closed and skipInitVerify must not bypass
-                    # it. Mirrors the platform-walk retry tail at :28229.
+                    # it. Mirrors the platform-walk retry tail below.
                     _controls.consume_retry_phase(0)
                     _controls.retry_init_verify = False
                     continue
@@ -72301,7 +72312,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # into Phase 1/2/3 where it crashes harder and later.
                     # Only Retry. The global Settings → Skip login
                     # verification toggle still bypasses the loop entirely
-                    # at the top of the platform-walk (line ~18677); that
+                    # at the top of the platform-walk; that
                     # path is the right escape hatch for "I know what I'm
                     # doing, run without CUA on purpose".
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
@@ -72328,7 +72339,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # retry loop. Without this check the function just falls
                     # through to consume_retry_phase and continues, ignoring
                     # the user's skip signal. Mirrors the login_required
-                    # pattern at line ~21700.
+                    # pattern in this walk.
                     if _controls.skip_init_verify:
                         log("Phase 0: SKIP_INIT_VERIFY during cua_unavailable — bailing CUA loop", "INFO")
                         _global_skip = True
@@ -72647,7 +72658,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # ChatGPT-runs-twice design (P1 brief + P2 task), skip-at-P1
                 # cannot silently produce an empty brief — Phase 2 hard-fails
                 # with "No brief text available". Mirror the existing post-fail
-                # manual_brief flow at ~line 20554: emit manual_brief_required,
+                # manual_brief flow in Phase 1: emit manual_brief_required,
                 # block on extra_context (3h backstop), consume the user-typed
                 # brief, then steer the dispatch into SKIP so brief_artifact
                 # is created and Phase 2 runs with the manual brief.
@@ -72929,7 +72940,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 # never-die contract: fail_phase emits the
                                 # actionable alert, await the user's
                                 # decision, and act on it. Mirrors the
-                                # pattern at research.py:22131-22146.
+                                # Phase 1 timeout decision above
+                                # (`_phase_timeout_decision`: retry / skip / stop).
                                 fail_phase(1,
                                            "No brief received",
                                            "We waited for you to type a research brief in "
@@ -72957,7 +72969,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                     break
                                 # "stop" / "timeout" — terminate the run.
                                 # pipeline_stopped emit matches the
-                                # canonical pattern at research.py:22128.
+                                # canonical `user_{_decision}_after_timeout`
+                                # stop in the Phase 1 timeout branch above.
                                 emit_event("pipeline_stopped", phase=1,
                                            reason=f"user_{_bs_decision}_after_brief_wait_backstop")
                                 return
@@ -72965,8 +72978,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # 2026-05-15: skip-after-backstop propagation.
                         # When the 3h-backstop skip branch breaks the inner
                         # loop with _p1_skipped_after_error=True, exit the
-                        # outer `while True:` so the run_phase1 tail at
-                        # ~line 22275 sees the flag and emits the stub
+                        # outer `while True:` so the Phase 1 tail below
+                        # (`if _p1_skipped_after_error:`) sees the flag and emits the stub
                         # phase_complete + sets up an empty brief artifact.
                         # Without this guard we'd fall through to the
                         # "user typed a brief" path below and reset the flag.
@@ -73056,7 +73069,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     skipped=True,
                     summary="Phase 1 skipped after error — no brief generated")
                 _update_firestore_research({"phase": 1, "status": "ongoing"})
-                # Tile/Icon Consistency (mirrors P2 at line ~19244): persist
+                # Tile/Icon Consistency (mirrors P2's): persist
                 # a terminal P1+ChatGPT status to the root doc so the listing
                 # tile + chat phase icon + agent dropdown stay correct after
                 # reload. Without this, on reopen the FE falls back to the
@@ -73070,7 +73083,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # before P2 ChatGPT had run. P1's status is fully captured by
                 # phases[1].status (read by the Brief icon, which has no
                 # `agent` field). P2 ChatGPT writes its own agents.chatgpt
-                # at P2 finalize (research.py:12716).
+                # at P2 finalize.
             elif _brief_from_file:
                 # Phase 1 bypassed via --brief-file (or frontend briefText).
                 # Persist to disk + Firestore. The user supplied the text;
@@ -73285,7 +73298,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # the public video description.
                         # ▶ Now identical to the three sibling branches: the
                         # brief's own in-app page, primary and verified.
-                        # ⛔ THE LABEL IS LOAD-BEARING — see #746 at :60576. It
+                        # ⛔ THE LABEL IS LOAD-BEARING — see the #746 notes above. It
                         # must be exactly "Read Brief report" or a phone/cold
                         # reopen renders the brief row TWICE, because the FE's
                         # hydration backfill synthesizes that label for the same
@@ -73486,7 +73499,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
             for da in disabled_agents:
                 # F2 (2026-05-06): emit with `reason` so the emit_event hook
-                # at :5818-5833 persists agents[<da>].status="skipped" to the
+                # persists agents[<da>].status="skipped" to the
                 # root doc. Pre-fix, the for-loop omitted reason and the hook
                 # gated persistence on truthy reason — leaving individually-
                 # config-skipped agents (e.g. Claude off, others on) without
@@ -73571,8 +73584,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # P2→P3 handoff are BE-internal (FE doesn't gate on them). Emitting
             # phase_complete:2 FIRST:
             #   • Flips the P2 tile to green immediately on the FE.
-            #   • Auto-cancels the per-tick narrator (emit_event hook at
-            #     ~line 6225) so "Claude is refining..." stops echoing
+            #   • Auto-cancels the per-tick narrator (an emit_event
+            #     hook) so "Claude is refining..." stops echoing
             #     while the user waits for P3.
             #   • Writes the per-agent terminal status to the root doc so
             #     reopen / tile listing renders correctly post-reload.
@@ -73930,7 +73943,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # consolidated.md is a P2 byproduct of claude+gemini concatenation
         # used for the Documents page only. 2026-05-11 fix: on a
         # checkpoint resume after PC death, `results` is empty and the
-        # synthesis loop at ~21117 used to hydrate results from this scan;
+        # synthesis loop used to hydrate results from this scan;
         # consolidated.md slipped in as a fourth "agent" and the rebuilt
         # NotebookLM notebook included it alongside chatgpt/claude/gemini.
         _P3_DERIVED_STEMS = {"brief", "consolidated"}
@@ -74080,12 +74093,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Pre-fix, the verify gate (when skip_init_verify=True) ran a 5-15s
         # CUA call BEFORE phase_start:3 was emitted — FE saw P2 done + blank
         # gap. Now: flip P3 to "running" first; the gate runs visibly under
-        # the P3 tile (the gate's own agent_progress notebooklm status emits
-        # at line ~6529 light up the dropdown). If the gate or downstream
-        # skip-check decides skip, the existing phase_skipped:3 emit at
-        # line ~20875 cleanly flips running → skipped via the FE's
+        # the P3 tile (the gate's own agent_progress notebooklm status emits,
+        # from `_phase_verify_gate`, light up the dropdown). If the gate or
+        # downstream skip-check decides skip, the existing phase_skipped:3 emit
+        # below cleanly flips running → skipped via the FE's
         # deterministic phaseId. The canonical phase_start:3 emit later in
-        # the elif at ~line 20939 is idempotent (same phaseId, just refreshes
+        # the `elif start_phase <= 3` branch is idempotent (same phaseId, just refreshes
         # description).
         if (start_phase <= 3
                 and 3 not in skip_phases
@@ -74098,7 +74111,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # NotebookLM (no tab/CUA/pause — run_phase3_upload/audio own real
         # verification via their work-tab preflights). 'skipped' =
         # prior-skip echo; it cascades to P4 (no YouTube without podcast —
-        # same rule as the skip_phase command handler at ~line 2833).
+        # same rule as the skip_phase command handler in `_start_command_listener`).
         if (start_phase <= 3 and 3 not in skip_phases
                 and 3 not in _controls.skipped_phases
                 and _controls.skip_init_verify
@@ -74426,8 +74439,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # first version of this copy did. The gate reaches
                             # here from three states, and only one of them has
                             # a notebook: the upload threw and exhausted its
-                            # retries (56307), the login pause ended in a skip
-                            # (56220), or the upload landed somewhere that is
+                            # retries, the login pause ended in a skip,
+                            # or the upload landed somewhere that is
                             # not a /notebook/{id} page. "We uploaded your
                             # reports but the notebook didn't open" is false on
                             # the first two — and the user has just dismissed a
@@ -74864,7 +74877,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             #
             # `_p3a_user_skipped` is the sibling, found in adversarial review of
             # that fix. A Skip on the P3 UPLOAD-timeout card does emit
-            # phase_skipped:3 (line ~44346) — so it looked correct — but it was
+            # phase_skipped:3 — so it looked correct — but it was
             # missing from this gate, so the phase then ALSO emitted
             # phase_complete:3: a double terminal event that flips the tile from
             # greyed-skipped back to green and overwrites the durable phase
@@ -75600,8 +75613,8 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
         .collection("researches")
     # 2026-05-22: dropped "queued" from rehydration. The
     # Firestore on_snapshot listener replays every existing
-    # queue doc as ADDED on first attach (research.py:3458)
-    # and the FIFO pre-query (3955-3989) handles ordering
+    # queue doc as ADDED on first attach (the start listener's `on_snapshot`)
+    # and its FIFO pre-query handles ordering
     # across all submitters (owner + sharers). Rehydrating
     # queued docs was owner-tree-only AND created a dual-
     # processing race. "ongoing" status is still rehydrated
@@ -75928,8 +75941,8 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                 # cited one that had drifted ~70 lines.)
                                 # This function is at MODULE scope while `_job_queue`
                                 # is a LOCAL of run_server, so the bare name raised
-                                # NameError here — the SAME bug already fixed at
-                                # research.py:~5405 for the device-cmd listener, and
+                                # NameError here — the SAME bug already fixed in
+                                # `_start_device_command_listener`'s hard_reset branch, and
                                 # worse in this spot: the caller's `except Exception`
                                 # logs one "Queue rehydration failed" WARN and abandons
                                 # the whole block, so neither the auto-resume nor the
@@ -77279,7 +77292,7 @@ async def run_server(port=8000):
                 # Position #1's "behind" is the currently-running pipeline
                 # when there is one. Two callers reach this branch with
                 # different semantics:
-                #   • Completion flow (after task_done at :25549) —
+                #   • Completion flow (after `_job_worker`'s task_done) —
                 #     `_QUEUE_STATE["running"]` was just flipped False and
                 #     `current_job` set to None. The else-branch clears
                 #     behind fields (no run ahead — position #1 is next up).
@@ -77342,12 +77355,12 @@ async def run_server(port=8000):
     # _do_cancel deferred-cancel branch. See helper docstring.
     _QUEUE_STATE["recompute_deferred_fn"] = _recompute_deferred_queue_positions
     # 2026-05-15: initialise the hard-reset lock here, before the device-cmd
-    # listener thread is spawned at research.py:24898. The lock makes the
-    # gate-state clear+persist (in the device-cmd thread) atomic w.r.t. the
-    # worker `finally` block writes (in the asyncio main thread). Without it,
-    # a worker finishing between the clear (line 1916-1918) and the persist
-    # (line 1919) of hard_reset would write stale uid_X back to _QUEUE_STATE,
-    # which the persist would then snapshot to disk — defeating the reset.
+    # listener thread is spawned further down run_server. The lock makes
+    # hard_reset's snapshot persist (in the device-cmd thread) atomic w.r.t.
+    # the worker `finally` block writes (in the asyncio main thread). Without
+    # it, a worker finishing inside the exit window could write a job back
+    # into the snapshot hard_reset just cleaned — defeating the reset. (It
+    # also guarded a prior-run gate-state clear until wave 10.9 removed it.)
     _QUEUE_STATE["_hard_reset_lock"] = _threading.Lock()
     _QUEUE_STATE["_pending_enq_lock"] = _threading.Lock()
 
@@ -77356,14 +77369,15 @@ async def run_server(port=8000):
     # exits — daemon-loop relaunch otherwise restarts with an empty queue,
     # losing any work that hadn't reached `status=queued` in Firestore yet.
     # Snapshot to disk on every worker boundary so a Phoenix restart can
-    # restore. Firestore-driven rehydration (line ~17850) takes precedence;
+    # restore. Firestore-driven rehydration (run_server's "Queue rehydration"
+    # block) takes precedence;
     # this is a belt-and-suspenders fallback for racing/network-blocked cases.
     # Per-worker pending-queue file (2026-05-21). Pre-multi-worker, all
     # writers raced on `_pending_queue.json` (+ its `.tmp` sibling). With
     # N workers, the tmp-then-replace dance still races: two workers
     # writing different snapshots both name the tmp the same, the second
     # write clobbers the first mid-buffer. Per-worker file isolates each
-    # snapshot. Restore (research.py:~26649, 26991) reads MY worker's
+    # snapshot. Restore (the disk-restore blocks in run_server) reads MY worker's
     # file only — siblings restore their own. Single-worker installs
     # keep the legacy filename (worker 1 = no suffix) so a pre-PR install
     # that never re-pairs into multi-worker still finds its snapshot.
@@ -77372,8 +77386,9 @@ async def run_server(port=8000):
     # spellings of one path are how a writer and a rewriter drift apart.
     _pending_queue_path = _pending_queue_snapshot_path()
 
-    # Forward declaration so the module-scope device-cmd listener at
-    # research.py:1766 can call this closure via _QUEUE_STATE["persist_fn"].
+    # Forward declaration so the module-scope device-cmd listener
+    # (`_start_device_command_listener`) can call this closure via
+    # _QUEUE_STATE["persist_fn"].
     # The assignment happens immediately after the function body below.
     def _persist_pending_queue(current_job=None):
         """Snapshot _job_queue contents (+ optional current_job) to disk.
@@ -77418,7 +77433,8 @@ async def run_server(port=8000):
             return False
 
     # 2026-05-15: expose the persist closure to the module-scope device-cmd
-    # listener at research.py:1766 so hard_reset can flush a clean snapshot
+    # listener (`_start_device_command_listener`) so hard_reset can flush a
+    # clean snapshot
     # to disk before os._exit (the listener can't directly close over this
     # function — it lives in a different scope).
     _QUEUE_STATE["persist_fn"] = _persist_pending_queue
@@ -77739,13 +77755,14 @@ async def run_server(port=8000):
         """Process pipeline jobs one at a time from the queue."""
         while True:
             job = await _job_queue.get()
-            # 2026-05-25: clear stale stop flag before gate-wait. A
+            # 2026-05-25: clear a stale stop flag before the job starts. A
             # prior HARD_RESET that fired while the worker was idle
             # (no run in flight to consume the flag) leaves
             # _controls.is_stop()=True dangling. Without this reset,
-            # the next job's gate-wait check at ~29094 sees the stale
-            # flag and bails with "cancelled during gate wait — skipping
-            # run_pipeline" — the user's Kalki repro from today's E2E
+            # the next job starts with a stop already requested. Until
+            # wave 10.9 removed the gate-wait, that check saw the stale
+            # flag first and bailed with "cancelled during gate wait — skipping
+            # run_pipeline" — the user's Kalki repro from that day's E2E
             # (HARD_RESET at 18:13:28 with no active run → Kalki claimed
             # at 18:20:45 → bailed 18:20:46 without ever starting).
             # Safe because (a) cancels for in-queue jobs remove from
@@ -77882,7 +77899,7 @@ async def run_server(port=8000):
                     _did = load_device_id()
                     if _firebase_db and _did:
                         # 2026-05-26: publish phase=0 alongside the run-meta
-                        # fields. The phase_start emit at ~line 26504 will
+                        # fields. The first phase_start emit (the `emit_event` hook) will
                         # re-write the same value within a few hundred ms
                         # — but BEFORE that fires there's a gap (job claim
                         # → run_pipeline entry → first phase_start) during
@@ -78116,7 +78133,7 @@ async def run_server(port=8000):
                 _job_queue.task_done()
                 # Clear the just-finished job's queue tracking fields from
                 # Firestore. `_flip_queued_to_ongoing` already deletes
-                # these on the queued→ongoing flip (:20869-20874), but if
+                # these on the queued→ongoing flip, but if
                 # the worker raced through completion before the listener
                 # delivered the "ongoing" intermediate frame — or the run
                 # errored / was watchdog-stopped without the flip running
@@ -78668,7 +78685,7 @@ async def run_server(port=8000):
         # detector's worker-idle check).
         #
         # If a job is auto-resumed by rehydration below, its dequeue at
-        # research.py:~26948 will re-write the fields. The 1-15s window
+        # `_job_worker` will re-write the fields. The 1-15s window
         # between this clear and re-write is invisible to the FE
         # because the cross-user fallback predicate requires
         # `currentRunId` set; cleared state ⇒ fallback not engaged ⇒ no
@@ -79800,7 +79817,7 @@ async def _pair_prompt_api_keys(uid: str):
 
 def _chrome_install_hint() -> str:
     """OS-appropriate one-liner for installing real Google Chrome — the browser
-    the pipeline drives via channel='chrome' (research.py:~16137). We never
+    the pipeline drives via channel='chrome' (`Browser.start`). We never
     auto-install it (needs admin/sudo + an assumed package manager); --pair and
     --doctor surface this hint when Chrome is absent."""
     plat = _supervisor_platform()
@@ -80728,7 +80745,8 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
             await asyncio.sleep(random.uniform(1.5, 3.0))
         try:
             # open_isolated_tab (not new_tab) so self.page isn't clobbered by a
-            # tab we immediately close (documented anti-pattern at :16891).
+            # tab we immediately close (documented anti-pattern: see
+            # `Browser.open_isolated_tab`).
             tab = await browser.open_isolated_tab(url)
         except Exception as e:
             log(f"verify: failed to open {name}: {e}", "WARN")
@@ -81603,10 +81621,11 @@ async def _continue_pair_stages_2_to_6(
     # Playwright DOM checks AND CUA vision before Stage 5 clears it.
     # Matches Phase 0 init rigor.
     _setup_cua_client = None
-    # Route through `resolve_api_key()` (research.py:203) so this site honors
+    # Route through `resolve_api_key()` so this site honors
     # the full precedence chain (Firestore → user-scope env → os.environ),
     # not just flat os.environ. Was previously a two-ladder inconsistency
-    # with vision.py:269 — both now go through the same resolver. After the
+    # with `VisionClient.__init__` in vision.py — both now go through the same
+    # resolver. After the
     # 2026-05-18 stage reorder, Stage 4 also busts `_RESOLVED_KEY_CACHE` so
     # a freshly-pasted key is visible here without restart.
     _setup_cua_api_key = resolve_api_key()
@@ -82005,7 +82024,8 @@ async def _continue_pair_stages_2_to_6(
 # Installs a Windows Scheduled Task that auto-starts `python research.py
 # --serve` at user logon, so a reboot (Windows Update, power blip, crash)
 # doesn't need manual re-launch. Paired with the backend's existing startup
-# auto-retry (research.py:8099 detects an incomplete checkpoint and resumes),
+# auto-retry (run_server's queue rehydration detects an incomplete checkpoint
+# and resumes),
 # this makes the pipeline survive unexpected downtime end-to-end.
 #
 # Task is scoped to the CURRENT USER — never elevated to SYSTEM — so it
@@ -82031,8 +82051,8 @@ _SUPERVISOR_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / _SUPERVIS
 # Per-machine env file consumed by the supervisor at startup. See PR-Env in
 # scripts/dg-supervisor.env.example. Values applied via `os.environ.setdefault()` —
 # existing process env (Windows user-scope from "Account → API Config") wins
-# for `resolve_api_key` callers (research.py:204-218). Missing file is fail-
-# soft (Vision defaults to off per research.py:66, CUA fallthrough is safe).
+# for `resolve_api_key` callers. Missing file is fail-soft (Vision defaults
+# to off per `vision.is_vision_enabled`, CUA fallthrough is safe).
 _SUPERVISOR_ENV_FILE_DEFAULT_PATH = Path(__file__).parent / ".dg-supervisor.env"
 
 
@@ -83317,7 +83337,7 @@ def _looks_like_our_backend(cmdline: str) -> bool:
     # holding the port, the caller printed "already in use by something that is
     # not Super Research" and refused to boot. Fail-safe, but a permanent
     # refusal on the one platform where reclaiming is most needed. `_prog_name`
-    # (research.py:210) has always stripped it; this function never did.
+    # has always stripped it; this function never did.
     base = [_strip_exe(os.path.basename(x).lower()) for x in toks]
     is_python = any(b.startswith("python") or b.startswith("pypy") for b in base)
     runs_script = any(b == "research.py" for b in base)
@@ -83942,8 +83962,8 @@ def run_daemon_loop(port: int = 8000):
     # platforms`. The pre-fix `getattr(...CREATE_NO_WINDOW, 0x08000000)`
     # fallback fired on Linux + macOS (CREATE_NO_WINDOW doesn't exist there
     # → 0x08000000 default), making every `--serve` respawn explode in the
-    # daemon-loop. Match the module-level `_PS_NO_WINDOW` pattern at
-    # research.py:128 — 0 on non-Windows is the only safe value.
+    # daemon-loop. Match the module-level `_PS_NO_WINDOW` pattern
+    # — 0 on non-Windows is the only safe value.
     _NO_WINDOW = (
         getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
         if sys.platform == "win32"
@@ -84859,7 +84879,7 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
         killed_serve_count = _kill_pids(plain_serve_pids)
 
     # Belt-and-suspenders: gate creationflags on win32 to mirror
-    # `run_daemon_loop`'s pattern (research.py:27223-27240) — function is
+    # `run_daemon_loop`'s pattern — function is
     # already Windows-only by name + caller chain, but a future refactor
     # that bypasses the dispatcher could otherwise re-introduce the same
     # POSIX ValueError class. 2026-05-18: caught after Linux Track C smoke
@@ -84874,7 +84894,7 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     )
     # Capture the spawned daemon-loop's raw stdout/stderr to backend.err.log
     # instead of DEVNULL. The daemon-loop reassigns its own stdio to the
-    # backend logs once running (research.py ~37695), but a crash in the window
+    # backend logs once running (in `run_daemon_loop`), but a crash in the window
     # BEFORE that — the _sr_core import, a native-extension load, an early
     # dispatch error — would otherwise vanish into DEVNULL, leaving the device
     # silently offline (the exact failure this fixes). Append so we never
@@ -85354,7 +85374,7 @@ def run_resurrect():
             print(f"  {_c(_WARN, '     Could not check port 8000 — no psutil and no netstat/lsof here.')}")
             print(f"  {_c(_DIM, f'     If the backend does not start, look yourself: {_port_holder_hint(8000)}')}")
         # Belt-and-suspenders: gate on win32 (mirrors `run_daemon_loop`'s
-        # _NO_WINDOW pattern at research.py:27223-27240). This branch is
+        # _NO_WINDOW pattern). This branch is
         # already only reachable on Windows after the Darwin/Linux early-
         # returns above, but the constants now self-defend against future
         # refactors that bypass the dispatcher. 2026-05-18.
@@ -87081,7 +87101,7 @@ def run_doctor():
         # Chromium boot on slow hardware (Crostini, low-power) can take
         # a while; this probe runs once per `--doctor`, not per request.
         # Probe REAL Google Chrome via channel="chrome" — the exact browser the
-        # pipeline drives (research.py:~16137 launch_persistent_context(channel=
+        # pipeline drives (`Browser.start`'s launch_persistent_context(channel=
         # "chrome")). Probing bundled Chromium instead would pass even when real
         # Chrome / its patchright wrapper is missing, masking the actual failure.
         _probe = (
