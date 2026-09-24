@@ -83,7 +83,11 @@ MINE = ("a_closed_context_is_recognised or a_live_context_is_not or "
         "the_audio_poll_asks_the_CONTEXT_not_just_the_tab or "
         "the_phase_two_hard_retry_no_longer_drains_pending_on_a_dead_browser or "
         "the_phase_three_entry_gate_does_not_park_for_a_day_on_a_dead_browser or "
-        "the_notebook_park_classifies_before_offering_an_impossible_retry")
+        "the_notebook_park_classifies_before_offering_an_impossible_retry or "
+        # Added to the owned file after this harness was written, by the crash
+        # retry that keeps finished agents; the coverage check below refused
+        # to run until the filter could see it.
+        "a_hand_closed_chrome_window_mid_phase_two_relaunches_silently")
 
 # ⛔⛔ EXACT COVERAGE, NOT A COUNT. A filter that silently deselects the guard
 # written to kill a mutant reports that mutant as a SURVIVOR, which reads
