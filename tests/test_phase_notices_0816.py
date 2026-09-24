@@ -291,6 +291,103 @@ def test_preflight_does_not_ask():
     assert "1 <= phase <= 5" not in trouble
 
 
+# ── The gate, executed ───────────────────────────────────────────────────────
+#
+# ⛔ The two pins above read the source, and since 2026-09-01 neither can fail on
+# the gate's own clause. The terminal list moved into a `_NOTIFY_TERMINAL = (…)`
+# assignment above the gate, and the comment over the gate quotes
+# `1 <= phase <= 5` word for word. Replacing the whole terminal clause with
+# `True`, or widening its range to include phase 0, left both pins green through
+# every sweep since. These call the real `emit_event` with its I/O stubbed and
+# record the asks it makes.
+#
+# Every refusal below is checked beside an event that DOES ask, in the same
+# test, so an `emit_event` that bailed before the gate cannot pass as a refusal.
+
+_SEQ = 41
+_STALE_SEQ = 7   # the module global: the seq of some EARLIER event
+
+
+def _asks(monkeypatch, seqs=None):
+    """Run the real gate. Returns the list the asks land in, as argument tuples.
+
+    `seqs` is what successive Firestore writes return; by default every write
+    succeeds with `_SEQ`."""
+    asks = []
+    returned = iter(seqs) if seqs is not None else None
+    monkeypatch.setattr(research, "_tracks_dir", object())
+    monkeypatch.setattr(research, "_firebase_db", None)
+    monkeypatch.setattr(research, "_fb_uid", "owner-uid")
+    monkeypatch.setattr(research, "_fb_research_id", "run-id")
+    monkeypatch.setattr(research, "_fb_seq", _STALE_SEQ)
+    monkeypatch.setattr(research, "_emit_to_firestore",
+                        lambda event: next(returned) if returned else _SEQ)
+    monkeypatch.setattr(research, "_post_fe_phase_notice",
+                        lambda *a: asks.append(a))
+    for name in ("_run_sink_note_event", "_tm_note_event",
+                 "_write_phase_terminal_status", "_write_agent_terminal_status",
+                 "_clear_pending_decision", "_disarm_registry",
+                 "_persist_pending_decision", "record_phase_duration",
+                 "start_narrator", "stop_narrator"):
+        monkeypatch.setattr(research, name, lambda *a, **k: None)
+    monkeypatch.setattr(research, "_recent_events", [])
+    monkeypatch.setattr(research._runtime, "phase", research._runtime.phase)
+    monkeypatch.setattr(research._runtime, "last_event_id",
+                        research._runtime.last_event_id)
+    return asks
+
+
+@pytest.mark.parametrize("event_type", ["phase_complete", "phase_skipped"])
+@pytest.mark.parametrize("phase", [1, 2, 3, 4, 5])
+def test_a_phase_that_lands_asks_once_naming_the_event_just_written(
+        monkeypatch, event_type, phase):
+    asks = _asks(monkeypatch)
+    research.emit_event(event_type, phase=phase)
+    assert asks == [("owner-uid", "run-id", phase, event_type, _SEQ)]
+
+
+@pytest.mark.parametrize("event_type, kwargs", [
+    ("phase_start", {"phase": 2}),
+    ("agent_progress", {"phase": 2, "agent": "chatgpt", "message": "Reading"}),
+    ("link_extracted", {"phase": 2, "agent": "chatgpt", "url": "https://x.test"}),
+    ("pipeline_stopped", {"phase": 3, "reason": "user_stop_run"}),
+])
+def test_progress_and_a_stop_the_person_pressed_ask_nothing(
+        monkeypatch, event_type, kwargs):
+    """⛔ Phase 2 alone emits thousands of progress events, so asking on any of
+    them is a notification per heartbeat. A stop is one the person just pressed."""
+    asks = _asks(monkeypatch)
+    research.emit_event(event_type, **kwargs)
+    research.emit_event("phase_complete", phase=2)   # the control: this one asks
+    assert asks == [("owner-uid", "run-id", 2, "phase_complete", _SEQ)]
+
+
+@pytest.mark.parametrize("event_type", ["phase_complete", "phase_skipped"])
+def test_preflight_landing_asks_nothing(monkeypatch, event_type):
+    """⛔ Phase 0 produces nothing the user asked for: one pointless round trip
+    per run, on every run."""
+    asks = _asks(monkeypatch)
+    research.emit_event(event_type, phase=0)
+    research.emit_event(event_type, phase=1)          # the control: this one asks
+    assert asks == [("owner-uid", "run-id", 1, event_type, _SEQ)]
+
+
+def test_a_blocker_in_preflight_still_asks(monkeypatch):
+    """The 1..5 range is on the terminal branch only. A sign-in wait raised
+    during preflight is exactly the kind that strands a run overnight."""
+    asks = _asks(monkeypatch)
+    research.emit_event("login_required", phase=0, recoverability="blocker")
+    assert asks == [("owner-uid", "run-id", 0, "login_required", _SEQ)]
+
+
+def test_a_write_that_did_not_happen_is_never_announced(monkeypatch):
+    """The first write fails, so there is no document for the web app to read."""
+    asks = _asks(monkeypatch, seqs=[None, _SEQ])
+    research.emit_event("phase_complete", phase=3)
+    research.emit_event("phase_complete", phase=4)    # the control: this one asks
+    assert asks == [("owner-uid", "run-id", 4, "phase_complete", _SEQ)]
+
+
 def test_the_ask_carries_ids_only():
     """⭐⭐ THE SECURITY OF IT. The request names an event; the web app reads
     that event out of Firestore and composes every word from what it says. A
