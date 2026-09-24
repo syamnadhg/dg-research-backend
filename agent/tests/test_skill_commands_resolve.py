@@ -102,8 +102,19 @@ def test_skill_within_sanity_bound():
     # request, who it is for, and the reminder that it is still two steps is longer
     # than the refusal was. The bound still catches unbounded growth; it is not a
     # trim mandate and not a target.
+    # ⛔ RAISED 545 → 555 AT THE 2026-09-23 SYNC, AND NEITHER SIDE ALONE CROSSED IT.
+    # The Mac's +5 is a refusal the model cannot infer — a stop / pause / skip
+    # with no run named, while the user has a run chat can't manage, is relayed
+    # and waited on, never guessed, because "a stop can't be undone". The
+    # Windows side's +14 rewrote the no-computer instructions that PRESCRIBED the
+    # reply the owner reported live (ask for the code, then a fenced `--pair`
+    # block) and split the routing row that sent a code-less "add a device" to a
+    # command that cannot run without one. Each fit under 545; the merge of the
+    # two did not. Trimming either to make room is the 0.1.14 mistake above. The
+    # bound still catches unbounded growth; it is not a trim mandate and not a
+    # target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 545, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 555, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():
