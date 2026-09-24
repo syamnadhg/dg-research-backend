@@ -22,6 +22,10 @@ Every mutant below undoes one decision of that fix, or over-corrects it:
   P4/P5 — the telemetry clause and the caption stop naming the SAME tier: one
           keeps setup's while the other names the button's.
   P6    — the pre-send check drops the button's tier on the way out.
+  P7    — the helper is handed the tier ALONE instead of setup's record with the
+          tier swapped in: setup's confirmation is lost, and the everyday run
+          (setup confirmed Max, the button reads Max) logs a false note that the
+          computer-use pass set it. Its verifier found it surviving every suite.
 
 The effort caption's older mutants (E9, E10, T1-T7) live in
 `wave1010_models_mutants.py`; every anchor they use is unchanged by this fix.
@@ -121,6 +125,11 @@ MUTANTS = [
      RESEARCH, TESTS),
     ("P6", "under", "the pre-send check drops the button's tier on the way out",
      [(HANDED_BACK, "")], RESEARCH, TESTS),
+    ("P7", "under", "⛔⛔ the helper gets the tier alone, not setup's record with it "
+     "swapped in — setup's confirmation is lost, and every everyday run (setup "
+     "confirmed Max, the button reads Max) logs that the computer-use pass set it",
+     [(CLAUSE, '                    _pol.get("effort"), {"effort_got": _eff_now},')],
+     RESEARCH, TESTS),
 ]
 
 
