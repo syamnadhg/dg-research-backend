@@ -104,7 +104,11 @@ MINE = (
     "glued_to_the_tail_of_a_bare_url or sits_before_the_full_stop or "
     "carrying_parentheses or numbers_ascend_through_the_document or "
     "already_numbered_document_changes_nothing or reordered_findings_list or "
-    "told_apart_by_their_host or does_not_say_it_twice or "
+    # ⛔ 2026-09-19 (the E2E source-title fix) renamed the host-suffix pin, which
+    # had pinned the defect, and added the title ladder's own class and the
+    # incident's twelve-title report. The old name matched nothing from then on.
+    "link_label_names_its_own_page or SourceTitleIsThePagesOwnName or "
+    "twelve_distinct_titles or does_not_say_it_twice or "
     "brackets_in_a_title or written_out_not_left_to_the_renderer or "
     "finds_the_documents_own_citations or a_failed_extraction_costs or "
     "handed_findings_are_used or bold_titled_report_its_sections or "
