@@ -283,8 +283,13 @@ def test_runtime_text_is_not_a_note():
 
 
 def test_a_prose_paragraph_is_read_across_its_line_breaks():
-    text = "Alerts go through `emit_decision` (research.py\n~" + N + ") today.\n\nNext.\n"
-    assert lp.find_in_file("README.md", text)
+    """⛔ The split has to be one that NEITHER half shows on its own — the first
+    version of this test split before a tilde-number, which the bare tilde form
+    catches on its own line, so reading prose line by line passed it (harness
+    F23 survived)."""
+    halves = ("Alerts go through `emit_decision` (see setup.py", "line 9) today.")
+    assert all(lp.find_in_text(h) == [] for h in halves)
+    assert lp.find_in_file("README.md", "\n".join(halves) + "\n\nNext.\n")
     assert lp.find_in_file("README.md", "Alerts go through `emit_decision`.\n") == []
 
 
