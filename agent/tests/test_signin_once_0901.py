@@ -426,8 +426,10 @@ def test_a_parked_ts_that_is_not_a_number_does_not_destroy_the_announce(live):
                          "origin": None})
     got = requests.get(base + "/updates?via=agent", timeout=5).json()
     assert got.get("signedIn", {}).get("email") == "e@x.y", got
-    # and the identity falls back to the session's capture epoch, not to a crash
-    assert prefs.get_announced_signin_ms("u1") == 7_000
+    # and the identity falls back to the session's capture epoch, not to a crash.
+    # ⚠ REPINNED 2026-09-23: the parked claim sits ONE BEHIND that identity (the
+    # owner's one-repeat decision), so the mark is the capture epoch minus one.
+    assert prefs.get_announced_signin_ms("u1") == 7_000 - 1
 
 
 def test_a_half_address_an_OLDER_bridge_parked_on_DISK_is_still_delivered(live):

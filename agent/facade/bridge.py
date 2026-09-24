@@ -5866,16 +5866,19 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # `__signed_in_ts__` and a client that already showed it drops it. That
                 # is what the rollback below relies on.
                 #
-                # ⚠ AND IT DOES NOT CLOSE THE GRACEFUL-TIMEOUT CASE — an earlier version
-                # of this comment claimed it did ("a client that lost it shows it"), and
-                # cross-verification refuted it: on a parked delivery the watermark is
-                # claimed at exactly the note's own ts, so `_remint_signin` finds
-                # `cap <= seen` and there is no repeat to show. A reader that receives
-                # the bytes and then dies is indistinguishable from one that acted on
-                # them, at this layer and at every layer the server can see.
-                # ▶ Closing it means NOT claiming the watermark on a parked delivery and
-                # letting one re-mint through for the client to de-dup — a change to what
-                # the person can be promised, so it is the owner's call, not a tidy-up.
+                # ⭐⭐ AND THE GRACEFUL-TIMEOUT CASE IS CLOSED — DECIDED (owner,
+                # 2026-09-23). A reader that receives the bytes and then dies is
+                # indistinguishable from one that acted on them, at this layer and at
+                # every layer the server can see. The claim used to sit at exactly the
+                # note's own ts, so `_remint_signin` found `cap <= seen` and there was no
+                # repeat to show: signed in, and never told. The decision is to allow ONE
+                # repeat — the claim below sits at ts - 1, so the next account-wide tick's
+                # re-mint wins exactly once, moves the mark to ts, and every tick after
+                # answers "already". The repeat carries the same ts, so a watcher that did
+                # show it drops it (`__signed_in_ts__`).
+                # ⛔ NOT "stop claiming here". `claim_signin_announce` answers "first"
+                # (set, stay SILENT) when no watermark exists yet, so a brand-new sign-in
+                # on this computer — the commonest case — would never get its repeat.
                 ev = state.take_signed_in(sess.uid)
                 if isinstance(ev, dict):
                     # ⛔ CLEANED HERE TOO, NOT ONLY AT THE MINT — cross-verification
@@ -5945,6 +5948,19 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         # ⛔ CLAIMED, NOT STAMPED, so the previous mark is known and a
                         # send that raises can put it back beside the note.
                         mark_ms = _announce_ms(ev, sess)
+                        # ⭐⭐ ONE BEHIND THE NOTE, SO EXACTLY ONE REPEAT CAN FOLLOW
+                        # (owner decision, 2026-09-23 — see the block above).
+                        # ⛔⛔ AND ONLY FOR AN ACCOUNT-WIDE DELIVERY. A re-mint carries
+                        # no chat address and only an account-wide reader ever takes
+                        # it, so for a note addressed to ONE chat the repeat could never
+                        # reach that chat — it could only surface in another one, which
+                        # this handler forbids ("announce 'signed in' in the WRONG
+                        # chat"), from a watcher that never recorded this ts and so
+                        # could not drop it. An addressed delivery keeps its claim at ts.
+                        # ⛔ `mark_ms` IS WHAT THE CLAIM INSTALLS, so the failed-send
+                        # rollback's compare-and-swap below stays consistent with it.
+                        if not ev_origin and mark_ms > 0:
+                            mark_ms -= 1
                         marked, mark_prev = _claim_announced(sess, mark_ms)
                     else:
                         # Not this chat's — put it straight back for the watchdog

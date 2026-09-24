@@ -647,8 +647,15 @@ def test_a_SCOPED_watchdog_never_gets_a_re_mint(monkeypatch):
 
 
 def test_the_watermark_moves_when_a_PARKED_announce_is_delivered(monkeypatch):
-    """Otherwise the re-mint fires on the very next tick and says it all again,
-    plainly — the person is greeted twice, the second time with less."""
+    """⭐ REWRITTEN FOR THE OWNER'S DECISION, 2026-09-23 — ONE REPEAT, THEN SILENCE.
+
+    This used to assert that NO re-mint followed a parked delivery, so the person
+    was never greeted twice. That same rule meant a reader that took the bytes and
+    died left the person signed in and never told. The decision: the parked claim
+    sits at ts - 1, the next account-wide tick re-mints exactly ONCE under the SAME
+    ts — which a watcher that already showed it drops by `__signed_in_ts__`, so the
+    person still sees it once — and every tick after answers nothing. The mark still
+    MOVES on a delivery; it moves to one behind the note instead of onto it."""
     sess = _sess()
     sess.connected_at_ms = 7_000
     base, state, httpd = _live(monkeypatch)
@@ -657,7 +664,12 @@ def test_the_watermark_moves_when_a_PARKED_announce_is_delivered(monkeypatch):
         state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y",
                              "origin": None, "autoStarted": True})
         assert requests.get(base + "/updates?via=agent").json()["signedIn"]["ts"] == 7_000
+        assert prefs.get_announced_signin_ms("u1") == 7_000 - 1   # moved, one behind
+        # the ONE repeat — same identity, so a watcher that showed it drops it
+        repeat = requests.get(base + "/updates?via=agent").json()
+        assert repeat.get("signedIn", {}).get("ts") == 7_000, repeat
         assert prefs.get_announced_signin_ms("u1") == 7_000
+        # …and never again
         assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
     finally:
         httpd.shutdown()
