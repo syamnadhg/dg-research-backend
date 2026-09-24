@@ -484,7 +484,7 @@ CONCLUSION: ERROR
 
 No quotes, no trailing punctuation. This line is parsed programmatically.
 
-Also include a plain-English line such as 'still generating' or 'response complete' BEFORE the CONCLUSION line — legacy callers (research.py:6509, 6848) parse for those substrings rather than the CONCLUSION marker."""
+Also include a plain-English line such as 'still generating' or 'response complete' BEFORE the CONCLUSION line — older callers parse for those substrings rather than the CONCLUSION marker."""
 
 PROMPT_FIX_ISSUE = SYSTEM_BASE + """
 
