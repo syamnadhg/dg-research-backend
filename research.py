@@ -15911,7 +15911,9 @@ def start_firestore_start_listener(job_queue, loop):
                         try: doc.reference.delete()
                         except Exception: pass
                         continue
-                    backend_run_id, rd = _on_disk.name, {}
+                    # `rd` is still the `{}` it started as: the read never
+                    # returned, so the topic comes from the checkpoint alone.
+                    backend_run_id = _on_disk.name
                 if rd is None:
                     log(f"Resume: research {target_rid[:8]}... not found", "WARN")
                     try: doc.reference.delete()

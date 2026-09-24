@@ -101,7 +101,7 @@ MARK_PATCH = ("        if await asyncio.to_thread(_update_research_doc, tree_uid
 
 # ── anchors: the Resume ─────────────────────────────────────────────────────
 RESUME_DISK = "                    _on_disk = _run_dir_owning_research(target_rid, target_uid)"
-RESUME_TAKE = "                    backend_run_id, rd = _on_disk.name, {}"
+RESUME_TAKE = "                    backend_run_id = _on_disk.name"
 RESUME_NONE = ("                    if _on_disk is None:\n"
                "                        try: doc.reference.delete()\n"
                "                        except Exception: pass\n"
@@ -241,7 +241,7 @@ MUTANTS = [
      [(RESUME_DISK, "                    _on_disk = None")],
      RESEARCH, PICKUP),
     ("C2", "over", "a run id is written into a record nobody could read",
-     [(RESUME_TAKE, "                    backend_run_id, rd = _on_disk.name, {}\n"
+     [(RESUME_TAKE, "                    backend_run_id = _on_disk.name\n"
                     "                    _update_research_doc(target_uid, target_rid,\n"
                     '                                         {"backendRunId": backend_run_id})')],
      RESEARCH, PICKUP),
