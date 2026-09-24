@@ -27,6 +27,8 @@ The quiet ones matter most:
   X1    — Reset Backend leaves a held entry, and it runs after the reset.
   T1-T4/R3 — the re-offer starts a second copy of a run a Resume started here
         or on a sibling worker, or one a sibling holds the lock for.
+  T7/T8 — the re-offer reads a missing worker stamp as worker 1's, and worker 2
+        lets go of its own mid-flight run (re-verify of this wave).
   M4/M5/M6 — the mark retry writes a Resume offer over a run the person
         stopped, over a record it could not read, or over a run somebody
         started since boot.
@@ -93,7 +95,7 @@ RETRY_ROUNDS = ("    for delay in _RESTART_RETRY_DELAYS_S:\n"
 RETRY_READ = ("                answer, record = await asyncio.wait_for(\n"
               "                    asyncio.to_thread(_ask_about_held_entry, job),\n"
               "                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)")
-SETTLE_ASKS = "    why = _run_taken_since_boot(rid, record, job_queue)"
+SETTLE_ASKS = "    why = _run_taken_since_boot(rid, record, job_queue, unstamped_is_worker_1=False)"
 
 # ── anchors: the one question both retries ask ─────────────────────────────
 TAKEN_RESUMED = "    if rid in _RESUMED_HERE:"
@@ -102,6 +104,8 @@ TAKEN_HELD = ('    if any((j or {}).get("research_id") == rid for j in '
 TAKEN_LOCK = "    holders = _scan_sibling_locks_for_research(rid, WORKER_ID)"
 TAKEN_ONGOING = '    if (record or {}).get("status") == "ongoing":'
 TAKEN_OWNER = "        if owner != WORKER_ID and 1 <= owner <= fleet:"
+TAKEN_STAMP = ("        if not isinstance(stamp, int) and not unstamped_is_worker_1:\n"
+               "            return None")
 RESUME_RECORDS = "                _RESUMED_HERE.add(target_rid)"
 
 # ── anchors: the carry ──────────────────────────────────────────────────────
@@ -135,7 +139,8 @@ MARK_UNREAD = ("        if record is None:\n"
 MARK_STATUS = ('        status = record.get("status")\n'
                '        if status != "ongoing":')
 MARK_TAKEN = ('        why = _run_taken_since_boot(research_id, record, '
-              '_QUEUE_STATE.get("queue_ref"))')
+              '_QUEUE_STATE.get("queue_ref"),\n'
+              '                                    unstamped_is_worker_1=True)')
 MARK_PATCH = ("        if await asyncio.to_thread(_update_research_doc, tree_uid, research_id,\n"
               "                                   _restart_recovery_patch(research_id)):")
 
@@ -279,6 +284,16 @@ MUTANTS = [
     ("T6", "under", "⛔ the stamp is asked of a 'queued' record too — a stale stamp "
      "from an earlier start lets go of a run still waiting for its turn",
      [(TAKEN_ONGOING, "    if True:")],
+     RESEARCH, PICKUP),
+    ("T7", "under", "⛔⛔ the re-offer reads a missing stamp as worker 1 again — "
+     "worker 2 lets go of its own mid-flight run, and nothing ever starts it",
+     [(SETTLE_ASKS, "    why = _run_taken_since_boot(rid, record, job_queue, "
+                    "unstamped_is_worker_1=True)")],
+     RESEARCH, PICKUP),
+    ("T8", "under", "⛔ the stamp rule stops asking whether a stamp is there — the "
+     "same let-go of worker 2's own unstamped run",
+     [(TAKEN_STAMP, "        if False:\n"
+                    "            return None")],
      RESEARCH, PICKUP),
     ("R3", "over", "⛔⛔ the Resume branch stops recording what it started — the "
      "retries cannot see a Resume whose job has not reached the queue yet",

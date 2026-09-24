@@ -17147,7 +17147,8 @@ _RESUMED_HERE: "set[str]" = set()
 _RESTART_RETRY_READ_TIMEOUT_S = 15.0
 
 
-def _run_taken_since_boot(research_id, record, job_queue) -> "str | None":
+def _run_taken_since_boot(research_id, record, job_queue, *,
+                          unstamped_is_worker_1: bool) -> "str | None":
     """Why a run a restart's retry is about to start or mark belongs to somebody
     else now — or None when it is still the retry's to act on.
 
@@ -17168,7 +17169,16 @@ def _run_taken_since_boot(research_id, record, job_queue) -> "str | None":
       · its record says "ongoing" and names another worker inside the fleet —
         the scan's own ownership rule, `_owner_worker_of`, which is also the
         stamp a Resume won by a sibling writes. A worker outside the fleet is
-        no live worker's, as the scan treats it."""
+        no live worker's, as the scan treats it.
+
+    ⛔⛔ ONLY THE MARK READS A MISSING STAMP AS WORKER 1 (`unstamped_is_worker_1`,
+    re-verify of this wave). The mark retry runs only where the scan itself
+    decided to mark, so it keeps the scan's rule. The re-offer lets go on a
+    stamp only when one is THERE: a Resume always writes one, so a missing
+    stamp is never the race this asks about — while "ongoing" with none is
+    routine (the idle-rescan pickup and the dequeue's queued-to-ongoing flip
+    write none). Read as worker 1's, worker 2's own mid-flight run was let go,
+    and nothing else would ever start it."""
     rid = str(research_id or "")
     if rid in _RESUMED_HERE:
         return "a Resume on this computer has started it"
@@ -17178,7 +17188,10 @@ def _run_taken_since_boot(research_id, record, job_queue) -> "str | None":
     if holders:
         return f"sibling worker {holders[0].get('worker_id')} is running it"
     if (record or {}).get("status") == "ongoing":
-        owner = _owner_worker_of(record.get("assignedWorker"))
+        stamp = record.get("assignedWorker")
+        if not isinstance(stamp, int) and not unstamped_is_worker_1:
+            return None
+        owner = _owner_worker_of(stamp)
         try:
             fleet = load_worker_count()
         except Exception:
@@ -17281,7 +17294,7 @@ def _settle_held_entry(job_queue, job, answer: str, record: dict) -> None:
     if answer != "take":
         return
     rid = str((job or {}).get("research_id") or "")
-    why = _run_taken_since_boot(rid, record, job_queue)
+    why = _run_taken_since_boot(rid, record, job_queue, unstamped_is_worker_1=False)
     if why is not None:
         log(f"[pending_queue] {rid[:24]}… not restored — {why}", "INFO")
         return
@@ -75980,7 +75993,8 @@ async def _remark_after_restart(tree_uid: str, research_id: str) -> bool:
             log(f"[rehydrate] {research_id[:24]}… is {status} now — the "
                 f"recovery mark is no longer this machine's to write", "INFO")
             return False
-        why = _run_taken_since_boot(research_id, record, _QUEUE_STATE.get("queue_ref"))
+        why = _run_taken_since_boot(research_id, record, _QUEUE_STATE.get("queue_ref"),
+                                    unstamped_is_worker_1=True)
         if why is not None:
             log(f"[rehydrate] {research_id[:24]}… {why} — no recovery mark", "INFO")
             return False

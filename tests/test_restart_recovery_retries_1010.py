@@ -502,8 +502,8 @@ def test_a_held_run_a_sibling_worker_is_running_is_let_go(monkeypatch, tmp_path,
 
 @pytest.mark.parametrize("owner", [None, 3], ids=["no-stamp", "out-of-fleet"])
 def test_a_held_run_no_live_worker_owns_is_restored(monkeypatch, tmp_path, owner):
-    """⭐ OTHER POLARITY: THE SCAN'S OWN RULE, NOT A WIDER ONE. A record with no
-    worker stamp is worker 1's, and a stamp outside the fleet is no live
+    """⭐ OTHER POLARITY: NO WIDER THAN THE SCAN'S OWN RULE. A record with no
+    worker stamp names no sibling, and a stamp outside the fleet is no live
     worker's; neither is a sibling's run, and treating them as one would let go
     of a run nobody else will ever pick up."""
     record = {k: v for k, v in ONGOING.items() if k != "assignedWorker"}
@@ -516,6 +516,38 @@ def test_a_held_run_no_live_worker_owns_is_restored(monkeypatch, tmp_path, owner
     _boot_and_retry(path, q)
 
     assert _rids(q._queue) == [RID], "a run no live worker owns was let go"
+
+
+def test_worker_2_restores_its_own_unstamped_mid_flight_run(monkeypatch, tmp_path):
+    """⛔⛔ THE REPAIR'S OWN REGRESSION (re-verify of this wave). Worker 2 of 2
+    crashed mid-run on a job whose record says "ongoing" with NO worker stamp —
+    routine: the idle-rescan pickup and the dequeue's queued-to-ongoing flip
+    write none. The boot restore's read blipped, so the entry was held, and the
+    retry read the missing stamp the scan's way — as worker 1's — and let go of
+    worker 2's own run. A Resume always stamps, so a missing stamp is never the
+    sibling-Resume race the check exists for.
+
+    The CONTROL is the boot restore itself: given the same answer at boot, it
+    takes the run — the retry must reach the same decision on it."""
+    unstamped = {k: v for k, v in ONGOING.items() if k != "assignedWorker"}
+    _machine(monkeypatch, tmp_path, _Answers(unstamped), fleet=2)
+    monkeypatch.setattr(research, "WORKER_ID", 2)
+    control = _Q()
+    _boot_and_retry(_snapshot(tmp_path, [_job()]), control)
+    assert _rids(control._queue) == [RID], "the boot restore refused it (premise)"
+
+    answers = _Answers(BLIP, BLIP, unstamped)
+    _machine(monkeypatch, tmp_path, answers, fleet=2)
+    monkeypatch.setattr(research, "WORKER_ID", 2)
+    q = _Q()
+
+    _boot_and_retry(_snapshot(tmp_path, [_job()]), q)
+
+    assert answers.reads == 3, "the retry never asked"
+    assert _rids(q._queue) == [RID], (
+        "worker 2 let go of its own mid-flight run: a record with no worker stamp "
+        "was read as worker 1's")
+    assert research._UNREAD_RESTORES == []
 
 
 def test_a_held_queued_run_is_restored_whatever_worker_stamp_it_carries(
