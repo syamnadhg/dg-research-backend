@@ -158,10 +158,19 @@ MUTANTS = [
      '⛔ A REFERENCE DEFINITION AN IMAGE USED IS KEPT: the image is rewritten and the platform URL survives on its own line below it',
      [('        if key in used and key not in linked:\n            return ""',
        '        if False:\n            return ""')]),
-    ('F2', RP, 'over',
-     '⛔ AN UNUSED data: DEFINITION IS KEPT — base64 in a saved document, against Firestore\'s 1 MiB limit',
-     [('        if dest.strip()[:5].lower() == "data:":\n            return ""\n',
-       '')]),
+    # ⛔ F2 RETIRED 2026-09-24 WITH THE LINE IT MUTATED ("an unused data: definition
+    # is kept"). Since wave 10.9 `_doc_scrub_private_links` runs after this pass on
+    # every path and drops a data: definition itself, so F2 survived — and its
+    # output was the BETTER one: dropped here first, the definition hid its label
+    # from the scrub and `[the csv][d]` stayed as literal brackets in any document
+    # holding an image. The line is gone; DF1 puts it back. The scrub's own data:
+    # rule is H2/H3 in wave109_docfunnel_mutants.py.
+    ('DF1', RP, 'under',
+     '⛔ THE IMAGE PASS DROPS data: DEFINITIONS AGAIN, before the scrub can read them: in any document holding an image a link to one is left as literal `[the csv][d]`',
+     [('        key = _doc_img_label_key(m.group("label"))\n        if key in used and key not in linked:\n',
+       '        dest = m.group("adest") if m.group("adest") is not None else m.group("dest")\n'
+       '        if dest.strip()[:5].lower() == "data:":\n            return ""\n'
+       '        key = _doc_img_label_key(m.group("label"))\n        if key in used and key not in linked:\n')]),
     ('F3', RP, 'over',
      'AN ESCAPED `\\![…](…)` IS TREATED AS AN IMAGE and its URL fetched — CommonMark says it is a literal bang and a link',
      [(r'''_DOC_IMG_MD_RE = re.compile(

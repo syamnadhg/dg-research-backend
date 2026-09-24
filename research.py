@@ -51555,9 +51555,11 @@ def _doc_images_rewrite_sync(text: str, run: "_DocImageRun") -> str:
     linked = _doc_img_link_ref_labels(text)
 
     def _definition(m):
-        dest = m.group("adest") if m.group("adest") is not None else m.group("dest")
-        if dest.strip()[:5].lower() == "data:":
-            return ""
+        # ⛔ Only a definition an image consumed goes here. A `data:` one is left
+        # to `_doc_scrub_private_links`, which runs next on every path and drops it
+        # WITH every link that reads it: dropped here first (wave 4's rule), it hid
+        # the label from the scrub, and in any document holding an image
+        # `[the csv][d]` stayed as literal brackets.
         key = _doc_img_label_key(m.group("label"))
         if key in used and key not in linked:
             return ""

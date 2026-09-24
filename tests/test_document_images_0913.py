@@ -398,6 +398,28 @@ def test_an_unused_data_uri_definition_is_removed(world):
     assert "data:" not in out
 
 
+_CSV_DEF = "[d]: data:text/csv;base64,YSxi\n"
+
+
+@pytest.mark.parametrize("text, expected", [
+    (f"See [the csv][d].\n\n{_CSV_DEF}", "See the csv.\n\n"),
+    (f"See [the csv][d].\n\n![x](https://img.example.com/missing.png)\n\n{_CSV_DEF}",
+     "See the csv.\n\n![x]()\n\n"),
+    (f"See [the chart][c].\n\n![Chart][c]\n\n"
+     f"[c]: data:image/png;base64,{base64.b64encode(png()).decode()}\n",
+     f"See the chart.\n\n![Chart]({ref_for(png())})\n\n"),
+], ids=["no-image", "another-image", "the-image-reads-it-too"])
+def test_a_link_to_a_data_definition_loses_its_brackets_whatever_else_the_document_holds(
+        world, text, expected):
+    """⛔ The image pass dropped every `data:` definition itself (wave 4), BEFORE
+    the private-link scrub (wave 10.9) could read it — so in a document holding any
+    image the scrub never learned the label was private, and `[the csv][d]` stayed
+    as literal brackets, while the same paragraph with no image in the document
+    came out as `the csv`. The scrub owns a `data:` definition on every path now,
+    and an image that reads the same definition is still stored."""
+    assert rehost(text) == expected
+
+
 def test_a_raw_html_img_in_markdown_is_rehosted(world):
     url = "https://img.example.com/raw.png?a=1&b=2"
     world.images[url] = png()
