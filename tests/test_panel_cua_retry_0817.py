@@ -36,6 +36,7 @@ went wrong.
 import re
 
 import research
+from _domshim import el, js_constant, run_js
 
 
 READY = dict(dom_misses=2, attempts=0, panel_open=False)
@@ -242,6 +243,39 @@ def test_the_snapshot_looks_for_a_shimmer_on_DESCENDANTS_too():
     body = _fn(src, at)
     assert "animKid" in body
     assert "el.querySelectorAll('*')" in body
+
+
+def test_the_snapshot_reports_a_shimmer_only_a_descendant_carries():
+    """⭐ The same promise, run through the snapshot's page JS instead of read.
+
+    ⛔ The source pin above cannot fail on it: the clip scan in the same
+    function also calls `el.querySelectorAll('*')`, so deleting the shimmer scan
+    still leaves the string in place, and that mutant survived.
+
+    The row's text sits on the row. The shimmer sits on a gradient span layered
+    over it that has no text, so that span can never be a snapshot row of its
+    own. The subtree question is the only way the log can say this line is
+    shimmering. The element's own answer has to stay false: the two readings are
+    reported separately so a miss line can tell them apart."""
+    js = js_constant(research._log_chatgpt_thread_snapshot, "JS")
+    line = el("div", {"role": "button", "w": "300", "h": "24", "x": "300",
+                      "y": "242"},
+              text="Developed the security scope",
+              kids=[el("span", {"anim": "shimmer", "w": "300", "h": "24",
+                                "x": "300", "y": "242"})])
+    page = el("body", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+        el("main", {"w": "1440", "h": "900", "x": "0", "y": "0"}, kids=[
+            el("div", {"data-message-author-role": "user", "w": "600",
+                       "h": "60", "x": "300", "y": "142"},
+               text="Compare the three models"),
+            el("section", {"data-testid": "conversation-turn-2", "w": "600",
+                           "h": "1800", "x": "300", "y": "242"}, kids=[line]),
+        ])])
+    snap = run_js(page, js)["ret"]
+    rows = [r for r in snap["rows"] if r["t"] == "Developed the security scope"]
+    assert len(rows) == 1, snap
+    assert rows[0]["animKid"] is True, rows[0]
+    assert rows[0]["anim"] is False, rows[0]
 
 
 def test_the_snapshot_reports_a_class_hook():
