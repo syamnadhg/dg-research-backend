@@ -268,6 +268,14 @@ MUTANTS = [
        '    out = re.sub(rf"\\s*(?:,|;|\\band\\b)?\\s*{_SET_EXCLUSION}\\s*$", "", out, flags=re.I).strip()'),
       ('    out = re.sub(r"[\\s,;]+$", "", out).strip()\n    return out or whole\n',
        '    out = re.sub(r"[\\s,;]+$", "", out).strip()\n    return out\n')]),
+    # ⛔⛔ N6's OLD EDIT, KEPT AS ITS OWN MUTANT. It is a real defect of its own:
+    # nothing pins the quoted-name escape at the visibility capture. ⛔ PENDING —
+    # its killing test is being written in the owner's Windows session (agent/ is
+    # theirs), so N6b SURVIVES until that lands; report it, never hide it.
+    ('N6b', SR, 'under',
+     '⛔⛔ A QUOTED NAME IS TRIMMED AT THE VISIBILITY CAPTURE. The visibility call takes the trim\'s inner half, which skips the quoted-name escape, so `hide "Mac, not the PC"` cuts the exclusion off the quoted name and hides a machine called \'Mac\' — quoting, the one way to be unambiguous, stops working on hide and publish. Killing test PENDING in the owner\'s Windows session (agent/ is theirs); survives until it lands',
+     [('            _vis_obj = _trim_trailing_clause(_vis_obj, t)',
+       '            _vis_obj = _trim_trailing_clause_inner(_vis_obj)')]),
     ('N7', SR, 'under',
      '⛔⛔ THE TOTALISER GOES AND FOUR SURFACES REOPEN AT ONCE. The words it holds are exactly the words this file\'s three capture-blankers erase to "", so a blank capture stops meaning anything: `pause everything`, `resume all of it` and `retry it all` EXECUTE with no confirm, `stop everything` and `approve the whole queue` reach confident single-target confirms',
      [('_SET_SIGNALS = (_SET_SIGNAL_PLURAL, _SET_SIGNAL_QUANTIFIED, _SET_SIGNAL_COLLECTIVE,\n                _SET_SIGNAL_TOTALISER, _SET_SIGNAL_CONJUNCTION)',
