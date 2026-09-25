@@ -2055,6 +2055,24 @@ def test_a_link_to_an_address_nobody_can_open_around_an_image_goes(world, href):
     assert rehost(md) == f"![Chart]({ref_for(png())})"
 
 
+@pytest.mark.parametrize("href", ["blob:https://x/1", "sandbox:/mnt/data/chart.png",
+                                  "data:image/png;base64,AAAA"], ids=["blob", "sandbox", "data"])
+def test_a_link_to_an_address_nobody_can_open_around_a_deeply_bracketed_image_goes(world, href):
+    """⛔ Since wave 10.9 `_doc_scrub_private_links` runs after this rule and unwraps
+    most links to these schemes by itself — so the case above passes whether or not
+    this rule reads the scheme. Not this one: this rule reads the link while the
+    image inside is still a short slot tag, and the scrub reads it EXPANDED, where
+    an alt holding `[b]` inside link text with its own bracket group is four
+    brackets deep, past the scrub's inline pattern. Only this rule unwraps it; left
+    to the scrub, `here](…)` becomes `here]()` around a stored image."""
+    src = "https://cdn.example.com/chart.png"
+    stored = ref_for(png())
+    expanded = f"a [see [![a [b]]({stored})] here]({href}) b"
+    assert R._doc_scrub_private_links(expanded).startswith("a [see [![a [b]]")
+    world.images[src] = png()
+    assert rehost(f"a [see [![a [b]]({src})] here]({href}) b") == f"a see [![a [b]]({stored})] here b"
+
+
 def test_a_link_around_an_image_to_a_different_page_stays(world):
     """⭐ The article the chart came from is a source, not a platform URL."""
     src = "https://cdn.example.com/chart.png"

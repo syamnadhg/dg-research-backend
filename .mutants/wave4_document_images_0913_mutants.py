@@ -90,9 +90,11 @@ links out of text a sharer may have prompted.
 runs after this harness's code on every path, and four mutants here survived it
 (all killed at the wave-10.8 close). Two were real: their tests used lh3 and
 oaiusercontent addresses, which the scrub now drops by itself, so P6 and LK1 are
-killed on hosts the scrub keeps. P3 was equivalent and is retired. F2's line was
-the defect — it hid a data: label from the scrub — so the line is gone and DF1
-puts it back.
+killed on hosts the scrub keeps. P3 is NOT equivalent: this pass reads a link
+while its image is a short slot tag, the scrub reads it expanded and allows
+brackets only three deep, so P3 is killed by an image whose alt holds `[b]`
+inside link text with its own bracket group. F2's line was the defect — it hid a
+data: label from the scrub — so the line is gone and DF1 puts it back.
 
     python .mutants/wave4_document_images_0913_mutants.py
 """
@@ -692,13 +694,16 @@ MUTANTS = [
      '⛔ A LINK TO THE IMAGE ITSELF STAYS — only data:/blob:/sandbox: targets go, and `[![Chart](ref)](https://lh3…)` keeps its platform URL',
      [('        if sources and (href in sources or href.lower().startswith(("data:", "blob:", "sandbox:"))):',
        '        if sources and href.lower().startswith(("data:", "blob:", "sandbox:")):')]),
-    # ⛔ P3 RETIRED 2026-09-24 AS AN EQUIVALENT MUTANT ("a link to blob:, data: or
-    # sandbox: around an image stays"). Since wave 10.9 `_doc_scrub_private_links`
-    # runs after this pass on every path and unwraps every inline link to those
-    # schemes, keeping its text — exactly what this rule hands back — so no
-    # document can tell the two apart. The schemes are measured at the scrub (H2,
-    # H3, I1, I2 in wave109_docfunnel_mutants.py). If the scrub ever stops
-    # following this pass on some path, P3 is real again and belongs here.
+    # ⛔ P3 IS NOT EQUIVALENT (a retirement at the 10.9 + 10.10 close was reverted).
+    # This rule reads the link while the image inside it is still a short slot tag;
+    # the scrub that runs after it reads the EXPANDED image, and its inline pattern
+    # allows brackets only three deep. An alt holding `[b]` inside a link text with
+    # its own bracket group — `a [see [![a [b]](S)] here](blob:…) b` — is past the
+    # scrub, and only this rule unwraps it; the scrub then leaves `here]()`.
+    ('P3', RP, 'over',
+     'A LINK TO blob:, data: OR sandbox: AROUND AN IMAGE STAYS — a dead address in a permanent share',
+     [('        if sources and (href in sources or href.lower().startswith(("data:", "blob:", "sandbox:"))):',
+       '        if sources and href in sources:')]),
     ('P4', RP, 'under',
      '⛔ EVERY LINK AROUND AN IMAGE GOES: the article a chart links to — its source — is lost',
      [('        if sources and (href in sources or href.lower().startswith(("data:", "blob:", "sandbox:"))):',
