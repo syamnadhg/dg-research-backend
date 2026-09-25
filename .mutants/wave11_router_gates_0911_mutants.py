@@ -279,7 +279,7 @@ MUTANTS = [
       ('        if _request_names_a_set(t, _skip_run):\n            return None, [_NL_SKIP_ONE_RUN',
        '        if False:\n            return None, [_NL_SKIP_ONE_RUN')]),
     ('Q9', SR, 'over',
-     '⛔⛔ `phones?` LEAVES THE SHARED DEVICE-NOUN LIST, and a PHONE stops counting as a device: `skip the video on my phone` extracts the PHASE and reconfigures a live run instead of returning a bare skip, and `skip the podcast on my phones` loses its set refusal too. ⭐ THE DESCRIPTION HERE WAS WRONG ON THE FIRST RUN — it claimed the mutant copied the question guard while the edit narrowed the noun list. A mutant whose words do not match its edit measures one thing and reports another, which is a harness fault',
+     '⛔⛔ `phones?` LEAVES THE SKIP BRANCH\'S DEVICE NOUN, and a PHONE stops counting as a device there: a machine called “video phone” has its unlink turned into a phase skip, and `remove claude from my phone` switches Claude off a LIVE run with no confirm. ⛔ RE-WORDED 2026-09-24: its old examples, `skip the video on my phone` and `skip the podcast on my phones`, come out the same with or without the edit since wave 1.2 made the phase the object and the set refusal reads its own list, so the words described a defect the edit no longer makes. ⭐ THE DESCRIPTION HERE WAS WRONG ON THE FIRST RUN — it claimed the mutant copied the question guard while the edit narrowed the noun list. A mutant whose words do not match its edit measures one thing and reports another, which is a harness fault',
      [('    _device_noun = re.search(rf"\\b({_MACHINE_NOUNS_SAID})\\b", low)\n    _runctl_question',
        '    _device_noun = re.search(rf"\\b({_MACHINE_NOUNS})\\b", low)\n    _runctl_question')]),
 
@@ -331,7 +331,7 @@ MUTANTS = [
      [('_SET_EXCLUSION = (r"(?:(?:(?<=,)|(?<=;)|(?<=\\band)|(?<=\\bbut)|(?<=^))\\s*\\bnot\\b[^,.;]*"',
        '_SET_EXCLUSION = (r"(?:\\bnot\\b[^,.;]*"')]),
     ('X4', SR, 'over',
-     "⛔⛔⛔ THE DROPPED-RUN-CONTROL GUARD GOES, AND FOR THE THIRD AND FOURTH TIME IN ONE WAVE A VETO HANDS ITS MESSAGE TO THE WRONG FEATURE. `pause and switch to the Studio PC` EXECUTES `device-use` and silently drops the pause; `stop and remove the video` EXECUTES a phase skip and drops the stop. Both name TWO acts, and quietly doing the second one is worse than asking. ⛔ A VETO IN AN ORDERED LADDER IS NOT INERT — it gives the message to whatever comes next, every single time, and this wave proved it four times",
+     "⛔⛔⛔ THE DROPPED-RUN-CONTROL GUARD GOES, AND FOR THE THIRD AND FOURTH TIME IN ONE WAVE A VETO HANDS ITS MESSAGE TO THE WRONG FEATURE. `pause and skip the video` EXECUTES a phase skip and silently drops the pause; `stop and no email` turns the email off a live run and drops the stop. Both name TWO acts, and quietly doing the second one is worse than asking. ⛔ RE-WORDED 2026-09-24: the examples it was written on, `pause and switch to the Studio PC` and `stop and remove the video`, have a second guard now and come out the same with or without this edit. ⛔ A VETO IN AN ORDERED LADDER IS NOT INERT — it gives the message to whatever comes next, every single time, and this wave proved it four times",
      [('    _runctl_dropped = bool(_runctl_verb) and not _runctl_ok',
        '    _runctl_dropped = False')]),
     ('X5', SR, 'over',
