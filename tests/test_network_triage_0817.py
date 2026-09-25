@@ -313,7 +313,9 @@ def test_the_pair_timeout_no_longer_gives_one_answer_to_two_questions():
     assert "polling timed out — re-run --pair to start fresh" not in src
     i = src.index("no answer within the pairing window")
     block = src[i:i + 900]
-    assert "never entered" in block
+    # ⚠ RE-AIMED 2026-09-24: the first cause now names BOTH handovers — a chat
+    # assistant or the web app — as the code screen above it does.
+    assert "never sent to a chat assistant or entered in the" in block
     assert "could not reach us" in block
     assert "--doctor" in block
 
