@@ -206,10 +206,17 @@ MUTANTS = [
      # swapped for a NARROWING — the opposite defect under an `over` label, which
      # nothing in this harness's own selection pins — so it survived the 10.10
      # close sweep while the wildcard went unmeasured for twelve days. The
-     # narrowing is a real, unpinned defect of its own and is reported for the
-     # agent's own suite rather than parked here as a survivor.
+     # narrowing is a real, unpinned defect of its own: it is N9b, directly below,
+     # a survivor until its killing test lands from the owner's Windows session.
      [('_NEG_FILLER = r"(?:\\s+(?:you|i|we|it|to|please|ever|even|really|actually|just|bother(?:ing)?|keep|keeps|continue|carry\\s+on|want\\s+to|need\\s+to|try(?:ing)?\\s+to))*"',
        '_NEG_FILLER = r"(?:\\s+\\w+)*"')]),
+    # ⛔⛔ N9's OLD NARROWING, KEPT AS ITS OWN MUTANT. ⛔ PENDING — its killing test
+    # is being written in the owner's Windows session (agent/ is theirs), so N9b
+    # SURVIVES until that lands; report it, never hide it.
+    ('N9b', SR, 'under',
+     '⛔⛔ THE INTERVENING WORDS SHRINK BACK TO THE PRONOUNS, so a negation with `even`, `need to` or `keep` between it and the verb stops vetoing: "don\'t even hide my studio pc" runs an unconfirmed hide and "i don\'t need to send the logs" sends the logs. Killing test PENDING in the owner\'s Windows session (agent/ is theirs); survives until it lands',
+     [('_NEG_FILLER = r"(?:\\s+(?:you|i|we|it|to|please|ever|even|really|actually|just|bother(?:ing)?|keep|keeps|continue|carry\\s+on|want\\s+to|need\\s+to|try(?:ing)?\\s+to))*"',
+       '_NEG_FILLER = r"(?:\\s+(?:you|i|we|it|to|please))*"')]),
     ('N10', SR, 'over',
      '⛔⛔ THE OFF-ARM GOES BACK TO ONE SHARED VERB LIST, and TURNING SHARING ON HIDES THE MACHINE. `off` belongs with the neutral verbs; the -ing words only ever mean a hide after a verb that is itself negative. `turn on sharing for my mac` executed a private',
      [('        or re.search(r"\\b(?:turn|switch|shut|toggle)\\b(?:(?!\\bon\\b)[^.?!]){0,20}"\n                     r"\\b(?:off|down)\\b", _pol_low)',
