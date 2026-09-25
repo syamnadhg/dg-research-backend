@@ -346,14 +346,16 @@ def test_the_terminal_lists_public_computers_with_their_ids(term):
     # an invitation to ask, and the route refuses these with certainty — so the
     # row invited an ask that spent one of five an hour on a guaranteed no.
     assert "can't take anyone else" in out
-    # ⛔ THE DISCLOSURE IS ON THE SCREEN THAT OFFERS THE ASK, not buried in the
-    # ask's own output — a person decides here whether to ask at all.
-    # ⛔⛔ AND IT SAYS WHAT THE ASK ITSELF SAYS. This file's own
-    # `test_the_terminal_ask_names_what_the_owner_sees` pins "or your email, if
-    # you have not set one" forty lines below; this screen said "your name and
-    # email address", which is the phrasing the chat client's confirm was
-    # corrected away from in 7.9-2.
-    assert "or your email, if you have not set one" in out
+    # ⭐ THE CHAT INVITE'S WORDS ON EVERY PUBLIC LIST (owner, 2026-09-24): "Once the
+    # request is accepted you can use that computer. They see your name." The
+    # email half moved to where an email is actually sent — the ask's own
+    # confirmation, pinned by `test_the_terminal_says_what_it_discloses_on_the_ask_itself`.
+    # ⚠ The terminal asks without a confirm step, so a terminal reader meets the
+    # email half after the ask rather than before it; the chat's device-ask confirm
+    # still says it before. Owner's call, made knowing that.
+    assert "Once the request is accepted you can use that computer. They see your name." in out
+    assert "or your email" not in out
+    assert "Its owner decides" not in out
     assert "name and email address" not in out
 
 

@@ -255,8 +255,8 @@ MUTANTS = [
      "⛔⛔ THE TERMINAL'S INVITATION SAYS \"your name and email address\" AGAIN — "
      "wrong twice, and the phrasing the chat confirm was corrected away from in "
      "7.9-2 while this screen kept saying it",
-     [('_PUBLIC_ASK_INVITE_T = ("     Its owner decides. They see your name — or your "\n                        "email, if you have not set one.")',
-       '_PUBLIC_ASK_INVITE_T = "     Its owner decides. Asking tells them your name and email address."')]),
+     [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "\n                        "They see your name.")',
+       '_PUBLIC_ASK_INVITE_T = "     Once the request is accepted you can use that computer. Asking tells them your name and email address."')]),
 
     # ═══════════ W — the two surfaces delivered word for word ════════════════
     ("W1", BRIDGE, "under",
@@ -273,7 +273,7 @@ MUTANTS = [
        '            f"Public computers — ask to use somebody else\'s. Ask me for the "\n'
        '            f"public computers and I\'ll list the ones on offer. Tell me which one "\n'
        '            f"to ask for. Once the request is accepted you can use that computer. "\n'
-       '            f"They see your name — or your email, if you have not set one."\n',
+       '            f"They see your name."\n',
        '            f"Connection)"\n')]),
     ("W3", BRIDGE, "under",
      "the wire sentence loses the add-a-computer half instead, so somebody who owns "
@@ -548,10 +548,13 @@ MUTANTS = [
      '⛔⛔ THE DEVICE LIST RELAYS THE BRIDGE\'S TERMINAL SYNTAX INTO CHAT — "not signed in — run /login" — and this wave made this command the answer to "I have no computer", so it hits exactly the people it was written for',
      [('        return _emit(body, args.json, [f"✗ {_signed_out_or(body.get(\'error\', code))}"],',
        '        return _emit(body, args.json, [f"✗ {body.get(\'error\', code)}"],')]),
-    ("X17", WATCH, "under",
-     '⛔⛔ THE WATCHER DROPS THE EMAIL HALF OF THE DISCLOSURE. Somebody who never set a display name is told a stranger sees their NAME when the product hands over their EMAIL — and this surface reaches them verbatim, with no model turn',
-     [('            f"They see your name — or your email, if you have not set one."\n',
-       '            f"They see your name."\n')]),
+    # ⛔ X17 RETIRED 2026-09-24 — ITS SUBJECT WAS REMOVED BY THE OWNER, NOT BY DRIFT.
+    # It guarded the watcher keeping "— or your email, if you have not set one".
+    # The owner asked for every LIST of public computers to say the chat's words,
+    # "They see your name.", and for the email half to be said where an email is
+    # sent: the ask's own confirmation, which keeps it on both clients (pinned by
+    # test_the_watcher_says_the_chat_invites_words_and_the_ask_keeps_the_email_half
+    # and test_the_terminal_says_what_it_discloses_on_the_ask_itself).
     ("X18", BRIDGE, "under",
      "the wire's two commands lose their program name, so neither is runnable as printed on the one surface that prints this sentence verbatim",
      [('                                          "it here (agent device add <code>), or ask "\n                                          "to use somebody else\'s (agent device public)"})',

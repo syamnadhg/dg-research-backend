@@ -1236,11 +1236,14 @@ _PUBLIC_TRUNCATED_NONE_T = ("     (There were more machines than one look can sc
                             "so this may not be the whole story.)")
 _PUBLIC_TRUNCATED_SOME_T = ("  (there are more public computers than one look can "
                             "scan, so some may be missing)")
-# ⛔ THE SAME CLAIM THE ASK ITSELF MAKES: the owner sees the NAME, and the email
-# only when no name is set. This screen said "your name and email address", which
-# is the phrasing the chat client's confirm was corrected away from in 7.9-2.
-_PUBLIC_ASK_INVITE_T = ("     Its owner decides. They see your name — or your "
-                        "email, if you have not set one.")
+# ⭐ THE CHAT'S INVITE, IN THIS FILE'S VOICE (owner, 2026-09-24). The chat list
+# says "Once the request is accepted you can use that computer. They see your
+# name." since 09-20 — no "Its owner decides", no email half — and the owner asked
+# for every public LIST to say the same. The email half is said where an email is
+# actually sent: `_device_ask`'s own confirmation below keeps it, as the chat
+# client's ask confirmation does.
+_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "
+                        "They see your name.")
 
 _PLAIN_VERBS = {
     "looked for public computers": "look for public computers",

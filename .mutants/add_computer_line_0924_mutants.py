@@ -108,8 +108,12 @@ MUTANTS = [
        '        pass')]),
     ("A12", SR, "a person who LOST a code for a computer they already have is told to set "
      "up a new one",
-     [(r'r"\b(?:new|another|again|expired?|lost|lose|forgot(?:ten)?|reset|wrong"',
-       r'r"\b(?:zzqq|lose|forgot(?:ten)?|reset|wrong"')]),
+     # ⚠ RE-ANCHORED 2026-09-24: rule 6d reuses 6c's exclusion list as its trigger,
+     # so the list alone matched twice; the 6c line above it pins which one.
+     [(r'            r"(?:access|pair(?:ing)?)[ -]?codes?\b", low) and not re.search(' + "\n"
+       r'            r"\b(?:new|another|again|expired?|lost|lose|forgot(?:ten)?|reset|wrong"',
+       r'            r"(?:access|pair(?:ing)?)[ -]?codes?\b", low) and not re.search(' + "\n"
+       r'            r"\b(?:zzqq|lose|forgot(?:ten)?|reset|wrong"')]),
     ("A13", SR, "the updates path shows a needsDevice sign-in announce with no relay rule",
      [('    if (isinstance(signed_in, dict) and signed_in.get("needsDevice")\n'
        '            and not signed_in.get("autoStarted")):',

@@ -403,18 +403,46 @@ def test_where_a_code_comes_from_has_a_real_answer(said):
     "the access code doesn't work, how do I find the right one",
     "the access code doesn’t work, where do I get it",
     "how do i get the access code to show again",
-    "how do i get the access code into the web app",
     "how does my friend get an access code from me",
     "where can I find my access code to give to my wife",
     "I need an access code for my friend",
+    "I forgot my pairing code",
 ])
-def test_a_recovery_or_sharing_question_is_never_sent_to_set_up_a_computer(said):
-    """⛔⛔ THESE COME FROM SOMEBODY WHOSE COMPUTER ALREADY EXISTS. The add line
-    says "set one up at …/install", and that setup ends in the pairing step —
-    which, on a machine that still exists, mints a NEW computer and drops everybody
-    it was shared with (`_PAIR_ERRORS`). The first cut of the rule took every one
-    of these; they keep the catch-all they had before the rule existed."""
+def test_a_recovery_or_sharing_question_gets_the_lost_code_answer(said):
+    """⛔⛔ THESE COME FROM SOMEBODY WHOSE COMPUTER ALREADY EXISTS, so they are
+    never sent to set one up — that setup ends in the pairing step, which on a
+    machine that still exists mints a NEW computer and drops everybody it was
+    shared with (`_PAIR_ERRORS`).
+    ⭐ AND SINCE 2026-09-24 THEY GET A REAL ANSWER (owner) instead of the catch-all:
+    reveal it in Account, Reset for a new one, or the screen of a computer still
+    being set up (`_LOST_CODE_REPLY`)."""
+    assert sr._nl_resolve(said) == (None, [sr._LOST_CODE_REPLY]), said
+
+
+@pytest.mark.parametrize("said", [
+    "how do i get the access code into the web app",
+    "how do I enter my access code",
+    "where do I paste my access code",
+    "how do I use my access code",
+])
+def test_a_question_about_entering_a_code_is_not_answered_as_a_lost_one(said):
+    """⛔ HANDING A CODE OVER IS A DIFFERENT QUESTION, and the lost-code reply
+    does not answer it — these keep the catch-all."""
     assert sr._nl_resolve(said) == (None, [sr._NL_CATCH_ALL]), said
+
+
+def test_the_lost_code_answer_is_the_owners_and_is_true():
+    """The owner approved this answer on 2026-09-24; each place it names was
+    checked against the web app: the owner's PIN-gated tap-to-reveal on the
+    computer's tile in Account, Reset under Settings → Manage devices (the new
+    code is emailed), and the screen of a computer still being set up."""
+    said = sr._LOST_CODE_REPLY
+    assert said.startswith("If the computer's already on your account, open Account")
+    assert "reveal the access code on that computer's tile" in said
+    assert "(you'll enter your PIN)" in said
+    assert "Reset in Settings → Manage devices and we'll email it to you" in said
+    assert "the code is on that computer's screen" in said
+    assert "superresearch.io/install" not in said and "--pair" not in said
 
 
 @pytest.mark.parametrize("said,expect", [
@@ -533,3 +561,19 @@ def test_the_connect_closing_card_carries_the_link_in_its_add_line():
     assert URL in adds[0], adds[0]
     assert "access code the computer shows" in adds[0], adds[0]
     assert "--pair" not in adds[0]
+
+
+def test_the_skill_file_routes_a_lost_code_to_the_lost_code_answer():
+    """⭐ The model reads the table before it runs anything, so the lost-code row is
+    what sends "I lost my access code" to `do` instead of to a guess — and every
+    phrase that row teaches must really reach `_LOST_CODE_REPLY`."""
+    skill = _SKILL.read_text(encoding="utf-8")
+    rows = [ln for ln in skill.splitlines() if ln.startswith('| "I lost my access code"')]
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert '`sr.py do "<message>"`' in row
+    assert "never send them to set up a new computer" in row
+    taught = re.findall(r'"([^"]+)"', row.split("|")[1])
+    assert len(taught) >= 4, taught
+    for said in taught:
+        assert sr._nl_resolve(said) == (None, [sr._LOST_CODE_REPLY]), said

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -626,18 +627,21 @@ def test_the_device_list_never_hands_a_slash_command_to_a_chat(chat):
     assert "tell me to log you in" in out.lower(), out
 
 
-def test_the_watcher_carries_the_whole_disclosure_not_half_of_it(monkeypatch):
-    """⛔⛔ THE ONE SURFACE THE DISCLOSURE WAS NOT UNIFIED ON. It said only "they
-    see your name", so somebody who has never set a display name is told a stranger
-    will see their name when the product hands over their EMAIL ADDRESS. It runs
-    with `no_agent`, so it reaches the reader verbatim with no model turn to
-    complete it."""
+def test_the_watcher_says_the_chat_invites_words_and_the_ask_keeps_the_email_half():
+    """⭐ OWNER, 2026-09-24: every LIST of public computers says what the chat
+    invite says — "They see your name." — and the email half ("or your email, if
+    you have not set one") is said where an email is actually sent: the ask's own
+    confirmation, on both clients. This note used to carry the email half because
+    it reaches the reader verbatim; the owner chose one wording for every list."""
     line = poll._signed_in_line({"email": "e@x.y", "needsDevice": True,
                                  "topic": "Golden Retrievers", "pendingTopic": ""})
-    # ⭐ CAPITALISED SINCE 2026-09-24 — it follows the chat invite's own sentence
-    # now (see the next test), so the claim is compared, not the case.
-    assert "they see your name" in line.lower()
-    assert "or your email, if you have not set one" in line, line
+    assert line.rstrip().endswith("They see your name."), line
+    assert "or your email" not in line, line
+    # …and the ask still says it, on both clients, where the email is sent
+    assert ("or your email, if you haven’t set one"
+            in code_only(inspect.getsource(sr.cmd_device_ask)))
+    assert ("or your email, if you have not set one"
+            in code_only(inspect.getsource(cli._device_ask)))
 
 
 def test_the_watcher_says_what_asking_gets_you_like_the_chat_invite():
@@ -691,9 +695,15 @@ def test_the_terminal_lists_the_public_ones_in_its_own_row_format(term):
     out = term.out()
     assert "id=dev-a1" in out and "id=dev-b2" in out
     assert "(can't take anyone else)" in out
-    # ⛔ THIS FILE HAS NO CURLY APOSTROPHES AND THE CHAT CLIENT IS FULL OF THEM. A
-    # guard compares the CLAIMS, not the glyphs.
-    assert "or your email, if you have not set one" in out
+    # ⭐ THE CHAT INVITE'S WORDS ON EVERY PUBLIC LIST (owner, 2026-09-24): "Once the
+    # request is accepted you can use that computer. They see your name." The
+    # email half moved to where an email is actually sent — the ask's own
+    # confirmation, pinned by `test_the_terminal_says_what_it_discloses_on_the_ask_itself`.
+    # ⚠ The terminal asks without a confirm step, so a terminal reader meets the
+    # email half after the ask rather than before it; the chat's device-ask confirm
+    # still says it before. Owner's call, made knowing that.
+    assert "They see your name." in out
+    assert "or your email" not in out
     assert "name and email address" not in out
 
 

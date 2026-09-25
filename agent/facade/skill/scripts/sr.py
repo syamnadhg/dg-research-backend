@@ -120,6 +120,21 @@ _ADD_A_COMPUTER = (f"Add a computer: set one up at {_INSTALL_PAGE_URL}, then sen
                    "me the 8-character access code the computer shows (or one a "
                    "computer's owner gave you).")
 
+# ⭐ A LOST OR SHARED CODE HAS ITS OWN ANSWER (owner, 2026-09-24). "I lost my access
+# code", "I need a new one", "what's my computer's code" come from somebody whose
+# computer ALREADY EXISTS, so `_ADD_A_COMPUTER` — set one up — is the wrong answer
+# (the page's setup ends in the pairing step, which mints a NEW computer and drops
+# everybody it was shared with). They reached the catch-all, and the assistant
+# improvised where a code lives. Three true places, checked against the web app:
+# the owner's tap-to-reveal on the computer's tile in Account (PIN-gated), Reset in
+# Settings → Manage devices (the new code is emailed), and — mid-setup — the screen
+# of the computer being set up.
+_LOST_CODE_REPLY = ("If the computer's already on your account, open Account in the "
+                    "web app and reveal the access code on that computer's tile "
+                    "(you'll enter your PIN). For a new one, use Reset in Settings → "
+                    "Manage devices and we'll email it to you. If you were still "
+                    "setting it up, the code is on that computer's screen.")
+
 # ⛔⛔ THE SAME CLAIM ON EVERY SCREEN THAT MAKES IT. The consent question was
 # corrected in 7.9-2 — the owner sees the NAME, and the email only when no name is
 # set — and the browse list's own trailer went on saying "your name and email
@@ -7513,6 +7528,23 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             r"|not working|stopped working|my|mine|our|friend|wife|husband|partner"
             r"|give|share|sharing|into)\b", low):
         return None, [_ADD_A_COMPUTER]
+
+    # 6d. ⭐ …AND THE RECOVERY AND SHARING QUESTIONS 6c TURNS AWAY GET THEIR OWN
+    #     ANSWER (owner, 2026-09-24): reveal it in Account, Reset for a new one, or
+    #     the screen of a computer still being set up — see `_LOST_CODE_REPLY`.
+    #     The trigger is 6c's exclusion list, less "into".
+    #     ⛔ NOT A QUESTION ABOUT ENTERING ONE. "How do I enter / paste / put / use my
+    #     access code" is about handing a code over, which this reply does not
+    #     answer — those keep the catch-all.
+    #     ⛔ SAME PLACE, SAME REASON AS 6c: above only the catch-all, so a run titled
+    #     with these words still reaches status, results and podcast.
+    if re.search(r"\b(?:access|pair(?:ing)?)[ -]?codes?\b", low) and re.search(
+            r"\b(?:new|another|again|expired?|lost|lose|forgot(?:ten)?|reset|wrong"
+            r"|right one|(?:does|do|did|is|was)\s*n[o'’]?t\s+work(?:s|ing)?"
+            r"|not working|stopped working|my|mine|our|friend|wife|husband|partner"
+            r"|give|share|sharing)\b", low) and not re.search(
+            r"\b(?:into|enter|entering|paste|pasting|type|typing|put|use|using)\b", low):
+        return None, [_LOST_CODE_REPLY]
 
     # 7. Nothing matched — user-safe capabilities line (never guess a command).
     #    (Research phrasings were resolved at 2b, before the control rules.)

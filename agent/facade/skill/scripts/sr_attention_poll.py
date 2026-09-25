@@ -615,12 +615,13 @@ def _signed_in_line(signed_in: dict) -> str:
         # now one line and a parenthetical, so the only numbers here are the two
         # ways in.
         #
-        # ⛔ THE FULL DISCLOSURE STAYS ON THIS SURFACE AND ONLY THIS ONE. The chat
-        # client's invite was shortened to "They see your name." because a model
-        # turn follows it and can be asked. Nothing follows this, and somebody who
-        # has never set a display name would otherwise be told a stranger sees
-        # their NAME at the moment the product hands over their EMAIL — see
-        # `test_the_watcher_carries_the_whole_disclosure_not_half_of_it`.
+        # ⭐ "THEY SEE YOUR NAME." — THE CHAT'S WORDS, NOT A LONGER DISCLOSURE (owner,
+        # 2026-09-24). This note used to keep "— or your email, if you have not set
+        # one", on the theory that nothing follows it. The owner shortened the chat
+        # invite to "They see your name." on 09-20 and asked for the same on every
+        # LIST of public computers; the email half is said where an email is
+        # actually sent — the ask's own confirmation (sr.py `cmd_device_ask`, the
+        # device-ask confirm, cli.py `_device_ask`), which keep it.
         # ⭐⭐ NO `superresearch --pair` HERE, AND THE INSTALL ROUTE IS THE PAGE
         # (owner, 2026-09-23). This line reaches the person WORD FOR WORD — no
         # model can trim it — so it is where a lead with `--pair` did the most
@@ -643,7 +644,7 @@ def _signed_in_line(signed_in: dict) -> str:
         # ⛔ THE PUBLIC PARAGRAPH SAYS WHAT THE CHAT INVITE SAYS (owner, 2026-09-24:
         # "same order and facts"). It had dropped "Once the request is accepted you
         # can use that computer" — the one sentence that says what asking GETS you.
-        # The only difference left is the email half of the disclosure, above.
+        # ⭐ And now nothing differs: the last sentence is the chat invite's too.
         return (
             f"✓ Signed in as {who}.\n\n"
             f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
@@ -656,7 +657,7 @@ def _signed_in_line(signed_in: dict) -> str:
             f"Public computers — ask to use somebody else's. Ask me for the "
             f"public computers and I'll list the ones on offer. Tell me which one "
             f"to ask for. Once the request is accepted you can use that computer. "
-            f"They see your name — or your email, if you have not set one."
+            f"They see your name."
         )
     if signed_in.get("needsDeviceChoice"):
         # Several usable computers and none obvious. NAME them and ask — the one

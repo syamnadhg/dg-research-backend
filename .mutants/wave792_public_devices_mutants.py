@@ -322,9 +322,10 @@ MUTANTS = [
     ("P7", CLI, "under",
      "⛔⛔ THE DISCLOSURE LEAVES THE SCREEN THAT OFFERS THE ASK. A person decides "
      "HERE whether to ask at all, and the fact that asking names them was the "
-     "thing they needed before deciding",
-     [('_PUBLIC_ASK_INVITE_T = ("     Its owner decides. They see your name — or your "\n                        "email, if you have not set one.")',
-       '_PUBLIC_ASK_INVITE_T = "     Its owner decides."')]),
+     "thing they needed before deciding. RE-ANCHORED 2026-09-24: the list says the "
+     "chat's words now (owner) — 'They see your name.' is the disclosure it keeps",
+     [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "\n                        "They see your name.")',
+       '_PUBLIC_ASK_INVITE_T = "     Once the request is accepted you can use that computer."')]),
     ("P8", CLI, "over",
      "⛔ THE TRUNCATION CAPTION PROMISES A NEXT PAGE. There is no cursor, no "
      "ordering and no second request — the rest are unreachable, permanently",
