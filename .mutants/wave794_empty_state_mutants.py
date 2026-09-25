@@ -101,18 +101,27 @@ MUTANTS = [
     #   `--pair`; X22 retired (see there)
     # Each keeps its ORIGINAL defect on the new text, and each was re-run and
     # KILLED against this harness's own selection before this note was written.
+    # ⛔⛔ AND AGAIN, LATER THE SAME DAY — the owner's one "Add a computer" line
+    # replaced `_ADD_WITH_CODE`, `_SETUP_NODE_LINES`, the terminal's closing install
+    # block and the watcher's closing pair, so eleven anchors matched nothing and
+    # `test_no_new_stale_anchors` went red:
+    #   E2, E7, S2, S5, T3, T4, W2, W3, X17, X19, X23 — plus E8, whose anchor still
+    #   matched but whose replacement named the deleted `_SETUP_NODE_LINES`, so it
+    #   "killed" on a NameError instead of measuring the order it is about.
+    # ⭐ The install page no longer trails the screen; it is INSIDE the add line.
+    # So E7 and X19 now take the page out of that line — the same defect (no route
+    # for somebody with no machine at all) on the text that carries it now. Each
+    # was re-run and KILLED against this harness's own selection, as above.
     # ═══════════ E — the empty state itself ══════════════════════════════════
     ("E1", SR, "under",
      "⛔⛔ THE FIRST THING GOES. Without it the reader cannot tell whether the "
      "silence is a fault or the ordinary state of a new account",
      [('    lines.append("No research computer on this account yet.")\n', '')]),
     ("E2", SR, "under",
-     "the pair-code route goes, so somebody who ALREADY HAS a machine is never "
-     "told the one step that connects it",
-     [('    lines.append(_ADD_WITH_CODE)\n'
-       '    lines.append("")\n'
+     "the add line goes, so somebody who ALREADY HAS a machine is never told the "
+     "one step that connects it — and somebody with none is never given the page",
+     [('    lines.append(_ADD_A_COMPUTER)\n'
        '    pub = _public_offer_lines()\n',
-       '    lines.append("")\n'
        '    pub = _public_offer_lines()\n')]),
     ("E3", SR, "under",
      "⛔⛔ THE THIRD THING GOES ENTIRELY and every screen is a dead end again — "
@@ -137,15 +146,19 @@ MUTANTS = [
      "has nowhere to run and reads as an unprompted lecture about hardware",
      [('    lines = [lead] if lead else []', '    lines = []')]),
     ("E7", SR, "under",
-     "the install walkthrough goes, so somebody with NO machine at all is offered "
-     "a pair code from a computer that is not running anything",
-     [('    lines += _SETUP_NODE_LINES\n    return lines', '    return lines')]),
+     "the install page leaves the add line, so somebody with NO machine at all is "
+     "offered an access code from a computer that is not running anything",
+     [('_ADD_A_COMPUTER = (f"Add a computer: set one up at {_INSTALL_PAGE_URL}, then send "',
+       '_ADD_A_COMPUTER = ("Add a computer: send "')]),
     ("E8", SR, "over",
-     "the install block leads, so seven lines of shell commands arrive before the "
-     "sentence that says what happened",
+     "the add line leads, so the step arrives before the sentence that says what "
+     "happened — a next step for a state the reader has not been told about",
      [('    lines.append("No research computer on this account yet.")',
-       '    lines += _SETUP_NODE_LINES\n'
-       '    lines.append("No research computer on this account yet.")')]),
+       '    lines.append(_ADD_A_COMPUTER)\n'
+       '    lines.append("No research computer on this account yet.")'),
+      ('    lines.append(_ADD_A_COMPUTER)\n'
+       '    pub = _public_offer_lines()\n',
+       '    pub = _public_offer_lines()\n')]),
 
     # ═══════════ L — the list, which is what makes it a next step ════════════
     ("L1", SR, "under",
@@ -231,15 +244,13 @@ MUTANTS = [
      "reader cannot simply ask again in words",
      [('        print("  Public computers — ask to use somebody else\'s:  "\n'
        '              "agent device public")\n'
-       '        _print_install_block_t()\n'
        '        return\n',
-       '        _print_install_block_t()\n'
        '        return\n')]),
     ("T4", CLI, "over",
-     "⛔ THE TERMINAL INVENTS A THIRD NAME FOR THE CODE. The chat client, this "
-     "file's own installer copy and SKILL.md all say \"8-char access code\"",
-     [('    print("                       8-char access code — your own, or one whose")',
-       '    print("                       8-char code — your own, or one whose")')]),
+     "⛔ THE TERMINAL INVENTS A THIRD NAME FOR THE CODE. The chat client, the "
+     "watcher and SKILL.md all say \"8-character access code\"",
+     [('    print("                       add the 8-character access code the computer shows")',
+       '    print("                       add the 8-character code the computer shows")')]),
     ("T5", CLI, "over",
      "⛔⛔ THE TERMINAL'S INVITATION SAYS \"your name and email address\" AGAIN — "
      "wrong twice, and the phrasing the chat confirm was corrected away from in "
@@ -258,16 +269,18 @@ MUTANTS = [
      "⛔⛔ THE WATCHER DROPS IT TOO. It runs with `no_agent`, so its text reaches "
      "the person with no model turn to launder it — and it is PROACTIVE, which "
      "makes it the one screen somebody reads without having asked anything",
-     [('            f"Public computers — ask to use somebody else\'s. Ask me for the "\n'
-       '            f"public computers and I\'ll list the ones on offer, and tell me which "\n'
-       '            f"one to ask for; they see your name — or your email, if you have not "\n'
-       '            f"set one.\\n\\n"\n',
-       '')]),
+     [('            f"Connection)\\n\\n"\n'
+       '            f"Public computers — ask to use somebody else\'s. Ask me for the "\n'
+       '            f"public computers and I\'ll list the ones on offer. Tell me which one "\n'
+       '            f"to ask for. Once the request is accepted you can use that computer. "\n'
+       '            f"They see your name — or your email, if you have not set one."\n',
+       '            f"Connection)"\n')]),
     ("W3", BRIDGE, "under",
-     "the wire sentence loses the access-code half instead, so somebody who owns "
-     "a machine already is sent to ask a stranger for one",
-     [('                                 "error": "no research computer on this account yet "\n                                          "— on the computer running Super Research, "\n                                          "grab the access code from its screen and add "\n                                          "it here (agent device add <code>), or ask "',
-       '                                 "error": "no research computer on this account yet "\n                                          "— ask to use "')]),
+     "the wire sentence loses the add-a-computer half instead, so somebody who owns "
+     "a machine already is sent to ask a stranger for one, and somebody with none "
+     "is never given the page",
+     [('                                 "error": "no research computer on this account yet "\n                                          "— set one up at "\n                                          "https://superresearch.io/install, then "\n                                          "grab the access code from its screen (or "\n                                          "one a computer\'s owner gave you) and add "\n                                          "it here (agent device add <code>), or ask "',
+       '                                 "error": "no research computer on this account yet "\n                                          "— ask "')]),
 
     # ═══════════ R — the routing: the rule that did not exist, and the six ═══
     #               hand-written noun lists the last wave's comment claimed
@@ -404,7 +417,7 @@ MUTANTS = [
     ("S2", SKILL, "under",
      "the deviceless row goes, so the assistant has no instruction for the one "
      "sentence this whole wave is about",
-     [('| "I don\'t have a computer of my own", "I have no computer", "I haven\'t got a machine" | `sr.py devices`',
+     [('| "I don\'t have a computer of my own", "I have no computer", "I haven\'t got a machine", "no devices — set one up" | `sr.py devices`',
        '| unrouted |')]),
     ("S3", SKILL, "under",
      "⛔ `install` LEAVES THE SAFE-DEFAULTS LIST, whose next clause says "
@@ -420,7 +433,7 @@ MUTANTS = [
     ("S5", SKILL, "under",
      "the paragraph telling the assistant an empty account is not a dead end "
      "goes, so the model is free to relay the shortest of the ten old sentences",
-     [("**An account with NO computer is not a dead end.** Every screen that reports it\nnames BOTH routes — add your own with an access code, or ask to use somebody else's —\nand the full ones (`devices`, `research`, the sign-in announce) also LIST the public\ncomputers on offer. Relay that list; never present setting up a machine as the only\nroute. The one-line sign-in confirmation names both routes without a list, which is\ndeliberate: it must not make a second call to render one.\n\n",
+     [("**An account with NO computer is not a dead end.** Every screen that reports it\nnames BOTH routes — “Add a computer: set one up at https://superresearch.io/install,\nthen send me the 8-character access code the computer shows (or one a computer's\nowner gave you)”, or ask to use somebody else's — and the full ones (`devices`,\n`research`, the sign-in announce) also LIST the public computers on offer. Relay\nthat list; never present setting up a machine as the only route.\n⛔ Keep https://superresearch.io/install inside the “Add a computer” sentence.\nThe access code comes from the person's computer at the end of that setup — never\nsay it comes from the app. The one-line sign-in confirmation names both routes\nwithout a list, which is deliberate: it must not make a second call to render one.\n\n",
        '')]),
 
     # ═══════════ C — the anti-drift constants ════════════════════════════════
@@ -537,20 +550,17 @@ MUTANTS = [
        '        return _emit(body, args.json, [f"✗ {body.get(\'error\', code)}"],')]),
     ("X17", WATCH, "under",
      '⛔⛔ THE WATCHER DROPS THE EMAIL HALF OF THE DISCLOSURE. Somebody who never set a display name is told a stranger sees their NAME when the product hands over their EMAIL — and this surface reaches them verbatim, with no model turn',
-     [('            f"one to ask for; they see your name — or your email, if you have not "\n'
-       '            f"set one.\\n\\n"\n',
-       '            f"one to ask for; they see your name.\\n\\n"\n')]),
+     [('            f"They see your name — or your email, if you have not set one."\n',
+       '            f"They see your name."\n')]),
     ("X18", BRIDGE, "under",
      "the wire's two commands lose their program name, so neither is runnable as printed on the one surface that prints this sentence verbatim",
      [('                                          "it here (agent device add <code>), or ask "\n                                          "to use somebody else\'s (agent device public)"})',
        '                                          "it here (device add <code>), or ask "\n                                          "to use somebody else\'s (device public)"})')]),
     ("X19", CLI, "under",
      "the terminal loses the route for somebody with NO machine at all — the "
-     "install page — on every exit from the empty state",
-     [('    print("\\n  Don\'t have your own Research Computer yet? Set one up: "\n'
-       '          "https://superresearch.io/install")\n'
-       '    print("  It gives you an 8-char access code — add it with:  agent device add <code>")\n',
-       '')]),
+     "install page — from the add line, the one place its empty state names it",
+     [('    print("  Add a computer:      set one up at https://superresearch.io/install, then")\n',
+       '    print("  Add a computer:")\n')]),
     ("X20", CLI, "over",
      'the terminal looks AFTER it starts printing again, so it emits three lines and then blocks for up to twenty seconds mid-message',
      [('    res = _bridge_get("/devices/public", timeout=20.0)\n    print("No research computer on this account yet.")',
@@ -567,9 +577,9 @@ MUTANTS = [
     # mutant re-aimed onto some other sentence would be a different mutant under
     # an old name, so it is retired rather than moved.
     ("X23", SKILL, "under",
-     '⛔ SKILL.md GATES `install` ON A STRING NO SURFACE PRINTS ANY MORE, so the documented trigger for the one command that turns the local PC into a Research Computer cannot be recognised',
-     [('  the PC). Use ONLY when `research` reports **"no research computer on this account\n  yet"** (reason `no_devices`) — the older wording "no devices yet" is gone —',
-       '  the PC). Use ONLY when `research` reports "no devices yet" (reason `no_devices`) —')]),
+     '⛔ SKILL.md NAMES THE NO-COMPUTER SCREEN BY A STRING NO SURFACE PRINTS ANY MORE, so the rule that keeps `install` OFF that screen — the one where a brand-new person meets the install page — cannot be recognised',
+     [('  says **"no research computer on this account yet"** (reason `no_devices`): that',
+       '  says "no devices yet" (reason `no_devices`): that')]),
 ]
 
 

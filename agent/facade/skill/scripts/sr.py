@@ -82,38 +82,43 @@ _TIMEOUT = 30
 # Mirrors the bridge's /updates limit cap (bridge.py `_updates`).
 _LOOKUP_LIMIT = 100
 
-# The human setup page (full walkthrough + the pro-account note). A markdown
-# hyperlink so it lands as a clickable label in chat, not a bare URL. Kept
-# distinct from the install.ps1/.sh SCRIPT URLs below.
+# The human setup page (per-OS install + the pairing step that ends in the access
+# code). A BARE URL — it auto-links on every channel, and Markdown would hard-code
+# a rich-text channel assumption. Kept distinct from the install.ps1/.sh SCRIPT
+# URLs, which never appear in chat.
 _INSTALL_PAGE_URL = "https://superresearch.io/install"
-# Bare URL (auto-links on every channel — NO Markdown, which would hard-code a
-# rich-text channel assumption). Conditional lead ("don't have one?") so it reads
-# gracefully even where the caller already told a user WITH a backend to just
-# paste their access code (reason=no_devices = no *paired* device, which includes an
-# installed-but-unpaired machine — that user pairs, they don't reinstall).
-_INSTALL_PAGE_LINE = (
-    f"Don't have your own Research Computer yet? Set one up: {_INSTALL_PAGE_URL}"
-)
 
-# ⭐⭐ THE INSTALL ROUTE IS THE PAGE, AND ONLY THE PAGE (owner, 2026-09-23). This
-# block used to carry a "Quick start" of three shell lines ending in
-# `superresearch --pair`. In chat that was the part a relay mangled — promoted
-# to the top, fenced, and offered as THE answer to "add a device" — and the one
-# time the owner saw the screen relayed the way he wanted, the assistant had
-# trimmed it to this link on its own. The page carries the commands, per OS, and
-# stays current when they change; a chat message cannot.
+# ⭐⭐ THE ONE ADD-A-COMPUTER LINE, AND THE LINK IS INSIDE IT (owner, 2026-09-24).
+# Every chat surface that tells a person how to add a computer renders THIS
+# constant — the no-computer screen, the tail of a populated device list, the
+# one-line confirmation after sign-in, and the router's answer to "install
+# Super Research" / "where do I get an access code". The watcher and the terminal
+# cannot import it and say the same words in their own files.
 #
-# ⛔ THE SECOND LINE IS THE ONE THING THE PAGE CANNOT SAY: bring the code back
-# HERE. Without it, somebody finishes the install and has no idea this chat is
-# waiting for the code it printed.
+# ⛔⛔ MEASURED, NOT GUESSED. The install link used to be its own paragraph at the
+# END of the screen, opening "Don't have your own Research Computer yet?", with a
+# second code sentence under it: "It gives you an 8-char access code". In the
+# Hermes history the link survived 0 of 3 relays of the `devices` screen
+# (2026-09-19 · 09-21 · 09-24). A condensing model drops a trailing paragraph and
+# a conditional aside, keeps ONE sentence about connecting a computer, and
+# resolves a pronoun on its own: "It" (the page) became "an 8-character access
+# code from the Super Research app", which is false for anybody without a
+# computer. So the link now travels INSIDE the one sentence a relay always keeps,
+# it is the only sentence on the screen that names the code, and it says where
+# the code really comes from: the computer, at the end of that setup.
 #
-# ⛔ NOT `--pair` ANYWHERE ON THIS SCREEN. It remains the right instruction when
-# a machine that is ALREADY set up needs a fresh code (device-add errors, unlink,
-# `sr.py install`) — those sites keep it deliberately.
-_SETUP_NODE_LINES = [
-    _INSTALL_PAGE_LINE,
-    "It gives you an 8-char access code — send it to me and I’ll connect it.",
-]
+# ⛔ "OR ONE A COMPUTER'S OWNER GAVE YOU" STAYS IN THE SAME SENTENCE. An access
+# code connects ANY computer running Super Research, so this route was never
+# "your own" only (owner, 2026-09-20) — somebody else's private machine joins the
+# same way, with the code its owner hands over.
+#
+# ⛔ NOT `--pair` ANYWHERE A NEW PERSON READS. The page carries the commands, per
+# OS, and stays current when they change; a chat message cannot. `--pair` remains
+# the right instruction only for a machine that is ALREADY set up and needs a
+# fresh code (the device-add errors, unlink) — those sites keep it deliberately.
+_ADD_A_COMPUTER = (f"Add a computer: set one up at {_INSTALL_PAGE_URL}, then send "
+                   "me the 8-character access code the computer shows (or one a "
+                   "computer's owner gave you).")
 
 # ⛔⛔ THE SAME CLAIM ON EVERY SCREEN THAT MAKES IT. The consent question was
 # corrected in 7.9-2 — the owner sees the NAME, and the email only when no name is
@@ -238,8 +243,9 @@ def _public_offer_lines() -> list[str]:
 # ⭐⭐ THE RELAY RULE FOR THE NO-COMPUTER SCREEN, CARRIED IN BAND (owner,
 # 2026-09-21). Measured, not guessed: asked "Add device to my Super Research", the
 # chat ran `status-account` AND `devices`, both printed this screen exactly as
-# designed — state of play, "Add a computer:", the public computers as a named
-# section with its list, the walkthrough last — and the reply the person got
+# designed THEN — state of play, "Add a computer:", the public computers as a named
+# section with its list, the walkthrough last (since 2026-09-24 the link rides in
+# the add line instead; see `_ADD_A_COMPUTER`) — and the reply the person got
 # dropped the section heading, demoted the list to an "Alternatively…" aside,
 # led with `superresearch --pair` in a fenced block, and lost the install link.
 # The client was right; the relay was not.
@@ -257,35 +263,22 @@ def _public_offer_lines() -> list[str]:
 # rules in this skill that have held are both attached to the bytes they govern
 # (`_AGENT_ONLY_MARKER` blocks and the `MEDIA:` line). This screen had no anchor.
 #
-# ⛔ NAMES THE FAILURE SEEN, INCLUDING THE DUPLICATE: two commands printed the
-# same screen, and a model merging two copies is exactly where sections get
-# folded together.
-# ⛔ THE ORDER IS THE WHOLE MESSAGE'S, NOT JUST THE SCREEN'S. `status-account`
-# prints an update notice AFTER the walkthrough and the sign-in paths print a
-# signed-in line or a held-topic promise BEFORE it; a rule saying "walkthrough LAST"
-# would have told a literal-minded model to drop or move the update line, and a
-# merge of two copies could shed the held-topic promise. Both are named.
+# ⭐⭐ SHORT, AND IT CARRIES THE URL ITSELF (owner, 2026-09-24). The rule that
+# stood here was a long ordering clause — "…then the install link, then any line
+# after it…" — and it was in the tool output of the 2026-09-24 relay that dropped
+# the link anyway: it could name the link but never put one back, and it never
+# said where the code comes from, so the model invented "from the Super Research
+# app". Now the URL is written into the rule literally, the code's true origin is
+# stated, and the only ordering left is the one the screen already prints.
+# ⛔ "AS PRINTED" STILL COVERS THE LINES AROUND THE SCREEN. `status-account`
+# prints an update notice after it and the sign-in paths a held-topic promise
+# before it; both sit above the marker, so both are part of "the screen above".
 _EMPTY_STATE_RELAY = (
-    "⛔ Relay the screen above as ONE message, exactly as printed and in its "
-    "order: any line before it (who is signed in, a held topic) first, then "
-    "whether this account has a computer, “Add a computer:”, the "
-    f"“{_PUBLIC_HEAD}” section with every row, then the install link, "
-    "then any line after it (an update notice) as printed. Keep every heading and "
-    "the install link. The install part is that ONE link: do NOT add install "
-    "commands, a code block or `superresearch --pair` of your own, and do NOT "
-    "turn the public computers into an "
-    "“Alternatively…” line or any other aside. If more than one command "
-    "printed this screen, relay it once, keeping every line any copy printed.")
-
-
-# ⭐ ONE SENTENCE, TWO SCREENS. The empty state renders it second; the populated
-# device list renders it because a no-code "add a device" now lands there too, and
-# a list that only says you MAY add one names no route.
-# ⛔ NEVER A SECOND WORDING — retyping this is the drift the shared empty state was
-# written to end; a test counts the literal.
-_ADD_WITH_CODE = ("Add a computer: paste the access code from any computer "
-                  "running Super Research — your own, or one whose owner hands "
-                  "you the code — and I’ll connect it.")
+    "⛔ Relay the screen above as ONE message, as printed. Keep "
+    f"{_INSTALL_PAGE_URL} inside the “Add a computer” sentence and keep the "
+    f"“{_PUBLIC_HEAD}” section with every row. The access code comes from the "
+    "person's computer at the end of that setup — never say it comes from the "
+    "app, and add no commands (no `superresearch --pair`).")
 
 
 def _with_empty_state_relay(lines: "list[str]") -> "list[str]":
@@ -299,13 +292,16 @@ def _with_empty_state_relay(lines: "list[str]") -> "list[str]":
     a directive baked into the renderer would silently swallow whatever they
     append. So each message that ENDS here attaches it itself: `devices`,
     `status-account` and `research` on an empty account, `login-done` when the
-    sign-in note says there is nowhere to run, and every device command whose
-    name lookup found no computer at all (via `_resolve_device_arg`).
+    sign-in note says there is nowhere to run, every device command whose name
+    lookup found no computer at all (via `_resolve_device_arg`), and `updates`
+    when the sign-in note it took says there is nowhere to run (there the rule
+    joins any re-arm directive under the ONE marker, as its last line).
 
     ⚠ KNOWN UNCOVERED, DELIBERATELY: `send-logs` with no computer renders the
     screen through `_pick_device_lines` and then appends its own agent-log offer,
     and `research`'s which-computer fallback reaches it only when a re-fetched
-    device list comes back empty. Neither is a whole-message tail today.
+    device list comes back empty. Neither is a whole-message tail today. Both
+    still carry the link where a relay keeps it — inside the add line.
 
     ⛔ NOT ON THE WATCHDOG'S LINE OR THE TERMINAL. The watchdog runs `no_agent`,
     so nothing relays it; the terminal prints straight to a person.
@@ -325,9 +321,16 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     one, was told to go and get one.
 
     ⭐ THREE THINGS, IN THIS ORDER, EVERY TIME. There is no computer on this
-    account · your own can be added with an access code · or you can ask to use
-    somebody else's — and the ones on offer are LISTED, because "ask for a public
-    one" with no list is advice rather than a next step.
+    account · “Add a computer:” — the install page, then the access code that
+    computer shows (or one its owner gave you), in ONE sentence · or you can ask to
+    use somebody else's — and the ones on offer are LISTED, because "ask for a
+    public one" with no list is advice rather than a next step.
+
+    ⛔ AND NOTHING AFTER THE PUBLIC SECTION (owner, 2026-09-24). The install link
+    used to close the screen as a paragraph of its own; that is the part a
+    condensing relay dropped every time it was measured. It lives inside the add
+    line now (see `_ADD_A_COMPUTER`), so the screen ends on the public section and
+    the caller's relay rule, if any, follows it.
 
     ⛔ `lead` is for the callers that arrive with an object already in hand (a
     topic that has nowhere to run). It is NOT a second phrasing of the three
@@ -349,13 +352,11 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     # was rewritten for was that the public half had no NOUN — it read as the tail
     # of a sentence, so a relay folded it into the option above it and the list
     # left the message. The names fix that; the numbers were never load-bearing.
-    lines.append(_ADD_WITH_CODE)
-    lines.append("")
+    lines.append(_ADD_A_COMPUTER)
     pub = _public_offer_lines()
     if pub:
-        lines += pub
         lines.append("")
-    lines += _SETUP_NODE_LINES
+        lines += pub
     return lines
 
 
@@ -1270,8 +1271,13 @@ def _connected_msg(who) -> str:
     # the empty state — it must not fire a second fetch to render a list — but the
     # sentence that used to end at the access code was the first thing a brand-new
     # account read, and it named the one route that needs hardware.
-    return (f"✓ Connected as {who}. To get started, paste the access code from your "
-            "Research Computer — or ask me for a public computer you could use.")
+    # ⭐ THE SHARED ADD LINE, NOT A THIRD WORDING (owner, 2026-09-24). This used to
+    # say "paste the access code from your Research Computer", which assumes the
+    # reader already has one and gave them no way to get it. The install link
+    # costs no fetch, so it rides here in the same sentence every other surface
+    # prints.
+    return (f"✓ Connected as {who}. {_ADD_A_COMPUTER} Or ask me for a public "
+            "computer you could use.")
 
 
 def cmd_status_account(args) -> int:
@@ -1343,11 +1349,15 @@ def cmd_devices(args) -> int:
     # ⛔⛔ A NO-CODE "add a device" NOW LANDS HERE TOO, so this branch has to
     # answer it. It used to close on a capability claim — "you can add, remove, or
     # switch devices anytime — just ask" — which, to somebody who just asked HOW
-    # to add one, restates the question. The route is the access code; the tail
-    # keeps the two verbs that route does not cover.
+    # to add one, restates the question. The route is the shared add line; the
+    # tail keeps the two verbs that route does not cover.
+    # ⭐ WITH THE INSTALL LINK, BECAUSE THIS READER CAN NEED ONE TOO (owner,
+    # 2026-09-24). Somebody whose only computer is shared, or who wants a second
+    # one of their own, asks "add a device" and lands here; the old tail offered
+    # only "paste the access code". The link costs no fetch.
     # ⛔ NOT the public list here: this is also what "which devices?" runs, and
     # the public list is a second network call on every one of those.
-    lines.append(_ADD_WITH_CODE)
+    lines.append(_ADD_A_COMPUTER)
     lines.append("You can remove or switch computers anytime — just ask.")
     return _emit(body, args.json, lines)
 
@@ -1388,7 +1398,11 @@ _PAIR_ERRORS = {
     # which the web app's own table has said since wave 2 and this one did not.
     # ⛔ `--pair` IS STILL NAMED, and only where it is right: once the computer is
     # gone from that list there is nothing to reset and it IS a new setup.
-    "code_not_found": "No computer is waiting for that code. If it came from a "
+    # ⭐ THE COMMONEST CAUSE COMES FIRST (2026-09-24): a mistyped code. A
+    # first-timer who misread the code their new computer showed was sent straight
+    # to reset emails they never got — re-reading the screen is the repair.
+    "code_not_found": "No computer is waiting for that code — check it against "
+                      "the code on that computer’s screen. If it came from a "
                       "reset email, use the newest one, or press Reset again in "
                       "Settings → Manage devices. Only if the computer isn’t "
                       "listed there, run “superresearch --pair” on it — that sets "
@@ -1484,7 +1498,10 @@ def cmd_device_add(args) -> int:
         lines.append("You can start researching whenever you like.")
     else:
         lines = [f"✓ Added “{name}” — it’s {kind} now."]
-    lines.append("You can add, remove, or switch devices anytime — just ask.")
+    # ⛔ THE DEVICE LIST'S OWN TAIL, NOT THE ONE IT RETIRED. "You can add, remove,
+    # or switch devices anytime" names no route for adding — the devices screen
+    # dropped it for that reason and this reply kept it (2026-09-24).
+    lines.append("You can remove or switch computers anytime — just ask.")
     return _emit(body, args.json, lines)
 
 
@@ -2794,7 +2811,22 @@ def cmd_updates(args) -> int:
         lines.append("No active runs.")
     # Watchdog self-heal: re-emit the arming directive when a live agent run
     # has no ticking watchdog in this chat (see _stream_health_lines).
-    return _emit(body, args.json, lines + _stream_health_lines(runs))
+    tail = _stream_health_lines(runs)
+    # ⛔⛔ THE NO-COMPUTER SCREEN RODE THROUGH HERE WITH NO RELAY RULE (2026-09-24).
+    # A taken announce that says there is nowhere to run renders the whole screen
+    # above, and this was the one door that printed it bare — missing even from
+    # `_with_empty_state_relay`'s own list of uncovered sites. The rule has to be
+    # the LAST thing printed, and the re-arm directive is already a block under
+    # the marker, so the rule JOINS that block as its last line rather than
+    # opening a second marker.
+    # ⚠ Keyed the way `_signed_in_lines` branches: `autoStarted` is checked first
+    # there, so only a note that did not start anything renders the screen.
+    signed_in = body.get("signedIn")
+    if (isinstance(signed_in, dict) and signed_in.get("needsDevice")
+            and not signed_in.get("autoStarted")):
+        tail = ([*tail, _EMPTY_STATE_RELAY] if tail
+                else _agent_directive_block([_EMPTY_STATE_RELAY]))
+    return _emit(body, args.json, lines + tail)
 
 
 # ── send logs ────────────────────────────────────────────────────────────────
@@ -4030,7 +4062,15 @@ def cmd_update(args) -> int:
 def cmd_install(args) -> int:
     """Install the Super Research BACKEND on the connected device — turns that PC
     into a research host (`pipx install superresearch`). The install runs in the
-    background; pairing afterwards is done on the host."""
+    background; the rest of the setup (ending in the access code) is the install
+    page's, done on the host.
+
+    ⭐ ONLY FOR AN EXPLICIT "install it HERE" (owner, 2026-09-24). "Install / set
+    up Super Research" on its own is answered with the install page by the router
+    — this command installs on the machine the CHAT runs on, which is rarely the
+    computer a new person means. So both replies OPEN with the page, and neither
+    hands anybody `superresearch --pair`: the page's own pairing step does that,
+    per OS, and stays current when it changes."""
     code, body = _post("/install-backend")
     if code != 200:
         err = body.get("error", "")
@@ -4040,19 +4080,28 @@ def cmd_install(args) -> int:
             msg = f"couldn't start the install: {err or code}"
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
     if body.get("already"):
+        # ⛔ NOT "say “devices” to see/pair it". `devices` lists; it cannot pair
+        # anything, so that sent somebody to a command that could not do what it
+        # promised. An installed machine that is not on the account yet finishes
+        # the page's steps, and those end with the code.
         return _emit(body, args.json, [
-            "Super Research is already installed on this device.",
+            f"The setup steps are at {_INSTALL_PAGE_URL} — Super Research is "
+            "already installed on this device.",
+            "If it isn’t on your account yet, carry on with that page’s next step "
+            "on this device — this device then shows an 8-character access code; "
+            "send it to me and I’ll connect it. Say “devices” to see the computers "
+            "your account has.",
             "To update it, run “superresearch --update” on that computer or update "
-            "it from the app (Settings → About); say “devices” to see/pair it.",
+            "it from the app (Settings → About).",
         ])
     return _emit(body, args.json, [
-        "⬇️ Installing Super Research on this device in the background.",
-        "When it finishes, pair it — run this on that PC:",
-        # Indent (not ``` fences) — plain-text/SMS relays can't render Markdown
-        # and would show literal backticks. Matches _SETUP_NODE_LINES' style.
-        "      superresearch --pair",
-        "It shows an 8-char code; read it to me and I’ll add it.",
-        "(Then finish the API-key + browser-login steps on the PC and it’s ready.)",
+        f"The setup steps are at {_INSTALL_PAGE_URL}.",
+        "⬇️ Installing Super Research on this device in the background — that’s "
+        "the first of them.",
+        "When it finishes, carry on with that page’s next step on this device — "
+        "this device then shows an 8-character access code; send it to me and "
+        "I’ll connect it.",
+        "(Then finish the API-key + browser-login steps on it and it’s ready.)",
     ])
 
 
@@ -5331,7 +5380,13 @@ _NL_CONFIRMS = {
     "logout": "Sign out of Super Research? (The skill stays installed — you can sign back in anytime.) Say yes and I’ll sign you out.",
     "device-remove": "Unlink {name}? It keeps running, but its access code changes — the old one stops working and I’ll show you the new one. Say yes and I’ll remove it.",
     "update": "Update the Super Research skill (this chat runtime)? The bridge restarts briefly. Say yes and I’ll update it.",
-    "install": "Install the Super Research backend on the connected device? Say yes and I’ll set it up.",
+    # ⭐ OPENS WITH THE PAGE (owner, 2026-09-24). Only an explicit "install it
+    # here / on this machine" reaches this confirm now, and a yes installs on the
+    # machine the chat runs on — so the page, which sets up ANY computer, is named
+    # before the offer.
+    "install": (f"The setup steps are at {_INSTALL_PAGE_URL}. Install the Super "
+                "Research backend on the connected device — the one this chat runs "
+                "on — now? Say yes and I’ll set it up."),
     # ⛔⛔ CONFIRM-GATED THOUGH IT DESTROYS NOTHING, and that is the point. It is
     # the only verb on this surface that hands the person's NAME AND EMAIL to a
     # stranger, spends one of five asks an hour, and arms a week-long refusal if
@@ -7299,8 +7354,35 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         return None, [_NL_CONFIRMS["update"]]
     if re.search(r"\bversions?\b", low):
         return ["version"], None
-    if re.search(r"\b(install|host|set ?up)\b.*\b(backend|super research|here|this (pc|machine|computer))\b", low):
-        return None, [_NL_CONFIRMS["install"]]
+    # ⭐⭐ "INSTALL SUPER RESEARCH" IS ANSWERED WITH THE PAGE (owner, 2026-09-24).
+    # This used to send every install / set-up phrasing — "how do I install super
+    # research", "set up super research" — to the confirm that installs the
+    # backend on the machine the CHAT runs on, and a yes then told a brand-new
+    # person to run `superresearch --pair`. What they were asking for is how to get
+    # a computer, and the answer to that is the one add line with the install page
+    # in it.
+    # ⛔ THE CONFIRM KEEPS ONLY THE EXPLICIT ASK: "here" or "this pc / machine /
+    # computer" AFTER the install verb, or the backend by name. Those are about
+    # THIS machine, and that confirm now opens with the page as well.
+    # ⛔⛔ TIED TO THE VERB, NOT FOUND ANYWHERE IN THE MESSAGE. The first cut took
+    # `here` / `host` wherever they stood, so "I'm new here, how do I set up super
+    # research" — a brand-new person, the exact reader decision 3 is for — was
+    # offered the install on the machine the CHAT runs on, and so was "how do I
+    # host super research for my team", which names no machine at all.
+    # ⛔ AND A MESSAGE THAT NAMES THE SKILL IS NOT ASKING FOR A COMPUTER. The web
+    # app's own paste-to-your-agent line is "Install Super Research from
+    # superresearch.io/skills.md", and it is shown to people whose agent still has
+    # this skill (`/sr logout` keeps it) — the app's tile relies on this rule to
+    # keep it off the install page. It gets the fresh account check a bare /sr
+    # gets: bridge, sign-in and computers, as they stand.
+    if re.search(r"\b(install|host|set ?up)\b.*\b(backend|super research|here|this (pc|machine|computer|device))\b", low):
+        if re.search(r"\bskills?\.md\b|\b(?:skill|agent|bridge)\b", low):
+            return ["status-account"], None
+        if re.search(r"\b(?:install|set ?up|host)\b[^.?!,]*"
+                     r"\b(?:here|this (?:pc|machine|computer|device|laptop|mac)|backend)\b",
+                     low):
+            return None, [_NL_CONFIRMS["install"]]
+        return None, [_ADD_A_COMPUTER]
 
     # 6. Listing + progress (before research — "results of X" is a status ask).
     # ⛔⛤ `did they answer?` AND `any word back?` — SKILL.md teaches both as the
@@ -7400,6 +7482,37 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             or re.fullmatch(rf"(?:no|zero|0)\s+(?:{_MACHINE_NOUNS_SAID})\b"
                             rf"[^.?!]{{0,32}}", low)):
         return ["devices"], None
+
+    # 6c. ⭐ "WHERE DO I GET AN ACCESS CODE?" HAS AN ANSWER NOW (2026-09-24). It
+    #     reached the catch-all, so no reply anywhere said where a code comes from
+    #     and the assistant made one up — "from the Super Research app", which is
+    #     false for anybody without a computer. The add line says it: the computer
+    #     shows it, at the end of the install page's setup, or its owner gives you
+    #     one.
+    #     ⛔⛔ IT SITS HERE, ABOVE ONLY THE CATCH-ALL, FOR 6b's REASON. Written at
+    #     rule 5 it took "status of the research on where to get access codes",
+    #     "results of how to get pairing codes for bluetooth" and "podcast for how
+    #     to get access codes" away from status and podcast — a run TITLED with the
+    #     words is not a question about the code. Down here it claims only what
+    #     every rule above left.
+    #     ⛔⛔ AND NEVER A RECOVERY OR A SHARING QUESTION. "I lost my access code",
+    #     "how do I get a new one", "it expired", "it doesn't work", "for my friend"
+    #     come from somebody whose computer ALREADY EXISTS — and the page's setup
+    #     ends in the pairing step, which on a machine that still exists mints a
+    #     NEW computer and drops everybody it was shared with (`_PAIR_ERRORS`). The
+    #     add line would send them straight there, so those keep the catch-all
+    #     they had before this rule existed. A message carrying a code never
+    #     reaches here (rule 1 pairs it), and a research request that mentions
+    #     codes was taken at 2b.
+    if re.search(r"\b(?:access|pair(?:ing)?)[ -]?codes?\b", low) and re.search(
+            r"\b(?:where|how)\b.*\b(?:get|find|obtain|receive|come|comes)\b"
+            r"|\b(?:get|need|want)\s+(?:me\s+)?(?:an?|the|one)?\s*"
+            r"(?:access|pair(?:ing)?)[ -]?codes?\b", low) and not re.search(
+            r"\b(?:new|another|again|expired?|lost|lose|forgot(?:ten)?|reset|wrong"
+            r"|right one|(?:does|do|did|is|was)\s*n[o'’]?t\s+work(?:s|ing)?"
+            r"|not working|stopped working|my|mine|our|friend|wife|husband|partner"
+            r"|give|share|sharing|into)\b", low):
+        return None, [_ADD_A_COMPUTER]
 
     # 7. Nothing matched — user-safe capabilities line (never guess a command).
     #    (Research phrasings were resolved at 2b, before the control rules.)

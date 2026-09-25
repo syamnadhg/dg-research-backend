@@ -154,6 +154,8 @@ def test_connected_msg_is_device_aware(bridge_port):
     assert "all set" in sr._connected_msg("e@x.y")  # FakeFS has My PC
     FakeFS.devices = []
     assert "access code" in sr._connected_msg("e@x.y").lower()
+    # ⚠ 2026-09-24: and the way to GET a computer, in the same sentence (owner)
+    assert "https://superresearch.io/install" in sr._connected_msg("e@x.y")
 
 
 def test_login_copy_does_not_demand_login_done():
@@ -556,8 +558,8 @@ def test_update_skill_alias(bridge_port, monkeypatch, capsys):
 
 
 def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
-    # reason=no_devices → the pair/install-a-backend step (the account genuinely has
-    # no research computer).
+    # reason=no_devices → the no-computer screen (the account genuinely has no
+    # research computer): the add line with the install page, then the public ones.
     monkeypatch.setattr(sr, "_origin_from_env", lambda: None)
     monkeypatch.setattr(sr, "_post", lambda path, body=None: (
         400, {"reason": "no_devices", "error": "no devices yet — grab the pair code"}))
@@ -583,9 +585,12 @@ def test_research_no_devices_shows_pair_prompt(monkeypatch, capsys):
     # resolver takes it. The id returns only when two rows read the same.
     assert "Studio PC" in out and "dev-a1" not in out
     assert "can’t take anyone else" in out
-    # the human setup-page URL is offered too as a bare URL (NOT Markdown); the
-    # trailing newline distinguishes it from the install.ps1/.sh script URLs
-    assert "https://superresearch.io/install\n" in out
+    # the human setup-page URL is offered too as a bare URL (NOT Markdown).
+    # ⚠ REPINNED 2026-09-24: it sits inside the add sentence now (owner), so the
+    # comma after it — not a trailing newline — is what tells it apart from the
+    # install.ps1/.sh script URLs, which never appear in chat at all
+    assert "set one up at https://superresearch.io/install, then" in out
+    assert "install.ps1" not in out and "install.sh" not in out
 
 
 def test_research_multi_device_asks_which_not_pair(monkeypatch, capsys):
@@ -734,18 +739,29 @@ def test_update_helper_fails(bridge_port, monkeypatch, capsys):
 
 def test_install_backend_starts(bridge_port, monkeypatch, capsys):
     # `install` installs the backend on the host (turning it into a research host),
-    # then the chat guides the user through host-side pairing.
+    # then the chat hands the rest of the setup to the install page.
+    # ⚠ REPINNED 2026-09-24: it used to require `--pair` here. The reply now OPENS
+    # with the install page and hands nobody `superresearch --pair` (owner) — the
+    # page's own pairing step does that, per OS.
     monkeypatch.setattr(bridge, "_backend_cli", lambda: None)  # not yet installed
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_backend_install", lambda: True)
     assert sr.main(["install"]) == 0
     out = capsys.readouterr().out
-    assert "Installing Super Research" in out and "--pair" in out
+    assert "Installing Super Research" in out
+    assert "https://superresearch.io/install" in out.splitlines()[0], out
+    assert "--pair" not in out
+    assert "8-character access code" in out
 
 
 def test_install_backend_already_present(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge, "_backend_cli", lambda: "/usr/local/bin/superresearch")
     assert sr.main(["install"]) == 0
-    assert "already installed" in capsys.readouterr().out.lower()
+    out = capsys.readouterr().out
+    assert "already installed" in out.lower()
+    # ⚠ 2026-09-24: opens with the page too, and no longer promises that
+    # `devices` can "pair" anything — it lists; it cannot pair
+    assert "https://superresearch.io/install" in out.splitlines()[0], out
+    assert "see/pair" not in out and "--pair" not in out
 
 
 def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
@@ -757,16 +773,17 @@ def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
 
 def test_setup_lines_have_no_code_fences():
     # SMS / plain-text relays can't render Markdown — a ``` fence shows literal
-    # backticks. The install commands are 6-space-indented instead (matching
-    # sr_attention_poll._signed_in_line's style).
-    assert "```" not in "\n".join(sr._SETUP_NODE_LINES)
+    # backticks.
     # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
     # (owner) — the one-liners and `superresearch --pair` left this screen.
-    # No command of any kind now — a link, and where to bring the code back.
-    joined = "\n".join(sr._SETUP_NODE_LINES)
-    assert "superresearch.io/install" in joined
+    # ⚠ AND 2026-09-24: the two setup lines are ONE now, the shared add line with
+    # the link inside it (`_SETUP_NODE_LINES` is gone). No command of any kind — a
+    # link, and where to bring the code back.
+    line = sr._ADD_A_COMPUTER
+    assert "```" not in line and "`" not in line
+    assert "superresearch.io/install" in line
     for gone in ("irm ", "curl ", "superresearch --pair"):
-        assert gone not in joined, gone
+        assert gone not in line, gone
 
 
 def test_install_backend_output_has_no_code_fences(bridge_port, monkeypatch, capsys):
@@ -774,7 +791,10 @@ def test_install_backend_output_has_no_code_fences(bridge_port, monkeypatch, cap
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_backend_install", lambda: True)
     assert sr.main(["install"]) == 0
     out = capsys.readouterr().out
-    assert "```" not in out and "      superresearch --pair" in out
+    # ⚠ REPINNED 2026-09-24: it pinned the indented `superresearch --pair` line;
+    # the reply now points at the page instead of printing any command (owner)
+    assert "```" not in out and "superresearch --pair" not in out
+    assert "superresearch.io/install" in out
 
 
 def test_status_account_prompts_available_skill_update(bridge_port, monkeypatch, capsys):

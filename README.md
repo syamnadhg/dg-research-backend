@@ -64,7 +64,7 @@ A **source** checkout has no such constraint — it runs on any 3.11+.
 - **Python 3.11+** (`python --version`).
 - **Real Google Chrome** installed (not just Chromium — patchright launches with `channel="chrome"`). Chrome itself is an OS-level prerequisite; the patchright Chrome wrapper, though, is **auto-fetched by `--pair`** — Stage 5 calls `_ensure_chrome_ready()`, which runs `patchright install chrome` before it opens the login tabs, so you don't have to do that step by hand. ⛔ **`--doctor` does not fetch it** — this bullet used to say it did. Doctor only *probes* the launch, and when Chrome won't boot it prints `patchright install chrome` as a **manual step** for you to run; a red row there is the probe telling you the truth, not an auto-fetch that failed.
 - **Anthropic API key** with browser-automation access (`ANTHROPIC_API_KEY`; see Step 2).
-- **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll paste the 8-char code into **Account → Pipeline Connection** during `--pair` Stage 1.
+- **Super Research web app account** — sign in at https://superresearch.io (Google sign-in). During `--pair` Stage 1 you hand the 8-char code over — send it to your chat assistant, or paste it into **Account → Pipeline Connection**.
 
 > **Two naming notes, so the doc and the screens agree.**
 > **(1) The app calls it the "access code".** Every label, error and placeholder in the web app says *access code*, and the pairing terminal now prints `Access code` above the eight characters. The wire names deliberately did **not** move — `pairCode`, `PAIR_CODE_SHOWN`, `/api/devices/pair-code`, `/api/devices/reset-pair-code` and the `--pair` verb itself are identifiers something else reads, and renaming one is a defect, not a cleanup. This README keeps saying "pair code" where it means the CLI/wire concept.
@@ -422,7 +422,13 @@ code under the heading `Access code` — the web's own word for it — in
 big mono digits with a dash at position 4 (`K7XQ-9B2M`), and an ASCII
 QR right below; the BE then polls
 `devices/{deviceId}/pending/{sha256(pollSecret)}` (anonymous Firestore
-REST) every ~2s for a customToken. Two ways to claim:
+REST) every ~2s for a customToken. Three ways to claim — the terminal
+names the first two under the code ("Send this code to your chat
+assistant, or enter it in the Super Research web app under Account →
+Pipeline Connection."):
+- **Chat** — send the code to your chat assistant (the `sr` skill); it
+  runs `sr.py device-add <code>`, which claims it through the same
+  web-app claim route. One message, the code alone is enough.
 - **Type** — Super Research app → **Account → Pipeline Connection**
   (press **+ add device** first if a computer is already listed) →
   paste the 8-char code → submit. Works on any device with the app open.
@@ -433,7 +439,7 @@ REST) every ~2s for a customToken. Two ways to claim:
   code; you still open the app and paste it.
 
 > **Don't have a web app account yet?** The Super Research app lives
-> at the deployment URL the dev shares with you (Google sign-in only).
+> at https://superresearch.io (Google sign-in only).
 > The app is required for this stage — `--pair` sits on its polling
 > loop until you claim the code. Default window is 15 minutes.
 
@@ -845,7 +851,7 @@ A device can run **multiple pipelines in parallel** when its backend has `worker
 
 ## Multiple Users (same backend) — sharing via pair code
 
-The same 8-char pair code drives sharing. Show the code under **Settings → Manage devices** (or copy it from the email after Reset), share it with a teammate, and they paste it into their own **Account → Pipeline Connection**. The FE claim function notices the device is already owned and appends their uid to `sharedWith[]` — they get a tile labeled "Shared by {your name}" and can submit research that runs on your PC.
+The same 8-char pair code drives sharing. Reveal the code on the computer's tile under **Account** — the one place the app shows it; **Settings → Manage devices** is Reset-only and shows no code — (or copy it from the email after Reset), share it with a teammate, and they paste it into their own **Account → Pipeline Connection**. The FE claim function notices the device is already owned and appends their uid to `sharedWith[]` — they get a tile labeled "Shared by {your name}" and can submit research that runs on your PC.
 
 Per-user scoping is enforced by Firestore rules + the BE's custom claim. Sharers can submit research and read their own runs; they can't read the owner's other data and can't read the owner's research history. Reset clears `sharedWith=[]` in one step — handy for revoking access to a stolen / overshared device without taking the BE down.
 

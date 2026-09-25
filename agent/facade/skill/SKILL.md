@@ -2,18 +2,18 @@
 name: sr
 description: >-
   USE THIS SKILL for ANY request to research a topic, run a deep-research report,
-  "do a Super Research", or deep-dive a subject — it runs the user's REAL
-  multi-agent Super Research pipeline on their own device and posts the result in
-  their web app. **NEVER answer a research or deep-dive request from your own
-  knowledge or with web search — ALWAYS invoke this skill instead**, whether the
-  user types /sr or just asks in plain language. A bare "status?" or "how's it going?" — with no
-  other subject — is THIS skill's status command; a question explicitly about
-  your runtime is not. An 8-char access code (like "K7XQ-9B2M",
-  alone or with "add / pair a device") always belongs here too. Also use it to get
-  a brief / podcast / audio overview / video on a subject; to list past researches
-  and fetch any one's links or podcast by name; to check, track, pause, skip, stop,
-  or resume a run; to sign in or out; to manage Research Computers; and to check
-  the version / update. A bare /sr is the welcome + help.
+  "do a Super Research", or deep-dive a subject, and to sign in or out ("Login to
+  Super Research") or list or add devices / Research Computers ("List devices",
+  "Add device") — an 8-char access code ("K7XQ-9B2M"), even alone, always belongs
+  here. It runs the user's REAL multi-agent pipeline on their own device and posts
+  the result in their web app. **NEVER answer a research or deep-dive request from
+  your own knowledge or with web search — ALWAYS invoke this skill instead**,
+  whether the user types /sr or just asks in plain language. A bare "status?" or
+  "how's it going?" — with no other subject — is THIS skill's status command; a
+  question explicitly about your runtime is not. Also use it to get a brief /
+  podcast / audio overview / video; to list past researches and fetch any one's
+  links or podcast by name; to check, track, pause, skip, stop, or resume a run;
+  and to check the version / update. A bare /sr is the welcome + help.
 platforms: [linux, macos, windows]
 ---
 
@@ -59,7 +59,7 @@ nothing to mean the most-recent / active run.
   in one message) · **the account HAS computers but none is the obvious one**
   (several linked, none online/selected → the client returns a "which computer
   should run this?" list; relay it — the user replies "use <name>", which the
-  client remembers — NEVER the pair/install step, they already have computers) ·
+  client remembers — NEVER the add-a-computer line, they already have computers) ·
   **skill genuinely broken** (`scripts/sr.py` missing / it
   errors / the bridge keeps failing → tell the user the skill isn't correctly
   installed, fix by re-running `connect`, and **STOP**). The same rule applies to
@@ -80,9 +80,9 @@ nothing to mean the most-recent / active run.
   code. Ask only when you truly cannot tell what they mean.
 - **Never show the user command syntax** — not `research <topic>`, not `/sr login`,
   not `login-done`. Those are how *you* drive the client; tell the user what to do
-  in plain words. The only commands you ever surface are the unavoidable
-  machine-setup ones the user runs on their **Research Computer**, and the device-add
-  form below — each on its own line, never inline; lines the client printed, as printed.
+  in plain words. Setting up a computer is a LINK, never commands:
+  https://superresearch.io/install. The only command you ever surface is the
+  device-add form below — on its own line, never inline; lines the client printed, as printed.
 - **An access code is the user's to spend — handle it, never repeat it back.** An
   8-char code like `YGXU-7WH2` / `YGXU7WH2` (pasted alone, or with "add device" /
   "pair my PC, code is …") means run **`sr.py device-add <code>`** right away. It is
@@ -173,14 +173,15 @@ back into `do`.
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | see **After a sign-in link** (NOT `retry`) |
 | "skip it", "skip this step" / "skip the video and the report" / "skip Claude (in P2)", "drop ChatGPT from the research" | `sr.py skip [phases\|agents] [--run "<title>"]` — phases (brief/podcast/video/report) AND the P2 research agents (chatgpt/gemini/claude), same as the app's per-agent toggles |
 | an **8-char access code** ("7F4V-6W7D"), "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
-| "add a device" — **no code in the message** | `sr.py devices` — relay it as printed (with no computer that IS the answer: access code, public computers, install link). Never ask for the code yourself first |
+| "add a device" — **no code in the message** | `sr.py devices` — relay it as printed (with no computer that IS the answer: the “Add a computer” line with the install link inside it, then the public computers). Never ask for the code yourself first |
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
 | "sign in", "log me in" | `sr.py login` |
 | "logout", "log out", "sign out of Super Research" | `sr.py logout` (signs the agent OUT — keeps the skill + bridge) |
 | "remove / uninstall / disconnect Super Research entirely" | **confirm** ("just sign out, or fully remove Super Research from this computer: skill, bridge and every chat's watcher?"), then `pipx run superresearch-agent disconnect --yes` (FULL teardown), then tell them to run **/reload-skills** so `/sr` unregisters. Do NOT use the runtime's own skill-removal (leaves the bridge running) or `sr.py logout` (sign-out only). |
-| "host the backend on this PC", "install Super Research here", "no devices — set one up" | **confirm**, then `sr.py install`, then guide pairing |
+| "install / set up Super Research", "how do I install Super Research?", "where do I get an access code?" | `sr.py do "<message>"` — it answers with the one “Add a computer” line (the install page). Relay it as printed; never offer `install` for these |
+| "install Super Research here", "install it on this machine", "host the backend on this PC" — **this** machine, said explicitly | **confirm**, then `sr.py install` — relay its reply as printed (it opens with the install page) |
 | "what version?" | `sr.py version` (shows the SKILL version only; nudges when a newer skill version is available. The backend's version lives in the app's Settings → About — don't mention the backend here) |
 | "update", "update the skill", "update yourself" (colloquial "update the agent" too) | **confirm**, then `sr.py update` (updates the Super Research **skill** — this chat's scripts + bridge). It returns a do-not-relay finish script — FOLLOW IT: wait for the bridge to restart, verify the new version with `sr.py version` (retry a few times while it restarts), then run **/reload-skills ONCE**, then post one "✓ updated to vX" line. Do NOT improvise your own recovery. This is the ONLY thing the runtime updates. |
 | "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
@@ -189,7 +190,7 @@ back into `do`.
 | "just the one about X", "only the first two", "not all of them" | ⛔ **ANSWERS TO THE PLAN THIS COMMAND JUST PRINTED**, not standalone asks — `sr.py do` cannot resolve them, because the numbers exist only on the screen in front of the user. the plan labels every row — `Run 0`, `Run 1`, `Run 2` — pass those numbers back with `--runs`, comma-separated: `sr.py send-logs --runs 1,3` (and again on `--confirm`). `--runs 0` is the agent's own log, `--runs all` is every run listed. A name works too. ⛔ **POSITIONAL PHRASES RESOLVE AGAINST THE LABEL, NEVER THE SCREEN POSITION** — `Run 0` is printed FIRST, so "the first two" means `Run 0` and `Run 1`, i.e. `--runs 0,1`, and "the first one" is `--runs 0`. Read the label off the row; do not count down the screen. Do **not** guess a number the plan did not print |
 | "send the agent's log too", "include the bridge log", "the log from this chat" | ⛔ **SAID INSIDE THE SEND-LOGS FLOW** — on its own, "include the bridge log" names no request to add it to, so `sr.py do` answers with the catch-all. add `--agent-log` to the **bare** command **and to `--confirm`** — or say `--runs 0`, which is the same thing and is the number the plan prints for it. On the bare command it only makes the plan name it. On `--confirm` the client sends it **immediately and on its own**, before it asks the research computer for anything, and hands back **a second support code** for it — quote both, and never re-send it with `--status <CODE> --agent-log`. **Not** owner-gated. See **Sending logs to support** |
 | "are there any public computers?", "show me computers I could ask to use" | `sr.py devices-public` (only machines whose owners offer them; the id on each row is what the next command takes — public names collide, an unnamed one reads as "Research computer" for everybody). A row marked "can't take anyone else" is full: asking would be refused |
-| "I don't have a computer of my own", "I have no computer", "I haven't got a machine" | `sr.py devices` — **not** `devices-public`. It answers from the account's own list, and when that list is empty it IS the full answer: no computer here, add your own with an access code, or ask to use one of the public ones, which it lists. Sending these to `devices-public` told anybody who DID have a computer to go and ask a stranger |
+| "I don't have a computer of my own", "I have no computer", "I haven't got a machine", "no devices — set one up" | `sr.py devices` — **not** `devices-public`. It answers from the account's own list, and when that list is empty it IS the full answer: no computer here, the “Add a computer” line (install link first), or ask to use one of the public ones, which it lists. Sending these to `devices-public` told anybody who DID have a computer to go and ask a stranger |
 | "make my computer public", "let people find my mac", "offer my machine to other people" | **confirm** — relay the client's question verbatim (strangers would see the name the computer reports, which on an unrenamed machine is often its OWNER'S own name; the user still approves each person) — then `sr.py device-visibility public` (add `"<name>"` only if they named a computer; with one machine the user OWNS the client picks it, with several it asks which — a shared machine is never picked and never offered, because its visibility is not theirs to set) |
 | "make my computer private", "hide my mac", "stop offering my machine", "take it off the public list" | `sr.py device-visibility private` — **no confirmation**: it only takes a computer OFF a list |
 | "is my computer public?", "which of my computers are findable?" | `sr.py devices` — the row for a computer the user OWNS says `public` or `private` (the same two words the command uses, and the web app's toggle). Do NOT change anything to answer a question |
@@ -318,12 +319,13 @@ never `retry`, never a question back to the user.
   off for the run — the same thing the app's per-agent toggles do ("skip Claude
   in P2" → `sr.py skip claude`). Mix freely: `sr.py skip claude video`.
 - **install** → confirm first. Installs the backend on the connected device (turns
-  that PC into a Research Computer) — then guide pairing (`superresearch --pair` on that
-  PC → 8-char code → you run `device-add`; they finish API-key + browser-login on
-  the PC). Use ONLY when `research` reports **"no research computer on this account
-  yet"** (reason `no_devices`) — the older wording "no devices yet" is gone —
-  NOT when it returns a "which computer?" list (the account already has computers;
-  relay the list and let the user pick with "use <name>").
+  that PC into a Research Computer). Use ONLY when the user explicitly asks to install
+  it on THIS machine — the one this chat runs on. Its reply opens with the install
+  page; relay it as printed and add no commands of your own. ⛔ NOT for a screen that
+  says **"no research computer on this account yet"** (reason `no_devices`): that
+  screen already carries the install page in its “Add a computer” line — relay it.
+  NOT when `research` returns a "which computer?" list either (the account already
+  has computers; relay the list and let the user pick with "use <name>").
 - **version / update** → `version` relays the SKILL version only (never mention a
   backend version — the app's Settings → About owns that) and nudges
   only when a newer **skill** version is available. `update` (alias `update-skill`;
@@ -343,11 +345,15 @@ never `retry`, never a question back to the user.
 ## Devices & Research Computers
 
 **An account with NO computer is not a dead end.** Every screen that reports it
-names BOTH routes — add your own with an access code, or ask to use somebody else's —
-and the full ones (`devices`, `research`, the sign-in announce) also LIST the public
-computers on offer. Relay that list; never present setting up a machine as the only
-route. The one-line sign-in confirmation names both routes without a list, which is
-deliberate: it must not make a second call to render one.
+names BOTH routes — “Add a computer: set one up at https://superresearch.io/install,
+then send me the 8-character access code the computer shows (or one a computer's
+owner gave you)”, or ask to use somebody else's — and the full ones (`devices`,
+`research`, the sign-in announce) also LIST the public computers on offer. Relay
+that list; never present setting up a machine as the only route.
+⛔ Keep https://superresearch.io/install inside the “Add a computer” sentence.
+The access code comes from the person's computer at the end of that setup — never
+say it comes from the app. The one-line sign-in confirmation names both routes
+without a list, which is deliberate: it must not make a second call to render one.
 
 A **Research Computer** is a computer running Super Research. **Any bare 8-char
 access code (e.g. `7F4V-6W7D`, dashes optional) means run
@@ -369,18 +375,12 @@ wrong one either shows a list nobody wanted or publishes a computer nobody meant
 to publish, so read the intent before choosing between them.
 
 If the user wants to add a Research Computer but hasn't given a code, run `sr.py devices`
-and relay it as printed — with no computer linked that IS the whole answer (access
-code, public computers, install link); with one linked, it names the code route. Only
-if they explicitly ask how to set up a machine, show these one-liners:
-
-```
-irm https://superresearch.io/install.ps1 | iex      # Windows
-curl -fsSL https://superresearch.io/install.sh | sh  # macOS / Linux
-superresearch --pair
-```
-
-It auto-installs Python + pipx + Super Research, then prints the 8-char access
-code — they read it to you and you run `device-add`.
+and relay it as printed — with no computer linked that IS the whole answer (the “Add
+a computer” line with the install link inside it, then the public computers); with
+one linked, it still carries the same “Add a computer” line.
+If they explicitly ask how to set up a machine, the answer is
+https://superresearch.io/install — nothing else: no install commands, no
+`superresearch --pair`.
 
 ## Sending logs to support
 

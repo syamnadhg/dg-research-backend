@@ -317,10 +317,15 @@ def cmd_connect(args: argparse.Namespace) -> int:
     b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.") + b.c(branding._DIM, tail))
     # Device prerequisite (soft heads-up): the agent DRIVES Super Research on a
     # paired computer — it doesn't run the research in chat. The hard prompt comes
-    # later, on the first research with no device (the /sr skill walks them through
-    # pairing then).
+    # later, on the first research with no device (the chat shows the no-computer
+    # screen then).
+    # ⭐ THE SAME ADD LINE THE CHAT PRINTS, WITH THE PAGE IN IT (owner, 2026-09-24).
+    # This said "make sure one computer is running Super Research and paired", which
+    # assumes one exists and names no way to get one.
     b.dim("Super Research runs on a paired computer — the agent drives it, it doesn't research in chat.")
-    b.dim('Make sure one computer is running Super Research and paired; say "add a device" in chat to pair.')
+    b.dim("Add a computer: set one up at https://superresearch.io/install, then send your "
+          "chat the 8-character access code the computer shows (or one a computer's "
+          "owner gave you).")
     b.next_grouped(_connect_next(runtime=chosen.runtime, logged_in=logged_in,
                                  startup_pinned=startup_pinned))
     return 0
@@ -1310,7 +1315,11 @@ _PAIR_FAILURES = {
     # which the web app's own table has said since wave 2 and this one did not.
     # ⛔ `--pair` IS STILL NAMED, and only where it is right: once the computer is
     # gone from that list there is nothing to reset and it IS a new setup.
-    "code_not_found": "no computer is waiting for that code. If it came from a "
+    # ⭐ THE COMMONEST CAUSE COMES FIRST (2026-09-24): a mistyped code. A
+    # first-timer who misread the code their new computer showed was sent straight
+    # to reset emails they never got — re-reading the screen is the repair.
+    "code_not_found": "no computer is waiting for that code — check it against the "
+                      "code on that computer's screen. If it came from a "
                       "reset email, use the newest one, or press Reset again in "
                       "Settings -> Manage devices. Only if the computer is not "
                       "listed there, run:  superresearch --pair   on it — that "
@@ -1647,10 +1656,15 @@ def _print_no_devices() -> None:
     emptiest of the lot, and nothing anywhere pinned it.
 
     ⭐ THE SAME THREE THINGS THE CHAT CLIENT SAYS, in this file's voice: no
-    computer on this account · add your own with an access code · or ask to use
+    computer on this account · "Add a computer:" — the install page, then the
+    access code that computer shows (or one its owner gave you) · or ask to use
     somebody else's, with the ones on offer LISTED. A guard compares the claims,
     not the punctuation — this file has no curly apostrophes and that one is full
     of them.
+
+    ⛔ AND NOTHING AFTER THE PUBLIC SECTION (owner, 2026-09-24). The install link
+    was a closing block of its own, owed by every exit; it is inside the add line
+    now, printed before anything can return early.
     """
     # ⛔⛔ THE LOOK GOES FIRST AND NOTHING IS PRINTED UNTIL IT ANSWERS. Printing
     # three lines and then blocking for up to twenty seconds mid-message reads as
@@ -1668,26 +1682,27 @@ def _print_no_devices() -> None:
     # way in that "two ways" silently denied (owner, 2026-09-20). What these
     # sections needed was NAMES, not ordinals: the defect was that the public half
     # had no noun to be recognised by, not that it had no number.
-    print("  Add a computer:      any computer running Super Research prints an")
-    print("                       8-char access code — your own, or one whose")
-    print("                       owner hands you the code:")
+    # ⭐⭐ THE INSTALL PAGE IS THE FIRST THING THIS LINE SAYS (owner, 2026-09-24).
+    # The chat client's `_ADD_A_COMPUTER`, in this file's voice: set one up at the
+    # page (the commands live there, per OS, and stay current), then add the code
+    # that computer shows — or one a computer's owner gave you. The page, never
+    # `superresearch --pair`, and never a code "from the app".
+    print("  Add a computer:      set one up at https://superresearch.io/install, then")
+    print("                       add the 8-character access code the computer shows")
+    print("                       (or one a computer's owner gave you) with:")
     print("                       agent device add <code>")
-    # ⭐⭐ THE PUBLIC HALF IS A NAMED, NUMBERED SECTION HERE TOO, and the install
-    # block moved BELOW it. Both halves of that are one fix. This screen rendered
-    # the list under "Or ask to use somebody else's — …" and never printed the
-    # noun, exactly as the chat client did — where a relay, which preserves what
-    # the client states and restructures what it leaves implicit, folded the
-    # nameless section into the option above it and it vanished from the chat
-    # (owner, 2026-09-20). A section with no name has nothing to survive on.
-    # ⛔ AND THE INSTALLER CANNOT SIT BETWEEN THE TWO OPTIONS. It did, so
-    # numbering them in source order would have read 1, 3, 2. The order is now the
-    # chat client's — said, own, ask, walkthrough — which is pinned on that side
-    # (tests/test_empty_state_794.py:177) for a reason that applies identically
-    # here: seven lines of shell arriving before the two options buries them.
+    # ⭐⭐ THE PUBLIC HALF IS A NAMED SECTION HERE TOO. This screen rendered the
+    # list under "Or ask to use somebody else's — …" and never printed the noun,
+    # exactly as the chat client did — where a relay, which preserves what the
+    # client states and restructures what it leaves implicit, folded the nameless
+    # section into the option above it and it vanished from the chat (owner,
+    # 2026-09-20). A section with no name has nothing to survive on.
+    # ⛔ AND IT IS THE LAST SECTION. The order is the chat client's — said, add a
+    # computer (link first), ask — and nothing trails it: the closing install
+    # block every exit used to owe is gone, because its link is already above.
     if res is None or res[0] != 200 or not isinstance(res[1], dict):
         print("  Public computers — ask to use somebody else's:  "
               "agent device public")
-        _print_install_block_t()
         return
     rows = [d for d in (res[1].get("devices") or []) if isinstance(d, dict)]
     if not rows:
@@ -1696,7 +1711,6 @@ def _print_no_devices() -> None:
         print(_PUBLIC_NONE_WHY_T)
         if res[1].get("truncated"):
             print(_PUBLIC_TRUNCATED_NONE_T)
-        _print_install_block_t()
         return
     print("  Public computers — ask to use somebody else's; on offer right "
           "now:")
@@ -1706,24 +1720,6 @@ def _print_no_devices() -> None:
         print(_PUBLIC_TRUNCATED_SOME_T)
     print("\nAsk for one by its id:  agent device ask <id>")
     print(_PUBLIC_ASK_INVITE_T)
-    _print_install_block_t()
-
-
-def _print_install_block_t() -> None:
-    """The route for somebody with no machine running Super Research at all.
-
-    ⛔⛔ EVERY EXIT FROM `_print_no_devices` OWES THIS BLOCK. It used to print
-    unconditionally, before the two options, which made it impossible to skip —
-    and also put seven lines of shell between the sentence saying what happened
-    and the two things you can do about it. Moving it last means the early
-    returns have to call it rather than fall past it, so it is a function.
-    """
-    # ⭐ THE PAGE, NOT THE COMMANDS (owner, 2026-09-23) — the same install route
-    # the chat screen and the sign-in announce give, in this file's voice. The
-    # page carries the per-OS commands and stays current; a printed copy does not.
-    print("\n  Don't have your own Research Computer yet? Set one up: "
-          "https://superresearch.io/install")
-    print("  It gives you an 8-char access code — add it with:  agent device add <code>")
 
 
 def _public_row(i: int, d: dict) -> str:

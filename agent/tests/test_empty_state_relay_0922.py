@@ -32,6 +32,8 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from tests.conftest import code_only
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "facade" / "skill" / "scripts"))
 import sr  # noqa: E402
 
@@ -107,12 +109,17 @@ def test_the_rule_is_last_and_hides_nothing_the_person_needs(empty_account, monk
     """⛔⛔ BELOW THE MARKER IS INVISIBLE. Every part of the screen sits above it."""
     fn, ns = SITES[name](monkeypatch)
     above, _, below = _run(fn, ns).partition(M)
-    for must_see in ("Add a computer:", sr._PUBLIC_HEAD, "Macbook",
-                     "superresearch.io/install", "It gives you an 8-char access code"):
+    # ⚠ REPINNED 2026-09-24: the add line IS the code sentence and carries the
+    # link (owner) — "It gives you an 8-char access code" is gone from every screen.
+    for must_see in (sr._ADD_A_COMPUTER, sr._PUBLIC_HEAD, "Macbook",
+                     "superresearch.io/install"):
         assert must_see in above, f"{name}: {must_see!r} fell below the marker"
+    assert "It gives you" not in above, name
     # ⛔ and the screen itself never hands the person `--pair` (owner, 2026-09-23)
     assert "superresearch --pair" not in above, name
     assert below.strip().startswith("⛔ Relay the screen above"), below[:120]
+    # ⛔ AND THE RULE IS THE LAST THING PRINTED — nothing follows it
+    assert below.rstrip().endswith(sr._EMPTY_STATE_RELAY), below[-200:]
 
 
 def test_the_held_topic_promise_stays_visible(empty_account, monkeypatch):
@@ -128,19 +135,31 @@ def test_the_update_notice_stays_visible(empty_account):
     assert "0.1.34" in above and "0.1.34" not in below
 
 
-def test_the_rules_order_matches_what_status_account_prints():
+def test_the_rule_is_short_carries_the_url_and_names_the_codes_origin():
     """⛔ THE RULE ONCE SAID "walkthrough LAST" while status-account prints an update
-    notice after it — a literal reading would drop the notice. It now names the
-    lines before and after the screen, and the observed "Alternatively…" shape."""
+    notice after it — a literal reading would drop the notice. Its replacement
+    named every line before and after the screen and was long enough that the
+    2026-09-24 relay dropped the link with it sitting in the tool output: it could
+    NAME the link but never put one back, and said nothing about where the code
+    comes from, so the model invented "from the Super Research app".
+
+    ⭐ THE RULE THAT REPLACED IT (owner, 2026-09-24): as printed, the URL written
+    into the rule itself so a model can restore it, the public section kept whole,
+    the code's true origin stated, and no commands added."""
     r = sr._EMPTY_STATE_RELAY
     assert "LAST" not in r
-    assert "update notice" in r and "held topic" in r
-    assert "“Alternatively…”" in r
-    # the install part is ONE link — the rule forbids adding commands to it
-    assert "install link" in r and "install commands" in r
-    assert "`superresearch --pair` of your own" in r
-    assert "keeping every line any copy printed" in r
-    assert f"“{sr._PUBLIC_HEAD}”" in r
+    # the URL, literally — a rule that only names "the install link" cannot
+    # restore one a relay dropped
+    assert sr._INSTALL_PAGE_URL in r
+    assert "“Add a computer”" in r
+    assert f"“{sr._PUBLIC_HEAD}”" in r and "every row" in r
+    assert "as printed" in r
+    assert "comes from the person's computer" in r
+    assert "never say it comes from the app" in r
+    assert "`superresearch --pair`" in r and "add no commands" in r
+    # ⛔ SHORT: the long ordering clause it replaced is gone
+    assert "then the install link" not in r and "update notice" not in r
+    assert len(r) < 400, len(r)
 
 
 def test_the_shared_renderer_never_carries_the_marker(empty_account):
@@ -180,15 +199,27 @@ def test_a_populated_device_list_names_the_code_route(monkeypatch):
         "devices": [{"id": "m1", "name": "Studio Mac", "role": "owner"}],
         "selectedDeviceId": "m1"}))
     out = _run(sr.cmd_devices, NS(json=False))
-    assert sr._ADD_WITH_CODE in out
+    assert sr._ADD_A_COMPUTER in out
+    # ⚠ AND 2026-09-24: with the install link — somebody whose only computer is
+    # shared, or who wants a second one, lands here too (owner)
+    assert "https://superresearch.io/install" in out
     assert "You can add, remove, or switch devices anytime" not in out
     assert M not in out
 
 
 def test_the_add_with_a_code_sentence_has_one_source():
     """⛔ NEVER A SECOND WORDING — retyping it is the drift the shared empty state
-    was written to end."""
-    assert SRC.count("Add a computer: paste the access code from any computer") == 1
+    was written to end.
+
+    ⚠ REPINNED 2026-09-24 to the new sentence, and to the CODE: the old count read
+    raw source, where a comment quoting the line would have counted too."""
+    code = code_only(SRC)
+    assert code.count("Add a computer: set one up at") == 1
+    # the retired wordings are gone from the code, not just from one screen
+    for gone in ("paste the access code from any computer",
+                 "Don't have your own Research Computer yet",
+                 "It gives you an 8-char access code"):
+        assert gone not in code, gone
 
 
 def test_the_owners_exact_words_reach_the_device_screen():

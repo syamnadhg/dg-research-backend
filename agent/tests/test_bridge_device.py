@@ -555,6 +555,9 @@ def test_research_with_zero_devices_guides_pairing(live):
     # legacy-bridge fallback pattern-matches — a half-rename here is how the
     # no-device empty state goes missing without anything going red.
     assert "pair code" not in err
+    # ⭐ 2026-09-24: and a way to GET a computer, first (owner) — it assumed one
+    # was already running Super Research.
+    assert err.index("https://superresearch.io/install") < err.index("access code"), err
 
 
 def test_research_seeds_topic_and_intro_messages(live):

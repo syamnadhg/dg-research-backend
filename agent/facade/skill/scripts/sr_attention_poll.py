@@ -574,7 +574,8 @@ def _signed_in_line(signed_in: dict) -> str:
     """The proactive sign-in announce. When a research was fired while signed out,
     the BRIDGE starts it server-side at sign-in and reports it here — no fragile
     "reply yes" round-trip that depends on the assistant interpreting a bare "yes".
-    If the account has no research node, this surfaces the pair-a-node step. Only
+    If the account has no research node, this surfaces the no-computer screen — the
+    add line with the install page in it, then the public computers. Only
     when the bridge couldn't auto-start (older bridge / ambiguous device) does it
     fall back to OFFERING to continue ("reply yes"). With no pending research it
     just confirms the connection."""
@@ -602,7 +603,7 @@ def _signed_in_line(signed_in: dict) -> str:
             f"Starting {quoted}{on_dev} now — I'll post progress here as each phase finishes."
         )
     if signed_in.get("needsDevice"):
-        # ⭐⭐ TWO NAMED SECTIONS, OWN FIRST — THE SAME TWO NOUNS AND THE
+        # ⭐⭐ TWO NAMED SECTIONS, "ADD A COMPUTER" FIRST — THE SAME TWO NOUNS AND THE
         # SAME ORDER AS `sr.py._no_device_lines` AND `cli.py._print_no_devices`.
         # This surface runs with `no_agent`, so it is the ONLY one of the three
         # whose structure is guaranteed: nothing relays it, nothing reflows it.
@@ -624,27 +625,38 @@ def _signed_in_line(signed_in: dict) -> str:
         # (owner, 2026-09-23). This line reaches the person WORD FOR WORD — no
         # model can trim it — so it is where a lead with `--pair` did the most
         # harm: a brand-new person with no computer was told to run a command on
-        # a machine they may not have. The code route and the install link now
-        # read as the chat screen does.
+        # a machine they may not have.
+        # ⭐⭐ AND THE PAGE IS INSIDE THE ADD LINE, NOT A PARAGRAPH AT THE END
+        # (owner, 2026-09-24). The same sentence as sr.py's `_ADD_A_COMPUTER`,
+        # word for word (this script imports nothing from there): the install
+        # link first, then the access code that computer shows. The old closing
+        # pair — "Don't have your own Research Computer yet?" and "It gives you an
+        # 8-char access code" — is gone on every surface: "It" read as the web
+        # page handing out the code, and a relay turned that into "the code from
+        # the Super Research app".
         # ⛔ `/sr device-add YOUR-CODE` AND THE WEB-APP PATH STAY. They are how to
         # HAND OVER a code, not how to make one, and the one-message chat form is
         # the shape the gateway routes reliably.
+        # ⛔ "Account → Pipeline Connection", NOT "→ Add Device". With no computer
+        # listed the web app shows the code field directly; the "+ add device"
+        # button only renders once a computer is already there.
+        # ⛔ THE PUBLIC PARAGRAPH SAYS WHAT THE CHAT INVITE SAYS (owner, 2026-09-24:
+        # "same order and facts"). It had dropped "Once the request is accepted you
+        # can use that computer" — the one sentence that says what asking GETS you.
+        # The only difference left is the email half of the disclosure, above.
         return (
             f"✓ Signed in as {who}.\n\n"
             f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
-            f"Add a computer: send me the access code from any computer running "
-            f"Super Research — your own, or one whose owner hands you the code — "
-            f"in ONE message:\n"
+            f"Add a computer: set one up at https://superresearch.io/install, then "
+            f"send me the 8-character access code the computer shows (or one a "
+            f"computer's owner gave you). Send it in ONE message:\n"
             f"      /sr device-add YOUR-CODE\n"
-            f"(or in the web app: superresearch.io → Account → Pipeline Connection "
-            f"→ Add Device)\n\n"
+            f"(or enter it in the web app: superresearch.io → Account → Pipeline "
+            f"Connection)\n\n"
             f"Public computers — ask to use somebody else's. Ask me for the "
-            f"public computers and I'll list the ones on offer, and tell me which "
-            f"one to ask for; they see your name — or your email, if you have not "
-            f"set one.\n\n"
-            f"Don't have your own Research Computer yet? Set one up: "
-            f"https://superresearch.io/install\n"
-            f"It gives you an 8-char access code — send it to me and I'll connect it."
+            f"public computers and I'll list the ones on offer. Tell me which one "
+            f"to ask for. Once the request is accepted you can use that computer. "
+            f"They see your name — or your email, if you have not set one."
         )
     if signed_in.get("needsDeviceChoice"):
         # Several usable computers and none obvious. NAME them and ask — the one

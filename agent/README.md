@@ -53,15 +53,17 @@ platform — *running the command* does.) The agent-facing companion is
 ("Install Super Research from superresearch.io/skills.md"); it tells the agent to
 run that one command, register the skill, and sign you in, and nothing else.
 
-**No backend host yet?** The agent orchestrates from chat; the research pipeline
-runs on a paired computer. If you don't have one, say **"install Super Research
-here"** (`/sr install`) to install the backend on this machine from chat, then
-pair it: run `superresearch --pair` on the host, read the 8-char **access code**
-off its screen to chat, and `device-add <code>`. The setup asks its own
-questions on the host — among them, in a step of its own, whether other people
-may **find** that machine, which defaults to *no* — and the agent answers none
-of them; `device-visibility` is how that one changes afterwards. (Or ask to use
-somebody else's machine instead — see **Computers other people offer**.)
+**No Research Computer yet?** The agent orchestrates from chat; the research
+pipeline runs on a paired computer. Set one up at
+**https://superresearch.io/install** — that computer then shows an 8-character
+**access code**; send it to your chat (or send one a computer's owner gave you).
+The setup asks its own questions on that computer — among them, in a step of its
+own, whether other people may **find** that machine, which defaults to *no* — and
+the agent answers none of them; `device-visibility` is how that one changes
+afterwards. (Or ask to use somebody else's machine instead — see **Computers
+other people offer**.) To make the machine the chat itself runs on the Research
+Computer, say **"install Super Research here"** (`/sr install`); its reply opens
+with the same page.
 
 ---
 
@@ -175,10 +177,13 @@ day somebody asked and falls back to a word shared by everyone the app couldn't
 look up. `agent device requests` prints the whole command for each row.
 
 An account with **no** computer is not a dead end. Every screen that reports it
-renders the one empty state — there's no computer here · add your own with an
-access code · or ask to use somebody else's — and the full ones **list** the
-public computers on offer, because "ask for a public one" with no list is advice
-rather than a next step.
+renders the one empty state — there's no computer here · "Add a computer: set one
+up at https://superresearch.io/install, then send me the 8-character access code
+the computer shows (or one a computer's owner gave you)" · or ask to use somebody
+else's — and the full ones **list** the public computers on offer, because "ask
+for a public one" with no list is advice rather than a next step. The install
+link sits inside the add line rather than after the list: a relay that condenses
+the screen keeps that sentence and drops a trailing paragraph.
 
 ### Sending logs to support
 
@@ -298,7 +303,7 @@ one-shot "✓ Signed in" note — in memory *and* on disk, so it survives the pr
 that minted it — and the chat watchdog posts it proactively. A research you asked
 for while signed out is routed by the **same ladder** as a fired run (above), so
 that note can name the computer it started on, ask which of several should take
-it, or walk the add-a-computer steps — instead of asking you to repeat the topic.
+it, or show the no-computer screen — instead of asking you to repeat the topic.
 
 `agent serve` writes a durable, rotating operational log to
 `~/.super-agent/bridge.log` (request + run-lifecycle lines; never a token);

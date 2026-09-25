@@ -167,26 +167,30 @@ def test_the_run_that_could_not_be_routed_says_all_three_things(chat):
     assert THING_NONE in blob and THING_OWN in blob and THING_ASK in blob, blob
 
 
-def test_the_pair_code_sentence_is_its_own_line_and_not_the_install_block(chat):
-    """⛔⛔ THE VACUITY THIS PAIR OF ASSERTIONS EXISTS TO CLOSE. The install block
-    below the three things also says "8-char access code", so a substring test for
-    that phrase can never see the second thing disappear."""
+def test_the_add_sentence_is_its_own_line_and_carries_the_install_link(chat):
+    """⛔⛔ THE VACUITY THIS PAIR OF ASSERTIONS EXISTED TO CLOSE IS GONE WITH ITS
+    CAUSE. The install block below the three things used to say "8-char access
+    code" too, so a substring test for that phrase could never see the second
+    thing disappear. There is ONE code sentence on the screen now, and the install
+    link lives inside it (owner, 2026-09-24)."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    # ⚠ REPINNED 2026-09-20, TWICE. The head is "Add a computer:" — the routes
-    # are NAMED (because the unnamed public half was being folded away by the
-    # relay) and deliberately NOT NUMBERED (because an access code connects any
-    # computer running Super Research, so "two ways in" was false). The claim
-    # under test is untouched: this sentence is its own line, not the install
-    # block. It is asserted WHOLE so the widened clause cannot quietly vanish.
-    assert ("Add a computer: paste the access code from any computer running "
-            "Super Research — your own, or one whose owner hands you the code "
-            "— and I’ll connect it.") in out
-    # ⛔ AND THE PROOF THAT IT IS NOT THE INSTALL BLOCK SPEAKING: that block is
-    # present too, and says the phrase in its own words.
-    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
-    # (owner) — the one-liners and `superresearch --pair` left this screen.
-    assert "It gives you an 8-char access code" in out
+    # ⚠ REPINNED 2026-09-20, TWICE, AND 2026-09-24. The head is "Add a computer:" —
+    # the routes are NAMED (because the unnamed public half was being folded away
+    # by the relay) and deliberately NOT NUMBERED (because an access code connects
+    # any computer running Super Research, so "two ways in" was false). It is
+    # asserted WHOLE, as a line of its own, so neither the link nor the widened
+    # clause can quietly vanish.
+    assert ("Add a computer: set one up at https://superresearch.io/install, then "
+            "send me the 8-character access code the computer shows (or one a "
+            "computer's owner gave you).") in out.splitlines()
+    # ⛔ AND THE SECOND CODE SENTENCE IS GONE, NOT JUST MOVED. "It gives you…" read
+    # as the web page handing out the code; a relay made that "from the app".
+    assert "It gives you" not in out
+    # (the relay rule below the marker names the code too — to the model, not the
+    # person — so the count is of what the person sees)
+    above = out.partition(sr._AGENT_ONLY_MARKER)[0]
+    assert above.count("access code") == 1, above
 
 
 def test_the_public_half_is_a_named_section_on_every_surface(chat, term, monkeypatch):
@@ -262,9 +266,12 @@ def test_the_access_code_route_does_not_narrow_itself_to_your_own_machine(chat):
     the only route is "your own", who hasn't got one, reads a dead end."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    assert "any computer running Super Research" in out
-    assert "whose owner hands you the code" in out
+    # ⚠ REPINNED 2026-09-24: the owner's wording for the same widening — the code
+    # the computer shows, "or one a computer's owner gave you".
+    add = next(ln for ln in out.splitlines() if ln.startswith("Add a computer:"))
+    assert "or one a computer's owner gave you" in add
     assert "Add your own" not in out
+    assert "your own" not in add.lower()
 
 
 def test_a_renderer_that_returns_nothing_still_leaves_a_whole_screen(chat, monkeypatch):
@@ -280,25 +287,29 @@ def test_a_renderer_that_returns_nothing_still_leaves_a_whole_screen(chat, monke
     lines = sr._no_device_lines()
     blob = "\n".join(lines)
     assert "Add a computer:" in blob
-    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
-    # (owner) — the one-liners and `superresearch --pair` left this screen.
-    assert any("superresearch.io/install" in ln for ln in lines), lines
+    # ⚠ REPINNED 2026-09-24: the install link rides INSIDE the add line (owner),
+    # so the early-out cannot separate them.
+    assert any(ln.startswith("Add a computer:") and "superresearch.io/install" in ln
+               for ln in lines), lines
 
 
-def test_the_three_things_come_before_the_install_walkthrough(chat):
-    """⛔ ORDER IS NOT DECORATION. With the walkthrough first, seven lines of shell
-    commands arrive before the sentence that says what happened — and a mutant that
-    moved it killed nothing, because every assertion in this file was a membership
-    test."""
+def test_the_install_link_rides_on_the_add_line_before_the_public_section(chat):
+    """⛔ ORDER IS NOT DECORATION — and the order this pinned was the one that
+    failed. It used to require the install link LAST, after the public list; in the
+    Hermes history a relay dropped that trailing link 3 times out of 3 (owner,
+    2026-09-24). The link is now inside the "Add a computer:" line, which comes
+    before the public section, and nothing trails the public section."""
     sr.cmd_devices(_ns())
-    lines = [ln.lower() for ln in chat.out().splitlines()]
+    above = chat.out().partition(sr._AGENT_ONLY_MARKER)[0]
+    lines = [ln.lower() for ln in above.splitlines()]
     said = next(i for i, ln in enumerate(lines) if THING_NONE in ln)
     own = next(i for i, ln in enumerate(lines) if THING_OWN in ln)
     ask = next(i for i, ln in enumerate(lines) if THING_ASK in ln)
-    # ⚠ REPINNED 2026-09-23: the install route is the install PAGE on every surface
-    # (owner) — the one-liners and `superresearch --pair` left this screen.
-    walkthrough = next(i for i, ln in enumerate(lines) if "superresearch.io/install" in ln)
-    assert said < own < ask < walkthrough, (said, own, ask, walkthrough)
+    assert said < own < ask, (said, own, ask)
+    assert "superresearch.io/install" in lines[own], lines[own]
+    # ⛔ AND IT IS SAID ONCE: no second link below the public list for a relay to
+    # treat as the "real" one and keep instead
+    assert [i for i, ln in enumerate(lines) if "superresearch.io" in ln] == [own], lines
 
 
 def test_the_lead_is_rendered_and_it_leads(chat):
@@ -316,15 +327,27 @@ def test_the_lead_is_rendered_and_it_leads(chat):
 def test_the_skill_file_still_tells_the_model_an_empty_account_is_not_a_dead_end():
     """⛔ NOTHING RENDERS THIS PARAGRAPH, so only a source guard can see it go — and
     without it the model is free to relay the shortest of the ten old sentences."""
-    skill = _SKILL.read_text(encoding="utf-8")
+    # ⚠ WHITESPACE-FOLDED SINCE 2026-09-24. The phrases were pinned with the
+    # file's own line breaks inside them, so rewrapping the paragraph — which this
+    # change had to, to put the install link in it — failed the guard without the
+    # claim changing. The claim is the words.
+    skill = " ".join(_SKILL.read_text(encoding="utf-8").split())
     assert "**An account with NO computer is not a dead end.**" in skill
     assert "names BOTH routes" in skill
-    assert "also LIST the public\ncomputers on offer" in skill
-    assert "never present setting up a machine as the only\nroute." in skill
+    assert "also LIST the public computers on offer" in skill
+    assert "never present setting up a machine as the only route." in skill
     # ⛔⛔ AND IT NO LONGER CLAIMS EVERY SCREEN LISTS THEM. Four surfaces name both
     # routes without a list — the one-line sign-in confirmation deliberately so,
     # because rendering one would cost it a second call.
-    assert "Every screen that reports it\nsays the same three things" not in skill
+    assert "Every screen that reports it says the same three things" not in skill
+    # ⭐ AND THE ROUTE IT NAMES FIRST CARRIES THE PAGE AND THE CODE'S TRUE ORIGIN
+    # (owner, 2026-09-24) — the paragraph used to call it "add your own with an
+    # access code", with no link, which is the shape the relay reproduced.
+    para = skill[skill.index("**An account with NO computer is not a dead end.**"):]
+    para = para[:para.index("A **Research Computer** is")]
+    assert "https://superresearch.io/install" in para
+    assert "never say it comes from the app" in para
+    assert "add your own with an access code" not in para
 
 
 def test_the_install_gate_names_a_string_a_surface_actually_prints():
@@ -332,12 +355,23 @@ def test_the_install_gate_names_a_string_a_surface_actually_prints():
     STRING FROM EVERY SURFACE THAT COULD PRINT IT — the bridge sentence was
     rewritten, and the chat client throws the bridge's English away and renders its
     own. The documented gate for the one command that turns the local PC into a
-    Research Computer could no longer be recognised."""
+    Research Computer could no longer be recognised.
+
+    ⚠ AND THE GATE IS NOW THE OTHER WAY ROUND (owner, 2026-09-24). That screen is
+    where a brand-new person meets the install page, so `install` is NOT offered
+    for it; the note names the printed string to say so, and `install` is kept for
+    an explicit "install it on THIS machine" only. The string it names must still
+    be one a surface prints — that half of the guard is unchanged."""
     skill = _SKILL.read_text(encoding="utf-8")
     i = skill.index("- **install**")
     said = skill[i:i + 700]
     assert "no research computer on this account" in said and "yet" in said
     assert '"no devices yet" (reason' not in said
+    folded = " ".join(said.split())
+    assert "explicitly asks to install it on THIS machine" in folded, folded
+    assert "NOT for a screen that says" in folded, folded
+    # ⛔ and it never hands anybody the pairing command in place of the page
+    assert "--pair" not in said
     # ⛔ AND THE STRING IT NAMES IS THE ONE THE WIRE ACTUALLY SENDS.
     src = code_only(_BRIDGE.read_text(encoding="utf-8"))
     j = src.index('"reason": "no_devices"')
@@ -349,12 +383,16 @@ def test_the_post_sign_in_one_liner_names_both_ways_out(chat):
     state — it must not fire a second look to render a list — but it was the first
     thing a brand-new account read and it named only the route that needs
     hardware."""
-    said = sr._connected_msg("e@x.y").lower()
-    # ⛔ ITS OWN WORDING, DELIBERATELY. This line has no install block under it, so
-    # "access code" here is unambiguous — it is the only place in the file where
-    # that phrase can only mean the pair-code route.
+    raw = sr._connected_msg("e@x.y")
+    said = raw.lower()
     assert "access code" in said and "public computer" in said, said
     assert "\n" not in said, said
+    # ⚠ REPINNED 2026-09-24: NOT ITS OWN WORDING ANY MORE. It said "paste the
+    # access code from your Research Computer", which assumed the reader had one
+    # and gave them no way to get one; it now carries the shared add line, link
+    # and all (owner), and still ends on the public-computer offer.
+    assert sr._ADD_A_COMPUTER in raw, raw
+    assert raw.rstrip().endswith("public computer you could use."), raw
 
 
 # ── C1's third thing is a LIST, and it is the browse screen's own rows ───────
@@ -563,6 +601,13 @@ def test_the_terminal_carries_the_route_for_somebody_with_no_machine_at_all(term
     # (owner) — the one-liners and `superresearch --pair` left this screen.
     assert "superresearch.io/install" in out
     assert "superresearch --pair" not in out and "install.ps1" not in out
+    # ⚠ AND 2026-09-24: on the "Add a computer:" line itself, before the public
+    # section — the closing install block every exit used to print is gone.
+    lines = out.splitlines()
+    add = next(i for i, ln in enumerate(lines) if "Add a computer:" in ln)
+    pub = next(i for i, ln in enumerate(lines) if "Public computers" in ln)
+    assert "superresearch.io/install" in lines[add] and add < pub, lines
+    assert "It gives you" not in out
 
 
 def test_the_device_list_never_hands_a_slash_command_to_a_chat(chat):
@@ -589,8 +634,22 @@ def test_the_watcher_carries_the_whole_disclosure_not_half_of_it(monkeypatch):
     complete it."""
     line = poll._signed_in_line({"email": "e@x.y", "needsDevice": True,
                                  "topic": "Golden Retrievers", "pendingTopic": ""})
-    assert "they see your name" in line
+    # ⭐ CAPITALISED SINCE 2026-09-24 — it follows the chat invite's own sentence
+    # now (see the next test), so the claim is compared, not the case.
+    assert "they see your name" in line.lower()
     assert "or your email, if you have not set one" in line, line
+
+
+def test_the_watcher_says_what_asking_gets_you_like_the_chat_invite():
+    """⛔ "SAME ORDER AND FACTS" (owner, 2026-09-24). The chat invite says what an
+    accepted request gets you; the watcher's paragraph had left that sentence out,
+    so the one surface nothing relays was the one that did not say it."""
+    line = poll._signed_in_line({"email": "e@x.y", "needsDevice": True,
+                                 "topic": "Golden Retrievers", "pendingTopic": ""})
+    for said in ("Tell me which one to ask for.",
+                 "Once the request is accepted you can use that computer."):
+        assert said in sr._PUBLIC_ASK_INVITE, said
+        assert said in " ".join(line.split()), (said, line)
 
 
 def test_a_non_dict_row_cannot_crash_the_empty_state(chat):
@@ -648,23 +707,25 @@ def test_one_name_for_the_code_on_every_surface(term, chat):
     there are two of them, and this file's own comment two hundred lines down says
     exactly that about `findable`/`public`.
     """
+    # ⚠ REPINNED 2026-09-24: "8-character access code" — the owner's wording for
+    # the add line on every surface. The NAME under guard is unchanged: "access
+    # code", never "8-char code" and never "pair code".
     cli.cmd_device(argparse.Namespace(device_command=None))
-    assert "8-char access code" in term.out()
+    assert "8-character access code" in term.out()
     sr.cmd_devices(_ns())
-    # ⛔ THE SENTENCE, NOT THE PHRASE — the install block below it also says
-    # "8-char access code", which is the vacuity this same file documents above.
-    assert "Add a computer: paste the access code" in chat.out()
-    assert "8-char access code" in _SKILL.read_text(encoding="utf-8")
+    # ⛔ THE SENTENCE, NOT THE PHRASE — it is the one line on the screen that names
+    # the code, so it is asserted as that line.
+    assert "then send me the 8-character access code the computer shows" in chat.out()
+    assert "8-character access code" in _SKILL.read_text(encoding="utf-8")
     # ⛔ SCOPED TO THE EMPTY STATE, WHICH IS THIS WAVE'S SUBJECT. The short form
-    # still appears twice in SKILL.md and once in the install flow, in sentences
-    # that name the thing properly first — those are older copy and correcting them
-    # is not this wave's to do. What must not drift is the screen that introduces
-    # the code to somebody who has never seen one.
+    # "8-char" still appears in SKILL.md, in sentences that name the thing
+    # properly ("8-char access code") — what must not drift is the screen that
+    # introduces the code to somebody who has never seen one.
     body = code_only(_CLI.read_text(encoding="utf-8"))
     body = body[body.index("def _print_no_devices"):]
     body = body[:body.index("def _public_row")]
-    assert "8-char access code" in body
-    assert "8-char code" not in body.replace("8-char access code", "")
+    assert "8-character access code" in body
+    assert "8-char code" not in body and "pair code" not in body
 
 
 def test_the_terminal_offer_survives_a_failed_look(term):
@@ -696,6 +757,14 @@ def test_the_watcher_names_both_ways_out(monkeypatch):
     assert "superresearch.io/install" in line
     assert "superresearch --pair" not in line
     assert "public computers" in low, line
+    # ⚠ AND 2026-09-24: the page is inside the "Add a computer:" line, before the
+    # public paragraph, and the "Don't have your own…" / "It gives you…" tail is
+    # gone — the same order as the chat screen (owner).
+    rows = line.splitlines()
+    add = next(i for i, ln in enumerate(rows) if ln.startswith("Add a computer:"))
+    pub = next(i for i, ln in enumerate(rows) if ln.startswith("Public computers"))
+    assert "https://superresearch.io/install" in rows[add] and add < pub, rows
+    assert "It gives you" not in line and "Don't have your own" not in line
 
 
 def test_the_bridge_sentence_names_both_ways_out():
@@ -746,10 +815,11 @@ def test_every_deviceless_door_calls_the_one_renderer():
 
     Seven occurrences in all: the `def` plus SIX call sites. The seventh door — the
     post-sign-in one-liner — deliberately does NOT call it, because rendering the
-    block would cost that line a second network call; it names both routes in one
-    sentence instead, and `test_the_post_sign_in_one_liner_names_both_ways_out`
-    pins that. The first version of this docstring said "seven callers", which
-    miscounted its own subject by one.
+    block would cost that line a second network call; it renders the shared add
+    line plus the public-computer offer in one line instead, and
+    `test_the_post_sign_in_one_liner_names_both_ways_out` pins that. The first
+    version of this docstring said "seven callers", which miscounted its own
+    subject by one.
     """
     src = code_only(_SR_PATH.read_text(encoding="utf-8"))
     assert src.count("_no_device_lines(") == 7, src.count("_no_device_lines(")

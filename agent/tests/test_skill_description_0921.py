@@ -89,3 +89,18 @@ def test_every_verb_the_skill_routes_still_appears():
                "list past researches", "pause", "skip", "stop", "resume",
                "sign in", "Research Computers", "version", "welcome + help"):
         assert kw in d, f"routing keyword lost from the description: {kw!r}"
+
+
+def test_the_two_unscoped_captures_survive_the_sign_in_and_devices_lead():
+    """⛔⛔ THE 2026-09-24 SHARPENING MOVED SIGN-IN AND DEVICES INTO THE FIRST
+    SENTENCE — AND ITS FIRST DRAFT QUIETLY TOOK TWO CAPTURES WITH IT. "ANY request
+    to research a topic" became "ANY Super Research request — … or research a
+    topic", which scopes 6db3c02's capture to a request that names the product; and
+    the bare-code rule ("an 8-char access code … alone … always belongs here") was
+    folded into an example. The add-a-computer line now ends "send me the
+    8-character access code", so the person's NEXT message is usually the code on
+    its own — the one message with no other word to route by."""
+    d = _description()
+    assert d.startswith("USE THIS SKILL for ANY request to research a topic"), d[:120]
+    assert re.search(r"8-char access code[^.]*\beven alone\b[^.]*\balways belongs here",
+                     d), d

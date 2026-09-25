@@ -405,7 +405,11 @@ def test_signed_in_line_prompts_to_pair_a_node_when_none():
     assert "superresearch --pair" not in line
     # ⛔ KEPT: how to HAND OVER a code — the reliable one-message chat form and
     # the web-app path. Only how to MAKE one moved to the page.
-    assert "Add Device" in line and "/sr device-add" in line
+    # ⚠ REPINNED 2026-09-24: the web-app path is "Account → Pipeline Connection",
+    # NOT "→ Add Device" — with no computer listed that button does not render;
+    # the section shows the code field directly (owner).
+    assert "Pipeline Connection" in line and "/sr device-add" in line
+    assert "Add Device" not in line
     assert "reply" not in line.lower()
     # Multi-line / readable (the user complained the old one was a wall of text).
     assert line.count("\n") >= 4

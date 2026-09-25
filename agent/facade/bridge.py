@@ -4693,10 +4693,16 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # dropped the no-device empty state for anybody whose installed
                 # bridge predates this line. sr.py now matches EITHER wording;
                 # do not narrow it back to one.
+                # ⭐ THE INSTALL PAGE FIRST (owner, 2026-09-24). This assumed a
+                # machine already running Super Research and gave somebody with
+                # none no way to get one. "grab the access code" survives the
+                # rewrite on purpose — it is what that older-bridge matcher reads.
                 self._json(400, {"reason": "no_devices",
                                  "error": "no research computer on this account yet "
-                                          "— on the computer running Super Research, "
-                                          "grab the access code from its screen and add "
+                                          "— set one up at "
+                                          "https://superresearch.io/install, then "
+                                          "grab the access code from its screen (or "
+                                          "one a computer's owner gave you) and add "
                                           "it here (agent device add <code>), or ask "
                                           "to use somebody else's (agent device public)"})
                 return None

@@ -80459,8 +80459,13 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         except Exception as e:
             log(f"    QR render failed: {e}", "WARN")
         print()
-        print(f"  {_c(_DIM, 'Enter this code in the Super Research app:')}")
-        print(f"       {_c(_ACCENT, '•')} Account → Pipeline Connection → Add Device")
+        # ⭐ BOTH PLACES THE CODE CAN GO, AND NO BUTTON THAT ISN'T THERE (owner,
+        # 2026-09-24). This said "Enter this code in the Super Research app:
+        # Account → Pipeline Connection → Add Device" — it never said a chat
+        # assistant takes the code, and for a first computer that button does not
+        # render (the section shows the code field directly).
+        print(f"  {_c(_DIM, 'Send this code to your chat assistant, or enter it in the')}")
+        print(f"  {_c(_DIM, 'Super Research web app under Account → Pipeline Connection.')}")
         print()
 
     last_tick = {"sec": -1}
@@ -80515,9 +80520,11 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
                        error_class=tm.ErrorClass.TIMEOUT)
             _pt("no answer within the pairing window — nothing was claimed, "
                 "so nothing was left half-paired.", "ERROR")
+            # ⭐ BOTH HANDOVERS, as the code screen above now names them (owner,
+            # 2026-09-24): a code sent to a chat assistant is claimed the same way.
             _pt("Two things produce this, and they need different fixes: "
-                "the code was never entered in the web app, or this machine "
-                "could not reach us while it waited.", "ERROR")
+                "the code was never sent to a chat assistant or entered in the "
+                "web app, or this machine could not reach us while it waited.", "ERROR")
             _pt(f"Enter the code faster and this works. If you did enter it, "
                 f"run  {_PROG} --doctor  — it names which host this machine "
                 f"cannot reach and why.", "ERROR")
