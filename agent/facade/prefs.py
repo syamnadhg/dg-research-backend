@@ -2,7 +2,8 @@
 
 Distinct from `store.py` (which holds the account refresh token in the OS
 keyring): these are the default device, the connected runtime, the install id, the
-agent label, and the parked sign-in announce — kept in a small JSON file at
+agent label, the parked sign-in announce, the sign-in epoch and the support-log
+requests still being watched — kept in a small JSON file at
 ``~/.super-agent/prefs.json`` so they survive a bridge restart.
 
 Deliberately NOT in the keyring: no credential lives here, and mixing mutable
@@ -89,17 +90,74 @@ _DEVICE_ASK_TTL = 7 * 24 * 3600
 # without being asked again is a surprise, not a convenience.
 _HELD_RESEARCH_TTL = 6 * 3600
 
+# ⭐⭐ A NUMBER THAT MOVES EVERY TIME "WHO IS SIGNED IN HERE" CHANGES (owner,
+# 2026-09-25). A reader that saw "signed in" at epoch N and sees N+1 now knows the
+# answer changed in between — a logout, a revoke, or a different sign-in — without
+# having to compare emails or guess from timing. The 2026-09-24 incident was a
+# true "✓ Signed in" delivered 19 s after the person logged out; nothing any
+# reader held could tell it the fact had gone stale.
+# ⛔ ON DISK, NOT IN MEMORY, because a counter that restarts at zero with the
+# bridge would hand two different sessions the same number.
+# ⛔ HOST-WIDE, NOT UID-BOUND: it counts changes to this computer's sign-in, and a
+# switch from account A to B is exactly such a change.
+_SIGNIN_EPOCH = "signinEpoch"
+
+# ⭐⭐ THE SUPPORT-LOG REQUESTS STILL BEING WATCHED (owner, 2026-09-25). They lived
+# in a dict in bridge memory, so a bridge restart — the ordinary case across a
+# packaging wait, not the edge one — silently dropped the one message that says
+# the logs arrived. Same shape as the parked announce and the device ask above.
+# ⚠ WHAT IS PARKED: the support code, the account's OWN (or shared) computer id
+# and name, the command/request ids and the chat that asked. All of it already
+# sits in `bridge.log` for the same request; 0600 is the protection. Each record
+# carries its uid, exactly like every other account-bearing key here.
+_LOG_REQUESTS = "logRequests"
+_LOG_REQUESTS_MAX = 20
+# ⛔ A DAY, THEN FORGOTTEN. Long past the half hour the watcher cares about, so a
+# `--status <code>` asked the next morning still gets the device name and age; not
+# forever, because a code nobody will ever quote again is not worth a record.
+_LOG_REQUEST_TTL = 24 * 3600
+
 # Default display name for the agent session in the app's "Shared with" popup;
 # renamable from the FE (the rename writes the label onto the agentSessions doc,
 # and the bridge preserves an FE rename across reconnects — see bridge.py).
 _DEFAULT_LABEL = "Super Agent"
 
 # Serialize read-modify-write so concurrent bridge worker threads don't clobber.
-_lock = threading.Lock()
+# ⛔ RE-ENTRANT, AND `load()` TAKES IT TOO (2026-09-25): on Windows a read and a
+# replace of the same file refuse each other (see `_retrying`), so inside this
+# process the two are simply never allowed to overlap — and a writer, which calls
+# `load()` while holding the lock, must be able to take it again. The retry stays
+# for the one overlap a lock cannot see: another process (the CLI) reading.
+_lock = threading.RLock()
 
 
 def _path():
     return config.store_dir() / "prefs.json"
+
+
+# ⛔⛔ ON WINDOWS A READ AND A REPLACE COLLIDE, IN BOTH DIRECTIONS (measured
+# 2026-09-25: one thread reading prefs.json while another saved it, for three
+# seconds — 576 reads and 879 replaces failed with PermissionError). Python opens
+# files without FILE_SHARE_DELETE, so `os.replace` onto a file somebody is reading
+# is refused, and a read that lands mid-replace is refused too. The reader then
+# saw `{}` — a parked sign-in note or device ask briefly "did not exist" — and the
+# writer's change was LOST (a note not parked, a delivered notice not marked). It
+# was always possible; the news peek (2026-09-25) reads this file every few
+# seconds, which made it likely. Both sides now retry, briefly and boundedly; the
+# collision window is microseconds wide. POSIX never raises here.
+_IO_RETRIES = 8
+_IO_RETRY_STEP = 0.01   # seconds; linear backoff, ~0.36 s worst case in total
+
+
+def _retrying(op):
+    for attempt in range(_IO_RETRIES):
+        try:
+            return op()
+        except PermissionError:
+            if attempt == _IO_RETRIES - 1:
+                raise
+            _time.sleep(_IO_RETRY_STEP * (attempt + 1))
+    return None  # pragma: no cover - the loop always returns or raises
 
 
 def load() -> dict[str, Any]:
@@ -108,7 +166,9 @@ def load() -> dict[str, Any]:
     if not p.exists():
         return {}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        with _lock:
+            raw = _retrying(p.read_bytes)
+        data = json.loads(raw.decode("utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         log.warning("prefs.json unreadable, treating as empty")
@@ -123,7 +183,8 @@ def save(prefs: dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(prefs, fh)
-        os.replace(tmp, _path())
+        with _lock:   # re-entrant: every locked writer already holds it
+            _retrying(lambda: os.replace(tmp, _path()))
         try:
             os.chmod(_path(), stat.S_IRUSR | stat.S_IWUSR)  # 0600 (POSIX; no-op on Windows)
         except OSError:
@@ -301,6 +362,58 @@ def restore_announced_signin_ms(ms: int | None, uid: str, *,
         return True
 
 
+def seal_signin_announce(ms: int, uid: str) -> int | None:
+    """Move the watermark to AT LEAST ``ms`` for ``uid``; never backwards.
+
+    Returns the watermark after the call (None when nothing could be recorded).
+
+    ⭐⭐ WHAT "THE PERSON HAS BEEN TOLD, OR THE SIGN-IN IS OVER" LOOKS LIKE ON DISK
+    (owner, 2026-09-25). Two callers, one meaning:
+      • a chat reply that said "signed in" (`POST /signin/ack`) — the person was
+        told, so no re-mint and no "one repeat" may follow it;
+      • a logout or revoke — the sign-in has ENDED, so nothing may re-announce it.
+        Before this, logout left the mark where it was and a `/updates` that had
+        captured the session before the logout could still win the re-mint claim
+        and hand out "signed in" for a session that no longer existed.
+
+    ⛔ A MAX, NOT A SET, and not `claim_signin_announce`: a claim answers "already"
+    at or behind the mark and "first" with no mark, and both callers want the same
+    outcome in every case — the mark at least here — without a result to misread.
+
+    ⛔ A MARK OWNED BY ANOTHER ACCOUNT IS REPLACED, not compared against — the same
+    rule the claim applies: another account's mark is not this account's mark.
+    """
+    if not uid:
+        return None
+    with _lock:
+        prefs = load()
+        mark, mark_uid = prefs.get(_ANNOUNCED_SIGNIN), prefs.get(_ANNOUNCED_SIGNIN_UID)
+        seen = int(mark) if isinstance(mark, (int, float)) and mark_uid == uid else None
+        if seen is not None and seen >= int(ms):
+            return seen
+        prefs[_ANNOUNCED_SIGNIN] = int(ms)
+        prefs[_ANNOUNCED_SIGNIN_UID] = uid
+        save(prefs)
+        return int(ms)
+
+
+def get_signin_epoch() -> int:
+    """How many times "who is signed in here" has changed on this computer."""
+    raw = load().get(_SIGNIN_EPOCH)
+    return int(raw) if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
+
+
+def bump_signin_epoch() -> int:
+    """Advance the sign-in epoch by one and return the new value."""
+    with _lock:
+        prefs = load()
+        raw = prefs.get(_SIGNIN_EPOCH)
+        cur = int(raw) if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
+        prefs[_SIGNIN_EPOCH] = cur + 1
+        save(prefs)
+        return cur + 1
+
+
 def get_verbose() -> bool:
     """Whether the bridge should log at DEBUG.
 
@@ -371,6 +484,16 @@ def set_pending_announce(event: dict[str, Any], uid: str) -> None:
         prefs[_PENDING_ANNOUNCE] = event
         prefs[_PENDING_ANNOUNCE_UID] = uid
         save(prefs)
+
+
+def has_pending_announce() -> bool:
+    """Whether ANY announce is parked, whoever it belongs to — for a clear that
+    wants to say in the log that it actually removed something (owner,
+    2026-09-25: the logout that should have closed the 2026-09-24 incident left
+    no line at all). Never an answer to "may I deliver it" — that is
+    `get_pending_announce`, uid-bound."""
+    ev = load().get(_PENDING_ANNOUNCE)
+    return isinstance(ev, dict) and bool(ev)
 
 
 def clear_pending_announce() -> None:
@@ -469,6 +592,77 @@ def set_held_research(rec: dict[str, Any], uid: str) -> None:
 def clear_held_research() -> None:
     """Started, superseded, expired, or signed out."""
     _clear_uid_bound(_HELD_RESEARCH, _HELD_RESEARCH_UID)
+
+
+def _log_request_live(rec: Any, now: float) -> bool:
+    """A stored support-log record that is well-formed and inside its TTL."""
+    if not isinstance(rec, dict) or not rec:
+        return False
+    try:
+        age = now - float(rec.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= _LOG_REQUEST_TTL
+
+
+def put_log_request(code: str, rec: dict[str, Any]) -> None:
+    """Remember one support-log request (``rec`` carries its own ``uid``).
+
+    ⛔ BOUNDED, OLDEST OUT FIRST — a diagnostic memory, not a store, exactly as the
+    in-memory dict it replaces was. Expired records are swept on the same write.
+    """
+    if not code or not isinstance(rec, dict) or not rec.get("uid"):
+        return
+    with _lock:
+        prefs = load()
+        cur = prefs.get(_LOG_REQUESTS)
+        cur = cur if isinstance(cur, dict) else {}
+        now = _time.time()
+        kept = {c: r for c, r in cur.items() if _log_request_live(r, now) and c != code}
+        kept[code] = {**rec, "at": rec.get("at") or now}
+        while len(kept) > _LOG_REQUESTS_MAX:
+            oldest = min(kept, key=lambda c: float(kept[c].get("at") or 0))
+            kept.pop(oldest)
+        prefs[_LOG_REQUESTS] = kept
+        save(prefs)
+
+
+def get_log_requests(uid: str) -> dict[str, dict[str, Any]]:
+    """Every live support-log request of THIS account, keyed by code.
+
+    ⛔ UID-BOUND PER RECORD, and an empty uid matches nothing — the same hole the
+    long note on `get_pending_announce` records."""
+    if not uid:
+        return {}
+    cur = load().get(_LOG_REQUESTS)
+    if not isinstance(cur, dict):
+        return {}
+    now = _time.time()
+    return {c: dict(r) for c, r in cur.items()
+            if isinstance(c, str) and _log_request_live(r, now) and r.get("uid") == uid}
+
+
+def get_log_request(code: str, uid: str) -> dict[str, Any] | None:
+    """One support-log request, but ONLY if it belongs to ``uid``."""
+    return get_log_requests(uid).get(code)
+
+
+def update_log_request(code: str, uid: str, fields: dict[str, Any]) -> bool:
+    """Merge ``fields`` into this account's record for ``code``. Returns whether
+    the record existed (a record that expired or belongs to another account is
+    left alone)."""
+    if not uid or not code:
+        return False
+    with _lock:
+        prefs = load()
+        cur = prefs.get(_LOG_REQUESTS)
+        rec = cur.get(code) if isinstance(cur, dict) else None
+        if not (_log_request_live(rec, _time.time()) and rec.get("uid") == uid):
+            return False
+        cur[code] = {**rec, **fields}
+        prefs[_LOG_REQUESTS] = cur
+        save(prefs)
+        return True
 
 
 def get_runtime() -> str | None:

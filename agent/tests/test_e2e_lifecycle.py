@@ -156,7 +156,8 @@ def test_full_chat_lifecycle(live, capsys):
 
     # 3. approve completes on the next poll → connected
     assert sr.main(["login-wait"]) == 0
-    assert "Connected as you@x.y" in capsys.readouterr().out
+    # ⚠ 2026-09-25 (owner): "Signed in as", the one line every sign-in answer says
+    assert capsys.readouterr().out.strip() == "✓ Signed in as you@x.y."
     assert state.session is not None and state.session.uid == "u1"
     # #790: connecting wrote the agent identity row (default label, not revoked)
     assert len(FakeFS.agent_sessions) == 1
@@ -222,3 +223,11 @@ def test_full_chat_lifecycle(live, capsys):
     assert FakeFS.agent_sessions == {}
     assert sr.main(["status-account"]) == 0
     assert "Not signed in" in capsys.readouterr().out
+
+    # 13. ⭐ 2026-09-25 (owner): `login-done` after the logout never says signed in —
+    #     it answered "✓ Connected as None — you're all set." off a sign-in flow
+    #     that outlived its session.
+    assert sr.main(["login-wait"]) == 0
+    after = capsys.readouterr().out
+    assert "Signed in" not in after and "Connected" not in after, after
+    assert "Not signed in" in after, after

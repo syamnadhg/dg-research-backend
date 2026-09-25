@@ -43,7 +43,7 @@ writes Firestore itself.
 > ⛔ **THE COUNT IS A SNAPSHOT, NOT A GUARD** — a pinned count gets updated by
 > whoever makes it red. Re-measure: `pytest tests -q --collect-only | tail -1`.
 
-## Bridge routes — all 39 the dispatcher declares
+## Bridge routes — all 40 the dispatcher declares
 
 Third column = test files measured RUNNING that route's handler. A blank means no
 test drove it. THREE routes answer inline in the `do_GET`/`do_POST` arm with no
@@ -95,6 +95,7 @@ measurable" on a route that is measurable retires the question.
 | `/research/<id>/stop` | `test_e2e_lifecycle`, `test_sr_client` |
 | `/researches` | `test_bridge_device`, `test_bridge_routes` |
 | `/shutdown` | `test_bridge_shutdown` |
+| `/signin/ack` | `test_signout_closes_signin_0925` |
 | `/status` | `test_bridge_remote_login`, `test_e2e_lifecycle`, `test_sr_client` |
 | `/updates` | `test_bridge_device`, `test_bridge_resolve_0831`, `test_e2e_lifecycle`, `test_signin_announce_0826`, `test_signin_once_0901`, `test_sr_attention_copy_0831`, `test_sr_client`, `test_stretch45_agent_0827` |
 | `/version` | `test_sr_client` |

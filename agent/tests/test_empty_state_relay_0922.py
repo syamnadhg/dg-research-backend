@@ -71,18 +71,26 @@ def _run(fn, ns):
 
 
 def _login_done(monkeypatch):
-    """The usual first-time path: signed in just now, a topic, no computer."""
-    monkeypatch.setattr(sr, "_post", lambda p, b=None, timeout=None: (
-        200, {"state": "connected", "email": "s@x.y", "pendingTopic": "creativity"}))
-    monkeypatch.setattr(sr, "_claim_signed_in_announce", lambda: {
-        "ts": 1, "email": "s@x.y", "needsDevice": True, "topic": "creativity",
-        "pendingTopic": ""})
+    """The usual first-time path: signed in just now, a topic, no computer.
+    ⚠ 2026-09-25: the note arrives through `POST /signin/ack` (with its news), and
+    a "connected" flow counts only while `authed` says so."""
+    note = {"ts": 1, "email": "s@x.y", "needsDevice": True, "topic": "creativity",
+            "pendingTopic": ""}
+
+    def _post(p, b=None, timeout=None):
+        if p == "/signin/ack":
+            return 200, {"ok": True, "authed": True, "email": "s@x.y",
+                         "consumed": True, "signedIn": note}
+        return 200, {"state": "connected", "authed": True, "email": "s@x.y",
+                     "pendingTopic": "creativity"}
+    monkeypatch.setattr(sr, "_post", _post)
     return sr.cmd_login_wait, NS(json=False)
 
 
+# ⚠ 2026-09-25 (owner): `status-account` left this table — a login answer is
+# about login only, so it prints no screen and needs no rule.
 SITES = {
     "devices": lambda mp: (sr.cmd_devices, NS(json=False)),
-    "status-account": lambda mp: (sr.cmd_status_account, NS(json=False)),
     "research": lambda mp: (sr.cmd_research, NS(json=False, topic="creativity",
                                                 device="", no_video=False,
                                                 no_email=False)),
@@ -131,8 +139,10 @@ def test_the_held_topic_promise_stays_visible(empty_account, monkeypatch):
 
 
 def test_the_update_notice_stays_visible(empty_account):
-    above, _, below = _run(sr.cmd_status_account, NS(json=False)).partition(M)
-    assert "0.1.34" in above and "0.1.34" not in below
+    # ⚠ 2026-09-25 (owner): status-account prints no screen and so no marker at
+    # all now — the notice is simply there, after the sign-in line.
+    out = _run(sr.cmd_status_account, NS(json=False))
+    assert "0.1.34" in out and M not in out, out
 
 
 def test_the_rule_is_short_carries_the_url_and_names_the_codes_origin():
@@ -264,4 +274,7 @@ def test_skill_md_no_longer_calls_this_screen_a_pairing_step():
                  "pair-a-device prompt", "in a fenced code block, never inline"):
         assert gone not in text, gone
     assert "lines the client printed, as printed" in text
-    assert "**Signed in, no computer yet**" in text
+    # ⚠ INVERTED 2026-09-25 (owner): the bare-/sr branch that relayed this screen
+    # from `status-account` is gone with the screen — a login answer is about
+    # login only, and a research with no computer says so itself.
+    assert "**Signed in, no computer yet**" not in text

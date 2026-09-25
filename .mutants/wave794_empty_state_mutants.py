@@ -144,7 +144,9 @@ MUTANTS = [
     ("E6", SR, "under",
      "the lead is dropped, so the sign-in announce stops naming the topic that "
      "has nowhere to run and reads as an unprompted lecture about hardware",
-     [('    lines = [lead] if lead else []', '    lines = []')]),
+     # ⭐ RE-AIMED 2026-09-25: the lead is a block of its own (owner) — a blank
+     # line follows it. Same defect: the lead is dropped.
+     [('    lines = [lead, ""] if lead else []', '    lines = []')]),
     ("E7", SR, "under",
      "the install page leaves the add line, so somebody with NO machine at all is "
      "offered an access code from a computer that is not running anything",
@@ -269,11 +271,12 @@ MUTANTS = [
      "⛔⛔ THE WATCHER DROPS IT TOO. It runs with `no_agent`, so its text reaches "
      "the person with no model turn to launder it — and it is PROACTIVE, which "
      "makes it the one screen somebody reads without having asked anything",
+     # ⭐ RE-AIMED 2026-09-25: the paragraph lost "Tell me which one to ask for."
+     # (owner: it shows no list). Same defect: the whole public half goes.
      [('            f"Connection)\\n\\n"\n'
        '            f"Public computers — ask to use somebody else\'s. Ask me for the "\n'
-       '            f"public computers and I\'ll list the ones on offer. Tell me which one "\n'
-       '            f"to ask for. Once the request is accepted you can use that computer. "\n'
-       '            f"They see your name."\n',
+       '            f"public computers and I\'ll list the ones on offer. Once the request "\n'
+       '            f"is accepted you can use that computer. They see your name."\n',
        '            f"Connection)"\n')]),
     ("W3", BRIDGE, "under",
      "the wire sentence loses the add-a-computer half instead, so somebody who owns "
@@ -433,7 +436,10 @@ MUTANTS = [
     ("S5", SKILL, "under",
      "the paragraph telling the assistant an empty account is not a dead end "
      "goes, so the model is free to relay the shortest of the ten old sentences",
-     [("**An account with NO computer is not a dead end.** Every screen that reports it\nnames BOTH routes — “Add a computer: set one up at https://superresearch.io/install,\nthen send me the 8-character access code the computer shows (or one a computer's\nowner gave you)”, or ask to use somebody else's — and the full ones (`devices`,\n`research`, the sign-in announce) also LIST the public computers on offer. Relay\nthat list; never present setting up a machine as the only route.\n⛔ Keep https://superresearch.io/install inside the “Add a computer” sentence.\nThe access code comes from the person's computer at the end of that setup — never\nsay it comes from the app. The one-line sign-in confirmation names both routes\nwithout a list, which is deliberate: it must not make a second call to render one.\n\n",
+     # ⭐ RE-AIMED 2026-09-25: the paragraph now says where the LIST appears (a
+     # sign-in whose waiting topic has nowhere to run) and that a sign-in answer
+     # carries none of it (owner). Same defect: the whole paragraph goes.
+     [("**An account with NO computer is not a dead end.** Every screen that reports it\nnames BOTH routes — “Add a computer: set one up at https://superresearch.io/install,\nthen send me the 8-character access code the computer shows (or one a computer's\nowner gave you)”, or ask to use somebody else's — and the full ones (`devices`,\n`research`, a sign-in whose waiting topic has nowhere to run) also LIST the public\ncomputers on offer. Relay that list; never present setting up a machine as the only route.\n⛔ Keep https://superresearch.io/install inside the “Add a computer” sentence.\nThe access code comes from the person's computer at the end of that setup — never\nsay it comes from the app. ⛔ A sign-in answer never carries any of this — it is\n\"✓ Signed in as <email>.\" and nothing about computers.\n\n",
        '')]),
 
     # ═══════════ C — the anti-drift constants ════════════════════════════════

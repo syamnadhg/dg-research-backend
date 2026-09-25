@@ -123,11 +123,19 @@ empty list".
 
 Almost nothing, and that is the design. A **streaming watchdog** — armed by the
 client itself for the chat you're in (`arm-stream`), and scoped to the runs *you*
-started from chat — posts unprompted for exactly three things: **one** completion
-message per run, carrying every phase's permanent, non-revocable Super Research
-link plus "the results have been emailed"; a run that **needs you** (a sign-in, a
-verification, a snag, an error), with how to answer it from chat; and a run that
-was stopped or cancelled, from either surface.
+started from chat — posts unprompted for exactly three things about runs: **one**
+completion message per run, carrying every phase's permanent, non-revocable Super
+Research link, plus "the results have been emailed" only when that run's email phase
+was on; a run that **needs you** (a sign-in, a verification, a snag, an error), with
+how to answer it from chat; and a run that was stopped or cancelled, from either
+surface. It also carries the one-shot notes the bridge parks for that chat — a
+sign-in, a public computer's owner saying yes, a support bundle landing (or still
+not, after half an hour). Where the chat runtime can compute cron expressions it
+ticks on every minute boundary, otherwise every minute from its last run; on Hermes
+the bridge can also run it immediately (`push.py`). A sign-out leaves it in place,
+silent until the next sign-in; only `agent disconnect` removes it. It never
+prints anything but the message itself — its own record is
+`~/.super-agent/watcher.log`.
 
 It deliberately does **not** narrate phase by phase — progress and the links so
 far are what `/sr status` is for — and it prints nothing at all when there's
@@ -305,6 +313,16 @@ for while signed out is routed by the **same ladder** as a fired run (above), so
 that note can name the computer it started on, ask which of several should take
 it, or show the no-computer screen — instead of asking you to repeat the topic.
 
+In chat, a plain sign-in is **"✓ Signed in as &lt;your email&gt;."** and nothing about
+computers — the watcher's note, `login-done` and a plain "am I signed in?" alike.
+The no-computer screen appears only when a research you asked for while signed out
+has nowhere to run. A chat reply takes the parked note (`POST /signin/ack`) so the
+watcher does not say it after the reply: `login-done` takes it with its news and
+relays that news; `status-account` and `login` take only a plain note and leave one
+that carries news for the watcher. If the watcher speaks first, your next "done"
+is still answered with the sign-in line. Asking to log in while already signed in
+says so and starts nothing; to switch accounts, log out first.
+
 `agent serve` writes a durable, rotating operational log to
 `~/.super-agent/bridge.log` (request + run-lifecycle lines; never a token);
 add `-v` / `--verbose` for DEBUG. Neither a flag nor an env var reaches a
@@ -412,8 +430,12 @@ facade/
   autostart.py       windowless logon autostart (schtasks / systemd --user / launchd)
   bridge.py          loopback HTTP server (/login, /login/remote/*, /devices,
                      /devices/public, /devices/requests, /device/{select,pair,remove,
-                     ask,decide,visibility}, /research, /updates, /logs/{runs,send,
-                     bundle,agent-log}, /version, /agent-install, /install-backend, …)
+                     ask,decide,visibility}, /research, /updates, /signin/ack,
+                     /logs/{runs,send,bundle,agent-log}, /version, /agent-install,
+                     /install-backend, …)
+  push.py            instant delivery: runs a chat's sr-stream watcher NOW through
+                     `hermes cron run` (never on a handler thread; one run per job;
+                     re-checked before every spawn; a no-op without Hermes)
   web/login.html     Firebase Web SDK Google sign-in (TOTP MFA aware)
   skill/             the chat-runtime bundle — SKILL.md + scripts/sr.py (the chat client)
                      + sr_attention_poll.py (the streaming watchdog) + sr_update_notice.py

@@ -193,16 +193,22 @@ MUTANTS = [
      "only place holding what the bridge DID about their research. The owner's own "
      "fleet transcript is this shape: 'they are signed in' and nothing about the three "
      "computers the note was holding",
-     [('        note = _claim_signed_in_announce()\n        if isinstance(note, dict) and (note.get("autoStarted")',
-       '        note = {}\n        if isinstance(note, dict) and (note.get("autoStarted")')]),
+     # ⭐ RE-AIMED 2026-09-25: `login-done` takes the note through `POST
+     # /signin/ack` now (sr.py `_signed_in_reply`), not the /updates claim — so the
+     # mutant stops the ACK. Same defect: told, and the note left parked.
+     [('    acode, ack = _ack_signed_in("login-done", with_news=True)',
+       '    acode, ack = 0, {}')]),
 
     ("D2", SR, "under",
      "⛔ THE CHAT SCOPE IS DROPPED FROM THE CLAIM, so the read looks like the "
      "account-wide watchdog and the bridge (correctly) refuses it an ADDRESSED note — "
      "which is the ORDINARY case, because `login` posts this chat's address. The fix "
      "then takes nothing and the double announce survives it",
-     [('    q = "/updates?via=agent&limit=1"\n    origin = _origin_from_env()\n    if origin:',
-       '    q = "/updates?via=agent&limit=1"\n    origin = None\n    if origin:')]),
+     # ⭐ RE-AIMED 2026-09-25: the claim is the ack now (`_ack_signed_in`) and the
+     # chat scope rides on its body; the /updates read is only an older bridge's
+     # fallback. Same defect: the scope is dropped and an addressed note refused.
+     [('    body: dict = {"reader": reader}\n    origin = _origin_from_env()\n    if origin:',
+       '    body: dict = {"reader": reader}\n    origin = None\n    if origin:')]),
 
     ("D3", SR, "over",
      "⛔⛔ THE OUTCOME GATE WIDENS TO ANY NON-EMPTY NOTE — the tidy simplification, and "
@@ -212,24 +218,30 @@ MUTANTS = [
      "go ahead'* — a question aimed at the person — where SKILL.md is written against "
      "*'Continuing your research on X…'* and treats it as the cue to start the run. The "
      "assistant then waits for a go-ahead that was already given",
-     [('        if isinstance(note, dict) and (note.get("autoStarted")\n'
-       '                                       or note.get("needsDevice")\n'
-       '                                       or note.get("needsDeviceChoice")):',
-       '        if isinstance(note, dict) and note:')]),
+     # ⭐ RE-AIMED 2026-09-25: the gate moved into `_signed_in_reply` (one indent
+     # less). Its PLAIN-note half is moot since then — a plain note and the sign-in
+     # line are the same "✓ Signed in as X." (owner: a login answer is login only)
+     # — and the TOPIC-ONLY half is what kills it: "go ahead" replaces the cue.
+     [('    if isinstance(note, dict) and (note.get("autoStarted")\n'
+       '                                   or note.get("needsDevice")\n'
+       '                                   or note.get("needsDeviceChoice")):',
+       '    if isinstance(note, dict) and note:')]),
 
     ("D5", SR, "under",
      "⛔⛔ `needsDeviceChoice` DROPS OUT OF THE GATE, so the one payload the owner's own "
      "fleet transcript proves was lost — *'you have 3 research computers, which should "
      "run this?'* — is taken and then not relayed. The exact defect, re-entered through "
      "the fix for it",
-     [('                                       or note.get("needsDeviceChoice")):',
-       '                                       or False):')]),
+     # ⭐ RE-AIMED 2026-09-25: same line, one indent less (`_signed_in_reply`).
+     [('                                   or note.get("needsDeviceChoice")):',
+       '                                   or False):')]),
 
     ("D4", SR, "under",
      "the note is claimed and then not rendered — the debt is taken and not paid, which "
      "is the silent eater this whole line of work exists to end, one function further in",
-     [('            return _emit({**body, "signedIn": note}, args.json, said)',
-       '            return _emit({**body, "signedIn": note}, args.json, [])')]),
+     # ⭐ RE-AIMED 2026-09-25: same line, one indent less (`_signed_in_reply`).
+     [('        return _emit({**body, "signedIn": note}, args.json, said)',
+       '        return _emit({**body, "signedIn": note}, args.json, [])')]),
 
     ("D6", SR, "under",
      "⛔⛔⛔ THE BLOCKER CROSS-VERIFICATION FOUND IN MY OWN FIRST FIX. The topic stops "
@@ -237,16 +249,18 @@ MUTANTS = [
      "flag) is minted exactly when the auto-start FAILED, by which point the flow's copy "
      "of the topic has already been nulled. So the note is TAKEN and the person's "
      "research request is destroyed: a fix that loses news the bug did not",
-     [('        if isinstance(note, dict):\n'
-       '            topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()',
-       '        if False:\n'
-       '            topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()')]),
+     # ⭐ RE-AIMED 2026-09-25: same lines, one indent less (`_signed_in_reply`).
+     [('    if isinstance(note, dict):\n'
+       '        topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()',
+       '    if False:\n'
+       '        topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()')]),
 
     ("D7", SR, "under",
      "the `--json` payload goes back to the poll body alone, so a caller reading JSON "
      "gets `state: connected` and none of the news this command just consumed",
-     [('            return _emit({**body, "signedIn": note}, args.json, said)',
-       '            return _emit(body, args.json, said)')]),
+     # ⭐ RE-AIMED 2026-09-25: same line, one indent less (`_signed_in_reply`).
+     [('        return _emit({**body, "signedIn": note}, args.json, said)',
+       '        return _emit(body, args.json, said)')]),
 
     # ══ E — the two readers agree about a missing timestamp ═════════════════
     ("E1", POLL, "under",

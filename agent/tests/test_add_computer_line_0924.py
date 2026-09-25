@@ -88,9 +88,15 @@ def empty_account(monkeypatch):
 
 
 def _login_done(mp):
-    mp.setattr(sr, "_post", lambda p, b=None, timeout=None: (
-        200, {"state": "connected", "email": "s@x.y", "pendingTopic": "creativity"}))
-    mp.setattr(sr, "_claim_signed_in_announce", lambda: dict(_NEEDS_DEVICE))
+    # ⚠ 2026-09-25: `login-done` takes the note through `POST /signin/ack` (with
+    # its news), and a "connected" flow counts only while `authed` says so.
+    def _post(p, b=None, timeout=None):
+        if p == "/signin/ack":
+            return 200, {"ok": True, "authed": True, "email": "s@x.y",
+                         "consumed": True, "signedIn": dict(_NEEDS_DEVICE)}
+        return 200, {"state": "connected", "authed": True, "email": "s@x.y",
+                     "pendingTopic": "creativity"}
+    mp.setattr(sr, "_post", _post)
     return sr.cmd_login_wait, NS(json=False)
 
 
@@ -101,9 +107,10 @@ def _updates(mp):
 
 
 # Every chat door that prints the whole no-computer screen and ENDS on it.
+# ⚠ 2026-09-25 (owner): `status-account` left this table — a login answer is
+# about login only (test_login_answers_login_only_0925.py pins what it says now).
 CHAT_SCREENS = {
     "devices": lambda mp: (sr.cmd_devices, NS(json=False)),
-    "status-account": lambda mp: (sr.cmd_status_account, NS(json=False)),
     "research no_devices": lambda mp: (sr.cmd_research, NS(
         json=False, topic="creativity", device="", no_video=False, no_email=False)),
     "sign-in needsDevice": _login_done,
@@ -218,10 +225,11 @@ def test_updates_attaches_no_rule_when_the_announce_did_not_need_a_device(monkey
 # ── one shared constant for every chat surface that says how to add a computer ─
 
 def test_every_chat_add_a_computer_surface_renders_the_shared_constant(monkeypatch):
-    """⛔ ONE SENTENCE, NOT FOUR. The empty screen, the populated list's tail, the
-    one-line sign-in confirmation and the router's answer to "install Super
-    Research" all print the SAME line — a second wording is how the link went
-    missing from three of them."""
+    """⛔ ONE SENTENCE, NOT FOUR. The empty screen, the populated list's tail and
+    the router's answer to "install Super Research" all print the SAME line — a
+    second wording is how the link went missing from three of them.
+    ⚠ 2026-09-25 (owner): the one-line sign-in confirmation was the fourth and
+    carries NO add line now — a login answer is about login only."""
     monkeypatch.setattr(sr, "_RENDERING_LINES", False)
     assert sr._ADD_A_COMPUTER in sr._no_device_lines()
     monkeypatch.setattr(sr, "_get", lambda p, timeout=None: (200, {
@@ -229,7 +237,7 @@ def test_every_chat_add_a_computer_surface_renders_the_shared_constant(monkeypat
         "selectedDeviceId": "m1"}))
     assert sr._ADD_A_COMPUTER in _run(sr.cmd_devices, NS(json=False)).splitlines()
     monkeypatch.setattr(sr, "_get", lambda p, timeout=None: (200, {"devices": []}))
-    assert sr._ADD_A_COMPUTER in sr._connected_msg("e@x.y")
+    assert sr._ADD_A_COMPUTER not in sr._connected_msg("e@x.y")
     assert sr._nl_resolve("how do I install super research") == (None, [sr._ADD_A_COMPUTER])
 
 
@@ -254,9 +262,8 @@ def _every_person_facing_screen(monkeypatch, capsys) -> dict:
                        lambda: {"platform": "hermes", "chat_id": "c1"})
             fn, ns = make(mp)
             screens[f"chat: {name}"] = _above(_run(fn, ns))
-    with monkeypatch.context() as mp:
-        mp.setattr(sr, "_get", lambda p, timeout=None: (200, {"devices": []}))
-        screens["chat: sign-in one-liner"] = sr._connected_msg("e@x.y")
+    # ⚠ 2026-09-25 (owner): the one-line sign-in confirmation is not a
+    # no-computer screen any more — it names no computer at all.
     screens["watcher: sign-in announce"] = _watcher()
     screens["terminal: agent device"] = _term_out(monkeypatch, capsys)
     screens["terminal: agent device, failed look"] = _term_out(monkeypatch, capsys,

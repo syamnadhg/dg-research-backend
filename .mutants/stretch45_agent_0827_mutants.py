@@ -189,8 +189,10 @@ MUTANTS = [
      "⛔⛔ THE SILENT EATER RETURNS. `?via=agent` takes the one-shot announce and "
      "moves the delivered watermark past it, so the re-mint cannot recover it "
      "either; the command then prints runs alone and the sign-in is lost for good",
-     [('    lines = _signed_in_lines(body.get("signedIn"))\n    for r in runs:',
-       "    lines = []\n    for r in runs:")]),
+     # ⭐ RE-AIMED 2026-09-25: a blank line now separates the sign-in block from
+     # the runs (owner), so the anchor ends on that guard. Same defect.
+     [('    lines = _signed_in_lines(body.get("signedIn"))\n    if lines:',
+       "    lines = []\n    if lines:")]),
     ("U2", SR_BE, "under",
      "the renderer answers nothing for every note, which is the same loss one "
      "function further in — and passes any test that only checks the call happens",
@@ -206,11 +208,13 @@ MUTANTS = [
      "copies already exist with a test holding them together, precisely so one "
      "question does not get two phrasings depending which door the person came "
      "through",
-     [('    if note.get("needsDeviceChoice"):\n        return [head] + _pick_device_lines(\n'
+     # ⭐ RE-AIMED 2026-09-25: the head is its own block now (`[head, ""]`,
+     # owner). Same defect: the ask worded a third time.
+     [('    if note.get("needsDeviceChoice"):\n        return [head, ""] + _pick_device_lines(\n'
        '            {"devices": note.get("devices")},\n'
        '            "stale_selection" if note.get("staleSelection") else "no_selection",\n'
        "            about=quoted)",
-       '    if note.get("needsDeviceChoice"):\n        return [head, "Which computer should run this?"]')]),
+       '    if note.get("needsDeviceChoice"):\n        return [head, "", "Which computer should run this?"]')]),
     ("U5", SR_BE, "under",
      "the reason stops being read, so somebody whose chosen computer has gone is "
      "told to pick from a list rather than that the one they used is unreachable",
@@ -562,8 +566,11 @@ MUTANTS = [
     ("Q5", BRIDGE, "under",
      "the field is dropped at the wire instead, which looks like a different bug "
      "from Q4 and produces the identical silence",
-     [('                            "deviceOnline": ev.get("deviceOnline"),',
-       '                            "deviceOnline": None,')]),
+     # ⭐ RE-AIMED 2026-09-25: the /updates wire dict moved, verbatim, into
+     # `_signed_in_payload` — ONE builder for /updates and POST /signin/ack —
+     # so the anchor follows it there. Same field, same defect.
+     [('        "deviceOnline": ev.get("deviceOnline"),',
+       '        "deviceOnline": None,')]),
     ("Q6", BRIDGE, "over",
      "⛔ the device lookup stops being best-effort, so a Firestore blip takes a "
      "STARTED run's whole announce down with it — a courtesy field failing the "

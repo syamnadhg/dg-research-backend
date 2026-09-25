@@ -133,7 +133,6 @@ run `sr.py status-account`, then branch on what it reports:
 - **Bridge unreachable** → the **Setup** above (run `connect` yourself).
 - **Bridge up, not signed in** → welcome them; tell them to just say "log me in"
   and you'll send a sign-in link.
-- **Signed in, no computer yet** → relay its screen as printed; add nothing, invite no topic.
 - **Signed in** → greet them by their account email, tell them what they can do in
   plain words (research a topic · check / stop / resume a run · their researches +
   podcasts & links by name · devices · version / update), and invite them to just
@@ -161,7 +160,7 @@ back into `do`.
 |---|---|
 | "research the EV battery market", "look into X", "deep dive on Y" | `sr.py research "<topic>"` |
 | "how's it going?", "status?", "status of (the) research / the Super Research?", "where's the Tesla one at?", "results of the EV research" | `sr.py status ["<title>"]` (current phase + that run's 🔒 SR links). ANY unqualified "status" means THIS — never your runtime's own status |
-| "am I signed in?", "which account?", "are we connected?" | `sr.py status-account` (fresh — see **Safe defaults**) |
+| "am I signed in?", "Logged in?", "Signed in?", "did the login work?", "which account?", "are we connected?" | `sr.py status-account` (fresh — see **Safe defaults**) — relay as printed; say nothing about computers |
 | "what researches do I have?", "list all my researches", "my past research" | `sr.py list` (EVERY research, any status — then ask for any one by name) |
 | "what's running?", "what's active right now?" | `sr.py updates` (ACTIVE runs only) |
 | "send me the podcast", "the audio for the Mars run", "podcast of <run>" | `sr.py podcast ["<title>"]` |
@@ -177,7 +176,7 @@ back into `do`.
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
-| "sign in", "log me in" | `sr.py login` |
+| "sign in", "log me in" | `sr.py login` (already signed in → it says so and sends no link; relay it) |
 | "logout", "log out", "sign out of Super Research" | `sr.py logout` (signs the agent OUT — keeps the skill + bridge) |
 | "remove / uninstall / disconnect Super Research entirely" | **confirm** ("just sign out, or fully remove Super Research from this computer: skill, bridge and every chat's watcher?"), then `pipx run superresearch-agent disconnect --yes` (FULL teardown), then tell them to run **/reload-skills** so `/sr` unregisters. Do NOT use the runtime's own skill-removal (leaves the bridge running) or `sr.py logout` (sign-out only). |
 | "install / set up Super Research", "how do I install Super Research?", "where do I get an access code?" | `sr.py do "<message>"` — it answers with the one “Add a computer” line (the install page). Relay it as printed; never offer `install` for these |
@@ -202,7 +201,7 @@ back into `do`.
 | "did they answer?", "my pending requests" | `sr.py device-requests` — of the ones the USER asked for, ONLY unanswered ones appear. A request that has been answered leaves that half **either way**; never read a missing row as a refusal. A **yes** shows up as the computer appearing in `sr.py devices`; for a **no**, ask for that computer again and the reply says so. The owner half above it drops a row for different reasons — a machine handed on or deleted takes its queue with it |
 | "cancel my request", "withdraw that request" | nothing withdraws a request — relay the client's line. It stays with the owner until they answer, or lapses after a week |
 | just `/sr` | `sr.py status-account` → welcome (see **A bare `/sr`**) |
-| "what can you do?", "help", "what is Super Research", "how do I start", "options", "commands" | `sr.py do "<message>"` relays the capability line — the same list the catch-all prints, without the sentence in front that says the request was not understood. ⛔ Not `status-account`: on an account that already has a computer that prints `✓ Signed in as <email>` and nothing else |
+| "what can you do?", "help", "what is Super Research", "how do I start", "options", "commands" | `sr.py do "<message>"` relays the capability line — the same list the catch-all prints, without the sentence in front that says the request was not understood. ⛔ Not `status-account`: that prints `✓ Signed in as <email>.` and nothing else |
 | "the brief link", "a report link", "the NotebookLM link", "the doc", "the video" | `sr.py status ["<title>"]` — every link lives in the status output; there is no separate link command. Said on their own these name the most-recent run |
 | "my past research", "my researches", "my runs" | `sr.py list` |
 | "skip the podcast on \"<title>\"", "skip the video on the <title> run" | `sr.py skip <phase> --run "<title>"` — a phase of a run that is **not** the newest. Without `--run` every skip lands on the most-recent active run — or asks which run, when the user has one chat can't manage |
@@ -250,7 +249,9 @@ duplicate is the bug this avoids).
 
 The proactive announce is best-effort, so **never wait on it and never say "what
 should I continue?"**. The moment the user replies **anything** ("done",
-"continue", "yes", "I signed in", or even a brand-new message):
+"continue", "yes", "I signed in", or even a brand-new message) **right after a fresh
+sign-in link** — that one reply only; any later "am I signed in?" / "Logged in?" is
+`sr.py status-account`:
 
 0. **If your last message (or the proactive announce) offered "continue with
    '<topic>'?" — that `<topic>` is already in hand. Immediately run
@@ -265,8 +266,8 @@ should I continue?"**. The moment the user replies **anything** ("done",
      prints, as printed, in one message.
    - "✓ Signed in … which should run '<topic>'?" — **relay that question with the
      computer names** and wait for their pick; then `sr.py device-use "<name>"`.
-   - "✓ Connected as <email>. Continuing your research on '<topic>'…" — the cue to act:
-     go straight to step 2.
+   - "✓ Signed in as <email>." then "Continuing your research on '<topic>'…" — the cue
+     to act: go straight to step 2. (A plain sign-in is just "✓ Signed in as <email>.")
 2. If `login-done` named a **pending topic** with that last wording, immediately run
    `sr.py research "<that topic>"` (this also returns the no-computer screen if
    they have no device yet). Do NOT run `research` for the first three shapes — the
@@ -282,10 +283,11 @@ never `retry`, never a question back to the user.
   connects automatically. The proactive "✓ Signed in" is best-effort — don't rely
   on it; on any reply, continue per **After a sign-in link**. When the user asked
   to *research* while signed out, run `sr.py research "<topic>"` (NOT `login`) — its
-  reply hands back the same link AND remembers the topic.
+  reply hands back the same link AND remembers the topic. Already signed in, it
+  sends no link and says so; switching accounts is log out, then log in.
 - **logout** → confirm first. Logging out of Super Research is ALWAYS this command —
   never refuse it or point the user at an account/profile menu. Removes the agent
-  from their account (keeps the skill + bridge).
+  from their account (keeps the skill, the bridge and this chat's watcher).
 - **research** → relay the clean "🚀 Started …" message (names the run by title +
   device). The client arms the watchdog **itself** so completion + any blocker posts
   here on its own — normally nothing for you to do. Only act on a directive if one
@@ -349,12 +351,12 @@ never `retry`, never a question back to the user.
 names BOTH routes — “Add a computer: set one up at https://superresearch.io/install,
 then send me the 8-character access code the computer shows (or one a computer's
 owner gave you)”, or ask to use somebody else's — and the full ones (`devices`,
-`research`, the sign-in announce) also LIST the public computers on offer. Relay
-that list; never present setting up a machine as the only route.
+`research`, a sign-in whose waiting topic has nowhere to run) also LIST the public
+computers on offer. Relay that list; never present setting up a machine as the only route.
 ⛔ Keep https://superresearch.io/install inside the “Add a computer” sentence.
 The access code comes from the person's computer at the end of that setup — never
-say it comes from the app. The one-line sign-in confirmation names both routes
-without a list, which is deliberate: it must not make a second call to render one.
+say it comes from the app. ⛔ A sign-in answer never carries any of this — it is
+"✓ Signed in as <email>." and nothing about computers.
 
 A **Research Computer** is a computer running Super Research. **Any bare 8-char
 access code (e.g. `7F4V-6W7D`, dashes optional) means run
@@ -506,16 +508,16 @@ Say nothing about arming — the user only sees the clean message above the mark
 `✗ watchdog not installed` error → re-run `connect` on the host and stop.
 
 The watchdog is scoped to THIS chat and **quiet by design** — it posts the sign-in announce plus: **🎉 a
-run's completion** (one message with every phase's 🔒 + 🔗 links + "results
-emailed"), **⏹ a stop** (including a stop done from the web app), and **⚠ "needs
+run's completion** (one message with every phase's 🔒 + 🔗 links, + "results
+emailed" when that run emailed them), **⏹ a stop** (including a stop done from the web app), and **⚠ "needs
 you: <reason>"** when a run blocks. **The ⚠ notice now names the verbs that
 actually work for that particular card — relay them as written and offer
 nothing else.** It de-dups, and once armed for a signed-in account it **persists** (⛔ a login listener that is never approved removes its own row) (ticking silently
 between runs, removed only by `agent disconnect`) — so re-arming on every research is
 a harmless no-op if it's already running. Per-phase progress is **on-demand** — for
-"how's it going / send the brief link" just run `sr.py status`. On `logout`, tear
-it down too: `cronjob(action="list")` → the `sr-stream…` job →
-`cronjob(action="remove", job_id=…)`.
+"how's it going / send the brief link" just run `sr.py status`. **Never remove it
+yourself — not on `logout` either**: signed out it stays silent and the next
+sign-in reuses it.
 
 ## Safety
 

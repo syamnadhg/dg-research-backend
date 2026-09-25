@@ -151,13 +151,27 @@ def test_every_line_returning_door_says_all_three_things(chat, door):
 
 @pytest.mark.parametrize("run", [
     lambda: sr.cmd_devices(_ns()),
-    lambda: sr.cmd_status_account(_ns()),
 ])
 def test_every_printing_door_says_all_three_things(chat, run):
     chat.gets["/status"] = (200, {"authed": True, "email": "e@x.y"})
     run()
     blob = chat.out().lower()
     assert THING_NONE in blob and THING_OWN in blob and THING_ASK in blob, blob
+
+
+def test_the_status_check_is_not_a_device_door(chat):
+    """⚠ RE-AIMED 2026-09-25 (owner): `status-account` used to be the second
+    printing door above. "Am I logged in?" is a login question, and a login answer
+    is about login only — so on an account with NO computer it says the sign-in
+    line and none of the three things, makes no second look for public computers,
+    and carries no relay rule."""
+    chat.gets["/status"] = (200, {"authed": True, "email": "e@x.y"})
+    sr.cmd_status_account(_ns())
+    out = chat.out()
+    assert out.strip() == "✓ Signed in as e@x.y.", out
+    blob = out.lower()
+    assert THING_NONE not in blob and THING_OWN not in blob and THING_ASK not in blob, out
+    assert not [c for c in chat.calls if c[1] in ("/devices", "/devices/public")], chat.calls
 
 
 def test_the_run_that_could_not_be_routed_says_all_three_things(chat):
@@ -319,7 +333,10 @@ def test_the_lead_is_rendered_and_it_leads(chat):
     unprompted lecture about hardware."""
     lines = sr._no_device_lines(lead="“Golden Retrievers” has nowhere to run yet.")
     assert lines[0] == "“Golden Retrievers” has nowhere to run yet."
-    assert THING_NONE in lines[1].lower()
+    # ⚠ 2026-09-25 (owner): the lead is a block of its own — a blank line, then
+    # the three things.
+    assert lines[1] == "", lines
+    assert THING_NONE in lines[2].lower()
     said = "\n".join(sr._signed_in_lines({"email": "e@x.y", "needsDevice": True,
                                            "topic": "Golden Retrievers"}))
     assert "“Golden Retrievers” has nowhere to run yet." in said, said
@@ -379,21 +396,17 @@ def test_the_install_gate_names_a_string_a_surface_actually_prints():
     assert "no research computer on this account yet" in src[j:j + 600]
 
 
-def test_the_post_sign_in_one_liner_names_both_ways_out(chat):
-    """⛔ ONE LINE, AND STILL BOTH ROUTES. This is a confirmation, not the empty
-    state — it must not fire a second look to render a list — but it was the first
-    thing a brand-new account read and it named only the route that needs
-    hardware."""
+def test_the_post_sign_in_line_names_no_computers_at_all(chat):
+    """⚠ INVERTED 2026-09-25 (owner). This pinned "ONE LINE, AND STILL BOTH
+    ROUTES": the confirmation carried the add line and a public-computer offer in
+    one run-on sentence. A login answer is about login only — the sign-in line,
+    with no add line, no install link, no public computers, and no second look."""
     raw = sr._connected_msg("e@x.y")
-    said = raw.lower()
-    assert "access code" in said and "public computer" in said, said
-    assert "\n" not in said, said
-    # ⚠ REPINNED 2026-09-24: NOT ITS OWN WORDING ANY MORE. It said "paste the
-    # access code from your Research Computer", which assumed the reader had one
-    # and gave them no way to get one; it now carries the shared add line, link
-    # and all (owner), and still ends on the public-computer offer.
-    assert sr._ADD_A_COMPUTER in raw, raw
-    assert raw.rstrip().endswith("public computer you could use."), raw
+    assert raw == "✓ Signed in as e@x.y.", raw
+    for gone in ("access code", "public computer", "Add a computer",
+                 "superresearch.io/install", sr._ADD_A_COMPUTER):
+        assert gone.lower() not in raw.lower(), (gone, raw)
+    assert not chat.calls, chat.calls
 
 
 # ── C1's third thing is a LIST, and it is the browse screen's own rows ───────
@@ -650,10 +663,13 @@ def test_the_watcher_says_what_asking_gets_you_like_the_chat_invite():
     so the one surface nothing relays was the one that did not say it."""
     line = poll._signed_in_line({"email": "e@x.y", "needsDevice": True,
                                  "topic": "Golden Retrievers", "pendingTopic": ""})
-    for said in ("Tell me which one to ask for.",
-                 "Once the request is accepted you can use that computer."):
-        assert said in sr._PUBLIC_ASK_INVITE, said
-        assert said in " ".join(line.split()), (said, line)
+    said = "Once the request is accepted you can use that computer."
+    assert said in sr._PUBLIC_ASK_INVITE, said
+    assert said in " ".join(line.split()), (said, line)
+    # ⚠ 2026-09-25 (owner): but NOT "Tell me which one to ask for." — the chat
+    # invite says it under a LIST, and this paragraph shows none.
+    assert "Tell me which one to ask for." in sr._PUBLIC_ASK_INVITE
+    assert "Tell me which one to ask for" not in " ".join(line.split()), line
 
 
 def test_a_non_dict_row_cannot_crash_the_empty_state(chat):
@@ -823,16 +839,15 @@ def test_no_deviceless_sentence_is_hand_written_anywhere_in_the_chat_client():
 def test_every_deviceless_door_calls_the_one_renderer():
     """⛔ A COUNT, SO A DOOR CANNOT QUIETLY STOP USING IT.
 
-    Seven occurrences in all: the `def` plus SIX call sites. The seventh door — the
-    post-sign-in one-liner — deliberately does NOT call it, because rendering the
-    block would cost that line a second network call; it renders the shared add
-    line plus the public-computer offer in one line instead, and
-    `test_the_post_sign_in_one_liner_names_both_ways_out` pins that. The first
-    version of this docstring said "seven callers", which miscounted its own
-    subject by one.
+    Six occurrences in all: the `def` plus FIVE call sites. ⚠ 2026-09-25 (owner):
+    `status-account` was a sixth caller and is not a device door any more — a
+    login answer is about login only (`test_the_status_check_is_not_a_device_door`),
+    and neither is the post-sign-in line
+    (`test_the_post_sign_in_line_names_no_computers_at_all`). The first version of
+    this docstring said "seven callers", which miscounted its own subject by one.
     """
     src = code_only(_SR_PATH.read_text(encoding="utf-8"))
-    assert src.count("_no_device_lines(") == 7, src.count("_no_device_lines(")
+    assert src.count("_no_device_lines(") == 6, src.count("_no_device_lines(")
     assert src.count("def _no_device_lines(") == 1
 
 

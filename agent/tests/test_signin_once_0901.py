@@ -544,18 +544,21 @@ def test_login_done_relays_the_device_question_the_note_was_holding(live, capsys
     assert state.signed_in is None, "the note must be TAKEN, or the watcher repeats it"
 
 
-def test_login_done_takes_a_plain_note_but_keeps_the_device_aware_greeting(live, capsys):
-    """⛔ A QUIET REGRESSION I ALMOST SHIPPED. Preferring the note unconditionally loses
-    the pair-a-computer steer: for a PLAIN sign-in `_connected_msg` is device-aware and
-    the note's single line is not. Take it either way — that is the half that stops the
-    double announce — but keep the better sentence."""
+def test_login_done_takes_a_plain_note_and_says_the_sign_in_line_alone(live, capsys):
+    """⚠ RE-AIMED 2026-09-25 (owner). This kept `_connected_msg`'s DEVICE-AWARE
+    greeting for a plain sign-in — on an account with no computer, the add line and
+    a public-computer offer glued to the confirmation. A login answer is about login
+    only now: the sign-in line and nothing else, on this empty account too. The
+    half that mattered stays pinned: the note is still TAKEN, or the watcher repeats
+    it."""
     base, state = live
     FakeFS.devices = []
     _connect_flow(state)
     state.set_signed_in({"ts": 7_000, "uid": "u1", "email": "e@x.y", "origin": None})
     assert sr.main(["login-done"]) == 0
     out = capsys.readouterr().out
-    assert "access code" in out, out
+    assert out.strip() == "✓ Signed in as e@x.y.", out
+    assert "access code" not in out and "Add a computer" not in out, out
     assert state.signed_in is None, "the note must still be taken"
 
 

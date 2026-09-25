@@ -216,6 +216,40 @@ def _isolate_prefs_dir(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_watcher_log(monkeypatch, tmp_path):
+    """⛔ NO TEST MAY WRITE INTO THE REAL ~/.super-agent/watcher.log (2026-09-25).
+    The chat-side scripts — the watcher, sr.py's arming writer and the update
+    notice — log to that FILE (their stdout is the chat message), and they are
+    stdlib-only copies that read no `config`, so they are pointed at the per-test
+    tmp through the one override all three honour."""
+    monkeypatch.setenv("SUPER_AGENT_WATCHER_LOG", str(tmp_path / "watcher.log"))
+
+
+@pytest.fixture(scope="session")
+def _nobody_listens_port() -> int:
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.fixture(autouse=True)
+def _no_real_bridge(monkeypatch, _nobody_listens_port):
+    """⛔⛔ NO TEST MAY TALK TO THE DEVELOPER'S OWN RUNNING BRIDGE (2026-09-25).
+
+    The chat client defaults to 127.0.0.1:9876, which on a developer's machine is
+    very often the REAL bridge, signed in as the real person. A test that stubbed
+    `_post` but not `_get` read the owner's live `/status` the day `login` started
+    checking it first — and a chat reply now POSTs `/signin/ack`, which TAKES the
+    live parked sign-in note and seals the live watermark. So every test starts
+    pointed at a port nothing listens on; a test that runs its own bridge sets the
+    variable itself, and monkeypatch applies in order, so its value wins."""
+    monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", str(_nobody_listens_port))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_account_session(monkeypatch, tmp_path):
     """⛔⛔ NO TEST MAY INHERIT THE DEVELOPER'S OWN SIGNED-IN ACCOUNT.
 
