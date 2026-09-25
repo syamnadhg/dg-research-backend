@@ -134,28 +134,31 @@ def test_status_account(bridge_port, capsys):
     assert "Signed in as e@x.y" in capsys.readouterr().out
 
 
-def test_status_account_no_device_nudges_pairing(bridge_port, capsys):
-    # #851 item 2: signed in but no paired device → can't run research yet, so
-    # steer to pairing instead of leaving the user at a dead end.
+def test_status_account_says_login_only_even_with_no_device(bridge_port, capsys):
+    # ⚠ RE-AIMED 2026-09-25 (owner): this pinned the OPPOSITE — #851 item 2 steered
+    # a deviceless account to pair from the status check. A login answer is about
+    # login only now: "am I signed in?" is answered with the sign-in line and
+    # nothing about computers; the no-computer screen belongs to device situations
+    # (a research with nowhere to run, add / list computers).
     FakeFS.devices = []
     assert sr.main(["status-account"]) == 0
     out = capsys.readouterr().out
-    assert "Signed in as e@x.y" in out
-    # ⛔⛔ ALL THREE THINGS, NOT JUST THE PAIR CODE. This screen used to end at
-    # "paste the access code", which is one route and it needs hardware the
-    # reader may not have. Every deviceless screen renders the same block now.
-    assert "No research computer on this account yet." in out
-    assert "access code" in out
-    assert "ask to use somebody else" in out.lower()
+    assert out.strip() == "✓ Signed in as e@x.y.", out
+    for gone in ("No research computer", "Add a computer", "access code",
+                 "superresearch.io/install", "Public computers", sr._AGENT_ONLY_MARKER):
+        assert gone not in out, (gone, out)
 
 
-def test_connected_msg_is_device_aware(bridge_port):
-    # #851 item 2: the post-sign-in confirmation depends on whether a device exists.
-    assert "all set" in sr._connected_msg("e@x.y")  # FakeFS has My PC
+def test_connected_msg_is_the_one_sign_in_line_and_never_device_aware(bridge_port):
+    # ⚠ RE-AIMED 2026-09-25 (owner): #851 made this device-aware ("— you're all
+    # set" with a computer, the add line + a public-computer offer without). It is
+    # the one sign-in line every answer opens with now, whatever the account has.
+    assert sr._connected_msg("e@x.y") == "✓ Signed in as e@x.y."   # FakeFS has My PC
     FakeFS.devices = []
-    assert "access code" in sr._connected_msg("e@x.y").lower()
-    # ⚠ 2026-09-24: and the way to GET a computer, in the same sentence (owner)
-    assert "https://superresearch.io/install" in sr._connected_msg("e@x.y")
+    assert sr._connected_msg("e@x.y") == "✓ Signed in as e@x.y."
+    # ⛔ and never "as None" — a missing email names nobody
+    assert sr._connected_msg(None) == "✓ Signed in."
+    assert sr._connected_msg("") == "✓ Signed in."
 
 
 def test_login_copy_does_not_demand_login_done():
@@ -341,6 +344,9 @@ def test_login_arms_watchdog_and_passes_origin(monkeypatch, capsys):
     posts = []
     monkeypatch.setattr(sr, "_post",
                         lambda path, body=None: posts.append((path, body)) or (200, {"verifyUrl": "https://x/c"}))
+    # ⚠ 2026-09-25: `login` asks /status first (already signed in → no new flow).
+    # Stubbed, or this test reads whatever bridge is running on the machine.
+    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (200, {"authed": False}))
     monkeypatch.setattr(sr, "_origin_from_env", lambda: {"platform": "telegram", "chat_id": "111"})
     armed = {"n": 0}
     monkeypatch.setattr(sr, "_prepare_stream_arm",

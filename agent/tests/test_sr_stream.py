@@ -56,6 +56,9 @@ def test_completion_posts_all_sr_links_once_then_dedups():
         _pu(3, "Audio Overview", [("Podcast", "https://sr.io/shared/podcast/P", True)]),
         _pu(5, "Delivery", [], final=True),
     ])]
+    # ⚠ 2026-09-25 (owner): "emailed" is said only when the run's own config has
+    # email on — this run's does (test_login_answers_login_only_0925 pins the rest).
+    runs[0]["pipelineConfig"] = {"emailEnabled": True}
     msgs, state = poll.compute(runs, {})
     blob = "\n".join(msgs)
     assert "pipeline complete" in blob and "emailed" in blob
@@ -77,6 +80,7 @@ def test_final_message_includes_sr_and_platform_links():
         _pu(4, "Video", [("YouTube", "https://youtu.be/abc", False)]),
         _pu(5, "Delivery", [("Google Doc", "https://docs.google.com/d/x", False)], final=True),
     ])]
+    runs[0]["pipelineConfig"] = {"emailEnabled": True, "skipPhases": []}  # ⚠ 2026-09-25
     blob = "\n".join(poll.compute(runs, {})[0])
     assert "pipeline complete" in blob and "emailed" in blob
     # channel-neutral label + bare URL (this is a no_agent DIRECT post — may land on
@@ -374,9 +378,12 @@ def test_signed_in_line_offers_to_continue_pending_topic():
     assert "continue" in line.lower() and "the EV battery market" in line
 
 
-def test_signed_in_line_without_topic_invites_a_topic():
+def test_signed_in_line_without_topic_is_the_sign_in_line_alone():
+    # ⚠ RE-AIMED 2026-09-25 (owner): this pinned "Just tell me what to research."
+    # after the sign-in — a second block the chat's own answer did not say. A plain
+    # sign-in is the one line every sign-in answer opens with, and nothing else.
     line = poll._signed_in_line({"email": "e@x.y", "pendingTopic": ""})
-    assert "Signed in as e@x.y" in line and "what to research" in line.lower()
+    assert line == "✓ Signed in as e@x.y.", line
 
 
 def test_signed_in_line_announces_an_auto_started_run():
@@ -651,6 +658,39 @@ def test_tick_unauthed_persists_a_signed_in_watchdog(monkeypatch, tmp_path):
         poll._tick_unauthed(origin, sf)
     assert "o" not in torn  # signed-in watchdog persists through sustained 401s
     assert "__login_wait__" not in json.loads(sf.read_text("utf-8"))  # counter never started
+
+
+def test_a_logout_never_removes_a_watcher_that_only_ever_saw_quiet_200s(monkeypatch, tmp_path):
+    """⛔⛔ OWNER DECISION 3 (2026-09-25): a logout keeps the watcher; only `agent
+    disconnect` removes it. A chat reply's `/signin/ack` can take the sign-in note
+    before the watcher reads it, so a signed-in chat with no runs gets 200s that
+    carry nothing — and those used to leave the state file `{}`. The logout's 401s
+    then counted to `_LOGIN_WAIT_LIMIT` and `_teardown` deleted the chat's cron row
+    (reproduced on the real `main()` before the fix: teardown on tick 19)."""
+    origin = {"platform": "telegram", "chat_id": "123"}
+    sf = tmp_path / "st.json"
+    monkeypatch.setattr(poll, "_state_path", lambda o: sf)
+    torn = []
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.append(o))
+    mode = {"authed": False}
+
+    def _fetch(o=None):
+        if not mode["authed"]:
+            raise poll.urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        return ([], None, None, None, None)     # signed in; the ack took the note
+
+    monkeypatch.setattr(poll, "_get_updates", _fetch)
+    for _ in range(3):                          # the listener, before the sign-in
+        poll.main(origin)
+    mode["authed"] = True
+    for _ in range(2):
+        poll.main(origin)
+    assert json.loads(sf.read_text("utf-8")).get("__authed__") == 1
+    mode["authed"] = False                      # logged out
+    for _ in range(poll._LOGIN_WAIT_LIMIT + 5):
+        poll.main(origin)
+    assert torn == [], "a logout removed the chat's watcher"
+    assert "__login_wait__" not in json.loads(sf.read_text("utf-8"))
 
 
 def test_main_authed_tick_clears_login_wait(monkeypatch, tmp_path):

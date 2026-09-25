@@ -11,20 +11,23 @@ what is NEW since the last tick. It is deliberately QUIET: it does NOT narrate
 per-phase progress. The only things it posts on its own are:
 
   • ONE completion message when a run finishes — the 🎉 banner + every phase's
-    permanent, non-revocable Super Research link (Brief, the three Deep-Research
-    reports, the Podcast) + "results have been emailed". Platform links
-    (NotebookLM / YouTube / final Google Doc) are never sent (revocable / not
-    openable when signed out),
+    link (the permanent 🔒 Super Research links and the 🔗 platform links), plus
+    "results have been emailed" ONLY when that run's pipeline had email on,
   • a run that needs the user (login / verification / a snag / an error), with how
     to act from chat ("retry" / "skip"),
-  • a run that was stopped / cancelled (from chat or the web app).
+  • a run that was stopped / cancelled (from chat or the web app),
+  • and the one-shot notes the bridge parks for this chat: a sign-in, a public
+    computer's owner saying yes, and a support bundle landing — or not yet.
 
 Per-phase progress + the links available SO FAR are ON-DEMAND only: the user asks
 "status" and sr.py returns the current phase + each finished phase's SR link. The
-watchdog never pushes those — so the chat isn't spammed phase by phase.
+watchdog never pushes those — so the chat isn't spammed phase by phase, and no
+line it prints may promise otherwise.
 
 It prints NOTHING when there's nothing new — the `no_agent` contract treats empty
-stdout as silent, so the user is never spammed. State lives in a sibling file so
+stdout as silent, so the user is never spammed. ⛔ AND IT PRINTS NOTHING BUT THE
+MESSAGE: the runtime delivers stdout word for word, so its own record goes to a
+FILE (`_log`, ~/.super-agent/watcher.log). State lives in a sibling file so
 de-dup (which phases were already seen, whether the completion was posted) survives
 across the fresh, contextless cron sessions. Stdlib only, loopback only (same
 contract as sr.py); it never touches Firestore, tokens, or the network.
@@ -64,6 +67,45 @@ _STATE_FILE = Path(__file__).with_name(".sr_stream_state.json")
 # window doesn't replay a stale 🎉, but a run that finished just before the first
 # tick (watchdog armed late — e.g. after an update/restart) still gets announced.
 _RECENT_COMPLETION_MS = 6 * 3600 * 1000  # 6h
+
+# ⭐⭐ THE WATCHER KEEPS ITS OWN RECORD, IN A FILE (owner, 2026-09-25). On
+# 2026-09-24 a "✓ Signed in" was delivered after the person had logged out, and
+# nothing on our side could say when this script had printed it or from which
+# note — the only timings came from the runtime's databases. Every line it prints
+# is now logged with the time and the note it came from.
+# ⛔⛔ NEVER STDOUT, AND NEVER STDERR: the runtime posts stdout into the chat word
+# for word, so a log line there IS a chat message. `SUPER_AGENT_WATCHER_LOG`
+# points it elsewhere (the test suite does). MUST match sr._watcher_log_path.
+_LOG_MAX_BYTES = 512 * 1024
+
+
+def _log_path() -> Path:
+    raw = (os.environ.get("SUPER_AGENT_WATCHER_LOG") or "").strip()
+    return Path(raw) if raw else Path.home() / ".super-agent" / "watcher.log"
+
+
+def _mask_emails(text: str) -> str:
+    """`a***@example.com`, the way bridge.log names an account."""
+    return re.sub(r"([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@", r"\1***@", text)
+
+
+def _log(msg: str) -> None:
+    """Append one line to the watcher's log (rotated once past `_LOG_MAX_BYTES`).
+    Never raises, never prints."""
+    try:
+        path = _log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if path.stat().st_size > _LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+        except OSError:
+            pass
+        stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        with open(path, "ab") as fh:
+            fh.write(f"{stamp} watcher[{os.getpid()}] {_mask_emails(msg)}\n"
+                     .encode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — diagnostics must never cost the message
+        pass
 
 
 def _now_ms() -> float:
@@ -138,7 +180,8 @@ def _state_path(origin: dict | None) -> Path:
 
 
 def _get_updates(origin: dict | None = None) -> tuple:
-    """``(runs, signedIn, deviceAccess)`` from the bridge.
+    """``(runs, signedIn, deviceAccess, supportLogs, supportLogsLate)`` from the
+    bridge.
 
     ``signedIn`` is the one-shot "just signed in" event (or None) the bridge
     delivers once after a remote-login capture — so an armed watchdog announces
@@ -167,10 +210,21 @@ def _get_updates(origin: dict | None = None) -> tuple:
     si = body.get("signedIn")
     da = body.get("deviceAccess")
     sl = body.get("supportLogs")
+    # ⭐ `supportLogsLate` (owner, 2026-09-25): a bundle with still no answer past
+    # the bridge's watch, said ONCE — a separate key because a watcher that does
+    # not know it would read any `supportLogs` as "✓ Support has the logs".
+    late = body.get("supportLogsLate")
     return (body.get("runs", []),
             (si if isinstance(si, dict) else None),
             (da if isinstance(da, dict) else None),
-            (sl if isinstance(sl, dict) else None))
+            (sl if isinstance(sl, dict) else None),
+            (late if isinstance(late, dict) else None))
+
+
+# ⭐ THE ONE PROMISE THIS SCRIPT KEEPS, in the words every auto-start line uses
+# (owner, 2026-09-25): it speaks when a run finishes or needs the person, and at
+# no other point in between.
+_TELL_WHEN = "I'll tell you here when it finishes or needs you."
 
 
 def _device_access_line(ev: dict) -> str:
@@ -196,12 +250,13 @@ def _device_access_line(ev: dict) -> str:
     if not topic:
         return head
     if ev.get("autoStarted"):
+        # ⛔ "I'LL POST PROGRESS HERE AS EACH PHASE FINISHES" WAS A PROMISE THIS
+        # SCRIPT NEVER KEEPS (owner, 2026-09-25): it is quiet by design and says
+        # only that a run finished or needs somebody. `_TELL_WHEN` says exactly that.
         if ev.get("online") is False:
             return (f"{head}\n\n{quoted} is queued on it — it's switched off, so "
-                    "it starts when it comes on. I'll post progress here as each "
-                    "phase finishes.")
-        return (f"{head}\n\nStarting {quoted} on it now — I'll post progress here "
-                "as each phase finishes.")
+                    f"it starts when it comes on. {_TELL_WHEN}")
+        return f"{head}\n\nStarting {quoted} on it now — {_TELL_WHEN}"
     return (f"{head}\n\nI'm still holding {quoted} for you, but {name} isn't ready "
             "to take work yet. Say the word and I'll try it again.")
 
@@ -233,6 +288,32 @@ def _support_log_line(ev: dict) -> str:
         line += f" Quote both {code} and {other} (the agent's own log)."
     else:
         line += " Quote it when you report the problem."
+    return line
+
+
+def _support_log_late_line(ev: dict) -> str:
+    """What to say when a support bundle has STILL not landed past the bridge's
+    watch (`supportLogsLate`, owner 2026-09-25).
+
+    ⛔⛔ THE WATCH USED TO END IN SILENCE. A person told "asked" never heard
+    anything again — no arrival, no failure, nothing — because the bridge simply
+    stopped looking after thirty minutes. It says so once now, and says how to
+    look again, because the bridge will not."""
+    code = str(ev.get("code") or "").strip()
+    if not code:
+        return ""
+    name = str(ev.get("deviceName") or "that computer").strip() or "that computer"
+    try:
+        minutes = max(1, int(ev.get("ageSeconds") or 0) // 60)
+    except (TypeError, ValueError):
+        minutes = 0
+    since = f" — it's been {minutes} minutes" if minutes else ""
+    line = (f"No answer yet from {name} about the logs for {code}{since}. "
+            f"Ask me to check on {code} whenever you like.")
+    other = str(ev.get("agentLogCode") or "").strip()
+    if other:
+        line += (f" The agent's own log did go — quote {other} when you report "
+                 "the problem.")
     return line
 
 
@@ -406,13 +487,33 @@ def _title(run: dict) -> str:
     return t if len(t) <= 60 else t[:60].rstrip() + "…"
 
 
+def _emailed(run: dict) -> bool:
+    """Whether this run's results were emailed: its pipeline config has P5 on.
+
+    ⛔⛔ "RESULTS HAVE BEEN EMAILED" WAS SAID OF EVERY RUN (owner, 2026-09-25),
+    including runs whose email phase was switched off in the app or skipped from
+    chat. It is said now only when the run's own config says email ran — and a
+    run with no config at all is NOT assumed to have emailed: a claim we cannot
+    back is left out. Same reading as sr.py `_fmt_pipeline_config` (P5 Email)."""
+    cfg = run.get("pipelineConfig")
+    if not isinstance(cfg, dict) or not cfg:
+        return False
+    for key in ("skippedPhases", "skipPhases"):
+        v = cfg.get(key)
+        if isinstance(v, list) and 5 in v:
+            return False
+    return cfg.get("emailEnabled", True) is not False
+
+
 def _final_lines(run: dict) -> list[str]:
     """The single end-of-run message: the pipeline-complete banner + EVERY phase's
     link, gathered across all phaseUpdates, de-duped, in phase order — the SR
     permanent links (🔒: Brief, the three reports, the Super Research and Summary
     documents, the Podcast) AND the real platform
-    links (🔗: NotebookLM, YouTube, the Google Doc). Results were also emailed."""
-    lines = [f"🎉 “{_title(run)}” · pipeline complete — results have been emailed."]
+    links (🔗: NotebookLM, YouTube, the Google Doc). "Results have been emailed"
+    only when the run emailed them (`_emailed`)."""
+    lines = [f"🎉 “{_title(run)}” · pipeline complete"
+             + (" — results have been emailed." if _emailed(run) else ".")]
     seen: set[str] = set()
     for pu in run.get("phaseUpdates", []) or []:
         for lk in pu.get("links", []) or []:
@@ -578,8 +679,16 @@ def _signed_in_line(signed_in: dict) -> str:
     add line with the install page in it, then the public computers. Only
     when the bridge couldn't auto-start (older bridge / ambiguous device) does it
     fall back to OFFERING to continue ("reply yes"). With no pending research it
-    just confirms the connection."""
-    who = signed_in.get("email") or "your account"
+    just confirms the sign-in.
+
+    ⭐⭐ ONE FIRST LINE, EVERYWHERE (owner, 2026-09-25): "✓ Signed in as <email>." —
+    the same line `login-done` and `status-account` print (sr.py `_connected_msg`),
+    and for a plain sign-in the WHOLE message. On 2026-09-24 this said "✓ Signed
+    in as X. Just tell me what to research." while the chat's own answer said
+    "Add a computer …", about the same sign-in, 34 s apart. Device content stays
+    only where a waiting topic has nowhere to run — a device situation."""
+    who = str(signed_in.get("email") or "").strip()
+    first = f"✓ Signed in{(' as ' + who) if who else ''}."
     # Full topic (bounded to 500 chars at ingest), never a truncated preview.
     topic = (signed_in.get("topic") or signed_in.get("pendingTopic") or "").strip()
     quoted = f"“{topic}”" if topic else "your research"
@@ -594,13 +703,15 @@ def _signed_in_line(signed_in: dict) -> str:
         # its own falsehood.
         if dev and signed_in.get("deviceOnline") is False:
             return (
-                f"✓ Signed in.\n\n"
+                f"{first}\n\n"
                 f"{quoted} is queued on {dev} — it's switched off, so it starts when "
-                f"it comes on. I'll post progress here as each phase finishes."
+                f"it comes on. {_TELL_WHEN}"
             )
+        # ⛔ "I'LL POST PROGRESS HERE AS EACH PHASE FINISHES" was never kept — this
+        # script is quiet by design (owner, 2026-09-25); `_TELL_WHEN` is what it does.
         return (
-            f"✓ Signed in.\n\n"
-            f"Starting {quoted}{on_dev} now — I'll post progress here as each phase finishes."
+            f"{first}\n\n"
+            f"Starting {quoted}{on_dev} now — {_TELL_WHEN}"
         )
     if signed_in.get("needsDevice"):
         # ⭐⭐ TWO NAMED SECTIONS, "ADD A COMPUTER" FIRST — THE SAME TWO NOUNS AND THE
@@ -644,9 +755,11 @@ def _signed_in_line(signed_in: dict) -> str:
         # ⛔ THE PUBLIC PARAGRAPH SAYS WHAT THE CHAT INVITE SAYS (owner, 2026-09-24:
         # "same order and facts"). It had dropped "Once the request is accepted you
         # can use that computer" — the one sentence that says what asking GETS you.
-        # ⭐ And now nothing differs: the last sentence is the chat invite's too.
+        # ⭐ And the last sentences are the chat invite's too — minus its first,
+        # "Tell me which one to ask for.", which answers a LIST and this paragraph
+        # shows none (owner, 2026-09-25).
         return (
-            f"✓ Signed in as {who}.\n\n"
+            f"{first}\n\n"
             f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
             f"Add a computer: set one up at https://superresearch.io/install, then "
             f"send me the 8-character access code the computer shows (or one a "
@@ -655,9 +768,8 @@ def _signed_in_line(signed_in: dict) -> str:
             f"(or enter it in the web app: superresearch.io → Account → Pipeline "
             f"Connection)\n\n"
             f"Public computers — ask to use somebody else's. Ask me for the "
-            f"public computers and I'll list the ones on offer. Tell me which one "
-            f"to ask for. Once the request is accepted you can use that computer. "
-            f"They see your name."
+            f"public computers and I'll list the ones on offer. Once the request "
+            f"is accepted you can use that computer. They see your name."
         )
     if signed_in.get("needsDeviceChoice"):
         # Several usable computers and none obvious. NAME them and ask — the one
@@ -676,7 +788,7 @@ def _signed_in_line(signed_in: dict) -> str:
         # "that computer"'. Found by its own test. With nothing to name, offer to
         # start it: the run path asks which computer for real, from a live list.
         if not devs:
-            return (f"✓ Signed in as {who}.\n\n"
+            return (f"{first}\n\n"
                     f"Tell me to start {quoted} and I'll ask which computer to use.")
         rows = []
         for d in devs:
@@ -690,18 +802,20 @@ def _signed_in_line(signed_in: dict) -> str:
         # a different explanation depending which door they came through.
         why = ("The computer you last used isn’t reachable anymore, so "
                if signed_in.get("staleSelection") else "")
-        head = (f"✓ Signed in as {who}.\n\n"
+        head = (f"{first}\n\n"
                 f"{why}you have {len(devs)} research computers — which should run "
                 f"{quoted}?" if why else
-                f"✓ Signed in as {who}.\n\n"
+                f"{first}\n\n"
                 f"You have {len(devs)} research computers — which should run "
                 f"{quoted}?")
         return f"{head}\n{listed}\nJust say: use “{_dev_name(devs[0])}”."
     # Fallback: the bridge hit an ERROR and we do not know what happened — OFFER to
     # continue (legacy handoff). This is now the ONLY case that reaches "reply yes".
     if (signed_in.get("pendingTopic") or "").strip():
-        return f"✓ Signed in as {who}.\n\nContinue with “{topic}”? Reply “yes” to start."
-    return f"✓ Signed in as {who}.\n\nJust tell me what to research."
+        return f"{first}\n\nContinue with “{topic}”? Reply “yes” to start."
+    # ⛔ AND NOTHING AFTER IT FOR A PLAIN SIGN-IN — not "Just tell me what to
+    # research", which the chat's own answer did not say (owner, 2026-09-25).
+    return first
 
 
 def _tick_unauthed(origin: dict | None, state_file: Path) -> int:
@@ -715,26 +829,53 @@ def _tick_unauthed(origin: dict | None, state_file: Path) -> int:
 
     The bounded give-up is ONLY for a genuine PRE-sign-in listener. A watchdog that
     was ALREADY signed in (a run tracked in state, or a sign-in event seen) must
-    PERSIST through a 401 — auth was lost mid-life (a web-app logout, a token that
-    can't refresh, a revoked session), NOT "never signed in". Tearing it down here
+    PERSIST through a 401 — auth was lost mid-life (a web-app logout, a chat
+    `logout` — which since 2026-09-25 leaves this watcher in place on purpose
+    (owner) — a token that can't refresh, a revoked session), NOT "never signed
+    in". Tearing it down here
     would drop the 🎉 for a run that completes during the outage; instead stay silent
     + alive (a 200 tick resumes streaming, and a genuine revoke re-arms on the next
     research). A revoked idle watchdog then just polls silently — the same cost as
-    any idle persistent watchdog — until `agent disconnect`."""
+    any idle persistent watchdog — until `agent disconnect`.
+
+    ⛔⛔ `__authed__` IS THE EVIDENCE, not only the sign-in note or a run
+    (2026-09-25). Since `/signin/ack` a chat reply (`login-done`, `status-account`,
+    an already-signed-in `login`) can take the note before this watcher reads it,
+    so a watcher that only ever saw 200s with no runs kept NO trace of them — and
+    after a logout its 401s counted up to the give-up and deleted the chat's cron
+    row, the teardown owner decision 3 forbids. Every 200 tick stamps `__authed__`."""
     if not origin:
         return 0
     prior = _load_state(state_file) or {}
-    signed_in_before = ("__signed_in_ts__" in prior
+    signed_in_before = ("__signed_in_ts__" in prior or "__authed__" in prior
                         or any(not str(k).startswith("__") for k in prior))
     if signed_in_before:
         return 0  # persist — never tear down a watchdog that was streaming
     waited = int(prior.get("__login_wait__", 0) or 0) + 1
     if waited > _LOGIN_WAIT_LIMIT:
+        _log(f"{_origin_slug(origin)}: never signed in after {waited - 1} ticks — "
+             "removing this listener's cron row")
         _teardown(origin)
         return 0
     prior["__login_wait__"] = waited
     _save_state(prior, state_file)
     return 0
+
+
+def _note_fetch(state_file: Path, slug: str, outcome: str) -> None:
+    """Log the bridge read's outcome only when it CHANGES (ok → http-401 →
+    failed → ok …), so a signed-out or bridge-down stretch is one line, not one a
+    minute. The last bad outcome rides in the state file under a reserved key
+    (`__fetch__`) — no new file for `agent disconnect` to miss — and a good tick
+    drops it simply by not copying it forward (compute() rebuilds the state)."""
+    prior = _load_state(state_file) or {}
+    before = str(prior.get("__fetch__") or "ok")
+    if before == outcome:
+        return
+    _log(f"{slug}: bridge read {before} → {outcome}")
+    if outcome != "ok":
+        prior["__fetch__"] = outcome
+        _save_state(prior, state_file)
 
 
 def main(origin: dict | None = None) -> int:
@@ -746,40 +887,52 @@ def main(origin: dict | None = None) -> int:
     except Exception:
         pass
     state_file = _state_path(origin)
+    slug = _origin_slug(origin) if origin else "account-wide"
     try:
         fetched = _get_updates(origin)
     except urllib.error.HTTPError as e:
         # 401 = a login-listener armed before the user signed in: wait quietly.
+        # ⭐ AND SIGNED OUT: a logout leaves this watcher in place (owner,
+        # 2026-09-25 — only `agent disconnect` removes it), and a 401 is how it
+        # stays silent until the next sign-in.
         # Any other HTTP error → silent (a non-zero exit would trip the cron error
         # alert every minute while the host bridge is off).
+        _note_fetch(state_file, slug, f"http-{getattr(e, 'code', '?')}")
         if getattr(e, "code", None) == 401:
             return _tick_unauthed(origin, state_file)
         return 0
-    except Exception:
+    except Exception as e:  # noqa: BLE001 — see below
         # ANY other fetch failure must stay silent + rc 0. This is a persistent cron
         # (it now ticks forever until `agent disconnect`), and a non-zero exit trips
         # Hermes's per-minute cron-error alert EVERY tick. Covers the common
         # bridge-down modes (URLError / OSError / timeout) AND a malformed/truncated
         # loopback response — http.client.BadStatusLine / IncompleteRead subclass
         # HTTPException, NOT OSError, so a narrow tuple would let them escape.
+        _note_fetch(state_file, slug, f"failed ({type(e).__name__})")
         return 0
-    # Back-compat unpack: the real fetch returns (runs, signedIn, deviceAccess);
-    # a test/monkeypatch or an older shim may hand back a 2-tuple or just the runs
-    # list. ⛔ THE OLD 2-TUPLE FORM STILL WORKS — a shim generated by a previous
-    # version is on disk in every chat that ever armed one, and this file is
-    # deployed by `connect`/`update` rather than by `pip install`, so the two
-    # versions genuinely coexist.
-    device_access = support_logs = None
+    _note_fetch(state_file, slug, "ok")
+    # Back-compat unpack: the real fetch returns (runs, signedIn, deviceAccess,
+    # supportLogs, supportLogsLate); a test/monkeypatch or an older shim may hand
+    # back a shorter tuple or just the runs list. ⛔ THE OLD 2-TUPLE FORM STILL
+    # WORKS — a shim generated by a previous version is on disk in every chat that
+    # ever armed one, and this file is deployed by `connect`/`update` rather than
+    # by `pip install`, so the two versions genuinely coexist.
+    device_access = support_logs = support_late = None
     if isinstance(fetched, tuple):
         runs, signed_in = fetched[0], (fetched[1] if len(fetched) > 1 else None)
         device_access = fetched[2] if len(fetched) > 2 else None
         support_logs = fetched[3] if len(fetched) > 3 else None
+        support_late = fetched[4] if len(fetched) > 4 else None
     else:
         runs, signed_in = fetched, None
     prior = _load_state(state_file)
     pdict = prior or {}
 
     out: list[str] = []
+    # ⭐ WHAT EACH PRINTED BLOCK CAME FROM, for the log (owner, 2026-09-25) —
+    # written only AFTER the print, so the log never claims a message that did
+    # not go out.
+    said: "list[str]" = []
     # Proactive "signed in" announce — one-shot. The bridge already clears it after
     # one delivery; __signed_in_ts__ is a belt-and-suspenders de-dup across ticks.
     announced_login = False
@@ -805,6 +958,10 @@ def main(origin: dict | None = None) -> int:
         si_key = new_ts if new_ts else "line:" + _signed_in_line(signed_in)[:200]
         if si_key != si_ts:
             out.append(_signed_in_line(signed_in))
+            kind = next((k for k in ("autoStarted", "needsDevice", "needsDeviceChoice")
+                         if signed_in.get(k)), "topic" if (signed_in.get("pendingTopic")
+                                                           or "").strip() else "plain")
+            said.append(f"sign-in note ts={new_ts} ({kind})")
             announced_login = True
             si_ts = si_key
 
@@ -826,6 +983,7 @@ def main(origin: dict | None = None) -> int:
         key = "dev:" + str(device_access.get("deviceId") or "") + ":" + line[:120]
         if line and key != da_key:
             out.append(line)
+            said.append(f"device access device={device_access.get('deviceId') or '?'}")
             da_key = key
 
     # ⭐⭐ AND THE LOGS THEY SENT ACTUALLY ARRIVED. The send can only ever say
@@ -838,7 +996,22 @@ def main(origin: dict | None = None) -> int:
         key = "log:" + str(support_logs.get("code") or "")
         if line and key != sl_key:
             out.append(line)
+            said.append(f"support logs code={support_logs.get('code')} "
+                        f"status={support_logs.get('status') or 'done'}")
             sl_key = key
+
+    # ⭐ AND WHEN THEY STILL HAVE NOT (owner, 2026-09-25): past its watch the bridge
+    # says so ONCE under its own key, and stops looking — so this is the last word
+    # the chat gets unprompted, and it says how to look again.
+    late_key = pdict.get("__support_logs_late__")
+    if isinstance(support_late, dict) and support_late:
+        line = _support_log_late_line(support_late)
+        key = "late:" + str(support_late.get("code") or "")
+        if line and key != late_key:
+            out.append(line)
+            said.append(f"support logs code={support_late.get('code')} still no answer "
+                        f"after {support_late.get('ageSeconds')}s")
+            late_key = key
 
     # Baseline = we've never recorded this chat's RUNS before. A state file that
     # holds only reserved keys (e.g. __login_wait__ written by unauthed login-wait
@@ -851,6 +1024,9 @@ def main(origin: dict | None = None) -> int:
     run_lines, new_state = compute(runs, pdict, baseline=not seen_runs_before,
                                    suppress_replay=announced_login)
     out += run_lines
+    # (a completion's link rows are indented — the banner above them names it)
+    said += [f"run: {ln.splitlines()[0][:80]}" for ln in run_lines
+             if ln and not ln.startswith(" ")]
     # compute() rebuilds new_state from runs only, so re-stamp the de-dup key (and
     # drop __login_wait__ now that we're authed).
     if si_ts is not None:
@@ -862,6 +1038,16 @@ def main(origin: dict | None = None) -> int:
         new_state["__device_access__"] = da_key
     if sl_key is not None:
         new_state["__support_logs__"] = sl_key
+    if late_key is not None:
+        new_state["__support_logs_late__"] = late_key
+    # ⭐ AND THAT THIS WATCHER WAS SIGNED IN AT ALL (owner decision 3, 2026-09-25):
+    # the only record `_tick_unauthed` can trust once a chat reply may have taken
+    # the sign-in note first. Without it a signed-in chat with no runs saved `{}`,
+    # and its first 19 signed-out ticks removed the watcher a logout must keep.
+    if "__authed__" not in pdict:
+        _log(f"{slug}: first signed-in tick — this watcher now stays through a "
+             "sign-out")
+    new_state["__authed__"] = 1
 
     # ⛔ SPEAK FIRST, THEN COMMIT. This was the other way round, which is the exact
     # shape FORK.md §4.2 records as learned the hard way about the holding-pen
@@ -872,6 +1058,9 @@ def main(origin: dict | None = None) -> int:
     # repeat is what `__signed_in_ts__` and compute()'s per-run bookkeeping are for.
     if out:
         print("\n".join(out))
+        # ⛔ STDOUT IS THE MESSAGE; this goes to the watcher's FILE (`_log`).
+        for what in said:
+            _log(f"{slug}: printed {what}")
     _save_state(new_state, state_file)
 
     # Persistent watchdog: once armed it NEVER self-removes. It ticks silently

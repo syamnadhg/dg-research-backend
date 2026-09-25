@@ -255,12 +255,18 @@ MUTANTS = [
     ("F3", BRIDGE, "under",
      "the flag never crosses the wire, so every client falls back to \"reply "
      "yes\" no matter what the bridge decided",
-     [('                            "needsDeviceChoice": bool(ev.get("needsDeviceChoice")),',
-       '                            "needsDeviceChoice": False,')]),
+     # ⭐ RE-AIMED 2026-09-25: the /updates wire dict moved, verbatim, into
+     # `_signed_in_payload` — ONE builder for /updates and POST /signin/ack —
+     # so the anchor follows it there. Same field, same defect.
+     [('        "needsDeviceChoice": bool(ev.get("needsDeviceChoice")),',
+       '        "needsDeviceChoice": False,')]),
     ("F4", BRIDGE, "under",
      "the devices never cross the wire, so the ask arrives with nothing to name",
-     [('                            "devices": ev.get("devices") or [],',
-       '                            "devices": [],')]),
+     # ⭐ RE-AIMED 2026-09-25: the /updates wire dict moved, verbatim, into
+     # `_signed_in_payload` — ONE builder for /updates and POST /signin/ack —
+     # so the anchor follows it there. Same field, same defect.
+     [('        "devices": ev.get("devices") or [],',
+       '        "devices": [],')]),
     ("F5", BRIDGE, "over",
      "⛔ the \"reply yes\" offer rides along WITH the pick-one ask, so the "
      "person is asked two different questions in one breath and can answer the "
@@ -287,7 +293,9 @@ MUTANTS = [
      "the empty-list guard goes, so an older bridge's bare flag renders \"You "
      "have 0 research computers\" and invites the person to use a machine called "
      "\"that computer\"",
-     [('        if not devs:\n            return (f"✓ Signed in as {who}.\\n\\n"\n                    f"Tell me to start {quoted} and I\'ll ask which computer to use.")',
+     # ⭐ RE-AIMED 2026-09-25: the sign-in line is one variable (`first`, the same
+     # line login-done prints — owner). Same guard, same defect.
+     [('        if not devs:\n            return (f"{first}\\n\\n"\n                    f"Tell me to start {quoted} and I\'ll ask which computer to use.")',
        '        if False:\n            pass')]),
     ("F10", POLL, "under",
      "the watchdog's name fallback loses the hostname rung, so a machine with no "
@@ -315,8 +323,14 @@ MUTANTS = [
      "⛔⛔ back to committing the cursor before speaking. A tick that dies "
      "between the two leaves a state file claiming the announce was delivered "
      "and no announce anywhere — and the bridge has already handed it over",
-     [('    if out:\n        print("\\n".join(out))\n    _save_state(new_state, state_file)',
-       '    _save_state(new_state, state_file)\n    if out:\n        print("\\n".join(out))')]),
+     # ⭐ RE-AIMED 2026-09-25: the print is followed by the watcher's FILE log of
+     # what it printed (owner), so the anchor spans it. Same defect: commit first.
+     [('    if out:\n        print("\\n".join(out))\n'
+       '        # ⛔ STDOUT IS THE MESSAGE; this goes to the watcher\'s FILE (`_log`).\n'
+       '        for what in said:\n            _log(f"{slug}: printed {what}")\n'
+       '    _save_state(new_state, state_file)',
+       '    _save_state(new_state, state_file)\n    if out:\n        print("\\n".join(out))\n'
+       '        for what in said:\n            _log(f"{slug}: printed {what}")')]),
 
     # ═══════════ T — a second chat may not take the first one's research ════
     ("T1", BRIDGE, "under",

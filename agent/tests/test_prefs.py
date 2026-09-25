@@ -144,3 +144,42 @@ def test_set_label_if_unset_seeds_default_but_never_clobbers(monkeypatch, tmp_pa
     prefs.save({**prefs.load(), "agentLabel": ""})
     assert prefs.set_label_if_unset("Rocky") is True
     assert prefs.get_label() == "Rocky"
+
+
+def test_a_reader_and_a_writer_never_lose_to_each_other(monkeypatch, tmp_path):
+    """⛔⛔ WINDOWS IS PRODUCTION (measured 2026-09-25): with a thread reading
+    prefs.json while another saved it, 576 reads and 879 replaces failed with
+    PermissionError in three seconds — the reader saw `{}` (a parked note briefly
+    "did not exist") and the writer's change was LOST. The news peek reads this
+    file every few seconds, which turned a rare collision into a likely one. Both
+    sides retry now. Trivially green on POSIX; the point is the Windows run."""
+    import threading
+    import time
+
+    _isolate(monkeypatch, tmp_path)
+    prefs.save({"n": 0})
+    stop = time.time() + 1.0
+    seen_empty: list = []
+    write_errors: list = []
+
+    def reader():
+        while time.time() < stop:
+            if prefs.load() == {}:
+                seen_empty.append(1)
+
+    def writer():
+        i = 0
+        while time.time() < stop:
+            i += 1
+            try:
+                prefs.save({"n": i})
+            except OSError as e:
+                write_errors.append(type(e).__name__)
+
+    ts = [threading.Thread(target=reader), threading.Thread(target=writer)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not seen_empty, f"a reader saw an empty prefs file {len(seen_empty)} time(s)"
+    assert not write_errors, write_errors

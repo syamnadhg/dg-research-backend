@@ -62,7 +62,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
-from . import __version__, config, devicelogin, prefs, runview, selfupdate
+from . import __version__, config, devicelogin, prefs, push, runview, selfupdate
 from .devicelogin import DeviceLoginError
 from .firestore_rest import (
     FirestoreError,
@@ -111,45 +111,57 @@ _SUPPORT_CODE_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{8}$")
 # this host to correlate it with, and `--status` could only recite "it may still
 # be packaging it, or may not have picked the request up" forever.
 #
-# ⛔ IN MEMORY, AND THAT IS THE DELIBERATE SMALL VERSION. Parking it in prefs.json
-# would survive a bridge restart, but prefs is a file other code loads wholesale
-# and every account-bearing key in it is uid-paired by hand; a new shape there
-# needs its own cap, prune and uid tests. A restart here simply degrades to the
-# old wording, which is the same way `ageSeconds` degrades and is already
-# accepted. Each record carries its uid anyway — this host re-logs in as
-# different accounts, and a stale record would otherwise answer a new session
-# with the PREVIOUS account's device name.
-_LOG_REQUESTS: "dict[str, dict[str, Any]]" = {}
-_LOG_REQUESTS_MAX = 20
-_LOG_REQUESTS_LOCK = threading.Lock()
+# ⛔⛔ ON DISK NOW, AND IT WAS "IN MEMORY, THE DELIBERATE SMALL VERSION" (owner,
+# 2026-09-25). Memory meant a bridge restart silently dropped the one proactive
+# message that says the logs arrived — and a restart inside a packaging wait is
+# the ordinary case. The store is `prefs.put_log_request` / `get_log_requests`:
+# bounded, uid-bound per record, expired read-side after a day. Each record still
+# carries its uid — this host re-logs in as different accounts, and a stale record
+# would otherwise answer a new session with the PREVIOUS account's device name.
 
 # ⛔ LONGER THAN PACKAGING TAKES, SHORTER THAN A PERSON'S PATIENCE. Past this a
 # bundle with no row is worth a WARNING in its own right: the 2026-09-20 episode
 # ran seventeen minutes and produced none.
 _BUNDLE_LATE_SECONDS = 300
 
-# ⛔ HOW LONG THE WATCHDOG KEEPS AN EYE ON A BUNDLE. Long enough to cover a slow
-# machine and a big archive; short enough that a machine which is never going to
-# answer stops costing a Firestore read a minute. Past this the person still has
-# the code and `--status` still works — only the unprompted notice lapses.
+# ⛔ HOW LONG THE WATCHDOG WAITS FOR A BUNDLE BEFORE SAYING "NO ANSWER YET". Long
+# enough to cover a slow machine and a big archive. ⛔⛔ AND IT NO LONGER ENDS IN
+# SILENCE (owner, 2026-09-25): the record used to be dropped here without a word,
+# so a person who was told "asked" never heard anything again. Past this the chat
+# is told ONCE that there is no answer yet (`supportLogsLate`), and then the watch
+# stops — the person still has the code and `--status` still works.
 _BUNDLE_WATCH_SECONDS = 1800
 
 
 def _remember_log_request(code: str, record: "dict[str, Any]") -> None:
-    with _LOG_REQUESTS_LOCK:
-        _LOG_REQUESTS[code] = record
-        # ⛔ BOUNDED, OLDEST OUT FIRST. A diagnostic memory, not a store.
-        while len(_LOG_REQUESTS) > _LOG_REQUESTS_MAX:
-            _LOG_REQUESTS.pop(next(iter(_LOG_REQUESTS)))
+    """Park one support-log request (never fatal — a courtesy record)."""
+    try:
+        prefs.put_log_request(code, record)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not remember support-log request %s (%s)", code,
+                    type(e).__name__)
 
 
 def _recall_log_request(code: str, uid: str) -> "dict[str, Any] | None":
     """The record for ``code``, but ONLY if it belongs to the live session."""
-    with _LOG_REQUESTS_LOCK:
-        rec = _LOG_REQUESTS.get(code)
-    if rec is None or rec.get("uid") != uid:
+    try:
+        return prefs.get_log_request(code, uid)
+    except Exception:  # noqa: BLE001 — a diagnostic extra, never fatal
         return None
-    return dict(rec)
+
+
+def _log_request_open(code: str, uid: str) -> bool:
+    """A support-log request that still exists and has not been announced."""
+    rec = _recall_log_request(code, uid)
+    return isinstance(rec, dict) and not rec.get("announced")
+
+
+def _mark_log_request(code: str, uid: str, fields: "dict[str, Any]") -> None:
+    try:
+        prefs.update_log_request(code, uid, fields)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not update support-log request %s (%s)", code,
+                    type(e).__name__)
 
 # ⛔⛔ THE ONLY DEVICE COMMAND THIS BRIDGE MAY EVER WRITE FOR LOGS, and the
 # reason is the whole shape of this feature on a fleet box.
@@ -297,6 +309,14 @@ def _same_origin(a: Any, b: Any) -> bool:
         return False
     return (ca["platform"].lower() == cb["platform"].lower()
             and ca["chat_id"] == cb["chat_id"])
+
+
+def _scope_label(origin: Any) -> str:
+    """How a log line names the chat a note is for: the SAME slug the chat's
+    watcher job is named by (`sr-stream-<slug>`), never the raw chat id — a chat
+    id is a personal identifier and bridge.log is uploadable to support."""
+    co = _clean_origin(origin)
+    return push.origin_slug(co) if co else "account-wide"
 
 
 def _config_from_settings(pipe: dict[str, Any] | None) -> dict[str, Any]:
@@ -751,6 +771,9 @@ def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str
         _spawn(_notify_device_owner_of_run, sess, device_id, rid, topic)
     except Exception as e:  # noqa: BLE001 — a courtesy notice, never a failure
         log.info("owner-notify %s: not dispatched (%s)", rid, type(e).__name__)
+    # ⭐ AND THE NEWS PEEK STARTS WATCHING IT — the one write path every agent run
+    # takes (chat, sign-in auto-start, approval auto-start), so none is missed.
+    _watch_run(sess.uid, rid, origin)
     return rid, qid
 
 
@@ -951,8 +974,11 @@ def _autostart_worker(state: BridgeState, sess: AccountSession, topic: str,
     # during the ~1-2s this worker spends in Firestore left the new person's
     # announce silently replaced by the old one's. `is_current` is the identity test
     # the same file already uses for exactly this concern.
-    if state.is_current(sess):
-        state.set_signed_in(ev)
+    # ⛔⛔ AND NOW CHECKED UNDER THE SAME LOCK AS THE PARK (owner, 2026-09-25): a
+    # separate `is_current()` then `set_signed_in()` left a gap a logout could land
+    # in, parking "signed in" for a session that had just ended.
+    if state.set_signed_in(ev, sess=sess):
+        _push_signin(state, sess, ev)
 
 
 def _audio_file_url(links: Any) -> str:
@@ -1312,15 +1338,87 @@ class BridgeState:
         # The `ts` of an announce that was handed out but whose disk clear failed —
         # so a parked copy that outlived its delivery is not handed out again.
         self._handed_out_ts: Any = None
+        # ⭐⭐ THE ONE "ALREADY TOLD" RECORD (owner, 2026-09-25): which reader
+        # last told the person they are signed in, for which sign-in, and when —
+        # {ts, reader, scope, at}. The watcher and `login-done` each announced the
+        # same sign-in on 2026-09-24, in contradicting words, 34 s apart, because
+        # nothing on this side remembered that the other had already spoken.
+        # In memory on purpose: it is a record of this sign-in, and a restart that
+        # loses it loses nothing the watermark does not already hold.
+        self._told: dict | None = None
+        # The sign-in epoch (prefs `signinEpoch`), cached after the first read.
+        self._epoch: int | None = None
 
     @property
     def session(self) -> AccountSession | None:
         with self._lock:
             return self._session
 
+    @property
+    def signin_epoch(self) -> int:
+        """How many times "who is signed in here" has changed — returned by
+        /status, /updates and /signin/ack so a reader can tell that the answer it
+        holds has gone stale. Never raises."""
+        with self._lock:
+            if self._epoch is not None:
+                return self._epoch
+        try:
+            val = prefs.get_signin_epoch()
+        except Exception:  # noqa: BLE001 — an unreadable file is epoch 0
+            val = 0
+        with self._lock:
+            if self._epoch is None:
+                self._epoch = val
+            return self._epoch
+
+    def _bump_epoch(self) -> None:
+        """Advance the epoch — on disk when possible, in memory regardless, so a
+        read-only prefs file can never leave two sessions sharing one number."""
+        try:
+            val: int | None = prefs.bump_signin_epoch()
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not record the sign-in epoch (%s) — memory only",
+                        type(e).__name__)
+            val = None
+        with self._lock:
+            base = self._epoch if self._epoch is not None else 0
+            self._epoch = max(val or 0, base + 1)
+
+    @property
+    def told(self) -> dict | None:
+        with self._lock:
+            return dict(self._told) if isinstance(self._told, dict) else None
+
+    def record_told(self, ts: Any, reader: str, scope: str) -> dict | None:
+        """Record that ``reader`` is telling the person about sign-in ``ts``;
+        returns the record it replaced.
+
+        ⛔ RECORDED BEFORE THE BYTES GO, undone if they do not (`undo_told`): a
+        chat reply racing the watcher's response must already see that the
+        watcher took the note, not find the record empty for the milliseconds
+        the send takes."""
+        with self._lock:
+            prior = dict(self._told) if isinstance(self._told, dict) else None
+            self._told = {"ts": ts, "reader": reader, "scope": scope,
+                          "at": round(time.time(), 3)}
+        return prior
+
+    def undo_told(self, reader: str, ts: Any, prior: dict | None) -> None:
+        """Put back the record ``record_told`` replaced — only while it is still
+        this reader's, so a newer one is never overwritten."""
+        with self._lock:
+            cur = self._told
+            if isinstance(cur, dict) and cur.get("reader") == reader and cur.get("ts") == ts:
+                self._told = prior
+
     def set_session(self, sess: AccountSession | None) -> None:
         with self._lock:
+            changed = self._session is not sess
             self._session = sess
+            if changed:
+                self._told = None
+        if changed:
+            self._bump_epoch()
         if sess is None:
             # ⛔⛔ THIS USED TO NULL THE ATTRIBUTE AND NOTHING ELSE, while a comment
             # beside it said a sign-out "invalidates any not-yet-delivered announce".
@@ -1328,21 +1426,30 @@ class BridgeState:
             # disk and re-warms the cache, so the announce came straight back.
             # Cross-verification measured it. A partial clear is worse than none,
             # because the comment made it look handled.
-            self.clear_signed_in()
+            self.clear_signed_in(why="signed out")
 
     @property
     def signed_in(self) -> dict | None:
         with self._lock:
             return self._signed_in
 
-    def set_signed_in(self, event: dict | None) -> None:
-        """Park the announce, in memory AND on disk.
+    def set_signed_in(self, event: dict | None, *, why: str = "parked",
+                      sess: AccountSession | None = None) -> bool:
+        """Park the announce, in memory AND on disk. Returns whether it parked.
 
         ⛔ The disk write is the point. Before it, a bridge restart in the window
         between the sign-in capture and the watchdog's next tick lost the announce
         for good — while a research COMPLETION in the same window lost nothing,
         because the watchdog re-derives those from the research store every tick.
-        That asymmetry was the whole defect."""
+        That asymmetry was the whole defect.
+
+        ⛔⛔ ``sess`` MAKES IT CONDITIONAL, UNDER THE SAME LOCK THE SESSION LIVES
+        UNDER (owner, 2026-09-25). Every production park — the capture, the
+        auto-start worker, a put-back, a failed-send restore — passes the session
+        the note belongs to, and a note for a session that is no longer the live
+        one is REFUSED rather than parked. Checking `is_current()` first and
+        parking second left a gap a logout could land in. ``why`` names the path
+        in the log ("parked" / "put back" / "restored")."""
         # ⛔⛔ THE DISK HALF IS INSIDE THE LOCK, and it was outside on the first
         # pass. `take_signed_in` holds this same lock across its WHOLE take
         # including the disk clear — so a take landing in the writer's gap cleared a
@@ -1351,20 +1458,38 @@ class BridgeState:
         # out. Reachable on a live path, since `_autostart_worker` parks from a
         # background thread while the watchdog polls.
         with self._lock:
-            self._signed_in = event
-            self._handed_out_ts = None
+            refused = sess is not None and self._session is not sess
+            if not refused:
+                self._signed_in = event
+                self._handed_out_ts = None
             uid = (event or {}).get("uid") if isinstance(event, dict) else None
             try:
-                if isinstance(event, dict) and isinstance(uid, str) and uid:
+                # ⛔ A REFUSED NOTE TOUCHES NEITHER HALF — memory above, disk here.
+                if not refused and isinstance(event, dict) and isinstance(uid, str) and uid:
                     prefs.set_pending_announce(event, uid)
-                else:
+                elif not refused:
                     prefs.clear_pending_announce()
             except Exception as e:  # noqa: BLE001 — never fail a sign-in for this
                 log.warning("could not park the sign-in announce (%s) — memory only",
                             type(e).__name__)
+        if isinstance(event, dict):
+            ts = event.get("ts")
+            to = _scope_label(event.get("origin"))
+            if refused:
+                log.info("sign-in note ts=%s NOT %s (for %s) — its session has ended",
+                         ts, why, to)
+            else:
+                log.info("sign-in note %s: ts=%s for %s", why, ts, to)
+        return not refused
 
-    def take_signed_in(self, uid: str) -> dict | None:
+    def take_signed_in(self, uid: str, *, sess: AccountSession | None = None) -> dict | None:
         """Atomically remove and return the pending announce for ``uid``.
+
+        ⛔⛔ ``sess``: TAKE ONLY WHILE THAT SESSION IS STILL THE LIVE ONE, decided
+        under the same lock as the take (owner, 2026-09-25). `/updates` captures
+        its session on entry and then spends seconds in Firestore; a logout in
+        that window must leave nothing for it to take. Every production caller
+        passes it.
 
         ⭐⭐ THE THIRD SHAPE OF THIS, AND THE FIRST CORRECT ONE. It went:
           1. take-and-clear — exactly-once, and ANY failure after the read
@@ -1393,6 +1518,8 @@ class BridgeState:
         # narrower window. `prefs` takes its own lock and never calls back in here,
         # so nesting is safe.
         with self._lock:
+            if sess is not None and self._session is not sess:
+                return None
             ev = self._signed_in
             if isinstance(ev, dict):
                 if ev.get("uid") not in (None, uid):
@@ -1434,9 +1561,10 @@ class BridgeState:
         then the parked copy on disk.
 
         ⛔⛔ A NON-CONSUMING INSPECTION SEAM, AND NOT THE DELIVERY PATH. Production
-        delivers through ``take_signed_in`` (the single call site is the
-        ``/updates?via=agent`` handler); everything here is for tests and for
-        reading state without disturbing it.
+        delivers through ``take_signed_in`` (the ``/updates?via=agent`` handler,
+        and ``POST /signin/ack`` since 2026-09-25); everything here is for tests,
+        for reading state without disturbing it, and for the instant-delivery
+        push's "is this note still waiting?" re-check.
 
         ⛔ THE DOCSTRING THAT USED TO BE HERE DESCRIBED A DESIGN THAT NO LONGER
         SHIPS. It said "WHY PEEK REPLACED TAKE" and "delivery is now at-least-once",
@@ -1462,7 +1590,7 @@ class BridgeState:
             return ev
         return None
 
-    def clear_signed_in(self) -> None:
+    def clear_signed_in(self, why: str = "") -> None:
         """Drop the announce from memory AND disk.
 
         ⛔ THE ONLY CLEARING POINT, and it did not use to be. Clearing was spread
@@ -1473,9 +1601,18 @@ class BridgeState:
         lock without touching the announce at all. The reachable consequence was a
         STALE announce: sign in from chat, revoke or log out, sign in again through
         the local page, and the chat was told "Starting <the old topic> on <the old
-        device> now" for a run that no longer existed."""
+        device> now" for a run that no longer existed.
+
+        ``why`` puts a line in the log when a note was actually dropped (owner,
+        2026-09-25) — "signed out", "a new sign-in started"."""
         # Disk half inside the lock, for the same reason as `set_signed_in`.
         with self._lock:
+            had = self._signed_in
+            if had is None and why:
+                try:
+                    had = prefs.has_pending_announce() or None
+                except Exception:  # noqa: BLE001 — only decides whether to log
+                    had = None
             self._signed_in = None
             self._handed_out_ts = None
             try:
@@ -1483,6 +1620,9 @@ class BridgeState:
             except Exception as e:  # noqa: BLE001
                 log.warning("could not clear the parked sign-in announce (%s)",
                             type(e).__name__)
+        if had and why:
+            ts = had.get("ts") if isinstance(had, dict) else "(parked)"
+            log.info("sign-in note cleared: ts=%s — %s", ts, why)
 
     def rotate_login_token(self) -> None:
         with self._lock:
@@ -1511,6 +1651,7 @@ class BridgeState:
         with self._lock:
             if self._session is sess:
                 self._session = None
+                self._told = None
                 cleared = True
             else:
                 cleared = False
@@ -1520,7 +1661,10 @@ class BridgeState:
             # production sign-out (the /logout route and the revoke self-logout)
             # arrives here instead. Without this line a not-yet-delivered announce
             # outlived the session that produced it.
-            self.clear_signed_in()
+            self.clear_signed_in(why="signed out")
+            # ⭐ AND THE EPOCH MOVES, so any reader holding "signed in" from before
+            # can see that it no longer holds (owner, 2026-09-25).
+            self._bump_epoch()
         return cleared
 
 
@@ -2268,7 +2412,7 @@ _SR_MINT_TRIES = 3          # attempts per unchanged run signature
 _SR_MINT_COOLDOWN = 1800.0  # seconds before an exhausted signature may try again
 _SR_MINT_MEMO_MAX = 200
 
-# The approval poll's backoff cursor. In memory by design — see `_device_ask_due`.
+# The approval check's cursor. In memory by design — see `_device_ask_check_due`.
 _DEVICE_ASK_CURSOR: "dict[str, float]" = {}
 _DEVICE_ASK_CURSOR_LOCK = threading.Lock()
 
@@ -2946,7 +3090,28 @@ def _resume_email() -> str:
     return ""
 
 
-def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
+def _drop_finished_remote_flow(state: BridgeState, route: str) -> None:
+    """Forget a remote sign-in flow that has FINISHED (connected / expired / error).
+
+    ⛔⛔ A "CONNECTED" FLOW OUTLIVED THE LOGOUT (found 2026-09-25). Nothing ever
+    called `set_remote(None)`, so after a logout `/login/remote/poll` still said
+    `state: connected` with no session behind it, and `login-done` answered
+    "✓ Connected as None — you're all set." — a second false "signed in" route.
+
+    ⭐ A PENDING FLOW IS KEPT, deliberately. It can only be a sign-in started AFTER
+    the session now ending was captured (a capture turns its own flow "connected"),
+    so it is somebody signing in right now — not a source of "signed in" until it
+    captures, at which point it is a new, true one. Under ``remote_lock``, so it
+    cannot interleave with a poll redeeming that flow's one-time token."""
+    with state.remote_lock:
+        flow = state.remote
+        if flow is not None and flow.state != "pending":
+            state.set_remote(None)
+            log.info("sign-in flow (%s) cleared by %s", flow.state, route)
+
+
+def _self_logout(state: BridgeState, sess: AccountSession | None,
+                 route: str = "logout") -> bool:
     """In-memory teardown shared by the /logout route and the revoke-consult.
 
     Compare-and-swap on ``sess``: tears down ONLY if it is still the live session
@@ -2959,10 +3124,31 @@ def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     Does NOT touch the agentSessions doc — the route deletes it (clean logout),
     while the revoke path leaves the ``revoked: true`` row in place so the app
     shows the disconnect and a re-login can clear it.
+
+    ⛔⛔ AND IT CLOSES EVERY SOURCE OF "SIGNED IN" (owner, 2026-09-25). On
+    2026-09-24 a true "✓ Signed in" reached the chat 19 s after the person logged
+    out, and nothing here could have stopped a repeat either — so a sign-out now,
+    in one place:
+      • drops the session and any parked note (`clear_session_if`), and moves the
+        sign-in epoch;
+      • SEALS the announce watermark at the ending session's capture epoch, so no
+        re-mint and no "one repeat" can ever re-announce the sign-in that ended —
+        including from a `/updates` that captured the session before this ran;
+      • forgets a finished remote sign-in flow, which otherwise kept answering
+        "connected" (`_drop_finished_remote_flow`);
+      • stops the news peek watching this account's runs;
+      • says so in bridge.log — ``route`` names the path (logout / revoke /
+        token-revoked / startup-revoke). Before this a logout left no line at all.
+    The chat's watcher job is NOT touched: it stays, silent while signed out, and
+    only `agent disconnect` removes it (owner decision 3, 2026-09-25).
     """
     if sess is None:
         prefs.clear_selected_device()
+        _drop_finished_remote_flow(state, route)
+        log.info("signed out: route=%s — no session was live", route)
         return False
+    cap = getattr(sess, "connected_at_ms", None)
+    who = _mask_email(getattr(sess, "email", "") or getattr(sess, "uid", ""))
     if not state.clear_session_if(sess):
         return False  # a concurrent reconnect already swapped the session in — leave it
     sess.logout()
@@ -2973,6 +3159,17 @@ def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     # waiting on, for a week.
     prefs.clear_device_ask()
     prefs.clear_held_research()
+    sealed = None
+    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap:
+        try:
+            sealed = prefs.seal_signin_announce(int(cap), sess.uid)
+        except Exception as e:  # noqa: BLE001 — a sign-out never fails for this
+            log.warning("could not seal the announce watermark on sign-out (%s)",
+                        type(e).__name__)
+    _drop_finished_remote_flow(state, route)
+    _forget_runs(sess.uid)
+    log.info("signed out: route=%s account=%s watermark=%s epoch=%s", route, who,
+             sealed, state.signin_epoch)
     return True
 
 
@@ -3051,7 +3248,7 @@ def _arm_agent_session_on_start(state: BridgeState) -> None:
     if isinstance(doc, dict) and doc.get("revoked") is True:
         if _should_honor_revoke(doc, sess):
             log.info("startup: agent was revoked while the bridge was down — honoring revoke (skill + runtime kept)")
-            _self_logout(state, sess)
+            _self_logout(state, sess, route="startup-revoke")
             return
         log.info("startup: ignoring a stale revoke that predates this sign-in — re-asserting the agent row")
         _write_agent_session_connected(sess, clear_revoked=True)
@@ -3077,7 +3274,7 @@ def _heartbeat_once(state: BridgeState) -> None:
         doc = fs.get_agent_session(sess.uid, sid)
     except RevokedError:
         log.info("heartbeat: account token revoked — self-logout")
-        _self_logout(state, sess)
+        _self_logout(state, sess, route="token-revoked")
         return
     except Exception as e:
         log.debug("heartbeat read transient failure: %s", type(e).__name__)
@@ -3085,7 +3282,7 @@ def _heartbeat_once(state: BridgeState) -> None:
     if isinstance(doc, dict) and doc.get("revoked") is True:
         if _should_honor_revoke(doc, sess):
             log.info("agent session %s revoked from the app — self-logout (skill + runtime kept)", sid)
-            _self_logout(state, sess)
+            _self_logout(state, sess, route="revoke")
             return
         # Stale revoke (predates THIS sign-in): a prior capture's clear_revoked
         # write may have failed (best-effort). Re-assert the clear rather than
@@ -3111,7 +3308,7 @@ def _heartbeat_once(state: BridgeState) -> None:
         fs.upsert_agent_session(sess.uid, sid, {"lastSeenAt": int(time.time() * 1000)})
     except RevokedError:
         log.info("heartbeat: account token revoked — self-logout")
-        _self_logout(state, sess)
+        _self_logout(state, sess, route="token-revoked")
     except Exception as e:
         log.debug("heartbeat write transient failure: %s", type(e).__name__)
 
@@ -3192,6 +3389,9 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
         # the user asked before signing in (the reliable, scheduler-independent
         # path). Token reuse is already prevented by the connected/expired/error
         # state-guard at the top of _advance_remote_flow — leaving the flow is safe.
+        # ⛔ UNTIL THE SESSION ENDS: a logout or revoke now forgets a finished flow
+        # (`_drop_finished_remote_flow`, owner 2026-09-25) — left in place, it kept
+        # answering "connected" for a session that no longer existed.
         # #790 identity row — explicit human sign-in, so clear any prior revoke.
         _write_agent_session_connected(sess, clear_revoked=True)
         # One-shot event for the chat watchdog: announce the moment approval is
@@ -3238,7 +3438,8 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
             # No pending research (or auto-start disabled) → announce immediately,
             # exactly as before. With a topic + autostart off, OFFER to continue.
             base_ev["pendingTopic"] = topic
-            state.set_signed_in(base_ev)
+            if state.set_signed_in(base_ev, sess=sess):
+                _push_signin(state, sess, base_ev)
         log.info("remote login connected as %s", _mask_email(sess.email or sess.uid))
     elif status == devicelogin.EXPIRED:
         flow.state = "expired"
@@ -3311,8 +3512,17 @@ def _backend_version() -> "str | None":
 # (turning a fresh PC into a research host) is a separate, still-supported action.
 
 
-def _remint_signin(sess: AccountSession) -> tuple[dict[str, Any] | None, int | None]:
+def _remint_signin(sess: AccountSession, state: "BridgeState | None" = None,
+                   ) -> tuple[dict[str, Any] | None, int | None]:
     """A plain "you are signed in" for a sign-in whose announce never arrived.
+
+    ⛔⛔ ``state``: RE-MINT ONLY FOR THE LIVE SESSION (owner, 2026-09-25). The
+    `/updates` that calls this captured its session on entry and has spent
+    seconds in Firestore since; a logout in that window used to be able to win
+    this claim and hand out "signed in" for a session that had just ended. The
+    logout now also SEALS the watermark at the session's capture epoch, so a
+    claim that loses this race answers "already" as well — two independent locks
+    on one door.
 
     Returns ``(note, previous_watermark)``. ``note`` is None — the ordinary case —
     when this session's sign-in has already been announced, or when the session
@@ -3326,6 +3536,9 @@ def _remint_signin(sess: AccountSession) -> tuple[dict[str, Any] | None, int | N
     moment this shipped — a bridge that has been signed in for a week greeting the
     person on its next tick.
     """
+    if state is not None and not state.is_current(sess):
+        log.info("re-announce skipped: the session ended while this request ran")
+        return (None, None)
     cap = getattr(sess, "connected_at_ms", None)
     if not isinstance(cap, (int, float)) or not cap:
         return (None, None)
@@ -3394,6 +3607,406 @@ def _announce_ms(ev: Any, sess: AccountSession) -> int:
         return int(raw)
     cap = getattr(sess, "connected_at_ms", 0)
     return int(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) else 0
+
+
+def _note_is_stale(ev: Any, sess: AccountSession) -> bool:
+    """Whether a parked note names a DIFFERENT sign-in than the live session's.
+
+    ⛔⛔ ONE NOTE, ONE SIGN-IN (owner, 2026-09-25). A note's `ts` IS its sign-in's
+    identity — the session's capture epoch, `connected_at_ms` (see the
+    "ONE SIGN-IN, ONE IDENTITY" block at the mint). A note whose ts is not the
+    live session's belongs to a sign-in that has ENDED, and is never handed out,
+    whatever else about it matches.
+
+    ⚠ TWO CASES CANNOT BE JUDGED AND ARE NOT REFUSED: a session with no capture
+    epoch (a rehydrated pre-epoch blob — nothing to compare against), and a note
+    whose ts is unreadable, which `_announce_ms` already defines as "this
+    session's" (refusing it would destroy the announce the fallback exists to
+    save)."""
+    cap = getattr(sess, "connected_at_ms", None)
+    if not isinstance(cap, (int, float)) or isinstance(cap, bool) or not cap:
+        return False
+    raw = ev.get("ts") if isinstance(ev, dict) else None
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not raw:
+        return False
+    return int(raw) != int(cap)
+
+
+def _signed_in_payload(ev: dict) -> dict[str, Any]:
+    """The wire shape of a sign-in note — ONE builder for `/updates` and
+    `POST /signin/ack` (owner, 2026-09-25), so the two readers of the same note
+    can never describe it in two different shapes."""
+    return {
+        "ts": ev.get("ts"),
+        "email": ev.get("email") or "",
+        "pendingTopic": ev.get("pendingTopic") or "",
+        # Sign-in auto-start hints (the bridge started/blocked the
+        # pending research server-side; the watchdog renders the
+        # right line). Absent on a plain sign-in.
+        "autoStarted": bool(ev.get("autoStarted")),
+        "needsDevice": bool(ev.get("needsDevice")),
+        "runId": ev.get("runId") or "",
+        "deviceName": ev.get("deviceName") or "",
+        # None when unknown — never coerced to a boolean, or
+        # "we could not tell" would render as "it is asleep".
+        "deviceOnline": ev.get("deviceOnline"),
+        "topic": ev.get("topic") or "",
+        # The FOURTH outcome: the account has several usable
+        # computers and the sign-in auto-start could not choose.
+        # Distinct from `needsDevice` (which means there is no
+        # research computer at all) and — the point of it —
+        # distinct from an ERROR, which the old empty-dict hint
+        # made indistinguishable from this.
+        "needsDeviceChoice": bool(ev.get("needsDeviceChoice")),
+        "devices": ev.get("devices") or [],
+        # WHY it is asking: the computer they last used is gone,
+        # or they simply never picked one. The run path has told
+        # those apart since 0.1.27; this one could not.
+        "staleSelection": bool(ev.get("staleSelection")),
+    }
+
+
+def _note_has_news(ev: Any) -> bool:
+    """Whether a sign-in note carries more than "you are signed in" — something
+    the bridge DID or needs decided about a research asked for before sign-in."""
+    return isinstance(ev, dict) and bool(
+        ev.get("autoStarted") or ev.get("needsDevice") or ev.get("needsDeviceChoice")
+        or str(ev.get("pendingTopic") or ev.get("topic") or "").strip())
+
+
+def _reader_label(raw: Any, default: str) -> str:
+    """A reader's self-description for the log and the "told" record — short,
+    lower-case, [a-z0-9-] only, so a caller cannot write anything else into
+    bridge.log through it."""
+    s = re.sub(r"[^a-z0-9-]", "", str(raw or "").strip().lower())[:24]
+    return s or default
+
+
+def _push_signin(state: BridgeState, sess: AccountSession, ev: dict) -> None:
+    """⭐⭐ DELIVER A FRESHLY PARKED SIGN-IN NOTE NOW (owner decision 1, 2026-09-25).
+
+    The note is addressed to the chat that asked for the sign-in link; that chat's
+    watcher is run immediately through Hermes's own CLI (`push`), which sends
+    directly instead of through Hermes's once-a-minute queue. An account-wide note
+    (no origin) runs every watcher on this computer. The cron tick stays the
+    fallback, and the atomic take means only one of the two can ever say it.
+
+    ⛔ RE-CHECKED BY THE PUSH IMMEDIATELY BEFORE IT SPAWNS: this session is still
+    the live one AND this very note (same ts) is still waiting. A logout, or a
+    chat reply that already said it (`/signin/ack`), turns the push into a no-op."""
+    ts = ev.get("ts")
+    uid = getattr(sess, "uid", "")
+
+    def still_waiting() -> bool:
+        if not state.is_current(sess):
+            return False
+        cur = state.peek_signed_in(uid)
+        return isinstance(cur, dict) and cur.get("ts") == ts
+
+    push.request(_clean_origin(ev.get("origin")), reason="signed-in",
+                 still_valid=still_waiting)
+
+
+# ── the news peek: completions / needs-you / approvals / support logs ─────────
+# ⭐⭐ WHY A PEEK AT ALL (owner decision 1, 2026-09-25). Instant delivery can only
+# run a watcher when the BRIDGE knows there is news, and for four kinds of news
+# nothing on this side used to know: a run finishing, a run needing the person, a
+# public computer's owner saying yes, a support bundle landing. The watcher
+# discovered each of them on its own ~2-minute tick and then waited in Hermes's
+# queue. This loop notices them and runs the chat's watcher at once; the watcher
+# still does the telling (it re-reads everything itself), so nothing is said
+# twice and nothing is said that the watcher would not have said.
+#
+# ⛔⛔ AND IT COSTS NOTHING UNLESS IT CAN HELP. It does no Firestore or web read
+# at all unless instant delivery is available here AND a watcher job exists for
+# the chat the news belongs to; otherwise the watcher's own tick does the work,
+# exactly as before. The Firestore cost when it does run:
+#   • runs      — ONE document read per watched agent run IN FLIGHT (queued or
+#                 ongoing, `_RUN_IN_FLIGHT`) every `_RUN_PEEK_SECONDS` (30 s)
+#                 ≈ 120 reads/hour per run in flight; zero once it finishes, stops,
+#                 pauses or errors, and zero with nothing in flight;
+#   • approvals — one web request (≈4 Firestore ops server-side) per
+#                 `_DEVICE_ASK_CHECK_SECONDS` while an ask is pending — the SAME
+#                 cursor the watcher's own tick spends, so never both;
+#   • logs      — one document read per pending support bundle every
+#                 `_LOG_PEEK_SECONDS` (30 s), for at most `_BUNDLE_WATCH_SECONDS`.
+_PEEK_TICK_SECONDS = 10.0
+_RUN_PEEK_SECONDS = 30.0
+_LOG_PEEK_SECONDS = 30.0
+
+# The statuses a run is still going in — the watcher's own `_ACTIVE`. A run that
+# leaves them without completing (and without needing the person) is the
+# watcher's "⏹ stopped" line.
+_RUN_LIVE = ("queued", "ongoing", "paused", "paused_backend_restart",
+             "paused_backend_restart_failed")
+# ⛔⛔ AND THE ONLY ONES WORTH A READ (2026-09-25). Watching every row the watcher
+# lists that was "live or needing the person" put every errored / stopped-by-
+# watchdog / paused run among the chat's newest twenty into the watch, and nothing
+# ever let them go: after the one needs-you push each was re-read every 30 s for
+# as long as the bridge ran (≈2,880 reads a day per abandoned run). A run in any
+# other state changes only when the person acts on it — and a retry or resume
+# puts it back here, where the watcher's own next read watches it again.
+_RUN_IN_FLIGHT = ("queued", "ongoing")
+
+# rid -> {uid, origin, status, needs, akey}: the last state of each agent run the
+# WATCHER is known to have seen (or, for a run this bridge just started, its
+# starting state). A transition away from it is news worth a push.
+_RUN_WATCH: "dict[str, dict[str, Any]]" = {}
+_RUN_WATCH_LOCK = threading.Lock()
+_RUN_WATCH_MAX = 20
+
+
+def _run_akey(attention: Any, action: Any) -> str:
+    """The watcher's `_attention_key` — the blocker AND what to do about it — so a
+    second, different card on a run that is still flagged is news too."""
+    return str(attention or "") + "\x1f" + str(action or "")
+
+
+def _watch_run(uid: str, rid: Any, origin: Any, status: str = "queued",
+               needs: bool = False, akey: "str | None" = None) -> None:
+    """Start (or refresh) watching one agent run. Pure memory; never raises."""
+    rid = str(rid or "")
+    if not uid or not rid:
+        return
+    with _RUN_WATCH_LOCK:
+        _RUN_WATCH.pop(rid, None)
+        _RUN_WATCH[rid] = {"uid": uid, "origin": _clean_origin(origin),
+                           "status": status, "needs": bool(needs), "akey": akey}
+        while len(_RUN_WATCH) > _RUN_WATCH_MAX:
+            _RUN_WATCH.pop(next(iter(_RUN_WATCH)))
+
+
+def _note_run_seen(uid: str, row: dict, status: Any, needs: bool, *,
+                   watchdog: bool, akey: "str | None" = None) -> None:
+    """Fold one `/updates` row into the watch.
+
+    ⛔ ONLY THE WATCHDOG'S READ ADVANCES WHAT "SEEN" MEANS — it is the reader that
+    announces. Another reader (`sr updates`, `login-done`) may START a watch on a
+    run in flight it happens to list, but never moves its state, or a completion
+    one of them glimpsed first would never be pushed.
+    ⛔ IN FLIGHT ONLY (`_RUN_IN_FLIGHT`) — see there for what watching the rest
+    cost."""
+    rid = str(row.get("id") or "")
+    if not uid or not rid:
+        return
+    live = status in _RUN_IN_FLIGHT
+    with _RUN_WATCH_LOCK:
+        cur = _RUN_WATCH.get(rid)
+        if live and (cur is None or watchdog):
+            _RUN_WATCH.pop(rid, None)
+            _RUN_WATCH[rid] = {"uid": uid, "origin": _clean_origin(row.get("chatOrigin")),
+                               "status": str(status or ""), "needs": bool(needs),
+                               "akey": akey}
+        elif not live and watchdog and cur is not None:
+            _RUN_WATCH.pop(rid, None)
+        while len(_RUN_WATCH) > _RUN_WATCH_MAX:
+            _RUN_WATCH.pop(next(iter(_RUN_WATCH)))
+
+
+def _forget_runs(uid: str | None = None) -> None:
+    """Stop watching this account's runs (all runs when ``uid`` is None)."""
+    with _RUN_WATCH_LOCK:
+        for rid in [r for r, e in _RUN_WATCH.items() if uid is None or e.get("uid") == uid]:
+            _RUN_WATCH.pop(rid, None)
+
+
+# ⭐⭐ THE APPROVAL CHECK: STEADY, THEN BOUNDED (owner, 2026-09-25). It was a
+# ladder — every tick for ten minutes, every five to the hour, then every half
+# hour — so an owner who said yes forty minutes in was announced up to five
+# minutes late, and two hours in up to half an hour late, on top of the watcher's
+# own delays. Now: one check every ~minute for the first `_DEVICE_ASK_STEADY_
+# SECONDS` of the ask, then the old half-hour tail until the ask's own seven-day
+# TTL. ~55 s, not 60, so a one-minute tick that lands a hair early is not skipped.
+# ⛔ THE BOUND IS THE HELD TOPIC'S OWN LIFETIME (`prefs._HELD_RESEARCH_TTL`, six
+# hours): that is how long a yes can still start the research the person asked
+# for, i.e. how long the answer is time-critical. After it the tail keeps the
+# Friday-ask / Monday-laptop case announced — a hard stop was rejected on
+# 2026-09-21 for exactly that, and stays rejected.
+# ⛔ THE CURSOR IS STILL IN MEMORY (a prefs write per poll is the wrong trade, see
+# the note that used to live on the handler) and still keyed on the ask's OWN age,
+# so a restart cannot walk a week-old ask back to one-a-minute.
+_DEVICE_ASK_CHECK_SECONDS = 55.0
+_DEVICE_ASK_STEADY_SECONDS = 6 * 3600
+_DEVICE_ASK_TAIL_SECONDS = 1800.0
+
+
+def _device_ask_check_due(device_id: str, asked_at: float) -> bool:
+    """Is this the moment to spend one approval check? Shared by the watcher's
+    own `/updates` tick and the news peek — one cursor, so never both."""
+    now = time.monotonic()
+    age = max(0.0, time.time() - asked_at) if asked_at else 0.0
+    interval = (_DEVICE_ASK_CHECK_SECONDS if age < _DEVICE_ASK_STEADY_SECONDS
+                else _DEVICE_ASK_TAIL_SECONDS)
+    with _DEVICE_ASK_CURSOR_LOCK:
+        last = _DEVICE_ASK_CURSOR.get(device_id)
+        if last is not None and (now - last) < interval:
+            return False
+        _DEVICE_ASK_CURSOR[device_id] = now
+        while len(_DEVICE_ASK_CURSOR) > 50:
+            _DEVICE_ASK_CURSOR.pop(next(iter(_DEVICE_ASK_CURSOR)))
+    return True
+
+
+def _device_ask_reset(device_id: str) -> None:
+    """Make the NEXT check due at once — the peek saw the answer, and the
+    watcher's own read has to be allowed to look again and deliver it."""
+    with _DEVICE_ASK_CURSOR_LOCK:
+        _DEVICE_ASK_CURSOR.pop(device_id, None)
+
+
+def _peek_device_ask(state: BridgeState, sess: AccountSession, memo: dict) -> None:
+    ask = prefs.get_device_ask(sess.uid)
+    if not ask:
+        return
+    origin = _clean_origin(ask.get("origin"))
+    device_id = str(ask.get("deviceId") or "")
+    at = float(ask.get("at") or 0)
+    key = (device_id, at)
+    if not origin or not device_id or key in memo["asks_seen"]:
+        return
+    if not push.has_target(origin):
+        return      # no watcher to run — its own tick (if one appears) looks instead
+    if not _device_ask_check_due(device_id, at):
+        return
+    status, body = _fe_api_get(sess, "/api/devices/access-request")
+    if status != 200 or not isinstance(body, dict):
+        log.debug("peek: access-request check failed: HTTP %s", status)
+        return
+    rows = body.get("outgoing")
+    rows = rows if isinstance(rows, list) else []
+    if any(isinstance(r, dict) and str(r.get("deviceId") or "") == device_id for r in rows):
+        return      # still unanswered
+    memo["asks_seen"].add(key)
+    # ⛔ THE WATCHER DECIDES WHAT THE ANSWER WAS. Gone from `outgoing` means
+    # answered — yes, no or expired — and `_device_access_note` tells them apart
+    # on the watcher's own read; the peek only makes that read happen now.
+    _device_ask_reset(device_id)
+    log.info("peek: the public-computer ask for %s was answered — running its "
+             "watcher now", _scope_label(origin))
+    uid = sess.uid
+    push.request(origin, reason="device-answered",
+                 still_valid=lambda: state.is_current(sess)
+                 and bool(prefs.get_device_ask(uid)))
+
+
+def _peek_support_logs(state: BridgeState, sess: AccountSession, memo: dict,
+                       now: float) -> None:
+    reqs = prefs.get_log_requests(sess.uid)
+    fs = None
+    for code, rec in sorted(reqs.items(), key=lambda kv: float(kv[1].get("at") or 0)):
+        if rec.get("announced") or code in memo["logs_pushed"]:
+            continue
+        origin = _clean_origin(rec.get("origin"))
+        if not origin or not push.has_target(origin):
+            continue
+        if now - memo["logs_checked"].get(code, -1e9) < _LOG_PEEK_SECONDS:
+            continue
+        memo["logs_checked"][code] = now
+        age = time.time() - float(rec.get("at") or 0)
+        if fs is None:
+            fs = FirestoreRest(sess.id_token)
+        try:
+            row = fs.get_log_bundle(sess.uid, code)
+        except (RevokedError, FirestoreError) as e:
+            log.debug("peek: bundle read failed for %s: %s", code, e)
+            continue
+        status = str((row or {}).get("status") or "")
+        if status not in ("done", "failed") and age <= _BUNDLE_WATCH_SECONDS:
+            continue
+        memo["logs_pushed"].add(code)
+        log.info("peek: bundle %s is %s — running its watcher now", code,
+                 status or "still unanswered past the watch window")
+        uid = sess.uid
+        push.request(origin, reason="support-logs",
+                     still_valid=lambda c=code: (state.is_current(sess)
+                                                 and _log_request_open(c, uid)))
+
+
+def _peek_runs(state: BridgeState, sess: AccountSession, memo: dict, now: float) -> None:
+    if now - memo["runs_at"] < _RUN_PEEK_SECONDS:
+        return
+    memo["runs_at"] = now
+    with _RUN_WATCH_LOCK:
+        entries = [(rid, dict(e)) for rid, e in _RUN_WATCH.items()
+                   if e.get("uid") == sess.uid]
+    fs = None
+    for rid, e in entries:
+        origin = e.get("origin")
+        if not push.has_target(origin):
+            continue
+        if fs is None:
+            fs = FirestoreRest(sess.id_token)
+        try:
+            doc = fs.get_research(sess.uid, rid)
+        except (RevokedError, FirestoreError) as err:
+            log.debug("peek: run read failed for %s: %s", rid, err)
+            continue
+        if not isinstance(doc, dict):
+            with _RUN_WATCH_LOCK:
+                _RUN_WATCH.pop(rid, None)
+            continue
+        status = str(doc.get("status") or "")
+        attention = _attention_text(doc)
+        needs = attention is not None or status in _ATTENTION_STATUSES
+        akey = _run_akey(attention, _attention_extras(_run_plan(doc))[0])
+        reason = None
+        if status == "completed":
+            reason = "run-completed" if e.get("status") != "completed" else None
+        elif needs:
+            # ⭐ A FIRST blocker, or a DIFFERENT one on a run still flagged — the
+            # watcher re-announces on either (its `_attention_key`), so both are
+            # news (2026-09-25; the second one used to wait for its own tick).
+            prev = e.get("akey")
+            if not e.get("needs") or (prev is not None and prev != akey):
+                reason = "run-needs-you"
+        elif status not in _RUN_LIVE:
+            # ⭐ Stopped / cancelled — the watcher's "⏹ stopped" line, from either
+            # surface (2026-09-25; it used to wait for the watcher's own tick).
+            reason = "run-ended"
+        # ⛔ Still in flight → keep reading it; anything else changes only when the
+        # person acts, and the watcher's own read watches it again if it runs again.
+        if status in _RUN_IN_FLIGHT:
+            _watch_run(sess.uid, rid, origin, status, needs, akey)
+        else:
+            with _RUN_WATCH_LOCK:
+                _RUN_WATCH.pop(rid, None)
+            if not reason:
+                log.info("peek: run %s is %s — no longer read (nothing to push)", rid,
+                         status or "?")
+        if reason:
+            log.info("peek: run %s → %s — running its watcher now", rid, reason)
+            push.request(origin, reason=reason, still_valid=lambda: state.is_current(sess))
+
+
+def _peek_memo() -> dict:
+    return {"asks_seen": set(), "logs_checked": {}, "logs_pushed": set(),
+            "runs_at": -1e9}
+
+
+def _peek_once(state: BridgeState, memo: dict) -> None:
+    """One pass of the news peek. A NO-OP — no network at all — unless instant
+    delivery is available here and somebody is signed in."""
+    sess = state.session
+    if sess is None or not push.available() or not push.PUSHER.armed:
+        return
+    now = time.monotonic()
+    for step in (lambda: _peek_device_ask(state, sess, memo),
+                 lambda: _peek_support_logs(state, sess, memo, now),
+                 lambda: _peek_runs(state, sess, memo, now)):
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001 — one kind of news never blocks another
+            log.debug("peek step failed: %s", type(e).__name__)
+
+
+def _news_peek_loop(state: BridgeState, stop: threading.Event) -> None:
+    """serve()-owned daemon — same shape as `_heartbeat_loop`."""
+    memo = _peek_memo()
+    while not stop.wait(_PEEK_TICK_SECONDS):
+        try:
+            _peek_once(state, memo)
+        except Exception as e:  # defensive — a tick must never kill the thread
+            log.debug("news peek tick error: %s", type(e).__name__)
 
 
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
@@ -3559,6 +4172,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._login_remote_pending()
             elif path == "/logout":
                 self._logout()
+            elif path == "/signin/ack":
+                self._signin_ack()
             elif path == "/device/select":
                 self._device_select()
             elif path == "/device/ask":
@@ -3736,7 +4351,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 state.set_remote(rf)
             # A fresh sign-in supersedes any prior, not-yet-delivered "signed in"
             # announce (e.g. a re-login) so the watchdog can't replay a stale one.
-            state.clear_signed_in()
+            state.clear_signed_in(why="a new sign-in started")
             log.info("remote login started — code shown to user, expires in %ss", ttl)
             self._json(200, {"code": flow["code"], "verifyUrl": flow["verifyUrl"], "expiresIn": ttl})
 
@@ -3750,7 +4365,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # loop so both drive the flow identically.
             with state.remote_lock:
                 if state.remote is None:
-                    self._json(400, {"error": "no remote login in progress — POST /login/remote/start first"})
+                    # ⛔⛔ SAY WHAT IS TRUE, IN WORDS A CHAT CAN RELAY (owner,
+                    # 2026-09-25). A logout now forgets a finished flow, so
+                    # `login-done` after a logout lands here — and this used to
+                    # answer in developer-speak ("POST /login/remote/start first")
+                    # that the chat relayed verbatim. `reason` + `authed` (+ the
+                    # email when signed in) let the client answer from ONE call.
+                    sess = state.session
+                    body = {"reason": "no_flow", "authed": sess is not None,
+                            "signinEpoch": state.signin_epoch,
+                            "error": ("no sign-in is in progress — already signed in"
+                                      if sess is not None else
+                                      "not signed in — ask to log in for a fresh link")}
+                    if sess is not None:
+                        body["email"] = sess.email
+                    self._json(400, body)
                     return
                 transient = _advance_remote_flow(state)
                 payload = self._remote_payload(state.remote)
@@ -3871,9 +4500,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 flow = state.remote
                 if flow is not None and flow.state in ("pending", "error", "expired"):
                     body["remoteLogin"] = flow.state
+                body["signinEpoch"] = state.signin_epoch
                 self._json(200, body)
                 return
-            self._json(200, {"authed": True, "uid": sess.uid, "email": sess.email, **updates})
+            # ⭐ `signinEpoch` (owner, 2026-09-25): moves on every sign-in and
+            # sign-out, so a reader can tell the answer it holds has gone stale.
+            self._json(200, {"authed": True, "uid": sess.uid, "email": sess.email,
+                             "signinEpoch": state.signin_epoch, **updates})
 
         def _icon(self, path: str) -> None:
             # Serve the bundled brand PNGs for the sign-in page's phase row.
@@ -3910,8 +4543,122 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # The device selection belongs to the account being logged out — drop
             # it so a later (possibly different) account doesn't inherit a stale
             # target it can't reach.
-            _self_logout(state, sess)
+            _self_logout(state, sess, route="logout")
             self._json(200, {"ok": True})
+
+        def _signin_ack(self) -> None:
+            """``POST /signin/ack`` — a chat reply is about to say "signed in".
+
+            ⭐⭐ THE ONE "ALREADY TOLD" RECORD (owner, 2026-09-25). On 2026-09-24
+            the watcher and `login-done` each announced the same sign-in, worded
+            differently and with contradicting advice, 34 s apart — nothing on
+            this side recorded that the person had already been told. A chat reply
+            that states the person is signed in (`login-done`, `status-account`)
+            calls this FIRST, and it:
+              • TAKES the parked note if it is this chat's (the same gate
+                `/updates` applies: a chat-addressed note to its own chat only, an
+                account-wide note to an unscoped caller only), so the watcher finds
+                nothing to repeat — and hands it back under ``signedIn`` in the
+                exact `/updates` shape, so the reply can say what the bridge did;
+              • SEALS the watermark at this sign-in, so no re-mint and no "one
+                repeat" can follow the chat's own answer;
+              • records {reader, scope, at} and returns the PREVIOUS record under
+                ``told`` — so a reply can see that the watcher already spoke.
+                ⚠ No chat reply acts on ``told`` yet (2026-09-25): when the watcher
+                spoke first, `login-done` still answers with the sign-in line. It
+                is in the log line below, "previously told by …".
+
+            ⛔ CHEAP ON PURPOSE: memory and prefs.json only — no Firestore, no web
+            call — so a status check can afford it on every answer.
+
+            ⛔ A NOTE THAT CARRIES NEWS IS NOT TAKEN unless the caller says it will
+            relay that news (``withNews: true``). "Started “X” on Y" or "“X” has
+            nowhere to run" is something the watcher must still say if the reply
+            will not — a plain "✓ Signed in" must never swallow it.
+
+            Body: ``{"platform": …, "chat": …}`` (or ``"origin": {platform,
+            chat_id}``), optional ``"reader"`` and ``"withNews"``."""
+            body = self._read_json()
+            sess = state.session
+            if sess is None:
+                self._json(401, {"error": "not signed in — run /login", "authed": False,
+                                 "signinEpoch": state.signin_epoch})
+                return
+            og = body.get("origin") if isinstance(body.get("origin"), dict) else {}
+            platform = str(body.get("platform") or og.get("platform") or "").strip().lower()
+            chat = str(body.get("chat") or body.get("chat_id") or og.get("chat_id") or "").strip()
+            scope_chat = bool(platform and chat)
+            reader = _reader_label(body.get("reader"), "chat")
+            with_news = body.get("withNews") is True
+            here = (push.origin_slug({"platform": platform, "chat_id": chat})
+                    if scope_chat else "account-wide")
+            cap = getattr(sess, "connected_at_ms", None)
+            cap = int(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap else None
+            ev = state.take_signed_in(sess.uid, sess=sess)
+            consumed = None
+            left_for_watcher = False
+            if isinstance(ev, dict) and _note_is_stale(ev, sess):
+                log.info("sign-in note ts=%s refused at ack: this session signed in at %s "
+                         "— dropped", ev.get("ts"), cap)
+                ev = None
+            if isinstance(ev, dict):
+                ev_origin = _clean_origin(ev.get("origin"))
+                mine = ((not ev_origin and not scope_chat)
+                        or (scope_chat and isinstance(ev_origin, dict)
+                            and ev_origin["platform"].lower() == platform
+                            and ev_origin["chat_id"] == chat))
+                if mine and (with_news or not _note_has_news(ev)):
+                    consumed = ev
+                else:
+                    left_for_watcher = mine
+                    state.set_signed_in(ev, why="put back", sess=sess)
+            sealed = None
+            if cap is not None:
+                try:
+                    sealed = prefs.seal_signin_announce(cap, sess.uid)
+                except Exception as e:  # noqa: BLE001 — a courtesy record, never fatal
+                    log.warning("could not seal the announce watermark at ack (%s)",
+                                type(e).__name__)
+            ts = (consumed or {}).get("ts") or cap
+            replaced = state.record_told(ts, reader, here)
+            prior = replaced
+            # ⛔ The previous record is only news if it is about THIS sign-in.
+            if isinstance(prior, dict) and cap is not None and prior.get("ts") != cap:
+                prior = None
+            if not state.is_current(sess):
+                # ⛔ The session ended while this ran: nothing may say "signed in".
+                state.undo_told(reader, ts, None)
+                log.info("sign-in ack from %s (%s): the session ended meanwhile — "
+                         "nothing handed out", reader, here)
+                self._json(401, {"error": "not signed in — run /login", "authed": False,
+                                 "signinEpoch": state.signin_epoch})
+                return
+            resp: dict[str, Any] = {
+                "ok": True, "authed": True, "uid": sess.uid, "email": sess.email,
+                "ts": cap, "signinEpoch": state.signin_epoch,
+                "consumed": consumed is not None,
+                # The watcher will still say it: the note carries news this
+                # caller did not offer to relay.
+                "newsPending": left_for_watcher,
+                "told": prior,
+            }
+            if consumed is not None:
+                resp["signedIn"] = _signed_in_payload(consumed)
+            try:
+                self._json(200, resp)
+            except Exception:
+                # ⛔ The reply never learned what the note said — hand it back to
+                # the watcher rather than lose it, and un-say "told".
+                if consumed is not None:
+                    state.set_signed_in(consumed, why="restored", sess=sess)
+                state.undo_told(reader, ts, replaced)
+                raise
+            log.info("sign-in ack from %s (%s): %s; watermark %s; previously told by %s",
+                     reader, here,
+                     (f"took the parked note ts={consumed.get('ts')}" if consumed is not None
+                      else "note left for the watcher (it carries news)" if left_for_watcher
+                      else "nothing parked for this chat"),
+                     sealed, (prior or {}).get("reader") or "nobody")
 
         def _researches(self) -> None:
             acct = self._account()
@@ -5275,34 +6022,24 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
 
         def _device_ask_due(self, device_id: str, asked_at: float) -> bool:
-            """Is this tick one the approval poll should actually spend?
+            """Is this tick one the approval check should actually spend?
 
-            The ladder: every tick for the first ten minutes (an owner who is
-            right there still gets told within a minute), then every five to the
-            first hour, then every half hour. ~354 requests over seven days
-            instead of ~10,080, with the common case unchanged.
+            ⛔⛔ NO LONGER A LADDER (owner, 2026-09-25): a steady check about once
+            a minute for the first six hours of the ask, then every half hour to
+            its seven-day TTL — see `_device_ask_check_due`, which the news peek
+            shares, so the watcher's tick and the peek spend ONE cursor.
 
             ⛔ THE CURSOR IS IN MEMORY, ON PURPOSE. Persisting it would mean a
             prefs.json write per poll, and `prefs.save()` is a mkstemp +
             os.replace that this same file records a truncated-write incident
             against — raising its write frequency to save web requests is a bad
-            trade. A bridge restart simply re-opens the ladder at the top, which
-            costs a handful of extra requests and never a missed announce.
+            trade. A bridge restart simply re-opens the cursor, which costs a
+            handful of extra requests and never a missed announce.
 
             ⛔ AGE IS THE ASK'S OWN, NOT THIS PROCESS'S, so a restart cannot walk
             a week-old ask back to one-a-minute forever.
             """
-            now = time.monotonic()
-            age = max(0.0, time.time() - asked_at) if asked_at else 0.0
-            interval = 0.0 if age < 600 else (300.0 if age < 3600 else 1800.0)
-            with _DEVICE_ASK_CURSOR_LOCK:
-                last = _DEVICE_ASK_CURSOR.get(device_id)
-                if last is not None and (now - last) < interval:
-                    return False
-                _DEVICE_ASK_CURSOR[device_id] = now
-                while len(_DEVICE_ASK_CURSOR) > 50:
-                    _DEVICE_ASK_CURSOR.pop(next(iter(_DEVICE_ASK_CURSOR)))
-            return True
+            return _device_ask_check_due(device_id, asked_at)
 
         def _device_access_note(self, out: dict, sess, fs, want_platform: str,
                                 want_chat: str, scope_chat: bool) -> None:
@@ -5343,26 +6080,25 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # announce — same rule the sign-in note follows.
                 return
             device_id = str(ask.get("deviceId") or "")
-            # ⭐⭐ A LADDER, NOT A CAP — AND BELOW THE SCOPE CHECK, DELIBERATELY.
+            # ⭐⭐ A STEADY CHECK, BOUNDED — AND BELOW THE SCOPE CHECK, DELIBERATELY.
             # Once an ask is pending this issued one web request per tick for the
             # full seven-day TTL: ~10,080 for a single unanswered request, each
             # amplifying to roughly four Firestore ops inside a serverless
-            # handler. Rate-limit safe (5 of a 60-per-5-minute budget) but about
-            # thirty times more than the job needs. Its sibling
-            # `_support_log_note` got `_BUNDLE_WATCH_SECONDS` in the same commit;
-            # this one got nothing.
+            # handler. A ladder (every tick / 5 min / 30 min) cut that to ~354 —
+            # and made an approval forty minutes in wait up to five minutes, two
+            # hours in up to thirty (owner, 2026-09-25: replaced). Now: about once
+            # a minute for the first six hours, then every half hour; ~680 over
+            # the week, shared with the news peek so the two never both spend it.
             #
             # ⛔ A HARD CAP WAS THE WRONG SHAPE and was rejected: a wall-clock
             # deadline burns while the host is asleep, so an ask made Friday and
             # approved Saturday is NEVER announced on a laptop reopened Monday.
-            # Today it is. That is a product regression dressed as a cost fix. The
-            # ladder only ever DELAYS the notice — most approvals are still seen
-            # within a minute, and the worst case settles at half an hour.
+            # Today it is. The half-hour tail is what keeps that true.
             #
             # ⛔ AND IT SITS BELOW THE SCOPE CHECK. Above it, a non-matching chat's
             # tick would spend the interval and starve the watchdog that actually
             # owns the ask — on a host with several armed chats that is an
-            # announce delayed indefinitely rather than by thirty minutes.
+            # announce delayed indefinitely rather than by a minute.
             if not self._device_ask_due(device_id, float(ask.get("at") or 0)):
                 return
             status, body = _fe_api_get(sess, "/api/devices/access-request")
@@ -5455,25 +6191,31 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             thinking to ask again, which is the same shape as the approval defect
             and was reported in the same breath (owner, 2026-09-20).
 
-            ⛔ IN-MEMORY, SO A BRIDGE RESTART SIMPLY MEANS NO PROACTIVE NOTICE.
-            The check still works on demand. A bundle normally lands in under a
-            minute, so the window this covers is short and the degradation is the
-            same one `ageSeconds` already accepts.
+            ⛔⛔ ON DISK NOW, SO A BRIDGE RESTART NO LONGER MEANS NO NOTICE (owner,
+            2026-09-25). This used to live in process memory, and "a restart
+            simply means no proactive notice" was written down as acceptable; a
+            restart inside a packaging wait is the ordinary case, and the one
+            message that says the logs arrived was lost with it.
 
-            ⛔ AND IT STOPS. Past `_BUNDLE_WATCH_SECONDS` the record is dropped
-            rather than read forever — a machine that has not answered in half an
-            hour is not answering, and the person has the code either way.
+            ⛔⛔ AND IT NO LONGER STOPS IN SILENCE. Past `_BUNDLE_WATCH_SECONDS`
+            the record used to be dropped without a word, so a person told "asked"
+            never heard anything again. Now the row is read one more time — a
+            late landing is still announced as what it is — and only if there is
+            still no answer is the chat told so, ONCE, under `supportLogsLate`;
+            then the watch ends. ⛔ A NEW KEY, NOT A NEW `supportLogs` STATUS: a
+            watcher from before this change renders every `supportLogs` that is
+            not "failed" as "✓ Support has the logs", so a "late" status sent
+            under the old key would reach an older watcher as a false success.
             """
             now = time.time()
-            with _LOG_REQUESTS_LOCK:
-                pending = [(c, dict(r)) for c, r in _LOG_REQUESTS.items()
-                           if r.get("uid") == sess.uid and not r.get("announced")]
+            try:
+                reqs = prefs.get_log_requests(sess.uid)
+            except Exception:  # noqa: BLE001 — prefs is best-effort, never fatal here
+                return
+            pending = sorted(((c, r) for c, r in reqs.items() if not r.get("announced")),
+                             key=lambda cr: float(cr[1].get("at") or 0))
             for code, rec in pending:
                 age = now - float(rec.get("at") or 0)
-                if age > _BUNDLE_WATCH_SECONDS:
-                    with _LOG_REQUESTS_LOCK:
-                        _LOG_REQUESTS.pop(code, None)
-                    continue
                 origin = _clean_origin(rec.get("origin"))
                 if scope_chat:
                     if not (isinstance(origin, dict)
@@ -5488,15 +6230,31 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     log.debug("bundle watch read failed for %s: %s", code, e)
                     continue
                 status = str((row or {}).get("status") or "")
+                uid = sess.uid
                 if status not in ("done", "failed"):
-                    continue
+                    if age <= _BUNDLE_WATCH_SECONDS:
+                        continue
+                    # ⭐ STILL NOTHING, PAST THE WATCH — say so once, then stop.
+                    def _mark_late(c=code):
+                        _mark_log_request(c, uid, {"announced": True, "outcome": "late",
+                                                   "announcedAt": time.time()})
+                    self._post_send.append(_mark_late)
+                    log.info("bundle %s: still no answer after %ss — telling the chat "
+                             "once, then the watch ends", code, int(age))
+                    out["supportLogsLate"] = {
+                        "code": code,
+                        "deviceName": rec.get("deviceName") or "",
+                        "ageSeconds": int(age),
+                        "runCount": int(rec.get("runCount") or 0),
+                        "agentLogCode": rec.get("agentLogCode") or "",
+                    }
+                    return
                 # ⛔ MARKED ONLY AFTER THE SEND SUCCEEDS, for the same reason the
                 # device-access note is: marking first means a dropped connection
                 # eats the one message that says the logs arrived.
-                def _mark(c=code):
-                    with _LOG_REQUESTS_LOCK:
-                        if c in _LOG_REQUESTS:
-                            _LOG_REQUESTS[c]["announced"] = True
+                def _mark(c=code, st=status):
+                    _mark_log_request(c, uid, {"announced": True, "outcome": st,
+                                               "announcedAt": time.time()})
                 self._post_send.append(_mark)
                 log.info("bundle %s reached %s — announcing", code, status)
                 out["supportLogs"] = {
@@ -5697,6 +6455,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # silently eat an approval nobody was listening for. Only the poller
             # sets this, and only the poller can deliver a proactive message.
             watchdog = qs.get("watchdog", [""])[0] in ("1", "true", "yes")
+            # WHO is reading, for the log and the "already told" record (owner,
+            # 2026-09-25): the watchdog is itself; anybody else may say who they
+            # are with `?reader=` (sr.py's `login-done` does), else "updates".
+            reader = ("watchdog" if watchdog
+                      else _reader_label(qs.get("reader", [""])[0], "updates"))
             # ?platform=…&chat=… (a PER-CHAT watchdog): further restrict to runs
             # fired FROM that chat (matched on the doc's chatOrigin) so a run
             # started in one chat streams back only to that chat. Both must be
@@ -5742,6 +6505,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 _plan = _run_plan(r)
                 _act, _det, _offers = _attention_extras(_plan)
                 needs = attention is not None or status in _ATTENTION_STATUSES
+                if via_agent:
+                    # The news peek's picture of what the watcher has seen.
+                    _note_run_seen(sess.uid, r, status, needs, watchdog=watchdog,
+                                   akey=_run_akey(attention, _act))
                 # active=1 keeps the in-flight runs AND any run that needs the
                 # user — an errored/paused run isn't "ongoing" but is exactly what
                 # a chat poller must surface, so it must not be filtered out.
@@ -5885,7 +6652,16 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # ⛔ NOT "stop claiming here". `claim_signin_announce` answers "first"
                 # (set, stay SILENT) when no watermark exists yet, so a brand-new sign-in
                 # on this computer — the commonest case — would never get its repeat.
-                ev = state.take_signed_in(sess.uid)
+                # ⛔⛔ TAKEN ONLY WHILE `sess` IS STILL THE LIVE SESSION, decided under
+                # the take's own lock (owner, 2026-09-25) — this request captured its
+                # session on entry and then spent seconds in Firestore above.
+                ev = state.take_signed_in(sess.uid, sess=sess)
+                if isinstance(ev, dict) and _note_is_stale(ev, sess):
+                    # ⛔ A NOTE FOR ANOTHER SIGN-IN IS NEVER HANDED OUT, NOR PUT BACK.
+                    log.info("sign-in note ts=%s refused: this session signed in at %s "
+                             "— dropped", ev.get("ts"),
+                             getattr(sess, "connected_at_ms", None))
+                    ev = None
                 if isinstance(ev, dict):
                     # ⛔ CLEANED HERE TOO, NOT ONLY AT THE MINT — cross-verification
                     # found the skew: prefs.json SURVIVES the upgrade (that is the whole
@@ -5908,34 +6684,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             and (ev_origin.get("chat_id") or "").strip() == want_chat)
                     )
                     if deliver:
-                        out["signedIn"] = {
-                            "ts": ev.get("ts"),
-                            "email": ev.get("email") or "",
-                            "pendingTopic": ev.get("pendingTopic") or "",
-                            # Sign-in auto-start hints (the bridge started/blocked the
-                            # pending research server-side; the watchdog renders the
-                            # right line). Absent on a plain sign-in.
-                            "autoStarted": bool(ev.get("autoStarted")),
-                            "needsDevice": bool(ev.get("needsDevice")),
-                            "runId": ev.get("runId") or "",
-                            "deviceName": ev.get("deviceName") or "",
-                            # None when unknown — never coerced to a boolean, or
-                            # "we could not tell" would render as "it is asleep".
-                            "deviceOnline": ev.get("deviceOnline"),
-                            "topic": ev.get("topic") or "",
-                            # The FOURTH outcome: the account has several usable
-                            # computers and the sign-in auto-start could not choose.
-                            # Distinct from `needsDevice` (which means there is no
-                            # research computer at all) and — the point of it —
-                            # distinct from an ERROR, which the old empty-dict hint
-                            # made indistinguishable from this.
-                            "needsDeviceChoice": bool(ev.get("needsDeviceChoice")),
-                            "devices": ev.get("devices") or [],
-                            # WHY it is asking: the computer they last used is gone,
-                            # or they simply never picked one. The run path has told
-                            # those apart since 0.1.27; this one could not.
-                            "staleSelection": bool(ev.get("staleSelection")),
-                        }
+                        # One builder for every reader of a note (`/signin/ack` too).
+                        out["signedIn"] = _signed_in_payload(ev)
+                        log.info("sign-in note ts=%s taken by %s for %s", ev.get("ts"),
+                                 reader, _scope_label(ev_origin))
                         # ⛔⛔ CLEARED AFTER THE RESPONSE IS WRITTEN, NOT BEFORE.
                         # This was the wrong way round on the first pass, and it
                         # quietly voided the whole point of replacing take with
@@ -5970,8 +6722,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         marked, mark_prev = _claim_announced(sess, mark_ms)
                     else:
                         # Not this chat's — put it straight back for the watchdog
-                        # that owns it.
-                        state.set_signed_in(ev)
+                        # that owns it. ⛔ Only while `sess` is still the live one.
+                        state.set_signed_in(ev, why="put back", sess=sess)
                 elif not scope_chat:
                     # ⛔⛔ NOTHING PARKED — SO CHECK WHETHER ONE WAS LOST. HTTP cannot
                     # tell us a reader received anything: a poller that times out and
@@ -5992,12 +6744,34 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     # same rule the parked path follows, for the same reason: with
                     # several channels armed, whichever polled first would announce a
                     # sign-in in the wrong chat.
-                    remade, mark_prev = _remint_signin(sess)
+                    remade, mark_prev = _remint_signin(sess, state)
                     if remade is not None:
                         out["signedIn"] = remade
                         taken = None
                         marked = True
                         mark_ms = int(remade.get("ts") or 0)
+            said = out.get("signedIn") if isinstance(out.get("signedIn"), dict) else None
+            # ⛔⛔ THE LAST LOOK BEFORE ANYTHING LEAVES (owner, 2026-09-25). This
+            # request captured its session on entry and has spent seconds in
+            # Firestore and the web app since. If the person logged out meanwhile,
+            # NOTHING built above may go out — not "signed in", not an approval, not
+            # a run list for an account that is no longer here. It answers exactly
+            # what a request arriving now would get: 401. Nothing is put back (the
+            # logout cleared it) and the watermark is left where the logout sealed it.
+            if not state.is_current(sess):
+                log.info("updates (%s): the session ended while this request ran — "
+                         "nothing handed out%s", reader,
+                         f" (sign-in note ts={said.get('ts')} withheld)" if said else "")
+                self._json(401, {"error": "not signed in — run /login",
+                                 "signinEpoch": state.signin_epoch})
+                return
+            out["signinEpoch"] = state.signin_epoch
+            told_to = told_prior = None
+            if said is not None:
+                # ⭐ THE ONE "ALREADY TOLD" RECORD: this reader, this sign-in, now —
+                # recorded before the bytes go, undone below if they do not.
+                told_to = _scope_label(taken.get("origin")) if taken else "account-wide"
+                told_prior = state.record_told(said.get("ts"), reader, told_to)
             try:
                 self._json(200, out)
                 # ⭐ THE BYTES ARE AWAY — now it is safe to forget. Never fatal: a
@@ -6012,9 +6786,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             except Exception:
                 # ⛔ THE SEND FAILED, SO THE ANNOUNCE WAS NOT DELIVERED. Put it back
                 # rather than let a dropped connection destroy it — that loss is the
-                # whole defect this stretch set out to fix.
+                # whole defect this stretch set out to fix. ⛔ Only while `sess` is
+                # still the live session (owner, 2026-09-25).
                 if taken is not None:
-                    state.set_signed_in(taken)
+                    state.set_signed_in(taken, why="restored", sess=sess)
                 # ⛔⛔ AND PUT THE WATERMARK BACK TOO, which it did not. Restoring the
                 # note while leaving the mark advanced left the two records of the same
                 # fact disagreeing: the note was claimable again, and the re-mint that
@@ -6022,7 +6797,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # this sign-in had already gone out. Both halves, or neither.
                 if marked:
                     _rollback_announced(sess, mark_prev, mark_ms)
+                if said is not None:
+                    state.undo_told(reader, said.get("ts"), told_prior)
+                    log.info("sign-in note ts=%s NOT delivered to %s (the send failed) "
+                             "— rolled back", said.get("ts"), reader)
                 raise
+            if said is not None:
+                log.info("sign-in note ts=%s delivered to %s for %s — committed "
+                         "(watermark %s)", said.get("ts"), reader, told_to,
+                         mark_ms if marked else "unmoved")
 
         def _research_cancel(self, rid: str) -> None:
             """Cancel a run (the chat /sr-cancel): one action:"cancel" to the run's
@@ -6639,6 +7422,16 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         target=_remote_autopoll_loop, args=(state, rp_stop), name="agent-remote-autopoll", daemon=True
     )
     rp_thread.start()
+    # ⭐⭐ INSTANT DELIVERY (owner decision 1, 2026-09-25): armed HERE and only
+    # here, so no handler-level test can ever run a real `hermes`. The news peek
+    # rides beside it — a no-op with no network at all unless instant delivery
+    # is available on this computer (see `_news_peek_loop`).
+    push.arm()
+    np_stop = threading.Event()
+    np_thread = threading.Thread(
+        target=_news_peek_loop, args=(state, np_stop), name="agent-news-peek", daemon=True
+    )
+    np_thread.start()
     log.info("Super Agent bridge on http://%s:%d (authed=%s)", host, port, authed)
     print(f"Super Agent bridge listening on http://{host}:{port}")
     print(f"  sign in:  {config.login_origin()}/login   (local page; or remote via chat /sr-login)")
@@ -6651,4 +7444,6 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     finally:
         hb_stop.set()
         rp_stop.set()
+        np_stop.set()
+        push.disarm()
         httpd.shutdown()

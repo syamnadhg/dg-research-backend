@@ -11,6 +11,14 @@ was given nothing, and that inconsistency is the tell.
 deadline burns while the host is asleep, so an ask made Friday and approved
 Saturday is NEVER announced on a laptop reopened Monday — today it is. That is a
 product regression dressed as a cost fix. A ladder only ever DELAYS the notice.
+
+⭐⭐ AND THE LADDER ITSELF WAS REPLACED (owner, 2026-09-25). It delayed an approval
+forty minutes in by up to five minutes, two hours in by up to thirty, on top of the
+watcher's own ~2-minute tick and Hermes's queue. Now: a STEADY check about once a
+minute for the first six hours of the ask (the held topic's own lifetime — how long
+a yes can still start the research), then the old half-hour tail to the seven-day
+TTL, which keeps the Friday/Monday case announced. The tests below were re-aimed
+from the ladder's numbers to these; the no-hard-cap guard is unchanged.
 """
 
 import sys
@@ -53,15 +61,25 @@ def test_a_fresh_ask_still_polls_every_single_minute():
     assert _spend(_due(), age_seconds=0, ticks=10) == 10
 
 
-def test_an_old_ask_is_throttled_hard():
-    """Past the first hour it settles at one poll per half hour."""
+def test_an_ask_two_hours_old_is_still_checked_every_minute():
+    """⭐⭐ THE OWNER'S DECISION (2026-09-25). Under the ladder this ask was polled
+    twice in ten minutes; an owner approving now waited up to half an hour to be
+    announced. Inside the steady window it is checked every minute."""
+    assert _spend(_due(), age_seconds=7200, ticks=10) == 10
+
+
+def test_past_the_steady_window_it_settles_at_the_half_hour_tail():
+    """⛔ BOUNDED: past six hours the steady check stops and the half-hour tail
+    takes over — re-aimed from the ladder's "past the first hour" (2026-09-25)."""
     due = _due()
-    assert _spend(due, age_seconds=7200, ticks=10) <= 2
+    assert _spend(due, age_seconds=7 * 3600, ticks=10) <= 2
 
 
-def test_the_seven_day_worst_case_is_a_few_hundred_not_ten_thousand():
-    """⛔ THE NUMBER THIS EXISTS FOR. 10,080 -> ~354, a 97% cut, with the common
-    case unchanged."""
+def test_the_seven_day_worst_case_stays_in_the_hundreds_not_ten_thousand():
+    """⛔ THE NUMBER THIS EXISTS FOR. The unthrottled poll spent 10,080; the ladder
+    ~354; the steady-then-tail check (owner, 2026-09-25) ~684 — six hours at one a
+    minute (360) plus the half-hour tail. Still a 93% cut, and the common case —
+    an approval inside the first hours — is now told within a minute."""
     due = _due()
     bridge._DEVICE_ASK_CURSOR.clear()
     now = time.time()
@@ -76,10 +94,12 @@ def test_the_seven_day_worst_case_is_a_few_hundred_not_ten_thousand():
                 spent += 1
     finally:
         time.monotonic = real
-    assert spent < 600, spent
-    # ⛔ AND NOT ZERO — a ladder that stopped entirely would be the hard cap this
-    # design rejected, and the test above would not notice.
-    assert spent > 100, spent
+    assert spent < 800, spent
+    # ⛔ AND THE STEADY WINDOW IS REALLY SPENT: every minute of the first six hours.
+    assert spent >= 360, spent
+    # ⛔ AND NOT ONLY THE STEADY WINDOW — a check that stopped after it would be
+    # the hard cap this design rejected, and the bound above would not notice.
+    assert spent > 360 + 100, spent
 
 
 def test_the_age_is_the_asks_own_not_this_processs():
@@ -91,6 +111,55 @@ def test_the_age_is_the_asks_own_not_this_processs():
     old = time.time() - 4 * 24 * 3600
     assert due("dev1", old) is True             # one free poll after a restart
     assert due("dev1", old) is False            # then straight back to the ladder
+
+
+def test_the_news_peek_and_the_watchers_tick_spend_ONE_cursor(monkeypatch):
+    """⛔⛔ (2026-09-25) The news peek checks approvals too, so a host with instant
+    delivery must not pay for two checks a minute. Both go through
+    `_device_ask_check_due`: a check the peek spent is not spent again by the
+    watcher's own tick inside the same minute."""
+    mono = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: mono[0])
+    bridge._DEVICE_ASK_CURSOR.clear()
+    due = _due()
+    asked = time.time()
+    assert bridge._device_ask_check_due("dev1", asked) is True      # the peek
+    mono[0] = 20.0
+    assert due("dev1", asked) is False                               # the watcher
+    mono[0] = 60.0
+    assert due("dev1", asked) is True
+
+
+def test_a_reset_makes_the_very_next_check_due(monkeypatch):
+    """⭐ The peek saw the answer and pushed; the watcher's own read must then be
+    allowed to look again AT ONCE and deliver it, not wait out the minute."""
+    mono = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: mono[0])
+    bridge._DEVICE_ASK_CURSOR.clear()
+    asked = time.time()
+    assert bridge._device_ask_check_due("dev1", asked) is True
+    mono[0] = 1.0
+    assert bridge._device_ask_check_due("dev1", asked) is False
+    bridge._device_ask_reset("dev1")
+    assert bridge._device_ask_check_due("dev1", asked) is True
+
+
+def test_a_one_minute_tick_that_lands_early_is_not_skipped(monkeypatch):
+    """⛔ ~55 s, NOT 60 (owner, 2026-09-25). The watcher's "every minute" is the
+    runtime's minute, not this process's: a tick that lands a second early against a
+    60 s interval is refused, and the owner's yes waits a whole extra minute. Found
+    by mutation (2026-09-25): every other test here steps exactly 60.0 s, so a 60 s
+    interval passed them all."""
+    mono = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: mono[0])
+    bridge._DEVICE_ASK_CURSOR.clear()
+    due = _due()
+    asked = time.time()
+    assert due("dev1", asked) is True
+    mono[0] = 59.0                                   # the next tick, a second early
+    assert due("dev1", asked) is True
+    mono[0] = 59.0 + 30.0                            # but never twice in one minute
+    assert due("dev1", asked) is False
 
 
 def test_the_cursor_is_bounded():

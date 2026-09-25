@@ -83,10 +83,10 @@ MUTANTS = [
      [('    lines.append(_ADD_A_COMPUTER)\n'
        '    lines.append("You can remove or switch computers anytime — just ask.")',
        '    lines.append("You can remove or switch computers anytime — just ask.")')]),
-    ("A7", SR, "⛔ THE FIRST LINE AFTER SIGN-IN on an account with no computer loses the "
-     "link — the commonest first contact",
-     [('    return (f"✓ Connected as {who}. {_ADD_A_COMPUTER} Or ask me for a public "',
-       '    return (f"✓ Connected as {who}. Or ask me for a public "')]),
+    # ⛔ A7 WAS DELETED 2026-09-25 — its subject no longer exists (owner decision):
+    # the first line after sign-in carries NO add line at all now, because a login
+    # answer is about login only. The id is retired, not reused; A15 below mutates
+    # the other way — device content creeping back into that line.
     ("A8", SR, "⛔ 'install / set up Super Research' goes back to installing the backend on "
      "the chat's own host (owner: those phrasings get the page)",
      [('            return None, [_NL_CONFIRMS["install"]]\n'
@@ -125,6 +125,11 @@ MUTANTS = [
        '        "I’ll connect it.",',
        '        "run superresearch --pair on it — it shows an 8-character access code; "\n'
        '        "send it to me and I’ll connect it.",')]),
+    ("A15", SR, "⛔⛔ THE SIGN-IN LINE CARRIES THE ADD LINE AGAIN — 'am I logged in?' "
+     "turns back into a device lecture glued to the answer (owner, 2026-09-25: a "
+     "login answer is about login only)",
+     [("    return f\"✓ Signed in{(' as ' + who) if who else ''}.\"",
+       "    return f\"✓ Signed in{(' as ' + who) if who else ''}. {_ADD_A_COMPUTER}\"")]),
     # ═══ W — the watcher (reaches the person with no model turn) ═══════════════
     ("W1", POLL, "⛔ THE WATCHER'S ADD LINE LOSES THE LINK — and nothing relays this text, "
      "so nothing could put it back",

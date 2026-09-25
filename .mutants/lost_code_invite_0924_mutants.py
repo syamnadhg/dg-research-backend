@@ -60,8 +60,11 @@ MUTANTS = [
     # ═══ I — the invite on every list, the email half at the ask ════════════════
     ("I1", POLL, "the sign-in note's public list carries the email half again, unlike "
      "every other list (owner: one wording)",
-     [('            f"They see your name."\n        )',
-       '            f"They see your name — or your email, if you have not set one."\n        )')]),
+     # ⭐ RE-AIMED 2026-09-25: "Tell me which one to ask for." left the line above
+     # (owner: this paragraph shows no list), so the sentence now ends a joined line.
+     [('            f"is accepted you can use that computer. They see your name."\n        )',
+       '            f"is accepted you can use that computer. They see your name — or your '
+       'email, if you have not set one."\n        )')]),
     ("I2", CLI, "the terminal's public list says 'Its owner decides' again",
      [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "',
        '_PUBLIC_ASK_INVITE_T = ("     Its owner decides. Once the request is accepted you can '

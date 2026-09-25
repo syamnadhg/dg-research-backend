@@ -285,9 +285,11 @@ def _public_offer_lines() -> list[str]:
 # said where the code comes from, so the model invented "from the Super Research
 # app". Now the URL is written into the rule literally, the code's true origin is
 # stated, and the only ordering left is the one the screen already prints.
-# ⛔ "AS PRINTED" STILL COVERS THE LINES AROUND THE SCREEN. `status-account`
-# prints an update notice after it and the sign-in paths a held-topic promise
-# before it; both sit above the marker, so both are part of "the screen above".
+# ⛔ "AS PRINTED" STILL COVERS THE LINES AROUND THE SCREEN. The sign-in paths
+# print the sign-in line and a held-topic promise before it; both sit above the
+# marker, so both are part of "the screen above". (`status-account` no longer
+# prints the screen at all — a login answer is about login only, owner
+# 2026-09-25.)
 _EMPTY_STATE_RELAY = (
     "⛔ Relay the screen above as ONE message, as printed. Keep "
     f"{_INSTALL_PAGE_URL} inside the “Add a computer” sentence and keep the "
@@ -305,8 +307,8 @@ def _with_empty_state_relay(lines: "list[str]") -> "list[str]":
     it as a fragment that other code extends — `_pick_device_lines` (send-logs
     then adds its own sentence about the agent's log) and the sign-in note — and
     a directive baked into the renderer would silently swallow whatever they
-    append. So each message that ENDS here attaches it itself: `devices`,
-    `status-account` and `research` on an empty account, `login-done` when the
+    append. So each message that ENDS here attaches it itself: `devices` and
+    `research` on an empty account, `login-done` when the
     sign-in note says there is nowhere to run, every device command whose name
     lookup found no computer at all (via `_resolve_device_arg`), and `updates`
     when the sign-in note it took says there is nowhere to run (there the rule
@@ -350,9 +352,10 @@ def _no_device_lines(lead: str | None = None) -> list[str]:
     ⛔ `lead` is for the callers that arrive with an object already in hand (a
     topic that has nowhere to run). It is NOT a second phrasing of the three
     things — it names what was being attempted, and the three things follow it
-    unchanged.
+    unchanged, as a block of their own (a blank line after the lead, owner
+    2026-09-25).
     """
-    lines = [lead] if lead else []
+    lines = [lead, ""] if lead else []
     lines.append("No research computer on this account yet.")
     lines.append("")
     # ⛔⛔ NOT NUMBERED, AND NOT COUNTED — THERE IS NO HONEST NUMBER TO GIVE
@@ -981,8 +984,9 @@ def _build_stream_cron_job(script_name: str, job_name: str, origin: dict | None,
     chat that armed it (resolved at fire time from ``job["origin"]``); no origin →
     ``"local"`` (the caller only writes directly when an origin is present, so this
     branch stays correct). ``next_run_at`` ≈ now so it's due within the scheduler's
-    grace window and fires on the very next tick; ``repeat.times=None`` = forever,
-    so mark_job_run never auto-removes it."""
+    grace window and fires on the very next tick — the start of this minute for a
+    cron expression (`_first_run_at`); ``repeat.times=None`` = forever, so
+    mark_job_run never auto-removes it."""
     now = _cron_now()
     return {
         "id": uuid.uuid4().hex[:12],   # REQUIRED — subscripted in Hermes' due-scan
@@ -1004,7 +1008,7 @@ def _build_stream_cron_job(script_name: str, job_name: str, origin: dict | None,
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
-        "next_run_at": now,
+        "next_run_at": _first_run_at(schedule),
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
@@ -1020,7 +1024,8 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
                      schedule: dict) -> bool:
     """Write the watchdog cron row into <HERMES_HOME>/cron/jobs.json deterministically
     — no dependence on the chat AI issuing cronjob:create. Idempotent BY NAME: a
-    RUNNABLE job of this name is left untouched, and a disabled/paused one is revived
+    RUNNABLE job of this name is left untouched (except, once, by the watcher
+    schedule migration — `_migrate_stream_schedules`), and a disabled/paused one is revived
     in place rather than duplicated (create has no dedupe, so a blind re-append would
     accumulate duplicates → the runtime's later name lookups raise
     AmbiguousJobReference). Serialized against the gateway via the
@@ -1052,6 +1057,11 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
             return False
         existing = next((j for j in data["jobs"]
                          if isinstance(j, dict) and j.get("name") == job_name), None)
+        # ⭐ THE ONE-TIME SCHEDULE MIGRATION (owner, 2026-09-25) — every watcher
+        # row on this host, not only this chat's, because the arm is the only
+        # moment this client holds the store. See `_migrate_stream_schedules`.
+        moved = (_migrate_stream_schedules(data["jobs"], schedule)
+                 if _is_stream_job_name(job_name) else [])
         if existing is not None:
             # Present — but "present" only counts as ARMED if it can actually run. A
             # disabled/paused row is skipped by the runtime's due-scan before any
@@ -1059,10 +1069,13 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
             # with no way back (a re-arm would keep finding it). Revive it in place
             # instead of appending a duplicate (duplicates break name lookups).
             if existing.get("enabled", True) and existing.get("state") != "paused":
-                return True  # genuinely armed — idempotent no-op
-            existing.update({"enabled": True, "state": "scheduled", "paused_at": None,
-                             "paused_reason": None,
-                             "next_run_at": _cron_now()})  # due now, inside the grace window
+                if not moved:
+                    return True  # genuinely armed — idempotent no-op
+            else:
+                existing.update({"enabled": True, "state": "scheduled", "paused_at": None,
+                                 "paused_reason": None,
+                                 # due now, inside the grace window
+                                 "next_run_at": _first_run_at(existing.get("schedule"))})
         else:
             data["jobs"].append(_build_stream_cron_job(script_name, job_name, origin, schedule))
         # Per-process temp name. Several writers touch this file — this arming
@@ -1076,6 +1089,12 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
         except OSError:           # the temp file's mode onto jobs.json
             pass
         os.replace(tmp, jobs_file)  # atomic; Hermes re-reads jobs.json each tick
+        if moved:
+            _watcher_log(f"arm {job_name}: moved {len(moved)} watcher row(s) to "
+                         f"{schedule.get('display', '')!r}: {', '.join(moved)}")
+        if existing is None:
+            _watcher_log(f"arm {job_name}: new row, schedule "
+                         f"{schedule.get('display', '')!r}")
         return True
     except OSError:
         return False
@@ -1089,32 +1108,244 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
             lock_fd.close()
 
 
-# INTERVAL, deliberately — not a cron expression. Both persist identically (the
+# INTERVAL, AS THE FALLBACK — not a cron expression. Both persist identically (the
 # runtime stores whatever we write and re-reads it each tick), but a cron-expr
 # schedule needs the runtime's OPTIONAL croniter dependency: without it, next-run
 # computation returns None, so the job would fire ONCE and then go permanently
-# silent — the exact failure this fix exists to eliminate, in an unrecoverable form
-# (a re-arm is idempotent, so it would find the broken row and leave it). An
-# interval schedule never touches croniter, so it ticks forever either way.
+# silent — the exact failure this fix exists to eliminate. An interval schedule
+# never touches croniter, so it ticks forever either way. It is what a runtime gets
+# whenever `_runtime_has_croniter` cannot CONFIRM croniter (see below).
 _STREAM_SCHEDULE = {"kind": "interval", "minutes": 1, "display": "every 1m"}
 _UPDATE_NOTICE_SCHEDULE = {"kind": "interval", "minutes": 1440, "display": "every 1440m"}
+
+# ⭐⭐ "EVERY 1m" RAN EVERY ~2 MINUTES, SO WHERE THE RUNTIME CAN COMPUTE A CRON
+# EXPRESSION THE WATCHER GETS ONE (owner, 2026-09-25). Hermes counts an interval
+# from the moment a run FINISHES and its due check is strict, so a run that ends a
+# second after its claim always misses the next 60-second pass: measured on
+# 2026-09-24, the owner's watcher ran every 113 s on average (72–154 s), and the
+# "✓ Signed in" waited a whole extra pass before the watcher even picked it up.
+# `* * * * *` is anchored to minute boundaries instead, so every pass finds it due.
+# ⛔ `next_run_at` IS ROUNDED DOWN TO THE MINUTE FOR THIS SHAPE (`_first_run_at`).
+# Hermes reads an off-boundary next_run_at on a cron row as a hand-edited
+# expression and re-anchors it WITHOUT firing — it would skip the first run, which
+# is exactly the one that carries a sign-in. The floor is at most 59 s in the past,
+# inside the runtime's 120 s catch-up grace window.
+_STREAM_CRON_SCHEDULE = {"kind": "cron", "expr": "* * * * *", "display": "* * * * *"}
+
+
+def _hermes_croniter_path() -> "str | None":
+    """Where the chat runtime's OWN install keeps croniter, or None if that cannot
+    be confirmed.
+
+    ⛔ THE RUNTIME'S INTERPRETER, NOT OURS. The gateway computes next runs in its
+    own environment; this script may be run by a different Python altogether, so
+    importing croniter here would prove nothing. The `hermes` command leads to that
+    environment: its real path (the owner's is ~/.local/bin/hermes →
+    ~/hermes-agent/.venv/bin/hermes) and its shebang both sit inside the virtualenv
+    whose site-packages we look in. Read-only; anything unusual answers None, which
+    keeps the interval — the direction that can never go silent."""
+    import glob
+    import shutil
+    clis: "list[str]" = []
+    found = shutil.which("hermes")
+    if found:
+        clis.append(found)
+    clis.append(str(Path.home() / ".local" / "bin" / "hermes"))
+    roots: "list[Path]" = []
+    for cli in clis:
+        try:
+            if not os.path.isfile(cli):
+                continue
+            real = Path(os.path.realpath(cli))
+            roots.append(real.parent.parent)
+            with open(real, "rb") as fh:
+                first = fh.readline(512)
+        except OSError:
+            continue
+        if first.startswith(b"#!"):
+            interp = first[2:].strip().split(b" ")[0].decode("utf-8", "replace")
+            # ⛔ NOT resolved: a venv's python is usually a symlink to the system
+            # one, and following it would leave the venv we are looking for.
+            if interp and not interp.endswith("/env"):
+                roots.append(Path(interp).parent.parent)
+    for root in dict.fromkeys(roots):
+        for sp in (glob.glob(str(root / "lib" / "python*" / "site-packages"))
+                   + [str(root / "Lib" / "site-packages")]):
+            for mod in (Path(sp) / "croniter" / "__init__.py", Path(sp) / "croniter.py"):
+                if mod.is_file():
+                    return str(mod)
+    return None
+
+
+def _runtime_has_croniter() -> bool:
+    return _hermes_croniter_path() is not None
+
+
+def _stream_schedule() -> dict:
+    """The watcher's schedule on THIS host: a minute-anchored cron expression
+    where the runtime can compute one, the interval everywhere else."""
+    return dict(_STREAM_CRON_SCHEDULE if _runtime_has_croniter() else _STREAM_SCHEDULE)
+
+
+def _first_run_at(schedule: "dict | None") -> str:
+    """`next_run_at` for a row being armed, revived or migrated: now for an
+    interval, the start of the current minute for a cron expression (see
+    `_STREAM_CRON_SCHEDULE` for why it must not be off the boundary)."""
+    if isinstance(schedule, dict) and schedule.get("kind") == "cron":
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
+    return _cron_now()
+
+
+def _is_stream_job_name(name: object) -> bool:
+    return isinstance(name, str) and (name == "sr-stream" or name.startswith("sr-stream-"))
+
+
+def _schedule_key(schedule: object) -> "tuple | None":
+    """The two watcher schedules this client has ever written, as comparable keys;
+    None for anything else (a hand-edited schedule, which migration leaves alone)."""
+    if not isinstance(schedule, dict):
+        return None
+    if schedule.get("kind") == "interval" and schedule.get("minutes") in (1, 1.0):
+        return ("interval", 1)
+    if schedule.get("kind") == "cron" and schedule.get("expr") == "* * * * *":
+        return ("cron", "* * * * *")
+    return None
+
+
+def _migrate_stream_schedules(jobs: list, want: dict) -> "list[str]":
+    """Move every watcher row still on the OTHER schedule this client writes onto
+    ``want``, in place; returns the names it moved.
+
+    ⭐ ONCE PER ROW, BY CONSTRUCTION. Arming used to leave a runnable row untouched
+    ("idempotent by name"), so every watcher already armed would have kept its
+    ~2-minute interval forever. A row that already has ``want`` is not touched
+    again, so this runs once per row and then never. It works in both directions:
+    a cron row on a host that no longer has croniter goes BACK to the interval,
+    because a cron row there would fire once and then never again.
+    ⛔ A schedule this client never wrote (somebody hand-edited it) is left alone."""
+    want_key = _schedule_key(want)
+    moved: "list[str]" = []
+    if want_key is None:
+        return moved
+    for job in jobs:
+        if not isinstance(job, dict) or not _is_stream_job_name(job.get("name")):
+            continue
+        have = _schedule_key(job.get("schedule"))
+        if have is None or have == want_key:
+            continue
+        job["schedule"] = dict(want)
+        job["schedule_display"] = want.get("display", "")
+        job["next_run_at"] = _first_run_at(want)
+        moved.append(str(job.get("name")))
+    return moved
+
+
+def _watcher_log_path() -> Path:
+    """The watcher's own log — a FILE, because its stdout IS the chat message.
+    `SUPER_AGENT_WATCHER_LOG` points it elsewhere (the test suite does, so no test
+    writes into a real home). MUST match sr_attention_poll._log_path."""
+    raw = (os.environ.get("SUPER_AGENT_WATCHER_LOG") or "").strip()
+    return Path(raw) if raw else Path.home() / ".super-agent" / "watcher.log"
+
+
+def _watcher_log(msg: str) -> None:
+    """Append one line to the watcher's log. Never raises, never prints: this runs
+    inside a chat reply, and a logging failure is not the person's problem."""
+    try:
+        path = _watcher_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open(path, "ab") as fh:
+            fh.write(f"{stamp} sr.py[{os.getpid()}] {msg}\n".encode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — best-effort diagnostics only
+        pass
 
 
 # ── commands ────────────────────────────────────────────────────────────────
 
-def cmd_login(args) -> int:
-    payload = {"runtime": args.runtime or "", "label": args.label or ""}
+# ⭐⭐ A LOGIN ANSWER IS ABOUT LOGIN ONLY (owner, 2026-09-25). On 2026-09-24 one
+# sign-in reached one chat three ways inside two minutes — "✓ Connected as … —
+# you're all set", the watcher's "Just tell me what to research", and a run-on
+# "Add a computer … Or ask me for a public computer" — to somebody who had only
+# asked whether they were logged in, with advice that contradicted itself. Every
+# reply that says somebody is signed in now opens with ONE line, and for a plain
+# sign-in it IS that line: `_connected_msg`. Device content belongs to device
+# situations — a research with nowhere to run, adding or listing computers, a
+# sign-in whose waiting topic has nowhere to run — and keeps its separate blocks
+# there.
+_SIGNED_OUT_LINE = "Not signed in — tell me to log you in and I'll send a link."
+
+
+def _ack_signed_in(reader: str, *, with_news: bool = False) -> "tuple[int, dict]":
+    """Tell the bridge this reply is about to say "signed in" (`POST /signin/ack`).
+
+    ⭐⭐ ONE "ALREADY TOLD" RECORD (owner, 2026-09-25). The watcher and the chat's
+    own answer each announced the same sign-in, 34 s apart, because nothing
+    recorded that the person had been told. The ack TAKES this chat's parked note
+    (so the watcher finds nothing to repeat), seals the bridge's watermark at this
+    sign-in (so nothing re-mints it), and records who said it. Memory and
+    prefs.json only on the bridge's side, so even a status check can afford it.
+
+    ⛔ ``with_news`` ONLY FROM A REPLY THAT RENDERS THE NOTE. A note that says what
+    the bridge DID with a waiting research ("Started X on Y", "X has nowhere to
+    run") is handed only to a caller that promises to relay it; any other caller
+    leaves it for the watcher, so a plain "✓ Signed in" can never swallow it.
+
+    Scoped to THIS chat whenever the runtime says which one it is, so a note
+    addressed to another chat is never taken. Returns the bridge's (code, body):
+    401 means the session ended — nothing may say "signed in" — and 404 is an
+    older bridge without the route."""
+    body: dict = {"reader": reader}
     origin = _origin_from_env()
     if origin:
-        payload["origin"] = origin
-    code, body = _post("/login/remote/start", payload)
-    if code != 200:
-        return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
-    lines = [
-        "Log in here:",
-        f"  {body.get('verifyUrl')}",
-        "Tap Authenticate when the page opens — you'll connect automatically.",
-    ]
+        body["platform"] = origin.get("platform", "")
+        body["chat"] = origin.get("chat_id", "")
+    if with_news:
+        body["withNews"] = True
+    code, out = _post("/signin/ack", body)
+    return code, (out if isinstance(out, dict) else {})
+
+
+def _already_signed_in() -> "tuple[str | None, dict]":
+    """``(line, status body)`` when the account is signed in right now, else
+    ``(None, {})`` — the check `login` makes before it starts anything."""
+    code, body = _get("/status")
+    if code != 200 or not isinstance(body, dict) or not body.get("authed"):
+        return None, {}
+    acode, ack = _ack_signed_in("login")
+    if acode == 401:
+        return None, {}  # it ended between the two reads — sign in afresh
+    who = (ack.get("email") if acode == 200 else None) or body.get("email") or body.get("uid")
+    return (f"You're already signed in as {who} — say log out to switch accounts.",
+            body)
+
+
+def cmd_login(args) -> int:
+    # ⭐⭐ ALREADY SIGNED IN → SAY SO AND START NOTHING (owner, 2026-09-25). A new
+    # sign-in used to start regardless, and starting one makes the bridge throw
+    # away the parked sign-in note — so "log me in" from somebody already signed in
+    # destroyed whatever that note was still holding, and quietly switched
+    # accounts in one step nobody had asked for. Switching is two deliberate steps
+    # now: log out, then log in. The chat's watcher is still armed below — the
+    # same idempotent arm as a fresh sign-in, so a chat without one gets it.
+    already, status = _already_signed_in()
+    if already:
+        body = status
+        lines = [already]
+    else:
+        payload = {"runtime": args.runtime or "", "label": args.label or ""}
+        origin = _origin_from_env()
+        if origin:
+            payload["origin"] = origin
+        code, body = _post("/login/remote/start", payload)
+        if code != 200:
+            return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
+        lines = [
+            "Log in here:",
+            f"  {body.get('verifyUrl')}",
+            "Tap Authenticate when the page opens — you'll connect automatically.",
+        ]
     # Arm THIS chat's watchdog so the moment the browser approval is captured the
     # bridge's "✓ signed in" lands here on its own — no need to poll for completion.
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
@@ -1153,9 +1384,15 @@ def _claim_signed_in_announce() -> dict:
     account-wide watchdog and an addressed note is (correctly) refused, so we would
     take nothing and the double-announce would survive the fix.
 
+    ⚠ THE FALLBACK SINCE 2026-09-25, NOT THE PATH. `login-done` takes the note
+    through `POST /signin/ack` (`_ack_signed_in`), which also seals the watermark
+    and records the telling, without this read's Firestore work. This runs only
+    against an older bridge that answers the ack with 404; `reader` names us in
+    its log (an older bridge ignores it).
+
     Returns {} on any failure: a courtesy line is never worth failing a sign-in over.
     """
-    q = "/updates?via=agent&limit=1"
+    q = "/updates?via=agent&limit=1&reader=login-done"
     origin = _origin_from_env()
     if origin:
         q += "&platform=" + urllib.parse.quote(origin.get("platform", ""), safe="")
@@ -1170,85 +1407,137 @@ def _claim_signed_in_announce() -> dict:
     return note if isinstance(note, dict) else {}
 
 
+def _not_signed_in_lines(body: dict) -> "list[str]":
+    """What `status-account` (and `login-done`, when there is no sign-in to poll)
+    says for an account that is NOT signed in, from a `/status` body."""
+    if body.get("remoteLogin") == "pending":
+        # A sign-in is mid-flight: approve it in the browser and the bridge
+        # captures it automatically (no second command needed) — #848.
+        return ["A sign-in is in progress — approve it in your browser; you'll connect automatically."]
+    if body.get("remoteLogin") in ("error", "expired"):
+        return ["The last sign-in didn't complete — just ask me to log you in again."]
+    return [_SIGNED_OUT_LINE]
+
+
+def _signed_in_reply(args, body: dict, who, topic: str = "") -> int:
+    """`login-done`'s answer once the account IS signed in: the sign-in line, plus
+    what the bridge did about a research that was waiting on it."""
+    # ⭐⭐ THE ACK FIRST (owner, 2026-09-25): it hands over this chat's parked note
+    # WITH its news (relayed below), seals the watermark, and records that this
+    # reply told them — so the watcher has nothing left to say it again.
+    acode, ack = _ack_signed_in("login-done", with_news=True)
+    if acode == 401:
+        # ⛔ The session ended while we were asking. Nothing may say "signed in".
+        return _emit({**body, "authed": False}, args.json, [_SIGNED_OUT_LINE])
+    if acode == 200:
+        who = ack.get("email") or who
+        note = ack.get("signedIn") if isinstance(ack.get("signedIn"), dict) else {}
+    elif acode == 404:
+        note = _claim_signed_in_announce()  # an older bridge, without the ack
+    else:
+        note = {}
+    if isinstance(note, dict) and note and not note.get("email") and who:
+        note = {**note, "email": who}
+    # ⭐ SAY WHAT HAPPENED, IN THE NOTE'S OWN WORDS, rather than a guess assembled
+    # from the poll reply. The note knows the four outcomes the poll reply cannot:
+    # the bridge started it, there is nowhere to run it, several computers could
+    # and none is obvious, or a topic is simply waiting. Taking it is also what
+    # stops the watchdog repeating this in a minute — which is what SKILL.md has
+    # always told the assistant this command does.
+    #
+    # ⛔ BUT ONLY WHEN THE NOTE ACTUALLY CARRIES NEWS. A plain note says nothing
+    # this reply does not already say — "✓ Signed in as <email>." either way (a
+    # login answer is about login only, owner 2026-09-25) — so the sign-in line
+    # below is the whole answer. Taking the note still stops the double announce.
+    #
+    # ⛔⛔ AND ONLY FOR THE THREE OUTCOMES THE BRIDGE DECIDED, not for the note's
+    # fourth case. That fourth case is the legacy fallback — *"Continue with X? Say
+    # go ahead and I'll start it."* — a question aimed at the PERSON. SKILL.md's
+    # "After a sign-in link" step 2 is written against the OTHER wording (*"Continuing
+    # your research on X…"*) and treats it as the cue to run `research` immediately,
+    # so preferring the note there swaps a cue-to-act for a question and the topic
+    # can be stranded: the assistant waits for a "go ahead" the person has already
+    # given. ⭐ TAKE THE NOTE EITHER WAY — taking it is what stops the watchdog
+    # repeating the news, and that half is true of all four cases.
+    if isinstance(note, dict) and (note.get("autoStarted")
+                                   or note.get("needsDevice")
+                                   or note.get("needsDeviceChoice")):
+        # A bridge-decided outcome: relay it in the note's own words. `body` still
+        # rides along so `--json` keeps every field the note carried.
+        said = _signed_in_lines(note)
+        # ⛔⛔ THE USUAL FIRST-TIME PATH: signed out, asks for research, signs
+        # in, has no computer. The note's lines then END on the no-computer
+        # screen and are this message's whole body, so they carry its relay
+        # rule — the review that found this called it the likeliest place a
+        # new person meets the screen at all.
+        if note.get("needsDevice"):
+            said = _with_empty_state_relay(said)
+        return _emit({**body, "signedIn": note}, args.json, said)
+    # ⛔⛔ AND THE TOPIC MUST BE READ BACK OFF THE NOTE, WHICH IS THE DEFECT THE
+    # FIRST VERSION OF THIS GATE INTRODUCED. The note's FOURTH shape — a topic and
+    # none of the three flags — is minted by `_autostart_worker` when its Firestore
+    # I/O FAILS, and by then `flow.pending_topic` has already been nulled (it is
+    # claimed under the lock before the worker is spawned). So the poll reply carries
+    # NO topic, the gate above excludes the note, and my first version fell through
+    # to a plain "you're all set": the note TAKEN, the topic destroyed, and the
+    # person's research request gone. Before any of this work the note simply stayed
+    # parked and the watchdog said it. **A fix that loses news the bug did not.**
+    # ⭐ SKILL.md's wording, not the note's. The note's own fourth line asks the
+    # PERSON ("say go ahead"); step 2 of "After a sign-in link" is written against
+    # "Continuing your research on X…" and treats it as the cue to run `research`
+    # immediately. Keep the cue, take the topic from wherever it survives.
+    if isinstance(note, dict):
+        topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()
+    if topic:
+        # The user asked to research this before signing in. Confirm + name the
+        # topic; per SKILL.md "After a sign-in link" the assistant now runs
+        # `research "<topic>"`, which starts it (or surfaces the no-computer
+        # screen if there's no device) — a device situation, so the screen is
+        # said there and not here. Two blocks: the sign-in, then the topic.
+        return _emit(body, args.json, [
+            _connected_msg(who),
+            "",
+            f"Continuing your research on “{topic}”…",
+        ])
+    return _emit(body, args.json, [_connected_msg(who)])
+
+
 def cmd_login_wait(args) -> int:
     code, body = _post("/login/remote/poll")
     if code != 200:
-        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+        # ⛔⛔ NEVER THE BRIDGE'S OWN WORDS FOR A POLL WITH NOTHING TO POLL (owner,
+        # 2026-09-25). A logout now forgets a finished sign-in flow, and a bridge
+        # restart always did — and this relayed "✗ no remote login in progress —
+        # POST /login/remote/start first" into the chat. Whether they are signed in
+        # is the answer to "did it work?", so ask the account itself.
+        return _login_state_from_status(args)
     state = body.get("state")
     if state == "connected":
-        who = body.get("email") or body.get("uid")
-        topic = (body.get("pendingTopic") or "").strip()
-        # ⭐ SAY WHAT HAPPENED, IN THE NOTE'S OWN WORDS, rather than a guess assembled
-        # from the poll reply. The note knows the four outcomes the poll reply cannot:
-        # the bridge started it, there is nowhere to run it, several computers could
-        # and none is obvious, or a topic is simply waiting. Taking it is also what
-        # stops the watchdog repeating this in a minute — which is what SKILL.md has
-        # always told the assistant this command does.
-        #
-        # ⛔ BUT ONLY WHEN THE NOTE ACTUALLY CARRIES NEWS. `_signed_in_lines` returns
-        # exactly ONE line for a plain sign-in and more for each of the four outcomes,
-        # so `> 1` is precisely "it knows something this reply does not". Preferring
-        # the note unconditionally would have been a quiet regression: for a plain
-        # sign-in `_connected_msg` is DEVICE-AWARE and steers an account with no
-        # computer to pair one, and the note's single line cannot. Taking it still
-        # stops the double announce either way — that is the half that matters.
-        #
-        # ⛔⛔ AND ONLY FOR THE THREE OUTCOMES THE BRIDGE DECIDED, not for the note's
-        # fourth case. That fourth case is the legacy fallback — *"Continue with X? Say
-        # go ahead and I'll start it."* — a question aimed at the PERSON. SKILL.md's
-        # "After a sign-in link" step 2 is written against the OTHER wording (*"Continuing
-        # your research on X…"*) and treats it as the cue to run `research` immediately,
-        # so preferring the note there swaps a cue-to-act for a question and the topic
-        # can be stranded: the assistant waits for a "go ahead" the person has already
-        # given. ⭐ TAKE THE NOTE EITHER WAY — taking it is what stops the watchdog
-        # repeating the news, and that half is true of all four cases.
-        note = _claim_signed_in_announce()
-        if isinstance(note, dict) and (note.get("autoStarted")
-                                       or note.get("needsDevice")
-                                       or note.get("needsDeviceChoice")):
-            # A bridge-decided outcome: relay it in the note's own words. `body` still
-            # rides along so `--json` keeps every field the note carried.
-            said = _signed_in_lines(note)
-            # ⛔⛔ THE USUAL FIRST-TIME PATH: signed out, asks for research, signs
-            # in, has no computer. The note's lines then END on the no-computer
-            # screen and are this message's whole body, so they carry its relay
-            # rule — the review that found this called it the likeliest place a
-            # new person meets the screen at all.
-            if note.get("needsDevice"):
-                said = _with_empty_state_relay(said)
-            return _emit({**body, "signedIn": note}, args.json, said)
-        # ⛔⛔ AND THE TOPIC MUST BE READ BACK OFF THE NOTE, WHICH IS THE DEFECT THE
-        # FIRST VERSION OF THIS GATE INTRODUCED. The note's FOURTH shape — a topic and
-        # none of the three flags — is minted by `_autostart_worker` when its Firestore
-        # I/O FAILS, and by then `flow.pending_topic` has already been nulled (it is
-        # claimed under the lock before the worker is spawned). So the poll reply carries
-        # NO topic, the gate above excludes the note, and my first version fell through
-        # to a plain "you're all set": the note TAKEN, the topic destroyed, and the
-        # person's research request gone. Before any of this work the note simply stayed
-        # parked and the watchdog said it. **A fix that loses news the bug did not.**
-        # ⭐ SKILL.md's wording, not the note's. The note's own fourth line asks the
-        # PERSON ("say go ahead"); step 2 of "After a sign-in link" is written against
-        # "Continuing your research on X…" and treats it as the cue to run `research`
-        # immediately. Keep the cue, take the topic from wherever it survives.
-        if isinstance(note, dict):
-            topic = topic or str(note.get("topic") or note.get("pendingTopic") or "").strip()
-        if topic:
-            # The user asked to research this before signing in. Confirm + name the
-            # topic; per SKILL.md "After a sign-in link" the assistant now runs
-            # `research "<topic>"`, which starts it (or surfaces the pair-a-device
-            # prompt if there's no device). Don't also print _connected_msg's
-            # no-device prompt here — running the research handles that once.
-            return _emit(body, args.json, [
-                f"✓ Connected as {who}.",
-                f"Continuing your research on “{topic}”…",
-            ])
-        return _emit(body, args.json, [_connected_msg(who)])
+        # ⛔⛔ "CONNECTED" DESCRIBES THE SIGN-IN FLOW, NOT THE SESSION (owner,
+        # 2026-09-25). A flow can still read "connected" after the person logs
+        # out, and this answered "✓ Connected as None — you're all set." to
+        # somebody who had just signed out. `authed` is the session; it decides.
+        if not body.get("authed"):
+            return _emit(body, args.json, [_SIGNED_OUT_LINE])
+        return _signed_in_reply(args, body, body.get("email") or body.get("uid"),
+                                (body.get("pendingTopic") or "").strip())
     msg = {
-        "pending": "… not approved yet — approve it in your browser; you'll connect automatically.",
+        "pending": "Not approved yet — approve it in your browser; you'll connect automatically.",
         "expired": "✗ The sign-in link expired — ask me to send a fresh sign-in link.",
         "error": f"✗ Sign-in failed: {body.get('error', 'unknown')}",
     }.get(state, f"state: {state}")
     return _emit(body, args.json, [msg])
+
+
+def _login_state_from_status(args) -> int:
+    """`login-done` with no sign-in to poll: answer from the account's state — the
+    sign-in line (with any news the note holds) or `status-account`'s own words."""
+    code, body = _get("/status")
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    if body.get("authed"):
+        return _signed_in_reply(args, body, body.get("email") or body.get("uid"))
+    return _emit(body, args.json, _not_signed_in_lines(body))
 
 
 def _update_notices(body: dict) -> list[str]:
@@ -1263,63 +1552,43 @@ def _update_notices(body: dict) -> list[str]:
     return out
 
 
-def _has_device() -> bool:
-    """Does the signed-in account have at least one usable device? A device is the
-    prerequisite to run research. On a transient /devices error, assume YES so we
-    never wrongly nag a paired user to pair again."""
-    try:
-        code, body = _get("/devices")
-        if code == 200:
-            return bool((body or {}).get("devices"))
-    except Exception:
-        pass
-    return True
-
-
 def _connected_msg(who) -> str:
-    """Post-sign-in confirmation, device-aware: steer a deviceless account to connect
-    one (research can't run without a device) instead of saying 'fire your research'.
-    Natural language only — no command syntax (the user just talks to the assistant)."""
-    if _has_device():
-        return f"✓ Connected as {who} — you’re all set."
-    # ⛔ ONE LINE, AND IT STILL CARRIES BOTH WAYS OUT. This is a confirmation, not
-    # the empty state — it must not fire a second fetch to render a list — but the
-    # sentence that used to end at the access code was the first thing a brand-new
-    # account read, and it named the one route that needs hardware.
-    # ⭐ THE SHARED ADD LINE, NOT A THIRD WORDING (owner, 2026-09-24). This used to
-    # say "paste the access code from your Research Computer", which assumes the
-    # reader already has one and gave them no way to get it. The install link
-    # costs no fetch, so it rides here in the same sentence every other surface
-    # prints.
-    return (f"✓ Connected as {who}. {_ADD_A_COMPUTER} Or ask me for a public "
-            "computer you could use.")
+    """THE sign-in line — the one every reply that says somebody is signed in
+    opens with, and the whole of it for a plain sign-in.
+
+    ⛔⛔ NO COMPUTERS IN IT (owner, 2026-09-25). This was "device-aware": with a
+    computer it said "✓ Connected as X — you’re all set", without one it glued the
+    add line and "Or ask me for a public computer you could use" onto the same
+    sentence, one run-on paragraph. A login answer is about login only; the
+    no-computer screen is said where there is a computer to be missing — a
+    research with nowhere to run, adding or listing computers.
+    ⛔ AND NEVER "as None". A flow that outlived its session used to render the
+    missing email that way; with nothing to name, the line names nothing."""
+    who = str(who or "").strip()
+    return f"✓ Signed in{(' as ' + who) if who else ''}."
 
 
 def cmd_status_account(args) -> int:
     code, body = _get("/status")
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-    # ⛔ Remembered, not re-derived at the end: `_has_device()` is a network
-    # read, and asking it twice could answer differently the second time.
-    empty = False
     if body.get("authed"):
-        lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
-        if not _has_device():
-            empty = True
-            lines += _no_device_lines()
-    elif body.get("remoteLogin") == "pending":
-        # A sign-in is mid-flight: approve it in the browser and the bridge
-        # captures it automatically (no second command needed) — #848.
-        lines = ["A sign-in is in progress — approve it in your browser; you'll connect automatically."]
-    elif body.get("remoteLogin") in ("error", "expired"):
-        lines = ["The last sign-in didn't complete — just ask me to log you in again."]
+        # ⭐⭐ "✓ Signed in as <email>." AND NOTHING ELSE (owner, 2026-09-25) — no
+        # no-computer screen, no relay rule. Asked "am I logged in?", this used to
+        # print the whole empty state glued to the sign-in line; that screen is for
+        # device situations. The ack records that this reply told them, so the
+        # watcher does not say it again — and it is taken WITHOUT the news a note
+        # may carry, which stays for the watcher, because this reply relays none.
+        acode, ack = _ack_signed_in("status-account")
+        if acode == 401:
+            # ⛔ It ended between the two reads: never say "signed in".
+            lines = [_SIGNED_OUT_LINE]
+        else:
+            lines = [_connected_msg((ack.get("email") if acode == 200 else None)
+                                    or body.get("email") or body.get("uid"))]
     else:
-        lines = ["Not signed in — tell me to log you in and I'll send a link."]
+        lines = _not_signed_in_lines(body)
     lines += _update_notices(body)
-    # ⛔ THE UPDATE NOTICE IS FOR THE PERSON, so the relay rule goes AFTER it —
-    # attached before, the marker would hide "a new version is available".
-    if empty:
-        lines = _with_empty_state_relay(lines)
     return _emit(body, args.json, lines)
 
 
@@ -2439,13 +2708,18 @@ def _signed_in_lines(note) -> list[str]:
     against each other, precisely so one question does not get two phrasings
     depending which door the person came through; writing a third here is how the
     third phrasing appears.
+
+    ⭐ THE HEAD IS `_connected_msg`, THE SAME LINE EVERY SIGN-IN ANSWER OPENS WITH,
+    AND IT IS ITS OWN BLOCK (owner, 2026-09-25): a blank line separates it from
+    whatever the bridge did, so the sign-in and the news never read as one run-on
+    paragraph.
     """
     if not isinstance(note, dict) or not note:
         return []
     who = str(note.get("email") or "").strip()
     topic = str(note.get("topic") or note.get("pendingTopic") or "").strip()
     quoted = f"“{topic}”" if topic else "your research"
-    head = f"✓ Signed in{(' as ' + who) if who else ''}."
+    head = _connected_msg(who)
     if note.get("autoStarted"):
         where = str(note.get("deviceName") or "").strip()
         # ⛔ "STARTED ON MACBOOK" READS AS WORK IN PROGRESS. Auto-start routes to a
@@ -2455,18 +2729,18 @@ def _signed_in_lines(note) -> list[str]:
         # ⚠ Only an explicit False says so: an absent flag means we do not know,
         # and inventing a wait would be its own falsehood.
         if where and note.get("deviceOnline") is False:
-            return [head, f"🚀 {quoted} is queued on {where} — it's switched off, "
-                          f"so it starts when it comes on."]
-        return [head, f"🚀 Started {quoted}{(' on ' + where) if where else ''}."]
+            return [head, "", f"🚀 {quoted} is queued on {where} — it's switched off, "
+                              f"so it starts when it comes on."]
+        return [head, "", f"🚀 Started {quoted}{(' on ' + where) if where else ''}."]
     if note.get("needsDevice"):
-        return [head] + _no_device_lines(lead=f"{quoted} has nowhere to run yet.")
+        return [head, ""] + _no_device_lines(lead=f"{quoted} has nowhere to run yet.")
     if note.get("needsDeviceChoice"):
-        return [head] + _pick_device_lines(
+        return [head, ""] + _pick_device_lines(
             {"devices": note.get("devices")},
             "stale_selection" if note.get("staleSelection") else "no_selection",
             about=quoted)
     if topic:
-        return [head, f"Continue with {quoted}? Say go ahead and I'll start it."]
+        return [head, "", f"Continue with {quoted}? Say go ahead and I'll start it."]
     return [head]
 
 
@@ -2802,6 +3076,10 @@ def cmd_updates(args) -> int:
     # implies is the one that was broken: whoever takes this note OWES the person
     # its contents. Every other `via=agent` reader in the tree already pays it.
     lines = _signed_in_lines(body.get("signedIn"))
+    if lines:
+        # ⭐ Two blocks, not one run-on (owner, 2026-09-25): the sign-in, a blank
+        # line, then the runs.
+        lines.append("")
     for r in runs:
         # A queued run has no phase yet — show its place in line (mirrors status).
         if r.get("status") == "queued":
@@ -4211,14 +4489,19 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     # Deterministic arm: write the cron rows straight into jobs.json. This skill runs
     # in-chat so it has the origin + reach to the cron store — no dependence on the AI
     # calling cronjob:create (the recurring miss). Idempotent by name.
-    armed = _arm_stream_cron(script_name, job_name, origin, _STREAM_SCHEDULE)
+    # ⭐ A minute-anchored cron expression where the runtime can compute one, the
+    # interval elsewhere (`_stream_schedule`, owner 2026-09-25).
+    schedule = _stream_schedule()
+    armed = _arm_stream_cron(script_name, job_name, origin, schedule)
     # The once-daily update notice rides the same deterministic arm (best-effort: its
     # result doesn't gate the fallback below — only the watchdog's does, since a missed
     # update NOTICE is cosmetic while a missed watchdog is the bug we're fixing).
     _arm_stream_cron("sr_update_notice.py", "sr-update-notice", origin,
                      _UPDATE_NOTICE_SCHEDULE)
+    # ⛔ The schedule REPORTED is the one written; the fallback directive below
+    # asks the AI for the interval, so that is what an unwritten arm reports.
     payload = {"script": script_name, "name": job_name,
-               "schedule": _STREAM_SCHEDULE["display"],
+               "schedule": (schedule if armed else _STREAM_SCHEDULE)["display"],
                "scoped": True, "origin": origin, "armed": armed}
     if armed:
         return ([], payload, 0)  # armed silently — nothing for the AI to do
@@ -5492,6 +5775,29 @@ def _nl_run_name(t: str, verb_tail: str = "") -> "str | None":
     return name
 
 
+# ⭐⭐ "LOGGED IN?" IS A QUESTION ABOUT THE ACCOUNT (owner, 2026-09-25) — rule 2.
+# Both are FULL matches over the whole message, so a research topic that merely
+# contains the words ("research login status pages") is never taken for one.
+# `ask` / `tail` let rule 2 tell a question ("are you logged in", "logged in yet")
+# from a statement ("signed in" after a link — the person saying they did it).
+_NL_SIGNIN_QUESTION = re.compile(
+    r"(?:so |and |ok |okay |well |hey )?"
+    r"(?P<ask>am i |are (?:you|we) |is (?:it|this|the agent|the skill|super ?research) )?"
+    r"(?:(?:now|already|still|all) )?"
+    r"(?:signed|logged)[ -]?in(?:to)?"
+    r"(?: (?:to )?(?:super ?research|sr|the app|my account))?"
+    r"(?: (?P<tail>yet|now|already|ok|okay|properly|successfully))?")
+_NL_LOGIN_CHECK = re.compile(
+    rf"{_NL_LEAD_IN}(?:"
+    r"(?:what'?s |what is )?(?:my |the )?(?:log ?in|sign[ -]?in) status"
+    r"|check (?:on )?(?:my |the )?(?:log ?in|sign[ -]?in)(?: status)?"
+    r"|(?:did (?:the |my )?(?:log ?in|sign[ -]?in|logging in|signing in) "
+    r"(?:work|go through|succeed|complete|finish)"
+    r"|(?:has|is) (?:the |my )?(?:log ?in|sign[ -]?in) (?:worked|done|complete|completed"
+    r"|finished|gone through|succeeded|working|ok|okay))(?: [^.?!]{1,40})?"
+    r")(?: (?:yet|now|please|for me))?")
+
+
 def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     """Map a verbatim user message to (argv, None) to execute, or
     (None, user-safe lines) to relay. Ordered — most specific first."""
@@ -5617,16 +5923,27 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                     low):
         # ⛔⛤ AND THE ANSWER IS THE CAPABILITY LINE, NOT AN ACCOUNT CHECK. I
         # routed these to `status-account`, which prints `✓ Signed in as <email>`
-        # and nothing else once the account has a machine — so `help` answered a
-        # question nobody asked. The list the comment calls the right answer is
+        # and nothing else (since 2026-09-25 on every account) — so `help` answered
+        # a question nobody asked. The list the comment calls the right answer is
         # the catch-all's own sentence, minus the line that blames the person.
         return None, [_NL_CATCH_ALL.split("that. ", 1)[-1]
                       if "that. " in _NL_CATCH_ALL else _NL_CATCH_ALL]
 
     # 2. Sign-in / connection questions — always a FRESH account check.
-    if re.search(r"\b(am i|are we|is (it|this|the agent))\b.*\b(signed?[ -]?in|logg?ed[ -]?in|connected|authenticated)\b", low) or \
+    # ⭐⭐ AND THE BARE ONES (owner, 2026-09-25). Driven through this resolver:
+    # "Logged in?", "Signed in?" and "are you logged in?" reached the catch-all,
+    # and "did the login work?" / "login status" STARTED A NEW SIGN-IN (rule 5's
+    # `\blogin\b`) — which also makes the bridge throw away the parked sign-in
+    # note. They are asked HERE, above every rule that can start a sign-in. A bare
+    # "signed in" with no question mark stays where it was: after a sign-in link
+    # it is a person saying they did it, not asking.
+    _signin_q = _NL_SIGNIN_QUESTION.fullmatch(low)
+    if re.search(r"\b(am i|are (?:we|you)|is (it|this|the agent|super ?research))\b.*\b(signed?[ -]?in|logg?ed[ -]?in|connected|authenticated)\b", low) or \
             re.search(r"\b(which|what) account\b", low) or "account status" in low or \
-            "connection status" in low:
+            "connection status" in low or \
+            (_signin_q and (_signin_q.group("ask") or _signin_q.group("tail") == "yet"
+                            or t.rstrip().endswith("?"))) or \
+            _NL_LOGIN_CHECK.fullmatch(low):
         return ["status-account"], None
 
     # 2b. A message that STARTS with a research verb is a research request —
@@ -7389,7 +7706,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # superresearch.io/skills.md", and it is shown to people whose agent still has
     # this skill (`/sr logout` keeps it) — the app's tile relies on this rule to
     # keep it off the install page. It gets the fresh account check a bare /sr
-    # gets: bridge, sign-in and computers, as they stand.
+    # gets: bridge and sign-in, as they stand (computers are not a login answer
+    # since 2026-09-25 — a research with none says so itself).
     if re.search(r"\b(install|host|set ?up)\b.*\b(backend|super research|here|this (pc|machine|computer|device))\b", low):
         if re.search(r"\bskills?\.md\b|\b(?:skill|agent|bridge)\b", low):
             return ["status-account"], None
