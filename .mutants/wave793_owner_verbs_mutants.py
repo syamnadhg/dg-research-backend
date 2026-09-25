@@ -815,7 +815,13 @@ MUTANTS = [
        '    _low_no_rc = low')]),
     ("W14", SR, "over",
      "⛔ the pairing rule eats a publish request again — \"add my computer to the "
-     "public list\" answered with \"paste the access code\"",
+     "public list\" gets the devices screen instead of the publish confirm",
+     # ⛔⛔ RE-WORDED 2026-09-24. The pairing branch said "paste the access code"
+     # until 2026-09-22 and hands over the devices screen now, so the old words
+     # named a reply the edit can no longer produce — and the guard, which only
+     # checked those words were absent, passed with this mutant in: W14 survived
+     # the 10.10 close sweep. It stays a survivor until that agent guard asserts
+     # the publish confirm itself.
      # ⛔⛔ REPAIRED 2026-09-17, and it is the shape W14 was BORN with at 7.9-3.
      # 7.9-4 re-anchored it onto the whole block down to the `elif` line and
      # wrote the replacement as a bare `elif …` at COLUMN 0 — the anchor eats the
