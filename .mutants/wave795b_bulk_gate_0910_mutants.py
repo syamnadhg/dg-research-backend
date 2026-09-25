@@ -256,8 +256,18 @@ MUTANTS = [
        '    _polite_imperative = re.match(r"^(?:can|could|would|will|please|do)"')]),
     ('N6', SR, 'over',
      "⛔⛔ THE EXCLUSION TRIM EATS THE WHOLE NAME AGAIN. Written to remove a trailing clause, it took everything when the NAME itself opens with a trigger word — a machine called 'Not My Mac' or 'Other Than Desktop' came back empty and the command fell to the picker, which is the unconfirmed-wrong-machine outcome the branch exists to avoid. Seven measured. The optional separator was what made the whole string matchable",
-     [('            _vis_obj = _trim_trailing_clause(_vis_obj, t)',
-       '            _vis_obj = _trim_trailing_clause_inner(_vis_obj)')]),
+     # ⛔⛔ RE-AIMED 2026-09-24 ONTO THE DEFECT THESE WORDS DESCRIBE. Wave 1.2 moved
+     # the trim into one shared helper and re-pointed this edit at the visibility
+     # call — swapping it for the helper's inner half, which drops only the
+     # QUOTED-NAME escape at that one site. That is a different defect, nothing in
+     # this harness's own selection pins it, and it survived the 10.10 close
+     # sweep while the whole-name eat went unmeasured. The eat now needs BOTH of
+     # the helper's protections gone — the required separator and the
+     # never-empty return; each alone leaves `hide my Not My Mac` intact.
+     [('    out = re.sub(rf"\\s*(?:,|;|\\band\\b)\\s*{_SET_EXCLUSION}\\s*$", "", out, flags=re.I).strip()',
+       '    out = re.sub(rf"\\s*(?:,|;|\\band\\b)?\\s*{_SET_EXCLUSION}\\s*$", "", out, flags=re.I).strip()'),
+      ('    out = re.sub(r"[\\s,;]+$", "", out).strip()\n    return out or whole\n',
+       '    out = re.sub(r"[\\s,;]+$", "", out).strip()\n    return out\n')]),
     ('N7', SR, 'under',
      '⛔⛔ THE TOTALISER GOES AND FOUR SURFACES REOPEN AT ONCE. The words it holds are exactly the words this file\'s three capture-blankers erase to "", so a blank capture stops meaning anything: `pause everything`, `resume all of it` and `retry it all` EXECUTE with no confirm, `stop everything` and `approve the whole queue` reach confident single-target confirms',
      [('_SET_SIGNALS = (_SET_SIGNAL_PLURAL, _SET_SIGNAL_QUANTIFIED, _SET_SIGNAL_COLLECTIVE,\n                _SET_SIGNAL_TOTALISER, _SET_SIGNAL_CONJUNCTION)',
