@@ -1204,6 +1204,13 @@ def test_prepare_stream_arm_scoped_writes_cron_job_deterministically(tmp_path, m
     scripts.mkdir()
     (scripts / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
     monkeypatch.setattr(sr, "_scripts_dir", lambda: scripts)
+    # ⛔ THE RUNTIME'S croniter IS PINNED, NOT READ OFF THIS HOST (2026-09-25). The
+    # schedule follows `_runtime_has_croniter`, which looks at the real `hermes`
+    # install — so on a machine that has one (the owner's WSL) this test saw the
+    # minute-anchored cron row and failed, while every host without Hermes passed.
+    # This pins the interval FALLBACK; the cron path has its own tests in
+    # test_login_answers_login_only_0925.py, stubbed both ways.
+    monkeypatch.setattr(sr, "_runtime_has_croniter", lambda: False)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "111")
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
