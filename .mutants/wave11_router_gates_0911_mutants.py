@@ -200,9 +200,16 @@ MUTANTS = [
      [('              rf"switch\\s+to|ask|request|borrow|apply)")',
        '              rf")")')]),
     ('N9', SR, 'over',
-     '⛔ THE INTERVENING-WORD LIST BECOMES A WILDCARD, so any negation anywhere in a sentence vetoes any verb later in it — `I don\'t have time, stop the run on my mac` stops being a stop. A free span here is how the OLD 40-character negation arm came to read a machine NAME as a negation',
+     '⛔ THE INTERVENING-WORD LIST BECOMES A WILDCARD, so a negation vetoes any verb later in the same clause — `I don\'t have an update on my machine`, a status ask, is refused on the word `update`. A free span here is how the OLD 40-character negation arm came to read a machine NAME as a negation',
+     # ⛔⛔ RESTORED 2026-09-24 TO THE WILDCARD THESE WORDS DESCRIBE. When `keep`
+     # joined the list in wave 1.2 the anchor was re-aimed and the replacement
+     # swapped for a NARROWING — the opposite defect under an `over` label, which
+     # nothing in this harness's own selection pins — so it survived the 10.10
+     # close sweep while the wildcard went unmeasured for twelve days. The
+     # narrowing is a real, unpinned defect of its own and is reported for the
+     # agent's own suite rather than parked here as a survivor.
      [('_NEG_FILLER = r"(?:\\s+(?:you|i|we|it|to|please|ever|even|really|actually|just|bother(?:ing)?|keep|keeps|continue|carry\\s+on|want\\s+to|need\\s+to|try(?:ing)?\\s+to))*"',
-       '_NEG_FILLER = r"(?:\\s+(?:you|i|we|it|to|please))*"')]),
+       '_NEG_FILLER = r"(?:\\s+\\w+)*"')]),
     ('N10', SR, 'over',
      '⛔⛔ THE OFF-ARM GOES BACK TO ONE SHARED VERB LIST, and TURNING SHARING ON HIDES THE MACHINE. `off` belongs with the neutral verbs; the -ing words only ever mean a hide after a verb that is itself negative. `turn on sharing for my mac` executed a private',
      [('        or re.search(r"\\b(?:turn|switch|shut|toggle)\\b(?:(?!\\bon\\b)[^.?!]){0,20}"\n                     r"\\b(?:off|down)\\b", _pol_low)',
