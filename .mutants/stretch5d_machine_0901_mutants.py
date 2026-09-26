@@ -151,12 +151,22 @@ def restore() -> None:
         _write(rel, text)
 
 
-atexit.register(restore)
-signal.signal(signal.SIGINT, lambda *_a: (restore(), sys.exit(130)))
-signal.signal(signal.SIGTERM, lambda *_a: (restore(), sys.exit(143)))
+# ⛔⛔ ARMED IN `main()`, NEVER AT IMPORT (2026-09-26). The static anchor sweep and
+# the apply sweep IMPORT every harness in this directory, so these three lines at
+# module level armed a restore of the target files — captured at import — in the
+# sweep's own process: its exit rewrote research.py with that copy (silently
+# reverting any edit made while the sweep ran), and a SIGTERM (a CI or wrapper
+# timeout) rewrote it mid-run while the sweep was reading it, which reported 3,169
+# anchors as stale on a clean tree. Guarded by
+# tests/test_harness_import_is_inert.py.
+def _arm_restore() -> None:
+    atexit.register(restore)
+    signal.signal(signal.SIGINT, lambda *_a: (restore(), sys.exit(130)))
+    signal.signal(signal.SIGTERM, lambda *_a: (restore(), sys.exit(143)))
 
 
 def main() -> int:
+    _arm_restore()
     killed = 0
     survivors: list[str] = []
     print(f"\n{len(MUTANTS)} mutants — stretch 5D (the machine half)\n")
