@@ -5,8 +5,10 @@ localhost. The bridge brokers an OAuth-device-style flow through the existing
 Super Research web app and makes only OUTBOUND calls:
 
   1. start  → POST {FE}/api/agent/login/start  → {code, pollToken, verifyUrl, expiresIn}
-              the bridge shows the user: "open {verifyUrl}, enter {code}".
-  2. (user approves on their phone — signs in to SR, taps Approve; the FE mints
+              the bridge shows the user: "open {verifyUrl}, enter {code}" — the
+              link first, and the short connection code (e.g. "WDJB-MJHT") for
+              typing at superresearch.io/connect when the link won't open.
+  2. (user approves on their phone — signs in to SR, taps Authenticate; the FE mints
      createCustomToken for THEIR OWN uid and parks it on the pending record.)
   3. poll   → GET {FE}/api/agent/login/poll?pollToken=…
               → {status: pending|approved|expired, customToken?}

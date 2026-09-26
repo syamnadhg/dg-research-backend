@@ -47,7 +47,8 @@ def test_remote_login_happy_path(live, mock_fe, monkeypatch):
     base, state, mem = live
     idt = make_jwt({"user_id": "u-remote", "email": "r@x.y"})
     fe = mock_fe(
-        start_resp={"code": "AB-12", "pollToken": "PT", "verifyUrl": "https://superresearch.io/connect-agent", "expiresIn": 600},
+        # ⚠ RE-AIMED 2026-09-25 (Mac brief): the live broker's short code + /connect link.
+        start_resp={"code": "WDJB-MJHT", "pollToken": "PT", "verifyUrl": "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT", "expiresIn": 600},
         poll_script=[(200, {"status": "pending"}), (200, {"status": "approved", "customToken": "CT"})],
         exchange_resp={"idToken": idt, "refreshToken": "RT-r", "expiresIn": "3600"},
     )
@@ -56,7 +57,8 @@ def test_remote_login_happy_path(live, mock_fe, monkeypatch):
     r = requests.post(base + "/login/remote/start", json={"runtime": "hermes"})
     assert r.status_code == 200
     body = r.json()
-    assert body["code"] == "AB-12"
+    assert body["code"] == "WDJB-MJHT"
+    assert body["verifyUrl"] == "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT"
     assert "pollToken" not in body  # the bearer stays server-side
 
     r1 = requests.post(base + "/login/remote/poll").json()

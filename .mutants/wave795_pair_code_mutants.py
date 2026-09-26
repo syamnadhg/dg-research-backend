@@ -233,7 +233,9 @@ MUTANTS = [
      [('            print(f"{_NO} couldn\'t remove device: "\n                  f"{_unlink_refusal(_err(res), body.get(\'retryAfterMs\'))}")', '            print(f"{_NO} couldn\'t remove device: {_err(res)}")')]),
     ('T5', CLI, 'over',
      'the terminal prints the raw code for a failed PAIR, including the recoverable `pair_bootstrap_failed`',
-     [('            print(f"{_NO} couldn\'t add device: "\n                  f"{_pair_refusal(_err(res), body.get(\'retryAfterMs\'))}")', '            print(f"{_NO} couldn\'t add device: {_err(res)}")')]),
+     # ⚠ RE-AIMED 2026-09-25 (Mac brief): the refusal's key is `_pair_refusal_key(res)` now
+     # (the bridge's own `signin_code` is a `reason`) — same mutation, new anchor.
+     [('            print(f"{_NO} couldn\'t add device: "\n                  f"{_pair_refusal(_pair_refusal_key(res), body.get(\'retryAfterMs\'))}")', '            print(f"{_NO} couldn\'t add device: {_err(res)}")')]),
     ('T6', SR, 'over',
      '⛔ THE CHAT CLIENT GUESSES THE RATE-LIMIT WAIT AGAIN, beside a number the route handed it — and the terminal reads that number, so the two disagree',
      [('    if err == "rate_limited":\n        ms = retry_after_ms\n        ok = (not isinstance(ms, bool)) and isinstance(ms, (int, float)) and ms > 0\n        if not ok:\n            return f"Too many attempts to {what} in a row — give it a minute."', '    if err == "rate_limited":\n        return "Too many attempts — wait a few minutes and try again."\n        ms = retry_after_ms\n        ok = (not isinstance(ms, bool)) and isinstance(ms, (int, float)) and ms > 0\n        if not ok:\n            return f"Too many attempts to {what} in a row — give it a minute."')]),

@@ -123,8 +123,9 @@ def live(monkeypatch, mock_fe):
     # mock FE broker: start → approve immediately → custom-token exchange
     idt = make_jwt({"user_id": "u1", "email": "you@x.y"})
     fe = mock_fe(
-        start_resp={"code": "AB-12", "pollToken": "PT",
-                    "verifyUrl": "https://superresearch.io/connect-agent", "expiresIn": 600},
+        # ⚠ RE-AIMED 2026-09-25 (Mac brief): the live broker's short code + /connect link.
+        start_resp={"code": "WDJB-MJHT", "pollToken": "PT",
+                    "verifyUrl": "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT", "expiresIn": 600},
         poll_script=[(200, {"status": "approved", "customToken": "CT"})],
         exchange_resp={"idToken": idt, "refreshToken": "RT-r", "expiresIn": "3600"},
     )
@@ -150,9 +151,12 @@ def test_full_chat_lifecycle(live, capsys):
     assert sr.main(["status-account"]) == 0
     assert "Not signed in" in capsys.readouterr().out
 
-    # 2. /login → shows the sign-in link (no code typed — it's embedded in the link)
+    # 2. /login → the sign-in link first, then the connection code as the "or" —
+    #    typed at /connect only when the link won't open (Mac brief, 2026-09-25)
     assert sr.main(["login"]) == 0
-    assert "connect-agent" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "Log in here: https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT", out
+    assert "enter this connection code: WDJB-MJHT" in out, out
 
     # 3. approve completes on the next poll → connected
     assert sr.main(["login-wait"]) == 0

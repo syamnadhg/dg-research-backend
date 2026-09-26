@@ -293,7 +293,7 @@ re-login.
 ## Sign-in
 
 `agent login` (and `/sr login`) default to the **web app**
-(`https://superresearch.io/agent-auth`) — the same page everywhere — brokering an
+(`https://superresearch.io/connect`) — the same page everywhere — brokering an
 approve-on-your-phone flow that makes only **outbound** calls (no localhost
 needed). `agent login --local` is the host-local Google page
 (`http://localhost:9876/login`), a fallback for when the web app's sign-in start
@@ -302,7 +302,9 @@ fails. It is not independent of the web app: its Google window opens on
 
 ```sh
 agent login --remote --runtime hermes
-#  → Open  https://superresearch.io/agent-auth  → sign in → tap Authenticate
+#  Log in here: https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT
+#  Or, if the link won't open (for example on another device): go to https://superresearch.io/connect and enter this connection code: WDJB-MJHT
+#  Either way, check the page shows the same connection code, then tap Authenticate.
 #  ✓ Connected as you@…
 ```
 

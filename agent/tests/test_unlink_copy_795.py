@@ -85,6 +85,14 @@ _ROUTES = {
     "claim": _CLAIM_CODES,
 }
 
+# ⭐ THE PAIR REFUSALS THE BRIDGE MAKES ITSELF (Mac brief + owner, 2026-09-25): the
+# sign-in's connection code, refused before the claim route is asked anything —
+# while it is pending (`signin_code`) and, for the rest of the code's life, once it
+# has connected (`signin_code_used`). Both pair tables word them; they are NOT in
+# `_CLAIM_CODES`, which is the route's contract — the drift detector below compares
+# that set with the real claim/route.ts, and the route never sends them.
+_BRIDGE_PAIR_CODES = {"signin_code", "signin_code_used"}
+
 
 def _route_src(name: str) -> str:
     """The real route's source with TypeScript comments blanked, or None when the
@@ -134,7 +142,7 @@ def test_chat_unlink_table_covers_the_unlink_route_exactly():
 
 
 def test_chat_pair_table_covers_the_claim_route_exactly():
-    assert set(sr._PAIR_ERRORS) == _CLAIM_CODES
+    assert set(sr._PAIR_ERRORS) == _CLAIM_CODES | _BRIDGE_PAIR_CODES
 
 
 def test_terminal_unlink_table_covers_the_unlink_route_exactly():
@@ -144,7 +152,7 @@ def test_terminal_unlink_table_covers_the_unlink_route_exactly():
 
 
 def test_terminal_pair_table_covers_the_claim_route_exactly():
-    assert set(cli._PAIR_FAILURES) | {"rate_limited"} == _CLAIM_CODES
+    assert set(cli._PAIR_FAILURES) | {"rate_limited"} == _CLAIM_CODES | _BRIDGE_PAIR_CODES
 
 
 @pytest.mark.parametrize("code", sorted(_UNPAIR_SELF_CODES))
@@ -158,7 +166,7 @@ def test_every_unlink_code_is_worded_by_both_clients(code):
     assert said and said != code, f"terminal leaves {code} unworded"
 
 
-@pytest.mark.parametrize("code", sorted(_CLAIM_CODES))
+@pytest.mark.parametrize("code", sorted(_CLAIM_CODES | _BRIDGE_PAIR_CODES))
 def test_every_claim_code_is_worded_by_both_clients(code):
     assert code in sr._PAIR_ERRORS
     said = cli._pair_refusal(code, 90_000)

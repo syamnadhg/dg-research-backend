@@ -304,15 +304,17 @@ MUTANTS = [
        '                            else " — ask me once you\'re in and I\'ll tell you where "\n'
        '                                 "it got to.")]',
        '                         + ". I\'ll post here when it\'s done."]')]),
+    # ⚠ RE-AIMED 2026-09-25 (Mac brief): the preface stopped saying "Log in here",
+    # which opens the sign-in link's own line now — same mutation, new words.
     ("A4", SR_BE, "over",
      "the other signed-out door promises it too",
-     [('                    ("You\'re not signed in yet. Log in here and I\'ll pick this "\n'
-       '                     "up — I\'ll post here when it\'s done:"\n'
+     [('                    ("You\'re not signed in yet. Log in and I\'ll pick this up "\n'
+       '                     "— I\'ll post here when it\'s done."\n'
        '                     if arm_payload.get("armed") else\n'
-       '                     "You\'re not signed in yet. Log in here and I\'ll pick this "\n'
-       '                     "up — ask me once you\'re in:"),',
-       '                    "You\'re not signed in yet. Log in here and I\'ll pick this "\n'
-       '                    "up — I\'ll post here when it\'s done:",')]),
+       '                     "You\'re not signed in yet. Log in and I\'ll pick this up "\n'
+       '                     "— ask me once you\'re in."),',
+       '                    "You\'re not signed in yet. Log in and I\'ll pick this up "\n'
+       '                    "— I\'ll post here when it\'s done.",')]),
 
     # ═══════════ F — the fork: the topic survives a sign-in ═══════════
     ("F1", FORK_SR, "under",

@@ -636,7 +636,10 @@ def test_connect_non_tty_proceeds_with_defaults(monkeypatch, capsys):
     assert "signin_ni" not in seen                              # sign-in DEFERRED, no link in chat
     out = capsys.readouterr().out
     assert "/reload-skills" in out and "/sr login" in out       # the two-step next line
-    assert "Sign in here" not in out                            # the link is NOT shown here
+    # ⚠ RE-AIMED 2026-09-25: the link's line opens "Log in here:" now (Mac brief) —
+    # the old "Sign in here" would pass here whatever was printed.
+    assert "Log in here" not in out                             # the link is NOT shown here
+    assert "connection code" not in out
 
 
 # ── cmd_status runtime-location rendering ─────────────────────────────────────

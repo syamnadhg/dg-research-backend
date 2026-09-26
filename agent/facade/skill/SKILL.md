@@ -238,10 +238,10 @@ it back so a mis-transcription is caught); too garbled to read → ask.
 ## After a sign-in link
 
 When you send a sign-in link (for "log me in", OR for a research the user asked
-while signed out), send the user **one** message: the click-to-approve link the
-client returned. The client arms this chat's live-updates watchdog **itself** so the
-bridge can post a proactive "✓ Signed in" here on its own — there is normally
-**nothing for you to do**. Only if the client prints a directive **under the
+while signed out), send the user **one** message: the link and connection code lines
+the client returned, as printed. The client arms this chat's live-updates watchdog
+**itself** so the bridge can post a proactive "✓ Signed in" here on its own — there
+is normally **nothing for you to do**. Only if the client prints a directive **under the
 `── for the assistant · do NOT relay ──` marker** (a fallback path) do you call your
 **cronjob tool** with exactly those args **silently**, in the same turn. **Do NOT
 send a second message about arming, and do NOT re-paste the sign-in link** (that
@@ -279,12 +279,15 @@ never `retry`, never a question back to the user.
 
 ## Per-command notes (what to relay after each)
 
-- **login** → relay the sign-in link; the user opens it + taps Authenticate and
-  connects automatically. The proactive "✓ Signed in" is best-effort — don't rely
-  on it; on any reply, continue per **After a sign-in link**. When the user asked
-  to *research* while signed out, run `sr.py research "<topic>"` (NOT `login`) — its
-  reply hands back the same link AND remembers the topic. Already signed in, it
-  sends no link and says so; switching accounts is log out, then log in.
+- **login** → relay the link AND the connection code exactly as it prints them, link
+  first; never shorten, invent or reformat the code. The user checks the page shows
+  the same connection code, then taps Authenticate and connects automatically. The
+  connection code is typed only at superresearch.io/connect — it is not an access
+  code: **never** run `device-add` with it. The proactive "✓ Signed in" is best-effort
+  — don't rely on it; on any reply, continue per **After a sign-in link**. When the
+  user asked to *research* while signed out, run `sr.py research "<topic>"` (NOT
+  `login`) — its reply hands back the same link AND remembers the topic. Already
+  signed in, it sends no link and says so; switching accounts is log out, then log in.
 - **logout** → confirm first. Logging out of Super Research is ALWAYS this command —
   never refuse it or point the user at an account/profile menu. Removes the agent
   from their account (keeps the skill, the bridge and this chat's watcher).

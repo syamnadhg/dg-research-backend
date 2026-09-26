@@ -64,8 +64,8 @@ def _point_exchange_at(monkeypatch, fe_base: str) -> None:
 
 def _pending_flow(poll_token: str = "PT", ttl: float = 600.0) -> bridge.RemoteFlow:
     return bridge.RemoteFlow(
-        poll_token=poll_token, code="AB-12",
-        verify_url="https://superresearch.io/agent-auth", expires_at=time.time() + ttl,
+        poll_token=poll_token, code="WDJB-MJHT",
+        verify_url="https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT", expires_at=time.time() + ttl,
     )
 
 

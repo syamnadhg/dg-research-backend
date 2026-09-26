@@ -1321,6 +1321,44 @@ def _already_signed_in() -> "tuple[str | None, dict]":
             body)
 
 
+# ⭐⭐ THE LINK FIRST, THE CONNECTION CODE AS THE "OR" (Mac brief, 2026-09-25). The
+# sign-in broker mints a short connection code ("WDJB-MJHT") and puts it LAST in the
+# link, and https://superresearch.io/connect takes it typed when the link won't open
+# — on another device, say. The chat used to print only the link, so a person whose
+# link would not open had nothing to type. Both doors that hand out a sign-in —
+# `login`, and a research asked while signed out — print these lines; the terminal's
+# `agent login` (cli.py `_remote_signin`) prints the same three, and a test holds
+# the two copies together.
+#   • The page address is the link up to its "?", never a literal: a local E2E's
+#     connect origin, or any later address, can never disagree with the link.
+#   • ⛔ The code is printed as the bridge handed it — never shortened, reformatted
+#     or upper-cased. The person compares it with the page, character for character.
+#   • ⛔ ONLY A SHORT CODE (1..12 characters). An older broker handed out a
+#     43-character token nobody can type or compare; with that it is the link alone,
+#     and an empty code is no code ("enter this connection code: " and nothing).
+#   • ⛔ NOTHING BUT A SPACE OR THE LINE'S END FOLLOWS A URL. Chat apps link a
+#     trailing "." or ",", and "/connect." is a 404.
+#   • ONE line for the "Or…", in the owner's words (the web's walkthrough models this
+#     reply as exactly these three lines).
+_CONNECTION_CODE_MAX = 12
+
+
+def _signin_link_lines(reply: dict) -> "list[str]":
+    """The lines that hand out a sign-in: the link, then — only for a short
+    connection code — where to type it instead, then the check before Authenticate."""
+    url = str(reply.get("verifyUrl") or "")
+    code = reply.get("code")
+    code = code.strip() if isinstance(code, str) else ""
+    page = url.split("?", 1)[0]
+    lines = [f"Log in here: {url}"]
+    if page and 0 < len(code) <= _CONNECTION_CODE_MAX:
+        lines.append("Or, if the link won't open (for example on another device): "
+                     f"go to {page} and enter this connection code: {code}")
+        lines.append("Either way, check the page shows the same connection code, "
+                     "then tap Authenticate.")
+    return lines
+
+
 def cmd_login(args) -> int:
     # ⭐⭐ ALREADY SIGNED IN → SAY SO AND START NOTHING (owner, 2026-09-25). A new
     # sign-in used to start regardless, and starting one makes the bridge throw
@@ -1341,11 +1379,12 @@ def cmd_login(args) -> int:
         code, body = _post("/login/remote/start", payload)
         if code != 200:
             return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
-        lines = [
-            "Log in here:",
-            f"  {body.get('verifyUrl')}",
-            "Tap Authenticate when the page opens — you'll connect automatically.",
-        ]
+        lines = _signin_link_lines(body)
+        if len(lines) == 1:
+            # No connection code to check (an older broker's long token): the link
+            # alone, and what to tap once it opens.
+            lines.append("Tap Authenticate when the page opens — you'll connect "
+                         "automatically.")
     # Arm THIS chat's watchdog so the moment the browser approval is captured the
     # bridge's "✓ signed in" lands here on its own — no need to poll for completion.
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
@@ -1659,7 +1698,9 @@ def cmd_device_use(args) -> int:
 
 
 # Friendly wording for the web app's CLAIM route (`/api/devices/claim`) — the
-# codes `device-add` can receive, and nothing else.
+# codes `device-add` can receive, and nothing else — plus the ONE refusal the
+# bridge makes before it asks that route: `signin_code`, sent as the reply's
+# `reason` (see `cmd_device_add`).
 #
 # ⛔⛔ IT USED TO SERVE `device-remove` TOO AND SHARED NOT ONE CODE WITH IT.
 # `unpair-self` emits nine codes and this table holds seven; the intersection is
@@ -1728,6 +1769,18 @@ _PAIR_ERRORS = {
     "invalid_json": "That request didn’t reach the app in one piece — send me the "
                     "code again.",
     "internal_error": "Something went wrong at our end — nothing was paired; try again.",
+    # ⛔⛔ THE CONNECTION CODE IS NOT AN ACCESS CODE (Mac brief, 2026-09-25). Both are
+    # eight characters and look alike, and the chat now prints the sign-in's one.
+    # The bridge refuses it while that sign-in is pending, before claiming
+    # anything. ⛔ The URL ends the sentence: a chat links a trailing "." and
+    # "/connect." is a 404.
+    "signin_code": "That’s your connection code — it signs you in, it doesn’t add a "
+                   "computer. Open the link I sent, or type the code at "
+                   "https://superresearch.io/connect",
+    # ⭐ …and the same code pasted just after the sign-in connected (owner,
+    # 2026-09-25): refused for the rest of the code's life, in its own words.
+    "signin_code_used": "That’s your connection code — you’re already signed in with "
+                        "it. It isn’t a computer’s access code.",
 }
 
 # Friendly wording for the web app's UNPAIR-SELF route — the codes
@@ -1769,6 +1822,14 @@ def cmd_device_add(args) -> int:
     code, body = _post("/device/pair", {"code": args.code})
     if code != 200:
         err = body.get("error", "")
+        # ⛔ THE BRIDGE'S OWN REFUSAL IS KEYED ON `reason` (Mac brief, 2026-09-25):
+        # `signin_code` arrives as {"reason": "signin_code", "error": <a sentence>},
+        # so a lookup by `error` alone never reaches its entry. Only a reason this
+        # table words wins — the 401 relay's `reason: "revoked"` keeps its
+        # signed-out sentence.
+        reason = body.get("reason")
+        if isinstance(reason, str) and _PAIR_ERRORS.get(reason):
+            err = reason
         msg = _device_refusal_line(err, _PAIR_ERRORS, "add the device",
                                    body.get("retryAfterMs"))
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
@@ -2829,8 +2890,9 @@ def cmd_research(args) -> int:
                 if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
                 return _emit(body, args.json, lines, _fail_code(code))
-            # No flow yet: start one carrying the topic, hand back the click-to-approve
-            # link, and the bridge captures it automatically on approval (#848).
+            # No flow yet: start one carrying the topic, hand back the sign-in link
+            # (and its connection code), and the bridge captures it automatically
+            # on approval (#848).
             lc, lbody = _post("/login/remote/start", stash)
             # ⛔ THE SAME REFUSAL REACHES THIS DOOR TOO. A flow can appear between
             # the /status read above and this call, and the bridge refuses a start
@@ -2845,17 +2907,24 @@ def cmd_research(args) -> int:
                 ], _fail_code(lc))
             link = lbody.get("verifyUrl") if lc == 200 else None
             if link:
+                # ⭐ THE SAME SIGN-IN LINES AS `login` (Mac brief, 2026-09-25): the
+                # link first, then the connection code as the "Or". The line above
+                # them stopped saying "Log in here", which now opens the link's own
+                # line — said twice in a row it read as a stutter.
                 lines = [
-                    ("You're not signed in yet. Log in here and I'll pick this "
-                     "up — I'll post here when it's done:"
+                    ("You're not signed in yet. Log in and I'll pick this up "
+                     "— I'll post here when it's done."
                      if arm_payload.get("armed") else
-                     "You're not signed in yet. Log in here and I'll pick this "
-                     "up — ask me once you're in:"),
-                    f"  {link}",
+                     "You're not signed in yet. Log in and I'll pick this up "
+                     "— ask me once you're in."),
+                    *_signin_link_lines(lbody),
                 ]
                 if arm_rc == 0 and arm_lines:
                     lines += _agent_directive_block(arm_lines)
-                return _emit({**body, "verifyUrl": link}, args.json, lines, _fail_code(code))
+                out = {**body, "verifyUrl": link}
+                if isinstance(lbody.get("code"), str):
+                    out["code"] = lbody["code"]
+                return _emit(out, args.json, lines, _fail_code(code))
             return _emit(body, args.json, [
                 "You're not signed in yet — tell me to log you in and I'll send a link.",
             ], _fail_code(code))

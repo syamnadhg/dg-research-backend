@@ -7,14 +7,16 @@ from facade.devicelogin import DeviceLoginError
 
 
 def test_start_returns_handle(mock_fe):
+    # ⚠ RE-AIMED 2026-09-25 (Mac brief): the live broker's reply — a short
+    # connection code, and a /connect link whose last part is that code.
     base = mock_fe(start_resp={
-        "code": "AB-12", "pollToken": "PT-1",
-        "verifyUrl": "https://superresearch.io/connect-agent", "expiresIn": 600,
+        "code": "WDJB-MJHT", "pollToken": "PT-1",
+        "verifyUrl": "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT", "expiresIn": 600,
     })
     out = devicelogin.start(fe_base=base, runtime="hermes", label="Scout")
-    assert out["code"] == "AB-12"
+    assert out["code"] == "WDJB-MJHT"
     assert out["pollToken"] == "PT-1"
-    assert out["verifyUrl"].endswith("/connect-agent")
+    assert out["verifyUrl"] == "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT"
     assert out["expiresIn"] == 600
 
 

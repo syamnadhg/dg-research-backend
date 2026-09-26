@@ -966,6 +966,11 @@ def cmd_login(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The longest connection code the sign-in lines print (Mac brief, 2026-09-25). The
+#: live broker's is "WDJB-MJHT" (9); an older one handed out a 43-character token.
+_CONNECTION_CODE_MAX = 12
+
+
 def _remote_signin(*, open_browser: bool, poll: bool = True, runtime: str = "", label: str = "") -> str:
     """Shared sign-in via the SR web app (superresearch.io) — the SAME page
     `/sr login` uses, so sign-in is consistent everywhere and works from any device
@@ -984,8 +989,26 @@ def _remote_signin(*, open_browser: bool, poll: bool = True, runtime: str = "", 
         return "start-failed"
     out = res[1]
     url = out.get("verifyUrl") or ""
-    b.line(f"Sign in here:  {url}")
-    b.dim("Sign in with your Super Research Google account, then tap Approve & connect.")
+    # ⭐⭐ THE LINK FIRST, THE CONNECTION CODE AS THE "OR" (Mac brief, 2026-09-25) —
+    # the same three lines the chat's `sr.py login` prints (`_signin_link_lines`
+    # there; a test holds the two copies together). The page address is the link
+    # up to its "?", so it always matches the link; the code is printed as handed
+    # over, and only when it is short enough to type (an older broker's 43-char
+    # token is not). Printed BEFORE the `poll` branch: `connect`'s headless path
+    # relays these same lines. ⛔ "Authenticate" is the page's real button — this
+    # said "Approve & connect", a label the page has never shown.
+    code = out.get("code")
+    code = code.strip() if isinstance(code, str) else ""
+    page = url.split("?", 1)[0]
+    b.line(f"Log in here: {url}")
+    if page and 0 < len(code) <= _CONNECTION_CODE_MAX:
+        b.line("Or, if the link won't open (for example on another device): "
+               f"go to {page} and enter this connection code: {code}")
+        b.line("Either way, check the page shows the same connection code, "
+               "then tap Authenticate.")
+        b.dim("Sign in with your Super Research Google account.")
+    else:
+        b.dim("Sign in with your Super Research Google account, then tap Authenticate.")
     if not poll:
         b.dim("Approve it in your browser — the bridge connects you automatically.")
         b.dim("(Confirm any time in chat:  /sr login-done.)")
@@ -1300,7 +1323,8 @@ _UNLINK_FAILURES = {
 
 # The CLAIM route's twelve codes. `device add` printed `_err(res)` raw, so every
 # one of them reached the terminal as an identifier — including the two that are
-# recoverable and say how.
+# recoverable and say how. Plus the bridge's own `signin_code`, which it sends as
+# the reply's `reason` before it asks the claim route anything (`_pair_refusal_key`).
 #
 # ⭐ `pair_bootstrap_failed` EARNS ITS SENTENCE: the device DID pair; the machine
 # just did not collect its token, and re-entering the SAME code finishes it. As
@@ -1352,7 +1376,29 @@ _PAIR_FAILURES = {
     "unauthorized": "this agent's sign-in was refused — run login again",
     "invalid_json": "that request didn't reach the app in one piece — try again",
     "internal_error": "the app hit a problem of its own — nothing was paired",
+    # ⛔⛔ THE CONNECTION CODE IS NOT AN ACCESS CODE (Mac brief, 2026-09-25): both are
+    # eight characters and look alike. ⛔ The URL ends the sentence (a trailing "."
+    # gets linked, and "/connect." is a 404).
+    "signin_code": "that's your connection code, for signing in — open the sign-in "
+                   "link, or type the code at https://superresearch.io/connect",
+    # ⭐ …and just after the sign-in connected (owner, 2026-09-25).
+    "signin_code_used": "that's your connection code — you're already signed in with "
+                        "it; it isn't a computer's access code",
 }
+
+
+def _pair_refusal_key(res: tuple[int, dict] | None) -> str:
+    """The key `_pair_refusal` looks up for one failed `device add`.
+
+    ⛔ The bridge's own refusal is keyed on `reason` — {"reason": "signin_code",
+    "error": <a sentence>} — so reading `error` alone never reaches its entry. Only
+    a reason this table words wins; the 401 relay's `reason: "revoked"` keeps its
+    signed-out sentence."""
+    body = res[1] if res and isinstance(res[1], dict) else {}
+    reason = body.get("reason")
+    if isinstance(reason, str) and reason in _PAIR_FAILURES:
+        return reason
+    return _err(res)
 
 
 def _pair_refusal(err: str, retry_after_ms=None) -> str:
@@ -1540,7 +1586,7 @@ def cmd_device(args: argparse.Namespace) -> int:
         if res is None or res[0] != 200:
             body = res[1] if res and isinstance(res[1], dict) else {}
             print(f"{_NO} couldn't add device: "
-                  f"{_pair_refusal(_err(res), body.get('retryAfterMs'))}")
+                  f"{_pair_refusal(_pair_refusal_key(res), body.get('retryAfterMs'))}")
             return 1
         d = res[1]
         nm = d.get("deviceName") or d.get("deviceId") or "device"

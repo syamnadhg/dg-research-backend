@@ -84,6 +84,19 @@ _DEFAULT_AGENTS = ["chatgpt", "gemini", "claude"]
 # matter what TTL the broker reports (defense against an unbounded expiresIn).
 _REMOTE_MAX_TTL_SECONDS = 900
 
+# Where a connection code is typed when the sign-in link won't open — used only when
+# the pending flow's own link names no page (the page is otherwise the link up to
+# its "?", so it follows any connect-origin override). Mac brief, 2026-09-25.
+_CONNECT_PAGE = "https://superresearch.io/connect"
+
+
+def _code_key(value: Any) -> str:
+    """A typed code reduced to what both kinds of code are made of: upper case,
+    A-Z and 0-9 only — the web app's own access-code normalizer (pair-code.ts).
+    "wdjb-mjht", "WDJB MJHT" and "WDJB–MJHT" are all "WDJBMJHT"."""
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
 # A run id must be a single Firestore document-id segment. Validated at the URL
 # boundary so a crafted rid (../, %2f, embedded /) can never be interpolated into
 # a Firestore path and steer a request out of the caller's own tree. Admits our
@@ -4821,6 +4834,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # routes — "revoked", the discriminator a client branches on —
                 # and a second meaning on the same key is how a client comes to
                 # test for the wrong one. The caller knows what it called.
+                # (The bridge does send reasons of its OWN on these routes, never
+                # relayed ones — e.g. /device/pair's "signin_code", sent before the
+                # web app is asked anything, which the pair clients look up in
+                # their pair tables only and never compare with "revoked".)
                 self._json(status if status >= 400 else 502,
                            {"error": body.get("error") or f"http_{status}",
                             "retryAfterMs": body.get("retryAfterMs")})
@@ -5015,10 +5032,65 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             fresh device → this account becomes the OWNER; claiming an
             already-owned device → this account becomes a SHARER. The app
             route enforces format, rate limits, expiry, and the revoked-sharer
-            blocklist — errors are relayed for the chat client to word."""
+            blocklist — errors are relayed for the chat client to word. The
+            refusals made HERE are the sign-in's own connection code — while it is
+            pending (`reason: "signin_code"`) and, for the rest of the code's life,
+            once it has connected (`reason: "signin_code_used"`) — and nothing is
+            claimed for either."""
             code = (self._read_json().get("code") or "").strip()
             if not code:
                 self._json(400, {"error": "code is required"})
+                return
+            # ⛔⛔ THE CONNECTION CODE IS NOT AN ACCESS CODE (Mac brief, 2026-09-25).
+            # Both are eight characters and look alike, the chat now prints the
+            # connection code, and SKILL.md sends any bare 8-character code pasted
+            # back into the chat to `device-add` — so it gets typed here. Forwarded,
+            # it came back "no computer is waiting for that code", or, for the ~1 in
+            # 3 with an L in it, "access codes never use I, L, O" — both about a code
+            # the person never had — and a signed-in claim spent one of the route's
+            # five tries. Normalized the way the web app normalizes an access code
+            # (upper case, A-Z0-9 only), so any case, dash or space matches.
+            # ⭐ AND FOR THE REST OF THE CODE'S LIFE ONCE IT HAS CONNECTED (owner,
+            # 2026-09-25). Right after signing in is the likeliest moment somebody
+            # pastes the code back into the chat, and it came back as a bad
+            # computer code ("check the code on that computer's screen"). A
+            # connected flow stays in `state.remote` until a logout (which drops
+            # it), so the refusal lasts exactly as long as the code could still
+            # mean anything — `expires_at` — and says so in its own words: "open the
+            # link I sent" would be wrong for a sign-in that already happened. An
+            # expired or failed flow is not checked; its code goes to the claim
+            # route like any other.
+            # ⛔ BEFORE `_account()`: a pending sign-in almost always means nobody
+            # is signed in, and after it the person reads "not signed in" — and
+            # the fresh sign-in that invites would void the code on the page they
+            # already have open.
+            # ⛔ `state.remote`, NEVER `remote_lock`: that lock is held across the
+            # broker's network poll, and pairing must not wait on it.
+            # ⛔ The code itself is never logged; bridge.log goes to support.
+            flow = state.remote
+            key = _code_key(code)
+            if (flow is not None and flow.state == "pending" and key
+                    and key == _code_key(flow.code)):
+                page = (flow.verify_url or "").split("?", 1)[0] or _CONNECT_PAGE
+                log.info("device pair: refused — that was the pending sign-in's "
+                         "connection code, not an access code (nothing claimed)")
+                # ⛔ " — not here", NOT ", not here": nothing but a space may follow
+                # the URL (a chat links a trailing comma or stop, and "/connect,"
+                # is a 404). An older sr.py relays this sentence as it stands.
+                self._json(400, {"reason": "signin_code",
+                                 "error": "that's your connection code — open the "
+                                          "link I sent, or type it at "
+                                          f"{page} — not here"})
+                return
+            if (flow is not None and flow.state == "connected" and key
+                    and key == _code_key(flow.code) and time.time() < flow.expires_at):
+                log.info("device pair: refused — that was the connection code of the "
+                         "sign-in that just connected, not an access code (nothing "
+                         "claimed)")
+                self._json(400, {"reason": "signin_code_used",
+                                 "error": "that's your connection code — you're already "
+                                          "signed in with it. It isn't a computer's "
+                                          "access code."})
                 return
             acct = self._account()
             if acct is None:
