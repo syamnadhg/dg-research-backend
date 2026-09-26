@@ -89,13 +89,26 @@ class _Ran(dict):
     __getattr__ = dict.__getitem__
 
 
-def _drive(callback, seconds=0.3):
-    """Run `callback` under the real BackgroundConsumer for a moment."""
+def _drive(callback, until=None, seconds=0.3, deadline=15.0):
+    """Run `callback` under the real BackgroundConsumer until `until(consumer, rpc)`
+    holds (or `deadline` passes), then snapshot.
+
+    ⛔ WAIT FOR THE CONDITION, NOT A FIXED 0.3 s (2026-09-26). A fixed sleep raced
+    the consumer thread: on a loaded Windows box it had delivered only 2 of the 3
+    messages when the snapshot was taken, and the unguarded test read "delivery
+    stopped at 2" — a product-shaped failure from a clock. Every caller now waits
+    for exactly what it asserts; a real defect still fails, because the condition
+    never comes true and the caller's own assertion fails after the deadline."""
     from google.api_core.bidi import BackgroundConsumer
     rpc = _FakeRpc()
     consumer = BackgroundConsumer(rpc, callback)
     consumer.start()
-    time.sleep(seconds)
+    if until is None:
+        time.sleep(seconds)
+    else:
+        stop_at = time.monotonic() + deadline
+        while time.monotonic() < stop_at and not until(consumer, rpc):
+            time.sleep(0.02)
     snap = _Ran(consumer_active=consumer.is_active,
                 rpc_active=rpc.is_active,
                 rpc_closed=rpc.closed,
@@ -122,7 +135,8 @@ class TestWhatOneThrowDoesToAListener:
             if seen["n"] == 3:
                 raise AttributeError("'NoneType' object has no attribute 'get'")
 
-        ran = _drive(raises_on_the_third)
+        ran = _drive(raises_on_the_third,
+                     until=lambda c, _r: seen["n"] >= 3 and not c.is_active)
         assert seen["n"] == 3, (
             f"delivery stopped at {seen['n']} — it should stop at the throw")
         assert ran.consumer_active is False, "the consumer thread should be gone"
@@ -133,7 +147,7 @@ class TestWhatOneThrowDoesToAListener:
         def always_raises(_r):
             raise RuntimeError("boom")
 
-        ran = _drive(always_raises)
+        ran = _drive(always_raises, until=lambda c, _r: not c.is_active)
         assert ran.consumer_active is False
         assert ran.rpc_active is True, "the RPC was left active"
         assert ran.rpc_closed is False, "nothing closed the stream"
@@ -146,14 +160,16 @@ class TestWhatOneThrowDoesToAListener:
             seen["n"] += 1
             raise AttributeError("'NoneType' object has no attribute 'get'")
 
-        ran = _drive(research._guard_snapshot(always_raises, "start"))
+        ran = _drive(research._guard_snapshot(always_raises, "start"),
+                     until=lambda _c, _r: seen["n"] > 3)
         assert seen["n"] > 3, (
             f"only {seen['n']} deliveries — the guard did not keep it running")
         assert ran.consumer_active is True, "the consumer thread should still be alive"
 
     def test_a_guarded_healthy_callback_is_untouched(self):
         seen = []
-        ran = _drive(research._guard_snapshot(seen.append, "start"))
+        ran = _drive(research._guard_snapshot(seen.append, "start"),
+                     until=lambda _c, _r: len(seen) > 3)
         assert len(seen) > 3
         assert ran.consumer_active is True
 
@@ -277,7 +293,8 @@ class TestSpottingADeadWatch:
     def test_it_reads_the_librarys_own_answer(self):
         """⭐ Against the real BackgroundConsumer, whose `is_active` is what
         `Watch.is_active` delegates to. A dead thread reads dead."""
-        ran = _drive(lambda *_a: (_ for _ in ()).throw(ValueError()))
+        ran = _drive(lambda *_a: (_ for _ in ()).throw(ValueError()),
+                     until=lambda c, _r: not c.is_active)
         assert research._watch_is_dead(ran.consumer) is True
 
 
