@@ -110,7 +110,7 @@ superresearch --serve
 superresearch "your topic"
 ```
 
-> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** — identical flags, identical branded UI, and the same `--pair` / `--login` / `--update` / `--restart` / `--serve` / `--resurrect` / `--retire` / `--visibility` / `--unpair` / `--doctor` / `--send-logs` / `--uninstall` / `--version` / `agent` verbs. Help is invocation-aware: it shows `superresearch …` when launched from the installed command, `python research.py …` from a source checkout. So every `python research.py …` example below works verbatim as `superresearch …` on an installed build.
+> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** — identical flags, identical branded UI, and the same `--pair` / `--login` / `--update` / `--restart` / `--serve` / `--resurrect` / `--retire` / `--visibility` / `--allow-all` / `--unpair` / `--doctor` / `--send-logs` / `--uninstall` / `--version` / `agent` verbs. Help is invocation-aware: it shows `superresearch …` when launched from the installed command, `python research.py …` from a source checkout. So every `python research.py …` example below works verbatim as `superresearch …` on an installed build.
 >
 > **`--update`** updates an installed build and is **idempotent** — it checks PyPI and only reinstalls the pipx package when the installed build is actually outdated, otherwise it says "already up to date" (no pointless reinstall). This is the CLI path for updating the backend; the app's Settings → About Check → Update is the remote equivalent (a source checkout updates with `git pull` instead).
 >
@@ -197,7 +197,9 @@ them web-app-only:
   into the machine's `sharedWith[]` and syncs the custom claim.
 - **Set who can find the machine.** `POST /device/visibility`
   (`sr device visibility public|private`) writes the same field `--visibility`
-  and the Shared-with popup write. The agent is one of the writers
+  and the Shared-with popup write. With `allowAll` (`sr device-allow-all
+  yes|no`, `agent device allow-all <id> yes|no`) it also sets **Allow all** —
+  anyone who asks joins at once; on, it makes the machine public too. The agent is one of the writers
   `firestore.rules` names by role — see [§ `--visibility`](#step-5a-bis-who-can-find-this-pc---visibility).
 
 What still has **no** chat route and stays in the web app: **revoking an
@@ -468,7 +470,7 @@ Let other people find this computer and ask to use it? [y/N]:
 ```
 
 - **`N` (default)** — private. Only people you hand the pair code to can ask for access. This is what an unattended or scripted pair records, deliberately: the default is the private answer, so a machine paired with no one watching is never published.
-- **`y`** — the machine is listed, and people who do not have its pair code can find it and **ask** you for access. **It grants nobody anything.** You still approve every person by hand, and an approved person becomes an ordinary sharer with the ordinary sharer's powers — submit a topic to the fixed pipeline, nothing else. Whether the record itself can be read is unchanged either way: owner, sharers, and the machine, exactly as before.
+- **`y`** — the machine is listed, and people who do not have its pair code can find it and **ask** you for access. **It grants nobody anything.** You still approve every person by hand (until you turn on **Allow all** — below), and an approved person becomes an ordinary sharer with the ordinary sharer's powers — submit a topic to the fixed pipeline, nothing else. Whether the record itself can be read is unchanged either way: owner, sharers, and the machine, exactly as before. Pairing never asks about Allow all.
 
 ⛔ **The write lands before the tick.** Both answers go up in that one patch first, and a refused write says so — `⚠  Could not save that — this computer stays private for now`, with `--visibility public` named as the retry — rather than ticking something that never reached Firestore.
 
@@ -478,6 +480,8 @@ Change it any time, from the machine:
 python research.py --visibility public     # let people find it
 python research.py --visibility private    # hide it again
 python research.py --visibility            # print the current setting
+python research.py --allow-all yes         # public, and anyone who asks joins at once
+python research.py --allow-all no          # back to approving each person
 ```
 
 …or from the app, in **Account → the Shared-with popup**, which writes the same field.
@@ -670,9 +674,15 @@ Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemc
 python research.py --visibility            # show the current setting
 python research.py --visibility public     # let people find it and ask for access
 python research.py --visibility private    # hide it again (the default)
+python research.py --allow-all             # show whether Allow all is on
+python research.py --allow-all yes         # public + anyone who asks joins at once
+python research.py --visibility public --allow-all   # the same, in one step
+python research.py --allow-all no          # approve each person again (stays public)
 ```
 
-Discovery, not access. A **public** machine is one other people can see listed and **ask** to use; you still approve each request by hand — **Review**, on the Account banner — and an approved person becomes an ordinary sharer with the ordinary sharer's powers (submit a topic to the fixed pipeline, nothing else). A **private** machine can only be asked about by someone you gave the pair code to. Machines paired before this setting existed are private, and nothing changes that on its own. Whether the device record itself can be **read** is unchanged either way: owner, sharers, and the machine, exactly as before.
+Discovery, not access. A **public** machine is one other people can see listed and **ask** to use; you still approve each request by hand — **Review**, on the Account banner — and an approved person becomes an ordinary sharer with the ordinary sharer's powers (submit a topic to the fixed pipeline, nothing else).
+
+**Allow all** is the one exception, and only on a public machine: anyone signed in who asks joins at once, with no approval — up to the 25-person limit, at most 10 new people an hour (past that, asks wait for you as usual). They run research on your AI accounts and can see your email and who else is on it. People you removed stay out, and a "no" you gave still stands for its week. It is a separate `allowAll` flag on the device record, never a third visibility value, and the web app's server does the join — no client is trusted to. Turning it on also makes the machine public; making the machine private, Reset, and an owner hand-off all clear it. The web's Shared-with popup has the same switch (an **Allow all** tick under Public), and the chat agent has `device-allow-all yes|no`. A **private** machine can only be asked about by someone you gave the pair code to. Machines paired before this setting existed are private, and nothing changes that on its own. Whether the device record itself can be **read** is unchanged either way: owner, sharers, and the machine, exactly as before.
 
 The setting lives on the device record, so every surface agrees. ⛔ **Four writers set it, and `firestore.rules` names them by role rather than counting them — because the count has already been wrong twice:** the **owner**, from Account → the Shared-with popup; the **machine**, at pair time and from `--visibility`; the **chat agent**, which has its own Firestore door (`POST /device/visibility` — see [§ Super Agent](#drive-it-from-chat--super-agent-hermes--openclaw)); and **owner-unlink**, which deletes the field server-side on a hand-off. Only the first three meet the rule — the Admin SDK bypasses rules entirely — and all three are checked, because a constraint one writer can walk around is decoration. This § used to name two.
 

@@ -26,7 +26,7 @@ superresearch --serve     # run the backend
 superresearch "<topic>"   # one-shot CLI run
 ```
 
-`superresearch <flags>` is a pure drop-in for `python research.py <flags>` — identical flags (`--pair` / `--serve` / `--resurrect` / `--retire` / `--restart` / `--unpair` / `--visibility` / `--doctor` / `--send-logs` / `--update` / `--uninstall` / `--version` / `--login` / `agent`), identical branded UI. ⛔ `--commands` is not one of them any more — the branded reference card it printed became `--help` / `-h` itself (`run_commands_help`, `add_help=False`), which is the only discovery surface there is. `--update` is **idempotent** — it only reinstalls when the installed build is actually outdated. `--login` runs a per-profile Y/N login walk (parity with the pair flow's **Browser logins** step — named rather than numbered, because the arc has renumbered twice and a step number in this sentence rots silently) fronted by a READ-ONLY pre-probe that never blows away an already-signed-in session (it does NOT run the patchright verify pass). Invocation-aware help shows whichever prefix matches how it was launched (`superresearch` when installed, `python research.py` from a checkout).
+`superresearch <flags>` is a pure drop-in for `python research.py <flags>` — identical flags (`--pair` / `--serve` / `--resurrect` / `--retire` / `--restart` / `--unpair` / `--visibility` / `--allow-all` / `--doctor` / `--send-logs` / `--update` / `--uninstall` / `--version` / `--login` / `agent`), identical branded UI. ⛔ `--commands` is not one of them any more — the branded reference card it printed became `--help` / `-h` itself (`run_commands_help`, `add_help=False`), which is the only discovery surface there is. `--update` is **idempotent** — it only reinstalls when the installed build is actually outdated. `--login` runs a per-profile Y/N login walk (parity with the pair flow's **Browser logins** step — named rather than numbered, because the arc has renumbered twice and a step number in this sentence rots silently) fronted by a READ-ONLY pre-probe that never blows away an already-signed-in session (it does NOT run the patchright verify pass). Invocation-aware help shows whichever prefix matches how it was launched (`superresearch` when installed, `python research.py` from a checkout).
 
 The **source / developer path** is unchanged and still fully supported:
 
@@ -1368,6 +1368,22 @@ listed and **ask** to use; the owner approves every request by hand, and an
 approved person becomes an ordinary sharer. Nothing about the setting grants
 anybody anything, and the device document stays readable by exactly the same
 three principals either way.
+
+⭐ **Allow all (wave 12) is the one door that opens without the owner.** A
+separate boolean `allowAll`, effective ONLY while the machine is public (by
+`_discovery_of`) AND the stored value is exactly `True` — never a third
+visibility value, because every older reader would read a third word as private
+and an old "make it private" would no-op. The JOIN is done by the web app's
+`access-request` route inside its transaction (live owner / already-shared /
+removed / 25-cap checks, a week's "no" still stands, 10 instant joins per machine
+per hour, then an ordinary ask); this program only writes the flag.
+`--allow-all yes` writes `{visibility: public, allowAll: true}` in ONE patch;
+`--allow-all no` writes `{allowAll: false}` and stays public; `--visibility
+private` closes FIRST and then clears a stored tick best-effort; a private→public
+flip carries `allowAll: false` when an old tick is stored, so it never comes back
+unasked. Bare `--allow-all` only SHOWS — except right after an explicit
+`--visibility public`, the owner's one-step form. Reset and owner-unlink delete
+the field server-side. Pairing never asks.
 
 **The state lives on the device document and nowhere else** — deliberately no
 `research_config.json` key, because the owner can change this from the app and a

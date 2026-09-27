@@ -567,9 +567,13 @@ def test_the_terminal_ask_waits_as_long_as_its_siblings(term):
     _run(device_command="ask", deviceId="dev-a1")
     sent = next(c for c in term.calls if c[1] == "/device/ask")
     assert sent[2] == {"deviceId": "dev-a1"}
+    # ⭐ FIFTY SINCE WAVE 12 (2026-09-26), deliberately: on a computer that lets
+    # anyone join the ask IS the grant, and the bridge gives that route 35 s plus a
+    # 10 s refresh. The executed pin is `test_terminal_join_says_joined_and_waits_fifty`
+    # (test_allow_all_clients_0926), whose stub records the wait this one does not.
     import inspect
     src = inspect.getsource(cli._device_ask)
-    assert "timeout=40.0" in src
+    assert "timeout=50.0" in src
 
 
 @pytest.mark.parametrize("sub,phrase", [

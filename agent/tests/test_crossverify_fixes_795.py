@@ -84,7 +84,7 @@ def test_browse_prunes_a_leaky_upstream_row(live, monkeypatch):
     publishing a credential."""
     leaky = {
         "deviceId": "dev-x", "label": "Someone's Mac", "osFamily": "mac",
-        "online": True, "full": False,
+        "online": True, "full": False, "allowAll": False,
         # —— none of this may survive the relay ——
         "pairCode": "SR-PLAINTEXT-CODE", "pollSecretHash": "sha256:beef",
         "syntheticDeviceUid": "synth-x", "ownerUid": "u9",
@@ -106,9 +106,14 @@ def test_browse_prunes_a_leaky_upstream_row(live, monkeypatch):
 def test_browse_uses_the_public_key_set_not_the_own_machine_one(live):
     """⛔ A BROWSE ROW IS A STRANGER'S MACHINE. Reusing `_DEVICE_PUBLIC_KEYS`
     here would widen it by four fields that are about the ASKING account —
-    `owned`, `selected`, `visibility` and the hostname ladder."""
+    `owned`, `selected`, `visibility` and the hostname ladder.
+
+    ⭐ WAVE 12 ADDED ONE KEY, DELIBERATELY: `allowAll`, the web app's "joins at
+    once" bit. It says how the machine answers an ask, never who is on it or
+    anything about the asking account, so it belongs on a stranger's row — and
+    without it the strict prune dropped the bit and every row read as "ask"."""
     assert set(bridge._PUBLIC_DEVICE_KEYS) == {"deviceId", "label", "osFamily",
-                                               "online", "full"}
+                                               "online", "full", "allowAll"}
     # ⛔ `online` IS LEGITIMATELY IN BOTH — a browse row and an own row both
     # carry a power state, and asserting the sets were disjoint was my own
     # overreach. What must hold is that the browse row carries NOTHING about the

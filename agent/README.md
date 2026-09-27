@@ -90,6 +90,7 @@ podcast"):
 /sr devices-public               computers other people offer   ·   device-ask <name|id>
 /sr device-requests              who's asking for yours, and what you're waiting on
 /sr device-approve [person]      ·   device-deny [person]   ·   device-visibility public|private [name]
+/sr device-allow-all yes|no [name]   anyone who asks joins at once (yes also makes it public)
 /sr send-logs                    package logs for support — prints the plan, sends nothing
 ```
 
@@ -154,6 +155,17 @@ other side, `devices-public` browses what's on offer and `device-ask` puts you i
 that owner's queue — they see your name, or your email if you haven't set one,
 and nothing happens on their machine until they say yes.
 
+**Allow all** is the one exception, and it is about access. `device-allow-all
+yes` (confirmed first) lets anyone signed in join a public computer you own at
+once — up to 25 people, running research on your AI accounts; people you removed
+stay out — and makes it public too if it wasn't; `device-visibility public
+--allow-all` is the same step. `device-allow-all no` goes back to approving each
+person (the computer stays public, and anyone who already joined keeps access);
+going private switches it off as well. On the other side, a public row marked
+*joins at once* lets `device-ask` in straight away: the reply says you're in,
+selects it when nothing else is selected, and starts a held research topic —
+nothing arrives later.
+
 **Where that setting starts is not here.** The machine's own `--pair` asks it
 during setup, in a step of its own, and the answer defaults to *no*; a computer
 paired before that question existed carries no answer at all and reads
@@ -180,7 +192,8 @@ In **chat** the person and the machine are optional — with one person waiting 
 one computer owned, the client picks; with several it prints the queue rather
 than guessing. In the **terminal** everything is named by **id**
 (`agent device approve <deviceId> <requesterUid>`, `agent device visibility
-<deviceId> public|private`), because a queue row's label is a snapshot taken the
+<deviceId> public|private [--allow-all]`, `agent device allow-all <deviceId>
+yes|no`), because a queue row's label is a snapshot taken the
 day somebody asked and falls back to a word shared by everyone the app couldn't
 look up. `agent device requests` prints the whole command for each row.
 
@@ -391,9 +404,10 @@ A **separate process** that never touches the existing app:
 - **It never writes membership.** Pairing, unlinking and answering an access
   request all forward to `/api/devices/*` and are authorised there against your
   own session; this package holds no admin credential and can grant itself
-  nothing. ⚠ `device-visibility` is the one device verb that does *not* forward —
-  no web route for it exists — so it PATCHes `devices/{id}` directly with one
-  field and one update mask, on the owner's own token. The rules examine that
+  nothing. ⚠ `device-visibility` and `device-allow-all` are the device verbs that
+  do *not* forward — no web route for them exists — so they PATCH `devices/{id}`
+  directly with literal update masks (`visibility`, `allowAll`, or both in one
+  patch when Allow all goes on), on the owner's own token. The rules examine that
   field's **value** — one of only two fields on the document where they do
   (`visibility`, and `joinPolicy`, the rename the rules already admit and
   nothing writes yet) — and the collection is `allow create: if false` for every

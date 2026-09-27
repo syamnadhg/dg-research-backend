@@ -106,6 +106,16 @@ def test_all_firestore_paths_are_account_scoped():
     name is a literal in the update mask and the value is checked against two
     words. The test below pins exactly that, for the same reason its neighbour
     pins the action name.
+
+    ⛔⛔ 2026-09-26 (wave 12) — A RULE DOES MOVE, AND THIS DOCSTRING MAY NOT GO ON
+    SAYING OTHERWISE. `allowAll` joins BOTH device update `hasOnly` lists, with an
+    `allowAllWriteIsValid()` bool check, in a ruleset the owner deploys by hand
+    BEFORE the web rollout and the wheels. No PATH moves — the device document was
+    already on this list — so the assertion below is unchanged; what changed is
+    that one more key is writable through it, and the next test pins that key the
+    way it pins `visibility`: a literal in the mask, a value checked before the
+    request is built. Until that ruleset is live every allow-all write from here is
+    refused as a 403, which the bridge words as "refused — nothing changed".
     """
     src = (FACADE_DIR / "firestore_rest.py").read_text(encoding="utf-8")
     paths = re.findall(r"config\.FIRESTORE_BASE\}(\S*)", src)
@@ -177,8 +187,10 @@ def test_this_client_can_never_choose_which_device_field_it_writes():
     from tests.conftest import code_only
 
     src = code_only((FACADE_DIR / "firestore_rest.py").read_text(encoding="utf-8"))
+    # ⛔ THE SLICE ENDS AT THE ALLOW-ALL WRITER NOW, which sits between the two and
+    # names `visibility` in a mask of its own — it has its own guard below.
     body = src[src.index("def set_device_visibility"):
-               src.index("def update_research")]
+               src.index("def set_device_allow_all")]
     assert body.count("updateMask.fieldPaths=visibility") == 1, (
         "the update mask must name the one field as a literal")
     # ⛔ ALL SEVEN OTHER KEYS THE OWNER RULE ADMITS, not the five this listed —
@@ -191,6 +203,39 @@ def test_this_client_can_never_choose_which_device_field_it_writes():
             f"{forbidden} must never be writable through this method")
     assert '("public", "private")' in body, (
         "the value must be checked against the two the rules accept")
+
+
+def test_the_allow_all_writer_cannot_choose_its_fields_either():
+    """The same two guards for the second writer on the device document (wave 12).
+
+    ⛔⛔ TWO KEYS, BOTH LITERALS, AND NOTHING ELSE. `set_device_allow_all` writes
+    `allowAll` — alone, or with `visibility: "public"` in the SAME patch — and the
+    owner's update rule admits nine keys. A field-name parameter or a patch dict
+    here would let any caller rename somebody's machine through it. The value is a
+    bool, checked before the request is built, because `allowAllWriteIsValid()`
+    refuses anything else and refuses the WHOLE update with it — the publish too.
+    """
+    import inspect
+
+    from facade.firestore_rest import FirestoreRest
+
+    sig = inspect.signature(FirestoreRest.set_device_allow_all)
+    assert list(sig.parameters) == ["self", "device_id", "value", "publish"], (
+        "set_device_allow_all must not grow a field name or a patch dict")
+    assert sig.parameters["publish"].kind is inspect.Parameter.KEYWORD_ONLY
+    from tests.conftest import code_only
+
+    src = code_only((FACADE_DIR / "firestore_rest.py").read_text(encoding="utf-8"))
+    body = src[src.index("def set_device_allow_all"):
+               src.index("def update_research")]
+    assert body.count("updateMask.fieldPaths=allowAll") == 2, (
+        "both masks must name the field as a literal")
+    assert body.count("updateMask.fieldPaths=visibility") == 1
+    for forbidden in ("name", "priority", "supervised", "restingWorkerIds",
+                      "restEtaMs", "restEtaSetAt", "restNote", "joinPolicy"):
+        assert f'"{forbidden}"' not in body and f"'{forbidden}'" not in body, (
+            f"{forbidden} must never be writable through this method")
+    assert "isinstance(value, bool)" in body and "isinstance(publish, bool)" in body
 
 
 def test_secret_store_isolated_from_device_keystore():

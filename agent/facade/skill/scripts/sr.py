@@ -157,6 +157,32 @@ _LOST_CODE_REPLY = ("If it's your own computer, open Account in the web app and 
 _PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "
                       "you can use that computer. They see your name.")
 
+# ⭐⭐ ALLOW ALL (wave 12, 2026-09-26). An owner can set a public computer so that
+# anyone who asks joins at once, with no approval step. Four sentences say it, and
+# each is said in ONE place so the screens cannot come to disagree about it.
+#
+# ⛔ THE ROW MARK. " · joins at once" rides a public row whose owner lets anyone
+# in — and never beside a full one, where `full` wins: a full computer refuses
+# everybody, allow-all or not, and "joins at once" beside it is a promise the
+# route breaks.
+_JOINS_AT_ONCE = " · joins at once"
+# ⛔⛔ THE INVITATION HAS TO BE TRUE OF EVERY ROW ABOVE IT. "Once the request is
+# accepted" is false for a row that joins at once — there is no request to accept.
+# So a list carrying one such row gets this instead; a list with none keeps
+# `_PUBLIC_ASK_INVITE` word for word, which is also what every row reads as until
+# the web app ships the bit — the safe direction.
+_PUBLIC_JOIN_INVITE = ("Tell me which one you want. Ones marked “joins at once” let "
+                       "you straight in; for the others its owner decides. They see "
+                       "your name.")
+# ⛔⛔ WHAT ALLOW ALL COSTS THE OWNER, IN THE SPEC'S OWN WORDS. The confirm before
+# switching it on and the reply after it say the same sentence, so what somebody
+# agreed to and what they are told they did are one text. Twenty-five is the
+# sharing cap — a token-size limit, not a setting — and "people you removed stay
+# out" is the one protection that survives: Remove is a ban.
+_ALLOW_ALL_MEANS = ("Anyone signed in can join {name} at once — up to 25 people — "
+                    "without asking you, and run research on your AI accounts. "
+                    "People you removed stay out.")
+
 # ⛔ ONE EXPLANATION OF AN EMPTY PUBLIC LIST. The two screens ask different
 # questions — "are there any?" and "I have none, is there another way?" — so the
 # lead differs and the word "either" only belongs on the second. The REASON is
@@ -260,7 +286,7 @@ def _public_offer_lines() -> list[str]:
     if body.get("truncated"):
         lines.append(_PUBLIC_TRUNCATED_SOME)
     lines.append("")
-    lines.append(_PUBLIC_ASK_INVITE)
+    lines.append(_public_invite(rows))
     return lines
 
 
@@ -1675,6 +1701,11 @@ def cmd_devices(args) -> int:
         # and it goes silently wrong: every public computer would read private,
         # with no error anywhere.
             state = ", public" if d.get("visibility") == "public" else ", private"
+            # ⭐ AND WHETHER ANYONE CAN WALK IN (wave 12). The bridge sends the
+            # EFFECTIVE value — public AND strictly true — so a private computer's
+            # leftover tick never reads as an open door here.
+            if state == ", public" and d.get("allowAll") is True:
+                state = ", public, anyone can join"
         # ⛔ AND WHETHER IT IS ONLINE (2026-09-26). SKILL.md now sends "are you
         # connected to my Mac?" here, and a row that never said online or offline
         # was read as "yes, connected" for a Mac that was switched off — the very
@@ -2002,6 +2033,13 @@ _ASK_ERRORS = {
     # its word reached the person as the sentence.
     "internal_error": "The app hit a problem of its own answering that. Nothing was "
                       "sent, so it’s safe to try again.",
+    # ⛔⛔ THE BRIDGE'S OWN CODE, NOT THE ROUTE'S (wave 12). An ask to a computer
+    # that lets anyone join IS the join, so a reply that never came may sit on a
+    # membership that landed — "couldn't ask" would be a claim about something
+    # that may well have happened, and asking again answers "you can already use
+    # that computer" with nothing selected and nothing started.
+    "ask_unconfirmed": "The app didn’t answer in time — that may have gone through. "
+                       "Ask me for your computers before asking again.",
 }
 
 # ⛔⛔ THE TWO LIST ROUTES HAD NO TABLE AT ALL, so `rate_limited`, `unauthorized`
@@ -2163,6 +2201,22 @@ def _public_rows_block(rows: "list[dict]") -> "list[str]":
     return out
 
 
+def _joins_at_once(d: dict) -> bool:
+    """A public row whose owner lets anyone in, and which has room (wave 12)."""
+    return d.get("allowAll") is True and not d.get("full")
+
+
+def _public_invite(rows: "list[dict]") -> str:
+    """The line under a public list — true of every row above it (wave 12).
+
+    ⛔ ONE ROW THAT JOINS AT ONCE CHANGES IT, because "once the request is
+    accepted" names a step that row does not have. Both screens call this, so the
+    browse list and the no-computer screen cannot say two things.
+    """
+    return (_PUBLIC_JOIN_INVITE if any(_joins_at_once(d) for d in rows)
+            else _PUBLIC_ASK_INVITE)
+
+
 def _public_row_line(d: dict, show_id: bool = False) -> str:
     """ONE public row, in this client's voice — used by the browse list AND by the
     empty state, so the two screens cannot drift apart.
@@ -2178,6 +2232,11 @@ def _public_row_line(d: dict, show_id: bool = False) -> str:
     # `share_cap_reached` for these with certainty, and a quiet word beside
     # an invitation spent one of five hourly asks on a guaranteed no.
     full = " · can’t take anyone else" if d.get("full") else ""
+    # ⭐ AND A COMPUTER THAT LETS ANYONE JOIN SAYS SO (wave 12) — but never beside
+    # `full`, which wins: a full computer refuses everybody. STRICTLY `True`: a
+    # row whose bit is missing or malformed reads as "ask", the safe direction.
+    if _joins_at_once(d):
+        full = _JOINS_AT_ONCE
     # ⛔⛔ THE ID IS NOT DECORATION, BUT IT IS ALSO NOT ALWAYS NEEDED. Public
     # labels genuinely collide — every unnamed machine is the identical string
     # "Research computer" — and the list is ordered online-first over a
@@ -2228,12 +2287,55 @@ def cmd_devices_public(args) -> int:
     # forbids the old phrasing there by name. This trailer, on the screen that
     # decides whether to ask at all, kept saying it. Same claim, same words, both
     # screens.
-    lines.append(_PUBLIC_ASK_INVITE)
+    lines.append(_public_invite(rows))
     return _emit(body, args.json, lines)
 
 
+def _joined_lines(body: dict, label: str) -> "list[str]":
+    """What the chat says when an ask joined at once (wave 12).
+
+    ⛔⛔ THE REPLY IS THE NOTICE. The bridge parks no watcher for a join, so
+    nothing will say "You're in" later — this is the only place it is said, and
+    "Its owner decides" (the pending wording) is false of it.
+
+    ⭐ THE WATCHER'S OWN SENTENCES for what happened to a held topic —
+    `_device_access_line` in sr_attention_poll — so an approval announced a minute
+    later and a join announced at once never word the same fact twice.
+
+    ⛔ AND THE PROMISE TO REPORT BACK IS MADE ONLY IF SOMETHING WILL KEEP IT,
+    exactly as `cmd_research` gates it: `_prepare_stream_arm` says whether a
+    watcher row was actually written.
+    """
+    name = str(body.get("deviceName") or label or "").strip() or "that computer"
+    lines = [f"✓ You're in — “{name}” lets anyone join, so you can use it now."]
+    if body.get("selected"):
+        lines.append("Your research will run on it.")
+    topic = str(body.get("topic") or "").strip()
+    if not topic:
+        return lines
+    quoted = f"“{topic}”"
+    if not body.get("autoStarted"):
+        # ⛔ "STARTING" WOULD BE A LIE about a machine that cannot take work yet;
+        # the bridge kept the topic, so this says so.
+        lines.append(f"I'm still holding {quoted} for you, but {name} isn't ready "
+                     "to take work yet. Say the word and I'll try it again.")
+        return lines
+    arm_lines, arm_payload, arm_rc = _prepare_stream_arm()
+    tell = ("I'll tell you here when it finishes or needs you."
+            if arm_payload.get("armed") else "Ask me how it’s going anytime.")
+    if body.get("online") is False:
+        lines.append(f"{quoted} is queued on it — it's switched off, so it starts "
+                     f"when it comes on. {tell}")
+    else:
+        lines.append(f"Starting {quoted} on it now — {tell}")
+    if arm_rc == 0 and arm_lines:
+        lines += _agent_directive_block(arm_lines)
+    return lines
+
+
 def cmd_device_ask(args) -> int:
-    """Ask the owner of a public computer for access to it."""
+    """Ask the owner of a public computer for access to it — or, on one that lets
+    anyone join, join it at once (wave 12)."""
     wanted = (getattr(args, "device", "") or "").strip()
     if not wanted:
         return _emit({}, args.json,
@@ -2273,11 +2375,17 @@ def cmd_device_ask(args) -> int:
     _ask_origin = _origin_from_env()
     if _ask_origin:
         ask_payload["origin"] = _ask_origin
-    code, body = _post("/device/ask", ask_payload)
+    # ⛔ FIFTY, LIKE `device-remove` (wave 12). On a computer that lets anyone join
+    # the ask IS a grant, and the bridge gives that route 35 s plus a 10 s token
+    # refresh; giving up first reported a join that landed as a bridge that is
+    # not running.
+    code, body = _post("/device/ask", ask_payload, timeout=50)
     if code != 200:
         return _emit(body, args.json,
                      [f"✗ {_ask_refusal_line(body.get('error', ''), body.get('retryAfterMs'))}"],
                      _fail_code(code))
+    if body.get("status") == "joined":
+        return _emit(body, args.json, _joined_lines(body, label))
     return _emit(body, args.json, [
         f"✓ Asked for “{label}”. Its owner decides — nothing runs on it until they "
         f"say yes.",
@@ -2487,53 +2595,128 @@ def cmd_device_deny(args) -> int:
 
 
 def cmd_device_visibility(args) -> int:
-    """Set who can FIND one of this account's machines."""
+    """Set who can FIND one of this account's machines — and, with --allow-all,
+    make it public AND let anyone who asks join at once (wave 12)."""
     value = (getattr(args, "value", "") or "").strip().lower()
     if value not in ("public", "private"):
         return _emit({}, args.json, ["Say public or private."], 1)
+    allow_all = bool(getattr(args, "allow_all", False))
+    if allow_all and value == "private":
+        # ⛔ A CONTRADICTION, REFUSED HERE AND NOT GUESSED. The bridge refuses it
+        # too; saying so before the round trip names what to say instead.
+        return _emit({}, args.json, [
+            "A private computer can’t let anyone join — Allow all makes it public. "
+            "Say public with Allow all, or private on its own."], 1)
+    payload = {"visibility": value}
+    if allow_all:
+        payload["allowAll"] = True
+    return _set_device_visibility(args, payload, "make “{name}” public")
+
+
+def cmd_device_allow_all(args) -> int:
+    """Let anyone who asks join one of this account's machines at once — or stop.
+
+    ⛔⛔ `yes` ON A PRIVATE COMPUTER MAKES IT PUBLIC TOO, in one write (owner,
+    2026-09-26: "allow all would by default make it public"). A private computer
+    that "lets anyone join" lets nobody in, so honouring the half that was asked
+    for means doing both. The router confirms it first, with the sentence below.
+
+    ⛔ `no` SENDS NO VISIBILITY. "Stop letting anyone join" says nothing about
+    being found: the computer stays public and people ask again.
+    """
+    value = (getattr(args, "value", "") or "").strip().lower()
+    if value not in ("yes", "no"):
+        return _emit({}, args.json, ["Say yes or no."], 1)
+    payload: dict = {"allowAll": value == "yes"}
+    if value == "yes":
+        payload["visibility"] = "public"
+    return _set_device_visibility(args, payload, "let anyone join “{name}”")
+
+
+def _set_device_visibility(args, payload: dict, example: str) -> int:
+    """The one writer behind both owner switches — picker, post, and the reply."""
     hint = (getattr(args, "device", "") or "").strip()
     if hint:
         dev, fail = _resolve_device_arg(hint)
         if dev is None:
             return _emit({}, args.json, fail, 1)
     else:
-        dev, fail = _pick_owned_device()
+        dev, fail = _pick_owned_device(example)
         if dev is None:
             return _emit({}, args.json, fail, 1)
     code, body = _post("/device/visibility",
-                       {"deviceId": dev.get("id"), "visibility": value}, timeout=40)
+                       {"deviceId": dev.get("id"), **payload}, timeout=40)
     if code != 200:
         # ⛔⛔ NOT `_list_refusal_line` — see the terminal's note. Its "Couldn’t
         # …" prefix contradicts the very payload the bridge built to say the
         # write may have landed.
         said = body.get("error") or "the app gave no reason"
         return _emit(body, args.json, [f"✗ {said}"], _fail_code(code))
+    return _emit(body, args.json,
+                 _visibility_lines(body, dev, payload.get("allowAll")))
+
+
+def _visibility_lines(body: dict, dev: dict, asked_all) -> "list[str]":
+    """What one owner switch did, in the words its state deserves.
+
+    `asked_all` is what the request said about Allow all: True, False, or None
+    when it said nothing (a plain public / private).
+    """
     name = body.get("deviceName") or _dev_label(dev)
     state = body.get("visibility")
-    head = (f"✓ “{name}” is now {state}." if body.get("changed")
-            else f"✓ “{name}” is already {state}. Nothing to change.")
-    if state == "public":
+    changed = body.get("changed")
+    # ⛔⛔ "YOU STILL APPROVE EVERY PERSON YOURSELF" IS FALSE ON AN ALLOW-ALL
+    # COMPUTER (wave 12), and a plain "make it public" on one that already lets
+    # anyone in used to print it. What the bridge says the machine now IS decides
+    # the sentence — never what was asked.
+    everyone = state == "public" and body.get("allowAll") is True
+    if everyone:
+        lines = [f"✓ “{name}” now lets anyone join at once." if changed
+                 else f"✓ “{name}” already lets anyone join at once. Nothing to "
+                      f"change.",
+                 _ALLOW_ALL_MEANS.format(name=f"“{name}”")]
+    elif asked_all is False and state == "public":
+        # ⛔ WHAT OFF DOES NOT DO IS THE HALF WORTH SAYING. Nobody who already
+        # joined is removed — that is Remove, in the web app, and it is a ban.
+        lines = ([f"✓ “{name}” no longer lets anyone join — you approve each "
+                  f"person again.",
+                  "Anyone who already joined keeps access — remove people in the "
+                  "web app (Shared with)."] if changed
+                 else [f"✓ “{name}” already asks you about each person. Nothing "
+                       f"to change."])
+    elif asked_all is False:
+        # The machine's own words for the same case: "Allow all is off (this
+        # computer is private)".
+        lines = [f"✓ Allow all is off (“{name}” is private)."]
+    elif state == "public":
+        head = (f"✓ “{name}” is now public." if changed
+                else f"✓ “{name}” is already public. Nothing to change.")
         lines = [head,
                  "Other people can find it and ask to use it. You still approve "
                  "every person yourself."]
-        # ⛔⛔ THE PUBLISHED NAME IS THE DISCLOSURE, not decoration: a computer
-        # nobody has renamed reports a hostname that often carries its owner's
-        # own name, and this is where that becomes visible to strangers.
-        if body.get("publicLabel"):
-            lines.append(f"They see it as “{body.get('publicLabel')}”.")
     else:
-        lines = [head,
-                 "Nobody can find it. An access code still lets someone in without "
-                 "asking you."]
-    return _emit(body, args.json, lines)
+        head = (f"✓ “{name}” is now {state}." if changed
+                else f"✓ “{name}” is already {state}. Nothing to change.")
+        return [head,
+                "Nobody can find it. An access code still lets someone in without "
+                "asking you."]
+    # ⛔⛔ THE PUBLISHED NAME IS THE DISCLOSURE, not decoration: a computer
+    # nobody has renamed reports a hostname that often carries its owner's
+    # own name, and this is where that becomes visible to strangers.
+    if state == "public" and body.get("publicLabel"):
+        lines.append(f"They see it as “{body.get('publicLabel')}”.")
+    return lines
 
 
-def _pick_owned_device() -> "tuple[dict | None, list]":
+def _pick_owned_device(example: str = "make “{name}” public") -> "tuple[dict | None, list]":
     """The machine an owner verb should act on when nobody named one.
 
     ⛔ OWNED ONLY. A shared machine is somebody else's to publish, and offering
     one in this picker would send the person into a refusal the picker could
     have spared them — the same reasoning the terminal's send-logs advice uses.
+
+    ⭐ THE EXAMPLE IS THE CALLER'S (wave 12). "make “X” public" answered "which
+    computer should let anyone join?" with an example of the other switch.
     """
     code, body = _get("/devices")
     if code != 200:
@@ -2546,7 +2729,7 @@ def _pick_owned_device() -> "tuple[dict | None, list]":
         return owned[0], []
     return None, (["Which computer?"] +
                   [f"  • {_dev_label(d)}" for d in owned] +
-                  [f'Say for example: make “{_dev_label(owned[0])}” public.'])
+                  [f"Say for example: {example.format(name=_dev_label(owned[0]))}."])
 
 
 def _looks_like_a_device_id(wanted: str) -> bool:
@@ -2681,6 +2864,31 @@ def _resolve_public_device(wanted: str):
                   "Otherwise ask me for the public list and name one from it."]
 
 
+def _allow_all_owner_lines(incoming: list) -> "list[str]":
+    """One line per OWNED computer that lets anyone join and has nobody waiting.
+
+    ⛔⛔ "NOBODY IS WAITING" READ AS "NOBODY IS USING IT" (wave 12). On a computer
+    that lets anyone join nobody ever waits — they are simply on it, up to 25 of
+    them — and this screen lists pending asks only. So the owner is told why the
+    queue is empty and where the people are, which chat cannot show: the bridge
+    has no sharers route.
+
+    ⛔ NOT ON A COMPUTER THAT STILL HAS SOMEBODY WAITING. Past the instant-join
+    limit (ten an hour) the web app files an ordinary ask; saying "nobody waits
+    here" over that row would be false. ⛔ And a failed look adds nothing: this is
+    a second fetch on a screen that already answered its own question.
+    """
+    code, body = _get("/devices")
+    if code != 200 or not isinstance(body, dict):
+        return []
+    waiting = {str(r.get("deviceId") or "") for r in incoming if isinstance(r, dict)}
+    return [f"“{_dev_label(d)}” lets anyone join at once, so nobody waits here — "
+            "see who's on it in the web app (Shared with)."
+            for d in (body.get("devices") or [])
+            if isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True
+            and str(d.get("id") or "") not in waiting]
+
+
 def cmd_device_requests(args) -> int:
     """Both halves of the queue: people waiting on THIS account's machines, and
     what this account is waiting on from other people.
@@ -2710,6 +2918,7 @@ def cmd_device_requests(args) -> int:
                      "them, but that depends on their own notification settings.")
     else:
         lines = ["Nobody is waiting on your computers."]
+    lines += _allow_all_owner_lines(incoming)
     if not rows:
         lines.append("You’re not waiting on any computer.")
     else:
@@ -5926,12 +6135,26 @@ _NL_CONFIRMS = {
     # RUNS on somebody else's computer using THEIR paid AI accounts, and that
     # computer can read the research in this account. Cross-verify caught it
     # against `BrowsePublicDevicesModal` and `requesterLabelOf`.
+    # ⛔⛔ AND IT HAS TO BE TRUE OF BOTH KINDS OF COMPUTER, WITH NO LOOKUP (wave
+    # 12). This question is built from the words alone — `_nl_resolve` makes no
+    # network call — so it cannot know whether the target lets anyone join. "They
+    # decide, and nothing runs on it unless they say yes" was false for one that
+    # does. The confirm STAYS: consent matters more when joining is instant.
     "device-ask": "Ask the owner of {name} to let you use it? Your research would "
                   "run on their computer, using their ChatGPT, Gemini and Claude "
                   "accounts; that computer can read the research in your account; "
                   "and they see your name — or your email, if you haven’t set one. "
-                  "They decide, and nothing runs on it unless they say yes. Say yes "
+                  "If its owner lets anyone in, you join straight away; otherwise "
+                  "they decide, and nothing runs on it unless they say yes. Say yes "
                   "and I’ll ask.",
+    # ⛔⛔ THE WIDEST DOOR ON THIS SURFACE, SO IT CONFIRMS (wave 12). A yes lets
+    # any signed-in stranger onto the owner's computer with no step between —
+    # research on their AI accounts, their email in view — and on a private
+    # computer it publishes the name too, which is its own consent moment. The
+    # first sentence is `_ALLOW_ALL_MEANS`, the same one the reply prints after.
+    "device-allow-all": (_ALLOW_ALL_MEANS + " If it isn’t public yet, this makes "
+                         "it public too — listed under the name it reports. Say "
+                         "yes and I’ll switch it on."),
     # ⛔⛔ THE WEB APP DOES NOT CONFIRM THIS AND THIS SURFACE MUST. Over there the
     # warning sits at the top of the list the Yes and No buttons are in, so the
     # cost is on screen at the moment of the tap. Here there is no screen — the
@@ -6734,6 +6957,171 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         r"(?:take|put|make|set|switch|turn|keep)\s+"
         r"(?:it|this|that|mine)\s+[^.?!]{0,40}", low)
         and re.search(rf"\b(?:{_POLARITY_WORDS[3:-1]}|list|listing|directory)\b", low))
+
+    # ⭐⭐ ALLOW ALL — "LET ANYONE JOIN MY COMPUTER" (wave 12, 2026-09-26).
+    # ⛔⛔ ABOVE THE VISIBILITY CLAUSE AND THE DECIDE CLAUSE, AND BOTH PLACEMENTS
+    # ARE MEASURED. Driven through this resolver before the arm existed:
+    #   · `turn off allow all for my mac` and `switch off auto join for my mac` —
+    #     the hide arm's turn/switch…off — RAN AN UNCONFIRMED HIDE; with one owned
+    #     machine the picker hid it at once, and for the DG fleet that computer is
+    #     the only way in. `disable allow all on my mac` hid a machine called
+    #     “allow all on my mac”, and `stop letting anyone join my mac` one called
+    #     “anyone join my mac”.
+    #   · `let anyone use my computer`, `allow everyone to join my computer` and
+    #     `auto-approve requests for my mac` raised the APPROVE confirm — and a yes
+    #     with no name lets the ONE waiting stranger in (`_resolve_asker("")`
+    #     returns the sole row), which is not what anybody asked for.
+    #   · `make my mac public and allow all` raised the PUBLISH confirm, which
+    #     promises "you would still approve every person yourself".
+    # ⛔ ON CONFIRMS, OFF ACTS. On is the widest door on this surface. Off only
+    # narrows — the computer stays public and people ask again — and confirming a
+    # narrowing change teaches people to click through the confirms that matter;
+    # the visibility clause's own rule for hiding.
+    # ⛔ QUOTED NAMES ARE BLANKED BEFORE A WORD IS READ, so a machine somebody
+    # called “Allow All Lab” is not a request.
+    _aa_low = _outside_quoted_names(low)
+    _aa_who = (r"(?:anyone|anybody|everyone|everybody|people|strangers|others|"
+               r"folks|whoever\s+asks)")
+    _aa_kw = re.search(
+        r"\ballow[- ]?all\b"
+        r"|\bauto(?:matically)?[- ]?(?:approv|accept|admit|join)\w*"
+        # ⛔ `let <nobody in particular> join|in`. `let them use my computer`
+        # names a PERSON who is waiting and stays the decide clause's; `let
+        # people FIND my mac` is a publish and stays the visibility clause's.
+        rf"|\blet(?:s|ting)?\s+{_aa_who}\s+(?:straight\s+)?(?:join|in|onto)\b"
+        rf"|\ballow(?:s|ing)?\s+{_aa_who}\s+to\s+join\b"
+        rf"|\b{_aa_who}\s+(?:can|could|may)\s+join\b"
+        # the same words as a question — answered below with the computer list
+        rf"|\b(?:can|could|may)\s+{_aa_who}\s+join\b"
+        r"|\bapprov\w*\s+(?:\w+\s+){0,2}automatically\b"
+        # ⛔ "without asking" ONLY WITH AN AUDIENCE. On its own it is how people
+        # say "stop the run without asking me", which is not this.
+        rf"|\b{_aa_who}\b[^.?!]{{0,40}}\bwithout\s+(?:asking|approv\w*|"
+        r"my\s+(?:ok|okay|approval|permission)|permission)\b"
+        r"|\bjoins?\s+(?:at\s+once|instantly|straight\s+away|automatically)\b",
+        _aa_low)
+    # ⛔⛔ `use` COUNTS ONLY TOWARD "ON". `let anyone use my computer` raised the
+    # APPROVE confirm and belongs here; but `stop allowing people to use my mac` has
+    # been a HIDE since 7.9-3 (test_chat_owner_793 pins it), and "stop people using
+    # it" is no more a request about allow-all than about being found — so a `use`
+    # phrase with an "off" word keeps the route it had.
+    _aa_use = re.search(rf"\blet(?:s|ting)?\s+{_aa_who}\s+use\b"
+                        rf"|\ballow(?:s|ing)?\s+{_aa_who}\s+to\s+use\b", _aa_low)
+    # ⛔ THE PHRASES THAT MEAN "OFF" ON THEIR OWN. None of them is a decide: an
+    # owner who wants to approve people again is not answering somebody.
+    _aa_off_phrase = re.search(
+        r"\brequir\w*\s+(?:my\s+)?approval\b|\bask\s+me\s+first\b"
+        r"|\b(?:make|have)\s+(?:people|everyone|everybody|them)\s+ask\b", _aa_low)
+    # ⛔⛔ POLARITY IS READ AFTER THE PHRASES THAT MEAN "ON" ARE REMOVED. "let anyone
+    # join WITHOUT asking" and "no approval needed" carry negative words and ask
+    # for allow-all; left in, they read as "off". ⛔ "DON'T ASK ME" TOO: `let anyone
+    # join my mac and don't ask me` switched allow-all OFF.
+    _aa_neutral = re.sub(r"\bwithout\s+\w+(?:\s+\w+)?|\bno\s+(?:need|questions|"
+                         r"approval\s+needed)\b"
+                         r"|\bdon['’]?t\s+(?:need\s+to\s+|have\s+to\s+)?ask(?:\s+me)?\b",
+                         " ", _aa_low)
+    _aa_off = bool(_aa_off_phrase or re.search(
+        r"\b(?:off|disabl\w*|deactivat\w*|stop\w*|no\s+more|no\s+longer|"
+        r"don['’]?t|do\s+not|never|cancel\w*|revok\w*|undo|unset)\b"
+        r"|\bno\s+(?:allow|auto)", _aa_neutral))
+    # A bare "allow all" / "turn allow all off" / "disable auto join" names the
+    # setting and nothing else — its own subject; the command picks the machine.
+    _aa_bare = re.fullmatch(
+        r"(?:please\s+)?(?:(?:turn|switch|set|put)\s+)?(?:(?:on|off)\s+)?"
+        r"(?:(?:disable|enable|stop)\s+)?(?:the\s+)?"
+        r"(?:allow[- ]?all|auto[- ]?(?:approve|accept|join))"
+        r"(?:\s+(?:on|off|back\s+on|again|mode|setting))?(?:\s+please)?", _aa_low)
+    # ⛔ AND "REQUIRE APPROVAL AGAIN" SAID ALONE — the phrasing SKILL.md teaches for
+    # OFF. With no machine word it reached the catch-all. Only the whole message:
+    # "ask me first" inside a longer one is how people talk about anything.
+    _aa_off_bare = re.fullmatch(
+        r"(?:please\s+)?(?:require|requiring)\s+(?:my\s+)?approval"
+        r"(?:\s+(?:again|back))?(?:\s+please)?", _aa_low)
+    # ⛔ A COMPUTER HAS TO BE IN VIEW — a machine word, a quoted name, the queue,
+    # or an audience that can only be joining one. "allow all cookies" is not
+    # about a research computer and falls through untouched.
+    # ⛔ AN AUDIENCE ALONE COUNTS ONLY WHEN THE JOIN HAS NO OTHER OBJECT. `let
+    # people join the call` raised the ON confirm and `stop letting people join the
+    # call` switched Allow all off on the one computer this account owns. "let
+    # anyone join" / "let everyone in" name nothing else, so they stay this arm's.
+    _aa_subject = (_machine_kw or _request_kw or _aa_bare or _aa_off_bare
+                   or (re.search(rf"\b{_aa_who}\b", _aa_low)
+                       and not re.search(r"\b(?:join\w*|in|onto|use|using)\s+(?:the|a|an|"
+                                         r"our|their|his|her|this|that)\s+\w", _aa_low))
+                   or re.search(_QUOTED_SPAN, t))
+    # ⛔ A HIDE WORD MEANS THE VISIBILITY CLAUSE: going private clears allow-all
+    # anyway, and "make it private and turn off allow all" must hide, not leave it
+    # public. `disable` is deliberately NOT here — it is how people say "off".
+    _aa_hides = re.search(rf"\b{_HIDE_POLARITY}\b|\b(?:hide|hides|hiding|"
+                          r"unlist\w*|unpublish\w*|delist\w*)\b", _pol_low)
+    # ⛔ "PUBLIC WITHOUT ALLOW ALL" IS A PLAIN PUBLISH. Taken here, `make my mac
+    # public without allow all` raised the ON confirm, and `…but not allow all`
+    # answered a request to be FOUND with `device-allow-all no`, which publishes
+    # nothing. A plain publish starts in approval mode, so the visibility clause
+    # below already does exactly what was asked.
+    _aa_publish_only = (_public_kw or _offering_kw) and re.search(
+        r"\b(?:without|not|no|never)\s+(?:the\s+|any\s+)?"
+        r"(?:allow[- ]?all|auto[- ]?(?:approv|accept|admit|join)\w*)", _aa_low)
+    # ⛔ A QUESTION CHANGES NOTHING — the row says it ("public, anyone can join").
+    # A polite imperative is not a question: "can you let anyone join my mac" is
+    # the commonest way anybody asks.
+    _aa_question = (re.match(_NL_LEAD_IN + r"(?:is|are|does|do|did|can|could|who|what|"
+                             r"which|how|why|when|will|has|have|tell me (?:if|whether)|"
+                             r"check)\b", low)
+                    and not re.match(_NL_LEAD_IN + r"(?:can|could|would|will|please|do)"
+                                     r"\s+(?:you\s+)?(?:please\s+)?(?:turn|switch|set|put|"
+                                     r"make|let|allow|enable|disable|stop|start|auto\w*|"
+                                     r"require)\b", low))
+    # ⛔ AND A QUESTION ANSWERS WITH THE COMPUTERS ONLY WHEN ONE IS IN VIEW.
+    # `how open source projects let anyone join` is a question about the world,
+    # and it was answered with this account's device list.
+    _aa_question_off_topic = _aa_question and not (
+        _machine_kw or _request_kw or re.search(_QUOTED_SPAN, t))
+    if (_aa_kw or (_aa_use and not _aa_off)
+            or (_aa_off_phrase and (_machine_kw or _aa_off_bare))) \
+            and _aa_subject and not _aa_question_off_topic \
+            and not _aa_hides and not _unlink_kw and not _aa_publish_only \
+            and not (_artefact_kw and not _machine_kw):
+        if _aa_question:
+            return ["devices"], None
+        # ⛔ THE MACHINE IS A HINT THE COMMAND VALIDATES, NEVER A NAME INVENTED
+        # HERE — a quoted name verbatim, or a determiner-led phrase ending in a
+        # machine word. Anything else, and every bare noun, goes to the picker:
+        # it takes the one computer this account owns, or asks which.
+        _aa_obj = ""
+        _aa_q = re.search(_QUOTED_SPAN, t)
+        if _aa_q:
+            _aa_obj = _cap(_aa_q).strip()
+        else:
+            # ⛔ NO PREPOSITION OR DETERMINER INSIDE THE NAME. `require my approval
+            # on my mac` captured “approval on my mac” from the FIRST `my`, and the
+            # command then went looking for a computer called that.
+            _aa_m = re.search(rf"\b(?:the|my|our|this|that)\s+("
+                              rf"(?:(?!(?:the|my|our|this|that|on|in|at|for|of|to|"
+                              rf"from|with|about)\b)[\w'’-]+\s+){{0,3}}?"
+                              rf"(?:{_MACHINE_NOUNS_SAID}))\b", t, flags=re.I)
+            if _aa_m:
+                _aa_obj = _strip_leading_noun(_aa_m.group(1).strip())
+                if _is_bare_machine_noun(_aa_obj) or re.search(
+                        rf"\b(?:allow|all|auto\w*|{_aa_who[3:-1]}|public|private)\b",
+                        _aa_obj, flags=re.I):
+                    _aa_obj = ""
+        # ⛔⛔ A SET OF MACHINES IS REFUSED, AND ONLY MACHINES COUNT. The shared
+        # set test also reads "everyone" as a set of PEOPLE — right for the
+        # decide clause, and exactly the audience this request names — so the
+        # machine signals are asked directly, with "allow all" blanked first.
+        _aa_set_src = re.sub(r"\ballow[- ]?all\b", " ",
+                             _outside_exclusions(_outside_quoted_names(t)), flags=re.I)
+        if _SET_SIGNAL_PLURAL.search(_aa_set_src) \
+                or _SET_SIGNAL_QUANTIFIED.search(_aa_set_src):
+            return None, ["I switch Allow all one computer at a time. Ask me to list "
+                          "them and name the one — nothing changes until you do."]
+        if _aa_off:
+            return (["device-allow-all", "no"] + ([_aa_obj] if _aa_obj else []),
+                    None)
+        return None, [_NL_CONFIRMS["device-allow-all"].format(
+            name=f"“{_aa_obj}”" if _aa_obj else "that computer")]
+
     if (_public_kw or _offering_kw or _hiding_kw) \
             and (_mine_kw or re.search(r"\bmy own\b", low) or _named_target
                  or _id_target or _pronoun_target
@@ -7186,7 +7574,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
            or re.search(r"\b(?:ask|apply)\s+(?:the\s+owner\s+of\s+)?"
                         r"(?:for|to\s+use|about)\s+(.+)$", t, flags=re.I)
            or re.search(r"\brequest\s+(?:access\s+to\s+)?(.+)$", t, flags=re.I)
-           or re.search(r"\bborrow\s+(.+)$", t, flags=re.I))
+           or re.search(r"\bborrow\s+(.+)$", t, flags=re.I)
+           # ⭐ `join <machine>` IS AN ASK (wave 12). The web app's button on a
+           # computer that lets anyone in says Join, so people say it — and
+           # `join the Studio PC` reached the catch-all. Last, so every older
+           # shape keeps its own capture.
+           or re.search(r"\bjoin\s+(.+)$", t, flags=re.I))
     if _om:
         _ask_obj = re.sub(r"[?.!,]+$", "", _om.group(1)).strip().strip(_NL_QUOTE_CHARS)
         # ⛔⛔ "access to" IS NOT PART OF THE NAME. "ask for access to the studio
@@ -7274,7 +7667,14 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         _public_kw or _machine_kw or _ask_obj_is_id
         or re.search(r"\baccess to\b|\bto use\b|\bpermission\b|\bborrow\b", low))
 
-    if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \
+    # ⛔ `join` IS ONLY AN ASK VERB HERE, not in `_ask_kw`: that signal also gates
+    # the withdraw, waiting and browse clauses, and none of them was measured with
+    # it. The object tests below apply to it unchanged — "join a public computer"
+    # is still the category and still the browse list. ⛔ And never the asker's
+    # OWN machine: "join my mac" is not a request to a stranger.
+    _join_kw = re.search(r"\bjoin\b", low) and not _mine_kw
+    if (_ask_kw or _join_kw) and _ask_obj and _ask_is_about_a_machine \
+            and not _ask_obj_is_thing \
             and not _ask_obj_is_pronoun and not _ask_obj_is_category \
             and not _control_kw and not _unlink_kw:
         # ⛔ ONE ASK NAMES ONE OWNER. A request for a SET would file a disclosure
@@ -8312,7 +8712,20 @@ def build_parser() -> argparse.ArgumentParser:
                          help="set who can find one of your computers")
     dvi.add_argument("value", choices=("public", "private"))
     dvi.add_argument("device", nargs="?", default="")
+    # ⭐ wave 12: `public --allow-all` makes it public AND lets anyone join, in one
+    # write. store_true, so it is safe beside the optional device positional.
+    dvi.add_argument("--allow-all", dest="allow_all", action="store_true",
+                     help="with public: anyone who asks joins at once, no approval")
     dvi.set_defaults(func=cmd_device_visibility)
+
+    # ⭐ wave 12: yes on a private computer makes it public too; no leaves it public
+    # and people ask again. Never `device-public-…`: see the note above.
+    daa = sub.add_parser("device-allow-all",
+                         help="let anyone who asks join one of your computers at "
+                              "once (yes), or approve each person again (no)")
+    daa.add_argument("value", choices=("yes", "no"))
+    daa.add_argument("device", nargs="?", default="")
+    daa.set_defaults(func=cmd_device_allow_all)
 
     rs = sub.add_parser("research", help="start a run")
     rs.add_argument("topic")

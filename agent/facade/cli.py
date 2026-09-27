@@ -1198,6 +1198,11 @@ _ASK_FAILURES = {
     # throw, and with no row here both clients printed that word at the person.
     "internal_error": "the app hit a problem of its own answering that — nothing "
                       "was sent, so it is safe to try again",
+    # ⛔⛔ THE BRIDGE'S OWN CODE (wave 12). On a computer that lets anyone join the
+    # ask IS the join, so an answer that never came may sit on a membership that
+    # landed — and asking again answers "you can already use that computer".
+    "ask_unconfirmed": "the app did not answer in time — that may have gone "
+                       "through; check `agent device` before asking again",
 }
 
 # ⛔⛔ ANSWERING A REQUEST HAS ITS OWN TABLE AND IT IS NOT `_ASK_FAILURES`.
@@ -1267,6 +1272,17 @@ _PUBLIC_TRUNCATED_SOME_T = ("  (there are more public computers than one look ca
 # client's ask confirmation does.
 _PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "
                         "They see your name.")
+# ⭐ WAVE 12: the invite has to be true of every row above it, and "once the request
+# is accepted" is false of a row that joins at once — there is no request. A list
+# with one such row says this instead; the chat client's `_PUBLIC_JOIN_INVITE`.
+_PUBLIC_JOIN_INVITE_T = ("     Ones marked (joins at once) let you straight in; for the "
+                         "others its owner decides. They see your name.")
+# ⭐ WAVE 12: what Allow all costs the owner, in the chat client's words
+# (`_ALLOW_ALL_MEANS`) — said under every reply that leaves a computer letting
+# anyone join, so what was done and what it means sit on one screen.
+_ALLOW_ALL_MEANS_T = ("     Anyone signed in can join it at once — up to 25 people — "
+                      "without asking you,\n     and run research on your AI "
+                      "accounts. People you removed stay out.")
 
 _PLAIN_VERBS = {
     "looked for public computers": "look for public computers",
@@ -1542,6 +1558,8 @@ def cmd_device(args: argparse.Namespace) -> int:
         "deny": "Answer a request from chat:  /sr say no to that request",
         "visibility": "Change who can find a computer from chat:  "
                       "/sr make my computer public",
+        "allow-all": "Let anyone join a computer from chat:  "
+                     "/sr let anyone join my computer",
     }
     rc = _redirect_if_wsl(_WSL_HINTS.get(getattr(args, "device_command", None) or "",
                                          "Manage devices from chat:  /sr devices"))
@@ -1565,7 +1583,11 @@ def cmd_device(args: argparse.Namespace) -> int:
                               args.device_command)
 
     if getattr(args, "device_command", None) == "visibility":
-        return _device_visibility(args.deviceId, args.value)
+        return _device_visibility(args.deviceId, args.value,
+                                  bool(getattr(args, "allow_all", False)))
+
+    if getattr(args, "device_command", None) == "allow-all":
+        return _device_allow_all(args.deviceId, args.value)
 
     if getattr(args, "device_command", None) == "use":
         res = _bridge_post("/device/select", {"deviceId": args.deviceId})
@@ -1689,6 +1711,10 @@ def cmd_device(args: argparse.Namespace) -> int:
         # and it goes silently wrong: every public computer would read private,
         # with no error anywhere.
             found = ", public" if d.get("visibility") == "public" else ", private"
+            # ⭐ WAVE 12 — the bridge's EFFECTIVE allow-all (public AND strictly
+            # true), so a private computer's leftover never reads as an open door.
+            if found == ", public" and d.get("allowAll") is True:
+                found = ", public, anyone can join"
         print(f"  {mark} {d.get('name') or d.get('id')}  ({kind}, {state}{found})  "
               f"id={d.get('id')}")
     if not selected:
@@ -1768,7 +1794,14 @@ def _print_no_devices() -> None:
     if res[1].get("truncated"):
         print(_PUBLIC_TRUNCATED_SOME_T)
     print("\nAsk for one by its id:  agent device ask <id>")
-    print(_PUBLIC_ASK_INVITE_T)
+    print(_public_invite_t(rows))
+
+
+def _public_invite_t(rows: list) -> str:
+    """The line under a public list, true of every row above it (wave 12) — both
+    terminal screens call this, as both chat screens call `_public_invite`."""
+    return (_PUBLIC_JOIN_INVITE_T if any(_joins_at_once(d) for d in rows)
+            else _PUBLIC_ASK_INVITE_T)
 
 
 def _public_row(i: int, d: dict) -> str:
@@ -1789,7 +1822,16 @@ def _public_row(i: int, d: dict) -> str:
     # word beside an invitation to ask spent one of five hourly asks on a certain
     # no; it says what it means now.
     full = "  (can't take anyone else)" if d.get("full") else ""
+    # ⭐ WAVE 12 — a computer whose owner lets anyone in says so, and never beside
+    # `full`, which wins: a full computer refuses everybody. Strictly `True`.
+    if _joins_at_once(d):
+        full = "  (joins at once)"
     return f"  {i:>2}  {label.ljust(34)}  {state.ljust(8)}{full}  id={d.get('deviceId')}"
+
+
+def _joins_at_once(d: dict) -> bool:
+    """A public row whose owner lets anyone in, and which has room (wave 12)."""
+    return d.get("allowAll") is True and not d.get("full")
 
 
 def _device_public() -> int:
@@ -1827,7 +1869,7 @@ def _device_public() -> int:
         # can be true beside a short list — and there is no next page to offer.
         print(_PUBLIC_TRUNCATED_SOME_T)
     print("\nAsk for one by its id:  agent device ask <id>")
-    print(_PUBLIC_ASK_INVITE_T)
+    print(_public_invite_t(rows))
     return 0
 
 
@@ -1842,7 +1884,10 @@ def _device_ask(device_id: str) -> int:
     # web app exactly as they do, and it was left on the thirty-second default
     # they were widened past — so the one verb that WRITES something was the one
     # most likely to report a failure on a request the app had already filed.
-    res = _bridge_post("/device/ask", {"deviceId": device_id}, timeout=40.0)
+    # ⛔⛔ AND FIFTY SINCE WAVE 12, like `device remove`: on a computer that lets
+    # anyone join, the ask IS the grant, and the bridge gives that route 35 s plus a
+    # 10 s refresh — giving up at forty reported a join that landed as a failure.
+    res = _bridge_post("/device/ask", {"deviceId": device_id}, timeout=50.0)
     if res is None:
         print(f"{_NO} couldn't ask for that computer: {_err(res)}")
         return 1
@@ -1850,6 +1895,18 @@ def _device_ask(device_id: str) -> int:
     if res[0] != 200:
         print(f"{_NO} {_ask_refusal(body.get('error') or '', body.get('retryAfterMs'))}")
         return 1
+    if body.get("status") == "joined":
+        # ⛔⛔ "ITS OWNER DECIDES" IS FALSE HERE (wave 12). The computer lets anyone
+        # join, so the person is on it already — and nothing will tell this screen
+        # later, because the terminal parks no watcher. A terminal ask carries no
+        # chat origin, so no held topic starts from here.
+        name = body.get("deviceName") or device_id
+        print(f"{_OK} Joined — {name} lets anyone in"
+              f"{' (now selected)' if body.get('selected') else ''}. It's in your "
+              f"list:  agent device")
+        print("     Its owner sees your name and email, and your research runs on "
+              "their AI accounts.")
+        return 0
     print(f"{_OK} Asked. Its owner decides — nothing happens on that computer "
           f"until they say yes.")
     # ⛔ SAID HERE TOO, AND NOT ONLY ON THE LIST. Somebody who already has an id
@@ -1941,15 +1998,42 @@ def _device_decide(device_id: str, requester: str, decision: str) -> int:
     return 0
 
 
-def _device_visibility(device_id: str, value: str) -> int:
-    """Make one of this account's machines findable by strangers, or hide it."""
+def _device_visibility(device_id: str, value: str, allow_all: bool = False) -> int:
+    """Make one of this account's machines findable by strangers, or hide it —
+    and with `--allow-all`, public AND letting anyone join at once (wave 12)."""
+    if allow_all and value != "public":
+        # ⛔ A CONTRADICTION, NOT A CHOICE TO MAKE FOR THEM — the bridge refuses it
+        # too, and saying so here names what to type instead.
+        print(f"{_NO} a private computer can't let anyone join — --allow-all goes "
+              f"with public:  agent device visibility <id> public --allow-all")
+        return 1
+    payload: dict = {"visibility": value}
+    if allow_all:
+        payload["allowAll"] = True
+    return _device_switch(device_id, payload, None if not allow_all else True)
+
+
+def _device_allow_all(device_id: str, value: str) -> int:
+    """Let anyone who asks join one of this account's machines at once, or stop
+    (wave 12). `yes` on a private computer makes it public too, in one write;
+    `no` leaves it public and people ask again. No prompt — the same pattern as
+    `visibility`: the reply prints what the setting means."""
+    on = value == "yes"
+    payload: dict = {"allowAll": on}
+    if on:
+        payload["visibility"] = "public"
+    return _device_switch(device_id, payload, on)
+
+
+def _device_switch(device_id: str, payload: dict, asked_all) -> int:
+    """The one writer behind both owner switches — post, refusal, and the reply."""
     device_id = (device_id or "").strip()
     if not device_id:
         print(f"{_NO} name the computer by its id — `agent device` prints one on "
               f"every row.")
         return 1
     res = _bridge_post("/device/visibility",
-                       {"deviceId": device_id, "visibility": value}, timeout=40.0)
+                       {"deviceId": device_id, **payload}, timeout=40.0)
     if res is None:
         print(f"{_NO} couldn't change that: {_err(res)}")
         return 1
@@ -1978,12 +2062,35 @@ def _device_visibility(device_id: str, value: str) -> int:
         print(f"{_OK} {name} was changed, but the app did not say to what.")
         print("     Run `agent device` to see where it stands.")
         return 0
-    if not body.get("changed"):
-        print(f"{_OK} {name} is already {word}. Nothing to change.")
-        _print_visibility_meaning(state, body.get("publicLabel"))
+    changed = body.get("changed")
+    # ⛔⛔ WHAT THE BRIDGE SAYS THE MACHINE NOW IS DECIDES THE SENTENCE (wave 12),
+    # never what was asked: a plain `public` on a computer that already lets anyone
+    # join used to print "You still approve every person yourself".
+    everyone = state == "public" and body.get("allowAll") is True
+    if everyone:
+        print(f"{_OK} {name} {'now lets' if changed else 'already lets'} anyone "
+              f"join at once.{'' if changed else ' Nothing to change.'}")
+    elif asked_all is False and state == "public":
+        if changed:
+            print(f"{_OK} {name} no longer lets anyone join — you approve each "
+                  f"person again.")
+            # ⛔ WHAT OFF DOES NOT DO: nobody who joined is removed. That is
+            # Remove, in the web app — and it is a ban.
+            print("     Anyone who already joined keeps access — remove people in "
+                  "the web app (Shared with).")
+        else:
+            print(f"{_OK} {name} already asks you about each person. Nothing to "
+                  f"change.")
         return 0
-    print(f"{_OK} {name} is now {word}.")
-    _print_visibility_meaning(state, body.get("publicLabel"))
+    elif asked_all is False:
+        # The machine's own words for the same case.
+        print(f"{_OK} Allow all is off ({name} is private).")
+        return 0
+    elif not changed:
+        print(f"{_OK} {name} is already {word}. Nothing to change.")
+    else:
+        print(f"{_OK} {name} is now {word}.")
+    _print_visibility_meaning(state, body.get("publicLabel"), everyone)
     return 0
 
 
@@ -1993,12 +2100,17 @@ def _device_visibility(device_id: str, value: str) -> int:
 _VISIBILITY_WORDS = {"public": "public", "private": "private"}
 
 
-def _print_visibility_meaning(state: str, public_label) -> None:
+def _print_visibility_meaning(state: str, public_label, everyone: bool = False) -> None:
     """What the state actually means, under the line that reports it."""
     if state == "public":
-        print("     Other people can find it and ask to use it. You still "
-              "approve every")
-        print("     person yourself.")
+        if everyone:
+            # ⭐ WAVE 12 — the approval sentence is false on a computer that lets
+            # anyone join: nobody is approved, they are simply on it.
+            print(_ALLOW_ALL_MEANS_T)
+        else:
+            print("     Other people can find it and ask to use it. You still "
+                  "approve every")
+            print("     person yourself.")
         # ⛔⛔ THE PUBLISHED LABEL IS NAMED, and this is not decoration. A Mac
         # nobody has renamed reports a hostname carrying its owner's own name,
         # so switching this on can publish that to every signed-in stranger.
@@ -2008,6 +2120,28 @@ def _print_visibility_meaning(state: str, public_label) -> None:
     else:
         print("     Nobody can find it. An access code still lets someone in "
               "without asking you.")
+
+
+def _print_allow_all_owner_lines(incoming: list) -> None:
+    """One line per OWNED computer that lets anyone join and has nobody waiting.
+
+    ⛔⛔ "NOBODY IS WAITING" READ AS "NOBODY IS USING IT" (wave 12). Nobody ever
+    waits on a computer that lets anyone join — they are simply on it, up to 25 of
+    them — so the owner is told why the queue is empty and where the people are.
+    ⛔ Not for a computer that still has somebody waiting (past the instant-join
+    limit the web app files an ordinary ask), and a failed look prints nothing.
+    The chat client's `_allow_all_owner_lines`, in this file's voice.
+    """
+    res = _bridge_get("/devices")
+    if res is None or res[0] != 200 or not isinstance(res[1], dict):
+        return
+    waiting = {str(r.get("deviceId") or "") for r in incoming if isinstance(r, dict)}
+    for d in res[1].get("devices") or []:
+        if (isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True
+                and str(d.get("id") or "") not in waiting):
+            print(f"     {d.get('name') or d.get('id')} lets anyone join at once, so "
+                  f"nobody waits here — see who's on it in the web app (Shared "
+                  f"with).")
 
 
 def _device_requests() -> int:
@@ -2034,6 +2168,7 @@ def _device_requests() -> int:
         # screen does not cover that" — which is what it USED to mean, and the
         # habit is the thing being replaced.
         print("Nobody is waiting on your computers.")
+        _print_allow_all_owner_lines(incoming)
         print()
     else:
         print(f"People asking to use your computers ({len(incoming)}):")
@@ -2060,6 +2195,7 @@ def _device_requests() -> int:
               "their own")
         print("     notification settings.")
         print("     Say no with:  agent device deny <computer id> <person id>")
+        _print_allow_all_owner_lines(incoming)
         print()
     if not rows:
         print("You are not waiting on any computer.")
@@ -3543,7 +3679,23 @@ def build_parser() -> argparse.ArgumentParser:
     dvvis.add_argument("deviceId", help="your computer's id (from `agent device`)")
     dvvis.add_argument("value", choices=("public", "private"),
                        help="public = other people can find it and ask")
+    # ⭐ WAVE 12 — `public --allow-all` is the one step that makes a computer public
+    # AND lets anyone who asks join at once. store_true: it takes no value, so it
+    # can never swallow the positional after it.
+    dvvis.add_argument("--allow-all", dest="allow_all", action="store_true",
+                       help="with public: anyone who asks joins at once — no "
+                            "approval step")
     dvvis.set_defaults(func=cmd_device)
+    # ⭐ WAVE 12 — yes makes it public too (one write); no leaves it public, and
+    # people ask again. Nobody who already joined is removed by either.
+    dvaa = dvsub.add_parser("allow-all", parents=[common],
+                            help="let anyone who asks join one of your computers "
+                                 "at once (yes), or approve each person (no)")
+    dvaa.add_argument("deviceId", help="your computer's id (from `agent device`)")
+    dvaa.add_argument("value", choices=("yes", "no"),
+                      help="yes = anyone who asks joins at once (and it becomes "
+                           "public); no = you approve each person again")
+    dvaa.set_defaults(func=cmd_device)
 
     sl = sub.add_parser("send-logs", parents=[common],
                         help="ask a research computer to package its logs for support "

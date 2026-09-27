@@ -451,8 +451,11 @@ MUTANTS = [
     ("A14", SR, "under",
      "⛔ THE ASK CONFIRM LOSES THE DISCLOSURE, so the only consent moment on the "
      "chat path stops saying what is disclosed",
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the confirm is true of both kinds of
+     # computer now ("If its owner lets anyone in…"). Same defect.
      [('                  "and they see your name — or your email, if you haven’t set one. "\n'
-       '                  "They decide, and nothing runs on it unless they say yes. Say yes "\n'
+       '                  "If its owner lets anyone in, you join straight away; otherwise "\n'
+       '                  "they decide, and nothing runs on it unless they say yes. Say yes "\n'
        '                  "and I’ll ask.",',
        '                  "Say yes and I’ll ask.",')]),
 
@@ -587,10 +590,12 @@ MUTANTS = [
     ("N7", SR, "over",
      "⛔ THE ASK STOPS NEEDING TO BE ABOUT A MACHINE, so any unfamiliar \"ask\" "
      "object is read as a request for somebody's computer",
-     [('    if _ask_kw and _ask_obj and _ask_is_about_a_machine and not _ask_obj_is_thing \\\n'
-       '            and not _ask_obj_is_pronoun and not _ask_obj_is_category \\\n',
-       '    if _ask_kw and _ask_obj and not _ask_obj_is_thing \\\n'
-       '            and not _ask_obj_is_pronoun and not _ask_obj_is_category \\\n')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `join` joined the ask verbs and the
+     # condition re-wrapped. Same defect: the machine test goes.
+     [('    if (_ask_kw or _join_kw) and _ask_obj and _ask_is_about_a_machine \\\n'
+       '            and not _ask_obj_is_thing \\\n',
+       '    if (_ask_kw or _join_kw) and _ask_obj \\\n'
+       '            and not _ask_obj_is_thing \\\n')]),
     ("N8", SR, "under",
      "⛔⛔ THE CODE-HIJACK COMES BACK: \"switch to the machine LABPC001\" is a "
      "pairing attempt again and is refused as a code that matched no device",
@@ -663,7 +668,9 @@ MUTANTS = [
      "was true until this wave and is false the moment browse lists other "
      "people's machines — a promise that has quietly stopped being true is worse "
      "than none",
-     [("""- You drive the user's own account only. Three things reach past it, and all three
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): FOUR things reach past it now (Allow all).
+     # Same defect: the false promise comes back in their place.
+     [("""- You drive the user's own account only. Four things reach past it, and all four
   are consent moments where the client refuses nothing — so YOU are the consent
   step every time.""",
        "- You drive the user's own account only — you cannot reach anyone else's data.")]),
@@ -678,9 +685,12 @@ MUTANTS = [
     ("S5", SKILL, "over",
      "⛔ THE PARENTHETICAL TELLS THE MODEL SHARING IS OWNER-ONLY IN THE WEB APP "
      "AGAIN, so it refuses the verbs it now has",
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the parenthetical names allow-all too and
+     # re-wrapped. Same defect.
      [("""  name a topic. (For a computer they OWN they can also answer the people asking
-  for it and set whether strangers can find it at all. Unlinking their own
-  machine issues it a new access code. Revoking one sharer stays in the web app.)""",
+  for it, set whether strangers can find it at all, and let anyone who asks join
+  at once. Unlinking their own machine issues it a new access code. Revoking one
+  sharer stays in the web app.)""",
        """  name a topic. (Sharing a device with other people, revoking sharers, and resets
   stay owner-only in the web app.)""")]),
     ("S6", SKILL, "under",
@@ -809,11 +819,14 @@ MUTANTS = [
      "MOST — that the research runs on somebody else's computer on their paid AI "
      "accounts, and that the computer can read this account's research — and "
      "overstates the third",
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the confirm is true of both kinds of
+     # computer now. Same defect.
      [('    "device-ask": "Ask the owner of {name} to let you use it? Your research would "\n'
        '                  "run on their computer, using their ChatGPT, Gemini and Claude "\n'
        '                  "accounts; that computer can read the research in your account; "\n'
        '                  "and they see your name — or your email, if you haven’t set one. "\n'
-       '                  "They decide, and nothing runs on it unless they say yes. Say yes "\n'
+       '                  "If its owner lets anyone in, you join straight away; otherwise "\n'
+       '                  "they decide, and nothing runs on it unless they say yes. Say yes "\n'
        '                  "and I’ll ask.",',
        '    "device-ask": "Ask the owner of {name} to let you use it? They’ll see your "\n'
        '                  "name and email address. Say yes and I’ll ask.",')]),
@@ -893,7 +906,9 @@ MUTANTS = [
      "⛔ THE ONE VERB THAT WRITES goes back to the 30-second wait its two read "
      "siblings were widened past, so it is the likeliest to report a failure on "
      "a request the app has already filed",
-     [('    res = _bridge_post("/device/ask", {"deviceId": device_id}, timeout=40.0)',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the wait is fifty now (an ask can be a
+     # grant). Same defect: back to the 30-second default.
+     [('    res = _bridge_post("/device/ask", {"deviceId": device_id}, timeout=50.0)',
        '    res = _bridge_post("/device/ask", {"deviceId": device_id})')]),
     ("V25", CLI, "under",
      "⛔ `internal_error` LEAVES THE ASK TABLE and the route's own 500 code is "
@@ -926,7 +941,8 @@ MUTANTS = [
      "⛔⛔ `device-ask` LEAVES THE SAFE-DEFAULTS CONFIRM LIST, whose next clause "
      "says everything not listed runs on a clear request — so the file positively "
      "licenses skipping the one consent moment this wave added",
-     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, `update`, and `install`**',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `device-allow-all yes` joined. Same defect.
+     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, `device-allow-all yes`, `update`, and `install`**',
        '`stop`, `logout`, `device-remove`, and `update`**')]),
     ("V31", SKILL, "under",
      "⛔ `device-ask` LEAVES THE CONFIRM HANDOFF LIST, so a \"yes\" to the consent "

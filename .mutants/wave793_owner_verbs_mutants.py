@@ -113,8 +113,12 @@ MUTANTS = [
     ("F3", FS, "over",
      "the write aims at the commands subcollection, so a setting becomes a "
      "command nothing will ever consume",
-     [('        target = f"{config.FIRESTORE_BASE}/devices/{device_id}"',
-       '        target = f"{config.FIRESTORE_BASE}/devices/{device_id}/commands"')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the allow-all writer builds the same
+     # target line, so the anchor carries the visibility PATCH after it. Same defect.
+     [('        target = f"{config.FIRESTORE_BASE}/devices/{device_id}"\n'
+       '        self._request("PATCH", f"{target}?updateMask.fieldPaths=visibility",',
+       '        target = f"{config.FIRESTORE_BASE}/devices/{device_id}/commands"\n'
+       '        self._request("PATCH", f"{target}?updateMask.fieldPaths=visibility",')]),
     ("F4", FS, "under",
      "⛔⛔ THE ERROR STOPS CARRYING ITS STATUS, so every failure reads as the "
      "unknown case and the one sentence a refusal HAS earned — nothing changed "
@@ -256,7 +260,9 @@ MUTANTS = [
     ("V2", BRIDGE, "under",
      "⛔⛔ THE VALUE IS NOT CHECKED BEFORE THE ROW IS READ, so a typo spends a "
      "Firestore read and then fails a write the person believes they made",
-     [('            if value not in ("public", "private"):\n'
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the check also admits an allowAll-only
+     # body now. Same defect: no value is refused before the read.
+     [('            if value not in ("public", "private") and not (value == "" and has_all):\n'
        '                # ⛔ REFUSED HERE, BEFORE THE ROW IS EVEN READ.',
        '            if False:\n'
        '                # ⛔ REFUSED HERE, BEFORE THE ROW IS EVEN READ.')]),
@@ -269,7 +275,9 @@ MUTANTS = [
     ("V4", BRIDGE, "over",
      "a no-op reports that something changed, so somebody believes they just "
      "published a machine that was already published",
-     [('            if value == current:\n',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the no-op compares allow-all too. Same
+     # defect: there is no no-op.
+     [('            if want == current and want_all == current_all:\n',
        '            if False:\n')]),
     ("V5", BRIDGE, "over",
      "⛔ the two failure sentences collapse into one, so a 5xx — which happened "
@@ -396,7 +404,10 @@ MUTANTS = [
     ("T8", CLI, "under",
      "an empty owner queue says nothing, and silence about that half reads as "
      "\"this screen does not cover it\" — which is what it used to mean",
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the allow-all owner line follows the
+     # sentence now. Same defect: the empty owner half says nothing.
      [('        print("Nobody is waiting on your computers.")\n'
+       '        _print_allow_all_owner_lines(incoming)\n'
        '        print()\n'
        '    else:\n',
        '        pass\n'
@@ -404,8 +415,12 @@ MUTANTS = [
     ("T9", CLI, "over",
      "⛔⛔ THE FINDABLE COLUMN APPEARS ON SHARED ROWS, so somebody else's setting "
      "is reported as if it were the reader's to change",
-     [('        found = ""\n        if d.get("owned"):\n        # ⛔⛔ THIS READS THE BRIDGE\'S ANSWER, NOT A FIRESTORE FIELD, AND THE\n        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is\n        # becoming `joinPolicy`; the bridge resolves both names into this one key\n        # before any row leaves it (`_discovery_of`), so this line keeps working\n        # without ever learning the new name. ⛔ Point it at a raw device document\n        # and it goes silently wrong: every public computer would read private,\n        # with no error anywhere.\n            found = ", public" if d.get("visibility") == "public" else ", private"\n',
-       '        found = ", public" if d.get("visibility") == "public" else ", private"\n')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the allow-all mark sits inside the owned
+     # branch now, so it is carried out of it too (dedented). Same defect.
+     [('        found = ""\n        if d.get("owned"):\n        # ⛔⛔ THIS READS THE BRIDGE\'S ANSWER, NOT A FIRESTORE FIELD, AND THE\n        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is\n        # becoming `joinPolicy`; the bridge resolves both names into this one key\n        # before any row leaves it (`_discovery_of`), so this line keeps working\n        # without ever learning the new name. ⛔ Point it at a raw device document\n        # and it goes silently wrong: every public computer would read private,\n        # with no error anywhere.\n            found = ", public" if d.get("visibility") == "public" else ", private"\n'
+       '            # ⭐ WAVE 12 — the bridge\'s EFFECTIVE allow-all (public AND strictly\n            # true), so a private computer\'s leftover never reads as an open door.\n            if found == ", public" and d.get("allowAll") is True:\n                found = ", public, anyone can join"\n',
+       '        found = ", public" if d.get("visibility") == "public" else ", private"\n'
+       '        if found == ", public" and d.get("allowAll") is True:\n            found = ", public, anyone can join"\n')]),
     ("T10", CLI, "over",
      "⛔ absent reads as findable on the owned list, and every machine paired "
      "before 2026-09-04 carries no such field",
@@ -518,9 +533,11 @@ MUTANTS = [
     ("C10", SR, "under",
      "chat stops naming the published label, so the disclosure lives on the "
      "terminal only — and chat is the surface most people use",
-     [('        if body.get("publicLabel"):\n'
-       '            lines.append(f"They see it as “{body.get(\'publicLabel\')}”.")',
-       '        pass')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the label line moved below the branches
+     # that word each state. Same defect.
+     [('    if state == "public" and body.get("publicLabel"):\n'
+       '        lines.append(f"They see it as “{body.get(\'publicLabel\')}”.")',
+       '    pass')]),
     ("C11", SR, "under",
      "the footer stops saying which half it describes, so a sentence about the "
      "asker's own requests is read as a claim about people waiting on them",
@@ -668,25 +685,33 @@ MUTANTS = [
     ("S1", SKILL, "under",
      "⛔⛔ `device-approve` LEAVES THE HANDOFF LIST, so a \"yes\" to the consent "
      "question has no command named for it and the model improvises",
-     [('device-approve/device-deny/device-visibility/update/install/research',
-       'device-visibility/update/install/research')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `device-allow-all yes` joined the list,
+     # which now wraps before `research`. Same defect.
+     [('device-approve/device-deny/device-visibility/device-allow-all yes/update/install/\nresearch',
+       'device-visibility/device-allow-all yes/update/install/\nresearch')]),
     ("S2", SKILL, "under",
      "⛔⛔ `device-deny` LEAVES THE SAFE-DEFAULTS LIST, whose next clause says "
      "everything not listed runs on a clear request — so the file positively "
      "licenses spending somebody's week without asking",
-     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, `update`, and `install`**',
-       '`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`,\n`device-visibility public`, `update`, and `install`**')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `device-allow-all yes` joined. Same defect.
+     [('`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`, `device-deny`,\n`device-visibility public`, `device-allow-all yes`, `update`, and `install`**',
+       '`stop`, `logout`, `device-remove`, `device-ask`, `device-approve`,\n`device-visibility public`, `device-allow-all yes`, `update`, and `install`**')]),
     ("S3", SKILL, "under",
      "⛔⛔ `device-visibility` LEAVES THE SAFETY BULLET — the third list, and the "
      "one 7.9-2 forgot. A row in the table was not enough then either",
-     [("`device-remove` (unlinks a device — an\n  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,\n  `device-deny`, `device-visibility public`, `install` (installs the backend on\n  the connected computer), and `update` (briefly restarts the chat",
-       "`device-remove` (unlinks a device — an\n  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,\n  `device-deny`, and `update` (briefly restarts the chat")]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `device-allow-all yes` joined and the
+     # bullet re-wrapped. Same defect: `device-visibility` leaves it.
+     [("`device-remove` (unlinks a device — an\n  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,\n  `device-deny`, `device-visibility public`, `device-allow-all yes`, `install`\n",
+       "`device-remove` (unlinks a device — an\n  owner's keeps running but on a NEW code), `device-ask`, `device-approve`,\n  `device-deny`, `device-allow-all yes`, `install`\n")]),
     ("S4", SKILL, "over",
      "⛔⛔ THE GREETING RESERVES THESE VERBS TO THE WEB APP AGAIN, so the model "
      "refuses the two commands it now has",
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the parenthetical names allow-all too
+     # and re-wrapped. Same defect.
      [('  name a topic. (For a computer they OWN they can also answer the people asking\n'
-       '  for it and set whether strangers can find it at all. Unlinking their own\n'
-       '  machine issues it a new access code. Revoking one sharer stays in the web app.)',
+       '  for it, set whether strangers can find it at all, and let anyone who asks join\n'
+       '  at once. Unlinking their own machine issues it a new access code. Revoking one\n'
+       '  sharer stays in the web app.)',
        '  name a topic. (Approving or refusing somebody, offering a computer publicly,\n'
        '  revoking sharers, and resets stay owner-only in the web app.)')]),
     ("S5", SKILL, "under",
@@ -705,16 +730,21 @@ MUTANTS = [
      # ⭐ REPOINTED IN 7.9-5, which corrected "they are told" to the hedged truth
      # (delivery depends on the asker's own notification settings). Same mutant:
      # the disclosure bullet loses ANSWERING.
-     [('**Answering** somebody lets a stranger run research on the user\'s own\n'
-       '  computer, exactly as an access code would, and a "no" spends that person\'s week —\n'
-       '  the app tries to tell them (their own notification settings decide), and giving\n'
-       '  them the access code is still the way back. ',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the bullet re-wrapped around the new
+     # Allow-all sentence. Same mutant: it loses ANSWERING.
+     [('**Answering** somebody\n'
+       '  lets a stranger run research on the user\'s own computer, exactly as an access\n'
+       '  code would, and a "no" spends that person\'s week — the app tries to tell them\n'
+       '  (their own notification settings decide), and giving them the access code is\n'
+       '  still the way back. ',
        '')]),
     ("S8", SKILL, "over",
      "⛔ the file stops exempting the private direction, so hiding a computer "
      "asks a question — and a confirm on a strictly narrowing change is how "
      "people learn to click through the ones that matter",
-     [('**`device-visibility private` needs no confirmation** — it only takes a\ncomputer off a list.',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the sentence names `device-allow-all no`
+     # beside it now. Same defect: the exemption goes.
+     [('**`device-visibility private` and `device-allow-all no` need no confirmation** —\nthey only narrow.',
        '')]),
     ("S9", SKILL, "under",
      "the queue row stops saying the two halves are never summed, so a model "
@@ -865,7 +895,10 @@ MUTANTS = [
      "⛔⛔ THE CHAT DEVICE LIST STOPS SAYING WHICH MACHINES ARE PUBLIC, and "
      "SKILL.md routes \"is my computer public?\" straight at it — a documented "
      "answer path landing on output that cannot answer",
-     [('        state = ""\n        if d.get("owned"):\n        # ⛔⛔ THIS READS THE BRIDGE\'S ANSWER, NOT A FIRESTORE FIELD, AND THE\n        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is\n        # becoming `joinPolicy`; the bridge resolves both names into this one key\n        # before any row leaves it (`_discovery_of`), so this line keeps working\n        # without ever learning the new name. ⛔ Point it at a raw device document\n        # and it goes silently wrong: every public computer would read private,\n        # with no error anywhere.\n            state = ", public" if d.get("visibility") == "public" else ", private"\n',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the allow-all mark sits inside the owned
+     # branch now and goes with it. Same defect.
+     [('        state = ""\n        if d.get("owned"):\n        # ⛔⛔ THIS READS THE BRIDGE\'S ANSWER, NOT A FIRESTORE FIELD, AND THE\n        # DIFFERENCE IS WHAT CARRIES IT THROUGH THE RENAME. `visibility` is\n        # becoming `joinPolicy`; the bridge resolves both names into this one key\n        # before any row leaves it (`_discovery_of`), so this line keeps working\n        # without ever learning the new name. ⛔ Point it at a raw device document\n        # and it goes silently wrong: every public computer would read private,\n        # with no error anywhere.\n            state = ", public" if d.get("visibility") == "public" else ", private"\n'
+       '            # ⭐ AND WHETHER ANYONE CAN WALK IN (wave 12). The bridge sends the\n            # EFFECTIVE value — public AND strictly true — so a private computer\'s\n            # leftover tick never reads as an open door here.\n            if state == ", public" and d.get("allowAll") is True:\n                state = ", public, anyone can join"\n',
        '        state = ""\n')]),   # re-aimed 2026-09-26: the row now also says online/offline
     ("W19", CLI, "under",
      "⛔⛔ THE TERMINAL FOOTER LOSES ITS QUALIFIER, so a sentence about the "

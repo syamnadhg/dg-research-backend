@@ -147,7 +147,30 @@ DISCOVERY_PICK = '            return "public" if value == "public" else "private
 # other. `# the one that hides.` occurs exactly once in the file.
 DISCOVERY_ABSENT = '    # the one that hides.\n    return "private"'
 #: The manual value check in `main`.
-VALIDATE = ('        if args.visibility != _VISIBILITY_SHOW and args.visibility not in _VISIBILITY_VALUES:')
+# ⛔ RE-ANCHORED 2026-09-26 (wave 12). `--allow-all` joined this dispatch and
+# arrives with no --visibility word, so `main` now normalises the flag into
+# `_vis` first (None → the show sentinel) and checks THAT. The check itself is
+# unchanged in meaning, and so is C1's mutation of it.
+VALIDATE = ('        if _vis != _VISIBILITY_SHOW and _vis not in _VISIBILITY_VALUES:')
+# ⛔ RE-ANCHORED 2026-09-26 (wave 12) — ALL FOUR BELOW. `run_visibility` stopped
+# writing `{"visibility": value}` from one line: it now resolves a TARGET, builds
+# one `patch` (which may carry `allowAll` beside `visibility`, or stand empty for
+# "already set") and writes it from a single site. V3/V4 moved onto the two
+# shortcuts that replaced `if value == current:`, and V5/O1/O2 onto the new
+# write site. Each mutation means what it meant; wave12_allow_all_machine
+# measures the new allow-all guards on the same lines.
+#: The single write site.
+WRITE = '    if patch and not _pair_patch_device(device_id, patch):'
+#: The private "already set" shortcut — a close only when there is one to make.
+CLOSE_SHORTCUT = '        patch = {"visibility": "private"} if current == "public" else {}'
+#: The public "already set" shortcut.
+PUBLIC_SHORTCUT = '    elif current == "public" and want == allow_now:\n        patch = {}\n'
+#: The dispatch in `main`.
+DISPATCH = ('        raise SystemExit(run_visibility(_vis, allow_all=args.allow_all,\n'
+            '                                        ignored_topic=args.topic))')
+#: The help row, whose last sentence wave 12 made conditional.
+HELP_DESC = ('         "Who can FIND this computer and ask to use it (bare = show current). '
+             'You approve each person unless --allow-all is on"),')
 
 MUTANTS = [
     # ═════════ B — pair Stage 2 ══════════════════════════════════════════════
@@ -257,20 +280,19 @@ MUTANTS = [
      "⛔ the no-op shortcut goes, so `--visibility private` on an untouched "
      "machine PATCHes the field onto every document the flag was ever pointed at, "
      "for no change at all",
-     [('    if value == current:\n'
-       '        _describe(current)\n'
-       '        print(f"  {_c(_DIM, \'     Already set — nothing to change.\')}")\n'
-       '        print()\n'
-       '        return 0\n\n', "")]),
+     [(CLOSE_SHORTCUT, '        patch = {"visibility": "private"}'),
+      (PUBLIC_SHORTCUT, "")]),
     ("V4", "under",
      "⛔⛔ the shortcut inverts, so the write happens ONLY when it would change "
      "nothing — every real change is silently reported as already set",
-     [("    if value == current:", "    if value != current:")]),
+     [(CLOSE_SHORTCUT,
+       '        patch = {"visibility": "private"} if current == "private" else {}'),
+      (PUBLIC_SHORTCUT,
+       '    elif current == "public" and want != allow_now:\n        patch = {}\n')]),
     ("V5", "under",
      "⛔ a refused write reports success. `--visibility public` then exits 0 "
      "having changed nothing, which is the answer a script reads",
-     [('    if not _pair_patch_device(device_id, {"visibility": value}):',
-       '    if not _pair_patch_device(device_id, {"visibility": value}) and False:')]),
+     [(WRITE, '    if patch and not _pair_patch_device(device_id, patch) and False:')]),
     ("V6", "under",
      "⛔⛔ the refusal goes back to ASSERTING a state. `_pair_patch_device` returns "
      "False for four situations and only two of them prove the write did not land "
@@ -296,18 +318,23 @@ MUTANTS = [
      "⛔ showing the setting WRITES it. A read-only question would start putting "
      "the field on documents that never had it, from a command whose whole "
      "contract is that it changes nothing",
-     [('    if value == _VISIBILITY_SHOW:\n        _describe(current)',
-       '    if value == _VISIBILITY_SHOW:\n'
+     # ⛔ RE-ANCHORED 2026-09-26 (wave 12): the show branch now also requires
+     # that no allow-all word was given, and describes both settings.
+     [('    if value == _VISIBILITY_SHOW and allow_all is None:\n'
+       '        _describe(current, allow_now)',
+       '    if value == _VISIBILITY_SHOW and allow_all is None:\n'
        '        _pair_patch_device(device_id, {"visibility": current})\n'
-       '        _describe(current)')]),
+       '        _describe(current, allow_now)')]),
     ("V9", "under",
      "⛔ the dropped topic is swallowed silently. Five other flags in this parser "
      "are ignored without a word when passed with the wrong command; this is the "
      "one where silence looks exactly like the argparse misparse going unnoticed",
+     # ⛔ RE-ANCHORED 2026-09-26 (wave 12): two flags lead here now, so the
+     # sentence stopped naming --visibility.
      [('    if ignored_topic:\n'
-       '        print(f"  {_c(_DIM, \'Ignoring the topic — --visibility only changes a setting.\')}")',
+       '        print(f"  {_c(_DIM, \'Ignoring the topic — this command only changes a setting.\')}")',
        '    if False:\n'
-       '        print(f"  {_c(_DIM, \'Ignoring the topic — --visibility only changes a setting.\')}")')]),
+       '        print(f"  {_c(_DIM, \'Ignoring the topic — this command only changes a setting.\')}")')]),
 
     # ═════════ C — the flag and the help screen ══════════════════════════════
     ("C1", "under",
@@ -325,22 +352,21 @@ MUTANTS = [
     ("C3", "under",
      "⛔ the command's exit code is thrown away, so a refused write, an unpaired "
      "machine and a successful change all exit 0 — and a script that checks",
-     [("        raise SystemExit(run_visibility(args.visibility, ignored_topic=args.topic))",
-       "        run_visibility(args.visibility, ignored_topic=args.topic)\n        return")]),
+     [(DISPATCH,
+       "        run_visibility(_vis, allow_all=args.allow_all,\n"
+       "                                        ignored_topic=args.topic)\n        return")]),
     ("C4", "under",
      "⛔ the dropped topic is never handed to the command, so nothing can report "
      "it — the same silence as V9, arriving from the caller's side",
-     [("        raise SystemExit(run_visibility(args.visibility, ignored_topic=args.topic))",
-       "        raise SystemExit(run_visibility(args.visibility))")]),
+     [(DISPATCH, "        raise SystemExit(run_visibility(_vis, allow_all=args.allow_all))")]),
     ("C5", "under",
      "⛔⛔ the help row goes. `add_help=False` and nothing in this file calls "
      "`format_help` or `print_help`, so the `help=` string on the flag is text no "
      "user can reach — this row is the only discovery surface there is, and its "
      "absence is exactly how --send-logs, --update and --uninstall shipped "
      "undocumented",
-     [('        ("python research.py --visibility [public|private]",\n'
-       '         "Who can FIND this computer and ask to use it (bare = show current). '
-       'You still approve everyone"),\n', "")]),
+     [('        ("python research.py --visibility [public|private]",\n' + HELP_DESC + '\n',
+       "")]),
     ("C6", "under",
      "⛔ the row is authored with the real program name instead of the "
      "`python research.py` prefix `_section` rewrites, so it prints literally on "
@@ -351,9 +377,7 @@ MUTANTS = [
      "⛔ the help row describes the flag as granting USE. It is the sentence most "
      "people will ever read about this feature, and it would be describing a "
      "product that was deliberately not built",
-     [('         "Who can FIND this computer and ask to use it (bare = show current). '
-       'You still approve everyone"),',
-       '         "Let anyone use this computer (bare = show current)"),')]),
+     [(HELP_DESC, '         "Let anyone use this computer (bare = show current)"),')]),
 
     # ═════════ O — over-corrections ══════════════════════════════════════════
     ("B10", "under",
@@ -390,16 +414,15 @@ MUTANTS = [
      "safety rail and is not one: whether a computer starts at login has nothing "
      "to do with whether people may ASK to use it, and the refusal is silent to "
      "anyone who did not read the code",
-     [('    if not _pair_patch_device(device_id, {"visibility": value}):',
-       '    if value == "public" and not meta.get("supervised"):\n'
-       '        return 1\n'
-       '    if not _pair_patch_device(device_id, {"visibility": value}):')]),
+     [(WRITE,
+       '    if target == "public" and not meta.get("supervised"):\n'
+       '        return 1\n' + WRITE)]),
     ("O2", "over",
      "⛔ a refused write is retried three times. A `hasOnly` refusal is a rules "
      "decision, not a blip — re-sending the same PATCH cannot change the answer, "
      "and it makes the person wait for three of them before being told",
-     [('    if not _pair_patch_device(device_id, {"visibility": value}):',
-       '    _ok = any(_pair_patch_device(device_id, {"visibility": value}) for _ in range(3))\n'
+     [(WRITE,
+       '    _ok = not patch or any(_pair_patch_device(device_id, patch) for _ in range(3))\n'
        '    if not _ok:')]),
 ]
 

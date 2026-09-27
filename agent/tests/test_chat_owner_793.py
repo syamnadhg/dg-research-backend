@@ -665,8 +665,10 @@ def test_no_decide_sentence_is_borrowed_from_the_ask_table():
 
 # ── SKILL.md: the three places that enumerate confirms ───────────────────────
 
+# ⭐ `device-allow-all` JOINED IN WAVE 12: its yes lets any signed-in stranger onto
+# the owner's computer with no step between, so it is a confirm in all three.
 @pytest.mark.parametrize("verb", ["device-approve", "device-deny",
-                                  "device-visibility"])
+                                  "device-visibility", "device-allow-all"])
 def test_every_new_confirm_lands_in_all_three_lists(verb):
     """⛔⛔ THE 7.9-2 BLOCKER, VERBATIM. A row in the table was not enough: two
     OTHER places enumerate what needs a confirmation, and one of them ends
@@ -701,10 +703,15 @@ def test_every_new_confirm_lands_in_all_three_lists(verb):
 
 def test_the_skill_says_hiding_needs_no_confirmation():
     """⛔ Both confirm lists carry `device-visibility public`, so both have to say
-    which direction they mean, or the file gates a strictly narrowing change."""
+    which direction they mean, or the file gates a strictly narrowing change.
+
+    ⭐ WAVE 12 CHANGED THE SENTENCES, NOT THE CLAIM: both lists now carry
+    `device-allow-all yes` too, so both name the two narrowing directions together
+    — and the assertion names both, so dropping either half is caught."""
     low = " ".join(_skill().lower().split())
-    assert "`device-visibility private` needs no confirmation" in low
-    assert "`device-visibility private` is not on the list" in low
+    assert ("`device-visibility private` and `device-allow-all no` need no "
+            "confirmation") in low
+    assert "`device-visibility private` and `device-allow-all no` are not on the list" in low
 
 
 def test_the_skill_no_longer_reserves_these_verbs_to_the_web_app():

@@ -132,8 +132,12 @@ def live(monkeypatch):
 # BEFORE: a test whose expectation is computed from its subject cannot see the
 # subject move. Widening the allow-list must now require editing this line, which
 # is the point — the edit is the decision.
+# ⭐ WIDENED ONCE, DELIBERATELY, IN WAVE 12: `allowAll`, and it is the EFFECTIVE
+# value the bridge computes (public AND strictly true), never the stored field. It
+# is the answer to "does my computer let anyone in?", the owned row prints it, and
+# `device-requests` needs it to stop telling an allow-all owner nobody is there.
 _EXPECTED_KEYS = {"id", "name", "hostname", "machineName",
-                  "owned", "selected", "online", "visibility"}
+                  "owned", "selected", "online", "visibility", "allowAll"}
 
 
 def test_the_allow_list_is_exactly_what_this_file_expects():

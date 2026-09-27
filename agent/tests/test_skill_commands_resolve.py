@@ -121,8 +121,18 @@ def test_skill_within_sanity_bound():
     # matched the "are we connected?" row and got the account line alone — it has
     # a row of its own. The bound still catches unbounded growth; it is not a trim
     # mandate and not a target.
+    # ⛔ RAISED 560 → 575 IN WAVE 12, FOR NINE LINES WITH A FACT IN EACH. Allow all
+    # is a new owner verb and a new consent moment: two routing rows (on confirms,
+    # off does not — the model cannot infer which), `device-allow-all yes` in all
+    # THREE places this file enumerates confirms (a name missing from one is a name
+    # the file licenses skipping), the fourth thing that reaches past the account,
+    # and the ask row's "joins at once" — the reply is the whole announcement, so
+    # nothing arrives later to wait for. The sentence that said the owner approves
+    # each person by hand had to become conditional rather than be deleted. The
+    # bound still catches unbounded growth; it is not a trim mandate and not a
+    # target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 560, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 575, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():

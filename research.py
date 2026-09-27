@@ -86296,6 +86296,26 @@ def run_retire():
 _VISIBILITY_SHOW = "__show__"
 _VISIBILITY_VALUES = ("public", "private")
 
+# ⛔⛔ `--allow-all` HAS THE SAME TRAP AND THE SAME CURE. It is `nargs="?"` for
+# the same reason — bare `--allow-all` SHOWS the setting — so it swallows a
+# following topic exactly like `--visibility` does, and `main` checks its word by
+# hand. Its own sentinel, not a shared one: bare `--allow-all` means "show" on
+# its own and "yes" straight after an explicit `--visibility public` (the owner's
+# one-step form), and `run_visibility` can only tell those apart if it can see
+# that the flag was given bare.
+#
+# ⛔ BARE NEVER OPENS THE DOOR BY ITSELF. Typing the flag to check where it
+# stands must not make the computer public and instantly joinable — the one
+# permissive reading of a bare flag is gated on the person having just said
+# "public" in the same command.
+_ALLOW_ALL_SHOW = "__show__"
+_ALLOW_ALL_VALUES = ("yes", "no")
+# A word that is really this flag with the dashes left off — as a topic,
+# `superresearch --visibility public allow-all`, or as --visibility's own word,
+# `superresearch --visibility allow-all` — normalised by dropping spaces, dashes
+# and underscores, so "allow all", "Allow-All" and "allow_all" all match.
+_ALLOW_ALL_TOPIC_WORD = "allowall"
+
 # ⛔⛔ THE MACHINE WAS THE HALF THAT NEVER LEARNED THE NEW NAME. `visibility` is
 # becoming `joinPolicy` — the same answer under the name groups give it, "who may
 # join this computer". `firestore.rules` has admitted both keys side by side since
@@ -86351,14 +86371,60 @@ def _discovery_of(meta: dict) -> str:
     return "private"
 
 
-def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
-    """`--visibility [public|private]` — show or set who can FIND this computer.
+def _allow_all_of(meta: dict) -> bool:
+    """Whether anyone who asks joins this computer at once, with no approval.
 
-    Discovery, not access. A discoverable machine is one strangers can see
-    listed and ASK to use; the person still approves every request by hand and
-    an approved person becomes an ordinary sharer. Nothing here grants anybody
-    anything, and the device document stays readable by exactly the same three
+    ⛔⛔ PUBLIC FIRST, THEN THE FLAG — the rule every reader shares (the web's
+    ask route, the Shared-with pop-up, the agent and this file). `allowAll` is a
+    separate boolean precisely so that no old reader ever sees it, and that means
+    old WRITERS never clear it either: an installed wheel's `--visibility
+    private`, the published agent and today's web toggle all write `visibility`
+    alone. So a private computer can carry a leftover `allowAll: true`, and it is
+    harmless ONLY because nothing honours it while the computer is unlisted.
+    Reading the flag on its own would report a hidden computer as open.
+
+    ⛔ "PUBLIC" IS `_discovery_of`, NEVER THE LITERAL `visibility` FIELD. The
+    field is being renamed to `joinPolicy`; a gate that compared the old literal
+    would read every allow-all computer as closed the day the migration drops it.
+
+    ⛔ STRICTLY `True`. The rules only admit a bool once they are deployed, and a
+    document written before that can carry anything — the string "false", a 1,
+    a map. The permissive answer is reachable by exactly one value.
+
+    ⛔ Like `_discovery_of`, apply this only to a read that SUCCEEDED: `{}` from a
+    failed fetch reads "off" here exactly like a real document with no field.
+    """
+    return meta.get("allowAll") is True and _discovery_of(meta) == "public"
+
+
+def run_visibility(value: str, allow_all: "str | None" = None,
+                   ignored_topic: "str | None" = None) -> int:
+    """`--visibility [public|private]` and `--allow-all [yes|no]` — show or set
+    who can FIND this computer, and whether they join it at once.
+
+    Discovery is not access. A discoverable machine is one strangers can see
+    listed and ASK to use; the owner approves every request by hand and an
+    approved person becomes an ordinary sharer — UNLESS Allow all is on, when an
+    ask joins at once with no approval. That grant happens on the web server,
+    inside the ask route's own transaction, and only on a computer that is
+    public AND carries `allowAll: true`; nothing here grants anybody anything
+    directly, and the device document stays readable by exactly the same three
     principals either way.
+
+    ⭐ ONE SCREEN, ONE READ, ONE WRITE PATH FOR BOTH FLAGS. Allow all only means
+    anything on a public computer, so the two settings are shown together and
+    written by one set of rules — the same rules the web and the agent follow:
+      · allow all ON  → `{visibility: public, allowAll: true}` in ONE patch. It
+        makes the computer public too (the owner: "allow all would by default
+        make it public"), and one patch means the computer is never left
+        allow-all-but-hidden while the screen says on.
+      · allow all OFF → `{allowAll: false}`. The computer stays public.
+      · public OFF    → `{visibility: private}` ALONE, first; then, only if the
+        document carried `allowAll: true`, a second best-effort
+        `{allowAll: false}`.
+      · public ON without allow all → `{visibility: public}`, with
+        `allowAll: false` in the same patch when an old tick is on the document,
+        so a tick nobody asked for this time never comes back.
 
     ⭐ THE STATE LIVES ON THE DEVICE DOCUMENT AND NOWHERE ELSE. There is no
     research_config.json key for it, deliberately: the owner can change this
@@ -86366,22 +86432,36 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
     moment they do. `_fetch_device_meta_rest` is the same reader --resurrect and
     --retire use, and it needs no gRPC client.
 
-    ⛔ ABSENT MEANS PRIVATE. A machine paired before 2026-09-04 carries no field
-    at all and nothing backfills one.
+    ⛔ ABSENT MEANS PRIVATE, AND AN ABSENT `allowAll` MEANS OFF. A machine paired
+    before 2026-09-04 carries no field at all and nothing backfills one.
+
+    `allow_all` is None (not given), `_ALLOW_ALL_SHOW` (given bare), "yes" or
+    "no"; `main` has already refused every other word and the contradiction
+    `--visibility private --allow-all yes`.
 
     Returns a process exit code — 0 on success, non-zero when the machine is
-    not paired or the write was refused.
+    not paired, the read failed or the write was refused.
     """
     _branded_header("visus", _BOLD + _ACCENT, "who can find this computer")
     print()
+
+    # ⛔⛔ A BARE `--allow-all` IS RESOLVED HERE, BEFORE ANYTHING READS IT. It
+    # means "yes" only straight after an explicit `--visibility public` — the
+    # owner's one-step form, `--visibility public --allow-all` — and "show"
+    # everywhere else, so checking the setting can never open the door.
+    # Resolving it first is what lets the empty-read verdict below see the
+    # one-step form for what it is: a requested change.
+    if allow_all == _ALLOW_ALL_SHOW:
+        allow_all = "yes" if value == "public" else None
 
     # ⛔ A TOPIC ALONGSIDE THIS FLAG IS DROPPED, SO SAY SO — and say it UNDER the
     # header rather than above it, or the banner's rule reads as belonging to
     # this line. Five other flags in this parser are silently ignored when
     # passed with the wrong command; this is the one where silence looks exactly
-    # like the argparse misparse having gone unnoticed.
+    # like the argparse misparse having gone unnoticed. The sentence names no
+    # flag because two flags lead here.
     if ignored_topic:
-        print(f"  {_c(_DIM, 'Ignoring the topic — --visibility only changes a setting.')}")
+        print(f"  {_c(_DIM, 'Ignoring the topic — this command only changes a setting.')}")
         # ⛔⛔ THE QUOTED TOPIC IS BUILT OUTSIDE THE f-STRING, and that is not
         # style. Nesting the same quote character AND a backslash inside an
         # f-string is PEP 701 syntax — legal from 3.12, a SyntaxError on 3.11 —
@@ -86434,7 +86514,11 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
         # a question and has already been answered above. Saying "nothing was
         # changed" to someone who changed nothing is noise, and saying nothing
         # to someone who tried to is the defect.
-        if value != _VISIBILITY_SHOW:
+        # ⛔⛔ A VALUE FOR EITHER FLAG IS A CHANGE. `--allow-all yes` arrives
+        # with `value` still the show sentinel, so testing `value` alone answered
+        # the one request that opens the door as if it were a status question —
+        # the exact silence this line exists to end.
+        if value != _VISIBILITY_SHOW or allow_all is not None:
             print(f"  {_c(_DIM, '     Nothing was changed — this computer is still')} "
                   f"{_c(_BOLD, 'set the way it was')}{_c(_DIM, '.')}")
         print()
@@ -86443,32 +86527,91 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
     # "private", so resolving before the guard would reinstate the exact defect
     # that guard exists to catch.
     current = _discovery_of(meta)
+    # ⛔ BELOW THE GUARD FOR THE SAME REASON: `_allow_all_of({})` answers "off".
+    allow_now = _allow_all_of(meta)
+    # ⛔⛔ THE RAW FLAG, READ ONLY IN ORDER TO CLEAR IT. `allow_now` is the
+    # answer every reader acts on; this is the tick an old writer left behind on
+    # a computer it then made private. It opens nothing while the computer is
+    # hidden, but the next plain "make it public" from an old wheel, the old
+    # agent or today's web toggle — all of which write `visibility` alone —
+    # would bring back an instant door nobody asked for this time.
+    leftover = meta.get("allowAll") is True
 
-    def _describe(state: str) -> None:
+    def _describe(state: str, allow: bool) -> None:
         if state == "public":
             print(f"  {_c(_OK, '●')}  {_c(_BOLD, 'Public')}  "
                   f"{_c(_DIM, '— other people can find this computer and ask to use it.')}")
-            print(f"  {_c(_DIM, '     You still approve every person yourself.')}")
+            # ⛔⛔ THIS LINE SAID "You still approve every person yourself." ON
+            # EVERY PUBLIC COMPUTER, which stops being true the day Allow all is
+            # ticked — and this is the screen an owner reads to check. Private
+            # gets no allow-all line: nothing honours the flag there.
+            if allow:
+                print(f"  {_c(_BOLD, '     Allow all: on — anyone who asks joins at once')}")
+            else:
+                print(f"  {_c(_DIM, '     Allow all: off — you approve each person')}")
         else:
             print(f"  {_c(_BOLD, '○')}  {_c(_BOLD, 'Private')}  "
                   f"{_c(_DIM, '— only people you give the access code to can ask.')}")
 
-    if value == _VISIBILITY_SHOW:
-        _describe(current)
+    if value == _VISIBILITY_SHOW and allow_all is None:
+        _describe(current, allow_now)
         print()
         _render_next_actions([
             ("python research.py --visibility public", "let people find this computer"),
             ("python research.py --visibility private", "hide it again"),
+            ("python research.py --allow-all yes",
+             "let anyone who asks join at once (makes it public too)"),
+            ("python research.py --allow-all no", "approve each person yourself"),
         ])
         return 0
 
-    if value == current:
-        _describe(current)
-        print(f"  {_c(_DIM, '     Already set — nothing to change.')}")
-        print()
-        return 0
+    # ── what was asked for, resolved against what is there ──────────────────
+    # An explicit --visibility word wins; allow all ON implies public; otherwise
+    # the computer stays where it is.
+    # ⛔ "private" OUTRANKS "yes". `main` refuses that pair out loud, and if the
+    # refusal were ever lost this still fails CLOSED — it closes the door rather
+    # than opening it.
+    if value in _VISIBILITY_VALUES:
+        target = value
+    elif allow_all == "yes":
+        target = "public"
+    else:
+        target = current
+    # A flag-less "public" on a computer that is already public leaves Allow all
+    # as it is; opening a private one starts with it off, since `allow_now` is
+    # False on every private computer.
+    want = (allow_all == "yes") if allow_all is not None else allow_now
 
-    if not _pair_patch_device(device_id, {"visibility": value}):
+    if target == "private":
+        want = False
+        # ⛔⛔ THE CLOSE CARRIES `visibility` ALONE. The rule it lands on is
+        # `hasOnly()`, which refuses the WHOLE update when one key is off-list —
+        # so a close that also carried `allowAll` would depend on the new key
+        # having been admitted for this machine's rule, and a lagging, partial or
+        # rolled-back ruleset would 403 it. The owner could then not make the
+        # computer private from the terminal at all. A narrowing write must never
+        # be blockable by a key it does not need.
+        patch = {"visibility": "private"} if current == "public" else {}
+    elif current == "public" and want == allow_now:
+        patch = {}
+    elif want:
+        # ⛔⛔ BOTH KEYS, ONE PATCH, ALWAYS — even on a computer that is already
+        # public. `allowAll` alone on a private computer would leave it hidden
+        # while this screen said on, and a widening write that the rules refuse
+        # fails CLOSED, so carrying `visibility` costs nothing.
+        patch = {"visibility": "public", "allowAll": True}
+    elif current == "private":
+        # ⛔ THE FIELD IS STATED ONLY WHEN A TICK IS THERE TO UNDO. Absent already
+        # means off, and writing `allowAll` onto every computer opened from this
+        # machine would make plain `--visibility public` depend on a rules deploy
+        # it never needed — the same whole-patch refusal as the close above.
+        patch = {"visibility": "public"}
+        if leftover:
+            patch["allowAll"] = False
+    else:
+        patch = {"allowAll": False}
+
+    if patch and not _pair_patch_device(device_id, patch):
         # ⛔⛔ "NOTHING CHANGED" IS A CLAIM THIS CANNOT MAKE, and the first
         # version of this made it in bold. `_pair_patch_device` returns False for
         # four different situations and only two of them prove the write did not
@@ -86485,11 +86628,40 @@ def run_visibility(value: str, ignored_topic: "str | None" = None) -> int:
         print()
         return 1
 
-    _describe(value)
+    # ⭐ THEN THE LEFTOVER, BEST-EFFORT, AND ONLY ON A PRIVATE COMPUTER. It goes
+    # out only if the document carried the tick, and only once the close has
+    # landed — a close that could not be confirmed returned above, so nothing
+    # follows it. Its own failure is not reported: every reader gates allow-all
+    # on public, so a tick left on a private computer opens nothing.
+    if target == "private" and leftover:
+        _pair_patch_device(device_id, {"allowAll": False})
+
+    _describe(target, want)
+    if not patch:
+        if target == "private" and allow_all == "no":
+            print(f"  {_c(_DIM, '     Allow all is off (this computer is private)')}")
+        else:
+            print(f"  {_c(_DIM, '     Already set — nothing to change.')}")
+        print()
+        return 0
+    if want:
+        if current == "private":
+            print(f"  {_c(_DIM, '     This made it public too — Allow all only works on a computer people can find.')}")
+        # ⛔ THE SAME WORDS THE WEB'S CHECKBOX PUTS UNDER ITSELF. With approval
+        # the owner looked at each of these people; now any signed-in account
+        # can join, and this is the moment to say what that account gets.
+        print(f"  {_c(_DIM, '     They run research on your AI accounts and can see your email and who else is on it.')}")
+        print(f"  {_c(_DIM, '     People you removed stay out.')}")
+    elif allow_now:
+        # ⛔ OFF IS NOT A REMOVAL. Everyone who joined while it was on is an
+        # ordinary sharer now, and an owner who reads "off" as "they are gone"
+        # would never go and look.
+        print(f"  {_c(_DIM, '     Anyone who already joined keeps access — remove people in the web app (Shared with).')}")
     print()
     _render_next_actions([
         ("python research.py --visibility", "check this again later"),
-    ])
+    ] + ([("python research.py --allow-all no", "approve each person yourself again")]
+         if want else []))
     return 0
 
 
@@ -87294,8 +87466,13 @@ def run_commands_help():
         # every `help=` string on every add_argument is text no user can reach.
         # That is how --send-logs, --update and --uninstall all shipped
         # undocumented: they have help strings and no row here.
+        # ⛔ "You still approve everyone" was this row's last word and stopped
+        # being true with Allow all, so approval is conditional now — and the
+        # flag that changes it gets a row of its own right under it.
         ("python research.py --visibility [public|private]",
-         "Who can FIND this computer and ask to use it (bare = show current). You still approve everyone"),
+         "Who can FIND this computer and ask to use it (bare = show current). You approve each person unless --allow-all is on"),
+        ("python research.py --allow-all [yes|no]",
+         "Anyone who asks joins at once, no approval (yes also makes it public; bare = show current)"),
         ("python research.py --unpair",
          "Fully disconnect this PC (deletes token + device doc + local config)"),
         ("python research.py --unpair --deep",
@@ -90558,7 +90735,14 @@ def main():
     parser.add_argument("--visibility", nargs="?", const=_VISIBILITY_SHOW, default=None,
         metavar="public|private",
         help="Show or set whether other people can find this computer and ask to use it. "
+             "You approve each person unless --allow-all is on. "
              "Bare --visibility prints the current setting.")
+    parser.add_argument("--allow-all", nargs="?", const=_ALLOW_ALL_SHOW, default=None,
+        dest="allow_all", metavar="yes|no",
+        help="yes: anyone who asks joins this computer at once, with no approval — and "
+             "the computer is made public too. no: you approve each person again (it "
+             "stays public). Bare --allow-all prints the current setting; straight "
+             "after --visibility public it means yes.")
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--force", action="store_true",
@@ -90723,19 +90907,65 @@ def main():
         run_retire()
         return
 
-    if args.visibility is not None:
+    if args.visibility is not None or args.allow_all is not None:
+        # ⭐ ONE DISPATCH FOR BOTH FLAGS, so one screen, one read and one write
+        # path serve them. `--allow-all` alone arrives with no --visibility word,
+        # which is the show sentinel's meaning exactly: "leave it where it is".
+        _vis = _VISIBILITY_SHOW if args.visibility is None else args.visibility
+        # ⛔ THE OWNER'S SPOKEN FORM, BOUND TO THE WRONG FLAG. `superresearch
+        # --visibility allow-all` hands the word to --visibility itself, and the
+        # refusal just below would offer to research "allow-all" as a topic —
+        # the person meant the other flag. Same normalisation as the topic check
+        # further down; no public/private word and no sentinel normalises to it.
+        if re.sub(r"[\s_-]+", "", _vis).lower() == _ALLOW_ALL_TOPIC_WORD:
+            parser.error(
+                f"did you mean --allow-all? --visibility takes "
+                f"{' or '.join(_VISIBILITY_VALUES)}, not {_vis!r}. To let anyone "
+                f"who asks join at once: {_PROG} --allow-all yes"
+            )
         # ⛔⛔ THE MISPARSE, CAUGHT AND NAMED. `topic` is `nargs="?"` too, so
         # `superresearch --visibility "my topic"` binds the topic to this flag
         # and leaves the positional empty. argparse cannot express "optional
         # value, but only these two words"; this is what turns a silent wrong
         # run into a sentence that says which word was not understood.
-        if args.visibility != _VISIBILITY_SHOW and args.visibility not in _VISIBILITY_VALUES:
+        if _vis != _VISIBILITY_SHOW and _vis not in _VISIBILITY_VALUES:
             parser.error(
                 f"--visibility takes {' or '.join(_VISIBILITY_VALUES)}, "
-                f"not {args.visibility!r}. To research a topic, put it first: "
-                f'{_PROG} "{args.visibility}"'
+                f"not {_vis!r}. To research a topic, put it first: "
+                f'{_PROG} "{_vis}"'
             )
-        raise SystemExit(run_visibility(args.visibility, ignored_topic=args.topic))
+        # ⛔⛔ THE SAME TRAP ON THE SECOND FLAG, AND THE SAME CURE. Exactly yes
+        # or no — `Yes`, `on`, `true` and a swallowed topic are all refused by
+        # name, never guessed at, because the guess that matters here is the one
+        # that opens a computer to every signed-in stranger.
+        if (args.allow_all is not None and args.allow_all != _ALLOW_ALL_SHOW
+                and args.allow_all not in _ALLOW_ALL_VALUES):
+            parser.error(
+                f"--allow-all takes {' or '.join(_ALLOW_ALL_VALUES)}, "
+                f"not {args.allow_all!r}. To research a topic, put it first: "
+                f'{_PROG} "{args.allow_all}"'
+            )
+        # ⛔ THE OWNER'S SPOKEN FORM WITHOUT THE DASHES. `--visibility public
+        # allow-all` parses as a TOPIC, which the command below would announce
+        # as ignored and offer to research — the person meant the flag.
+        if (args.visibility is not None and args.topic and re.sub(
+                r"[\s_-]+", "", args.topic).lower() == _ALLOW_ALL_TOPIC_WORD):
+            parser.error(
+                f"did you mean --allow-all? {args.topic!r} is read as a research "
+                f"topic here. To let anyone who asks join at once: "
+                f"{_PROG} --visibility public --allow-all"
+            )
+        # ⛔⛔ A CONTRADICTION IS REFUSED, NOT RESOLVED. "Hide it" and "let
+        # anyone in" cannot both be done; picking either one silently acts on a
+        # sentence the person did not finish thinking through.
+        if _vis == "private" and args.allow_all == "yes":
+            parser.error(
+                "--visibility private and --allow-all yes contradict each other: "
+                "Allow all only works on a computer people can find. "
+                f"To let anyone join at once: {_PROG} --allow-all yes"
+            )
+        raise SystemExit(run_visibility(_vis, allow_all=args.allow_all,
+                                        ignored_topic=args.topic))
 
     if args.unpair:
         # ⛔ `raise SystemExit`, not `return` — and not `return run_unpair(...)`

@@ -186,12 +186,14 @@ MUTANTS = [
     ("L5", SR, "under",
      "truncation is unreported beside a short list, so \"these are on offer\" "
      "reads as the whole story when the scan filled up",
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the invite line is `_public_invite(rows)`
+     # now (a list with a joins-at-once row says so). Same defect.
      [('    if body.get("truncated"):\n'
        '        lines.append(_PUBLIC_TRUNCATED_SOME)\n'
        '    lines.append("")\n'
-       '    lines.append(_PUBLIC_ASK_INVITE)',
+       '    lines.append(_public_invite(rows))',
        '    lines.append("")\n'
-       '    lines.append(_PUBLIC_ASK_INVITE)')]),
+       '    lines.append(_public_invite(rows))')]),
     ("L6", SR, "under",
      "⛔⛔ TRUNCATION IS UNREPORTED ON THE EMPTY BRANCH — the branch where it "
      "matters most, because zero rows over a filled scan means everything found "
@@ -202,7 +204,8 @@ MUTANTS = [
     ("L7", SR, "under",
      "the invitation and its disclosure go, so a list of strangers' machines is "
      "printed with no word about what asking for one tells them",
-     [('    lines.append(_PUBLIC_ASK_INVITE)\n    return lines', '    return lines')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `_public_invite(rows)`. Same defect.
+     [('    lines.append(_public_invite(rows))\n    return lines', '    return lines')]),
     ("L8", SR, "under",
      "the row guard goes, so one non-dict row from the app takes down a screen "
      "that was answering something else entirely",
@@ -426,13 +429,17 @@ MUTANTS = [
      "⛔ `install` LEAVES THE SAFE-DEFAULTS LIST, whose next clause says "
      "everything not listed runs on a clear request — and it was missing from "
      "BOTH confirm lists at HEAD while being confirm-gated in the client",
-     [('`device-visibility public`, `update`, and `install`**',
-       '`device-visibility public`, and `update`**')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `device-allow-all yes` joined the list
+     # before `update`. Same defect: `install` leaves it.
+     [('`device-visibility public`, `device-allow-all yes`, `update`, and `install`**',
+       '`device-visibility public`, `device-allow-all yes`, and `update`**')]),
     ("S4", SKILL, "under",
      "`install` leaves the Safety bullet — the third list, and the one 7.9-2 "
      "already recorded as the one people forget",
-     [('  `device-deny`, `device-visibility public`, `install` (installs the backend on\n  the connected computer), and `update`',
-       '  `device-deny`, `device-visibility public`, and `update`')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): `device-allow-all yes` joined the list
+     # and the bullet re-wrapped. Same defect: `install` leaves it.
+     [('  `device-deny`, `device-visibility public`, `device-allow-all yes`, `install`\n  (installs the backend on the connected computer), and `update`',
+       '  `device-deny`, `device-visibility public`, `device-allow-all yes`, and `update`')]),
     ("S5", SKILL, "under",
      "the paragraph telling the assistant an empty account is not a dead end "
      "goes, so the model is free to relay the shortest of the ten old sentences",
@@ -448,7 +455,9 @@ MUTANTS = [
      "and the empty state can disagree about what asking costs. Four sentences "
      "are printed by two screens each, and the anchor sweep caught me copying "
      "them by hand while building the wave that exists to stop that",
-     [('    lines.append(_PUBLIC_ASK_INVITE)\n    return lines',
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the one call is `_public_invite(rows)`
+     # now, which picks between the two shared constants. Same defect.
+     [('    lines.append(_public_invite(rows))\n    return lines',
        '    lines.append("Tell me which one to ask for and I’ll ask its owner.")\n    return lines')]),
     ("C2", SR, "over",
      "⛔ THE SHARED SENTENCE IS SPLICED AFTER AN EM-DASH AGAIN, printing "

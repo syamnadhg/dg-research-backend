@@ -545,6 +545,21 @@ def _discovery_of(d: dict[str, Any]) -> str:
     return "private"
 
 
+def _allow_all_of(d: dict[str, Any]) -> bool:
+    """Does anyone who asks join this computer at once? (wave 12)
+
+    ⛔⛔ PUBLIC FIRST, AND "PUBLIC" MEANS `_discovery_of`, NEVER THE LITERAL FIELD.
+    `allowAll` is a separate boolean, not a third value of `visibility` — old
+    readers would read a third value as private — and it only counts while the
+    computer is listed. A private computer carrying `allowAll: true` (an older
+    writer's leftover, or a hand-off) lets nobody in, so it reads false here.
+
+    ⛔ STRICTLY `True`. Missing, false, `"true"`, `1` — anything else is today's
+    approval flow, which is the direction that cannot let a stranger in by typo.
+    """
+    return _discovery_of(d) == "public" and d.get("allowAll") is True
+
+
 # ⛔⛔ THE ONLY DEVICE FIELDS THAT MAY LEAVE THIS PROCESS. `list_devices` sends
 # no field mask, so a device row arrives WHOLE — and a never-rotated machine's
 # row still carries a plaintext `pairCode`, which is the credential that claims
@@ -563,8 +578,14 @@ def _discovery_of(d: dict[str, Any]) -> str:
 # not a machine's whole shape. It is pinned as a SUBSET rather than rebuilt from
 # this tuple, so widening the list for a device-list consumer can never widen a
 # chat error body behind anyone's back.
+#
+# ⭐ `allowAll` JOINED IN WAVE 12, AND IT IS THE EFFECTIVE VALUE, NEVER THE RAW
+# FIELD — public AND strictly true (`_allow_all_of`). Both clients print ", public,
+# anyone can join" off it, and `device-requests` needs it to tell an owner that
+# nobody waits on a computer that lets people straight in: without it that screen
+# said "Nobody is waiting" while up to 25 people were on the machine.
 _DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",
-                       "owned", "selected", "online", "visibility")
+                       "owned", "selected", "online", "visibility", "allowAll")
 
 
 # ⛔ THE BROWSE PROJECTION, WHICH IS A DIFFERENT AND NARROWER LIST. These five are
@@ -572,7 +593,13 @@ _DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",
 # an id to ask for, a label, an OS glyph, a power state and whether it is full.
 # Nothing about ownership, nothing about the account's own selection, and no
 # hostname ladder, because none of that is the browsing account's business.
-_PUBLIC_DEVICE_KEYS = ("deviceId", "label", "osFamily", "online", "full")
+# ⛔⛔ AND A SIXTH SINCE WAVE 12: `allowAll`, the web app's "joins at once" bit
+# (true only when listable AND allowAll === true). THIS PRUNE IS STRICT, so a key
+# missing here is dropped in silence — every allow-all row would have read as
+# "ask the owner" with nothing anywhere saying why. It says nothing about who is
+# on the computer, which is why it may reach a stranger.
+_PUBLIC_DEVICE_KEYS = ("deviceId", "label", "osFamily", "online", "full",
+                       "allowAll")
 
 # ⛔⛔ THE REQUEST QUEUE'S TWO HALVES, AND THEY ARE DIFFERENT LISTS. This relay had
 # NO allow-list at all — it handed the web app's `incoming` and `outgoing` arrays
@@ -1932,6 +1959,15 @@ _FE_JSON_TIMEOUT = 15
 # PER CALL, on the one route that needs it, and its callers wait longer to match —
 # the same shape `_fe_api_post_bytes` already uses for its 60s upload.
 _FE_UNLINK_TIMEOUT = 35
+
+# ⛔⛔ AN ASK CAN BE A GRANT NOW, SO IT GETS THE LONG WAIT TOO (wave 12). On a
+# computer set to Allow all, `access-request` joins the person inside a
+# transaction, syncs the machine's claims and sends the owner a notice — the same
+# work as the decide route, which declares thirty seconds. At the shared fifteen
+# a join that COMMITTED came back here as a failure, and the retry it invited
+# answers `already_shared` with no selection and no held topic started. PER CALL,
+# for the reason `_FE_UNLINK_TIMEOUT` records above, and both clients wait fifty.
+_FE_ASK_TIMEOUT = 35
 
 
 def _fe_json_body(r: "requests.Response") -> dict:
@@ -4724,6 +4760,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # the key set below is unchanged and `test_app_plane_unchanged`
                 # still holds. See `_discovery_of`.
                 d["visibility"] = _discovery_of(d)
+                # ⭐ THE EFFECTIVE ALLOW-ALL, RESOLVED HERE FOR THE SAME REASON
+                # (wave 12). The raw field is overwritten, not kept beside it: a
+                # client that read a private computer's leftover `true` would tell
+                # its owner strangers can walk in when nobody can.
+                d["allowAll"] = _allow_all_of(d)
                 for k in [k for k in d if k not in _DEVICE_PUBLIC_KEYS]:
                     del d[k]
             return devs
@@ -4849,8 +4890,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             /api/devices/public`), relayed as the web app sent them.
 
             ⛔⛔ NOT `_decorate_devices`, AND NOT A DEVICE ROW. A public row is a
-            five-field projection — deviceId, label, osFamily, online, full —
-            with no `ownerUid`, no `id` and no `lastHeartbeat`. Running it
+            six-field projection — deviceId, label, osFamily, online, full and,
+            since wave 12, allowAll — with no `ownerUid`, no `id` and no `lastHeartbeat`. Running it
             through the member-row decorator would answer all three of its
             questions from ABSENT fields: `owned` false because there is no
             ownerUid, `selected` false because the id is under another key, and
@@ -4886,7 +4927,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # returned nothing.
             #
             # ⭐ THE WEB APP'S OWN PROJECTION IS CORRECT TODAY — `toPublicDevice`
-            # is an allow-list of exactly these five fields, and its file says so
+            # is an allow-list of exactly these fields, and its file says so
             # in its own header. That is precisely why this is worth having: the
             # bridge should not be one upstream regression away from publishing a
             # credential, and a relay that trusts its source is exactly the shape
@@ -4961,7 +5002,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
         def _device_ask(self) -> None:
             """Ask the owner of a public machine for access (`POST
-            /api/devices/access-request`).
+            /api/devices/access-request`) — or, on a computer set to Allow all,
+            join it at once: the web app answers `status: "joined"` and this reply
+            is then the whole announcement (`_instant_join`).
 
             ⛔⛔ BY deviceId, NEVER BY NAME OR BY A NUMBER FROM THE LIST. Two
             public machines can carry the same label — an unnamed one is
@@ -4986,9 +5029,22 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             acct = self._account()
             if acct is None:
                 return
-            sess, _fs = acct
+            sess, fs = acct
             status, body = _fe_api_post(sess, "/api/devices/access-request",
-                                        {"deviceId": device_id})
+                                        {"deviceId": device_id},
+                                        timeout=_FE_ASK_TIMEOUT)
+            # ⛔⛔ A TRANSPORT FAILURE MAY SIT ON A COMMITTED JOIN (wave 12). On an
+            # allow-all computer the ask IS the grant, so "could not reach the app"
+            # would be a claim about something that may well have happened — and
+            # the retry it invites answers `already_shared`. The same split
+            # `_device_decide` makes: a dead session keeps its own 401 below, only
+            # a transport failure is unconfirmed. A bare code, which both clients
+            # word in their ask tables.
+            if status == 0 and body.get("reason") != "revoked":
+                log.warning("device ask: no answer — outcome unknown")
+                self._json(502, {"reason": "ask_unconfirmed",
+                                 "error": "ask_unconfirmed"})
+                return
             if not self._fe_relay(status, body, "could not ask for that computer"):
                 return
             # ⛔⛔ THE STRANGER'S ID DOES NOT GO IN THE LOG, and every neighbouring
@@ -4999,6 +5055,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # those. Nothing here masks a machine's LABEL either, so the whole row
             # stays out. What is worth keeping is that an ask left the building.
             log.info("device ask: sent")
+            _ask_origin = _clean_origin(ask_body.get("origin"))
+            # ⭐⭐ "JOINED" IS AN ANSWER, NOT A WAIT (wave 12). A computer set to
+            # Allow all lets the person in inside the web app's own transaction,
+            # so there is nothing for the watcher to notice — and parking it as if
+            # there were made the watcher see the row gone plus a membership and
+            # announce "You're in" a second time, a minute later. The reply IS the
+            # notice; `_instant_join` does what the watcher's approval path does.
+            if body.get("status") == "joined":
+                self._json(200, self._instant_join(sess, fs, device_id, body,
+                                                   _ask_origin))
+                return
             # ⭐⭐ REMEMBERED, SO THE ANSWER CAN BE NOTICED. The approval lands in
             # `deviceAccessRequests`, which is `allow read, write: if false` to
             # every credential this agent holds — the web route is the only door,
@@ -5015,13 +5082,96 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # nothing but a week of web requests against a route nobody reads.
             # A terminal `agent device ask` lands here and behaves as it always
             # did. The held-research park next door already gates this way.
-            _ask_origin = _clean_origin(ask_body.get("origin"))
             if _ask_origin:
                 prefs.set_device_ask({"deviceId": device_id,
                                       "origin": _ask_origin,
                                       "at": time.time()}, sess.uid)
             self._json(200, {"ok": True, "deviceId": device_id,
                              "status": body.get("status") or "pending"})
+
+        def _instant_join(self, sess: AccountSession, fs: FirestoreRest,
+                          device_id: str, body: dict[str, Any],
+                          ask_origin: dict[str, str] | None) -> dict[str, Any]:
+            """The reply to an ask the web app answered `joined` (wave 12).
+
+            ⛔⛔ THE KEYS ARE A CONTRACT. The DG HERMES fleet branches on them under
+            `--json` — ok, status, deviceId, deviceName, selected, online, usable,
+            autoStarted, runId, and topic when one was held — so every one is sent
+            on every join, with a stable type, whatever happened below.
+
+            Three things the watcher's approval path does, done here because a join
+            never parks the watcher:
+              • CLEAR a parked ask for THIS computer — an earlier pending ask that
+                the join converted would otherwise be announced a minute later.
+              • SELECT it when nothing is selected or the saved choice is gone —
+                never over a live selection (pairing's rule, one rung wider: a
+                fleet box whose code-shared computer was taken away still points
+                at it, and would answer the next research with "which computer?").
+              • START a held topic on it, pinned to this computer, only when the
+                ask came from a chat and the machine can take work.
+            """
+            parked = prefs.get_device_ask(sess.uid)
+            if isinstance(parked, dict) and str(parked.get("deviceId") or "") == device_id:
+                prefs.clear_device_ask()
+            try:
+                devs: list[dict[str, Any]] | None = fs.list_devices(sess.uid)
+            except (RevokedError, FirestoreError) as e:
+                # ⛔ NOT FATAL. The join committed on the web app's side; failing to
+                # read the list costs the name and the auto-start, never the answer.
+                log.warning("device ask: joined, but the list could not be read: %s", e)
+                devs = None
+            row = next((d for d in (devs or []) if d.get("id") == device_id), None)
+            saved = prefs.get_selected_device(sess.uid)
+            # ⛔ UNKNOWN IS NOT STALE. A list that could not be read proves nothing
+            # about the saved choice, so it is replaced only when it was READ and
+            # is not there.
+            gone = devs is not None and bool(saved) and not any(
+                d.get("id") == saved for d in devs)
+            if not saved or gone:
+                prefs.set_selected_device(device_id, sess.uid)
+                saved = device_id
+            # ⛔ READ BEFORE ANYTHING DECORATES THE ROW. `pair_state_usable` needs
+            # `pairState`, which the prune removes; and liveness is computed the
+            # way every own row computes it, never read off the document.
+            usable = row is not None and pair_state_usable(row)
+            online = row is not None and _device_is_online(row)
+            name = body.get("deviceName")
+            if not (isinstance(name, str) and name.strip()):
+                name = _device_label(row) if row is not None else None
+            out: dict[str, Any] = {"ok": True, "status": "joined",
+                                   "deviceId": device_id, "deviceName": name,
+                                   "selected": saved == device_id, "online": online,
+                                   "usable": usable, "autoStarted": False,
+                                   "runId": None}
+            # ⛔ THE SAME GATE AS THE WATCHER: a topic is only ever held for a chat,
+            # and only the ask a chat is waiting on may start it. A terminal
+            # `agent device ask` leaves it where it is.
+            held = prefs.get_held_research(sess.uid) if ask_origin else None
+            topic = str((held or {}).get("topic") or "").strip()
+            if topic:
+                out["topic"] = topic
+                if usable:
+                    # ⛔⛔ CLAIMED BEFORE THE ENQUEUE, PUT BACK IF IT FAILS. get →
+                    # enqueue → clear is not atomic, and a watcher answering an
+                    # older parked ask in the same second would start the topic
+                    # twice. Clearing first narrows that to nothing this side can
+                    # see; a failed start restores the record exactly as it was.
+                    prefs.clear_held_research()
+                    try:
+                        cfg = _resolve_run_config(fs, sess, {})
+                        rid, _qid = _enqueue_research_run(
+                            fs, sess, topic=topic, device_id=device_id, cfg=cfg,
+                            origin=_clean_origin(held.get("origin")))
+                        out["autoStarted"] = True
+                        out["runId"] = rid
+                    except (RevokedError, FirestoreError, _EnqueueFailed) as e:
+                        log.warning("auto-start after an instant join failed: %s", e)
+                        prefs.set_held_research(held, sess.uid)
+            # ⛔ THE COMPUTER IS NOW THIS ACCOUNT'S TO USE, but the id still stays
+            # out of the log: the line records the outcome, as the ask's does.
+            log.info("device ask: joined at once (selected=%s, autoStarted=%s)",
+                     out["selected"], out["autoStarted"])
+            return out
 
         def _device_pair(self) -> None:
             """Pair a device to this account by its ACCESS CODE (the chat
@@ -5248,6 +5398,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._json(404, {"error": _NOT_LINKED_ERROR,
                                  "reason": "not_linked"})
                 return None
+            # ⛔⛔ THE STORED TICK IS READ BEFORE THE PRUNE, BECAUSE THE PRUNE
+            # REPLACES IT (wave 12). The row leaves `_decorate_devices` carrying the
+            # EFFECTIVE allow-all — false on a private computer whatever is stored —
+            # and `/device/visibility` needs the stored one: going private clears it
+            # only if it was set, and re-publishing writes `false` beside the publish
+            # only if an old `true` would otherwise come back. Same side channel as
+            # `_resolve_reason`, for the same reason: one caller wants it, and a
+            # second return shape would reach every other verb that gates here.
+            self._stored_allow_all = row.get("allowAll") is True
             self._decorate_devices([row], sess.uid,
                                    prefs.get_selected_device(sess.uid))
             if not row.get("owned"):
@@ -5357,7 +5516,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             ⛔⛔ DISCOVERY, NOT ACCESS, in the same words the machine's own
             `--visibility` uses. A findable computer is one strangers can SEE
             listed and ASK for; each of them still waits for the owner to say
-            yes, and who may READ the document does not change either way.
+            yes — UNLESS the owner has switched Allow all on (wave 12), which is
+            the one setting here that is about access — and who may READ the
+            document does not change either way.
 
             ⛔⛔ THERE IS NO WEB ROUTE TO RELAY. The app writes this field
             straight from the browser and the machine writes it from the
@@ -5378,6 +5539,22 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             the write did not land. A 5xx happened after the request went out and
             proves nothing at all, so the two get different sentences and the
             second one does not promise the machine is as it was.
+
+            ⭐⭐ ALLOW ALL RIDES THE SAME HANDLER (wave 12) — an optional
+            `allowAll` bool, one owner gate. `visibility` may be left out when
+            `allowAll` is given ("stop letting anyone join" says nothing about
+            being found). The writes follow the one rule the web app and the
+            machine follow too:
+              • allow all ON  → `{visibility:'public', allowAll:true}`, ONE patch —
+                it makes the computer public too (owner: "allow all would by
+                default make it public");
+              • allow all OFF → `allowAll:false` alone; the computer stays public;
+              • public OFF    → `{visibility:'private'}` alone and FIRST, then a
+                best-effort `{allowAll:false}` only if it was set — a narrowing
+                write must never be blocked by a lagging ruleset;
+              • public ON with no flag, from private → `allowAll:false` rides the
+                same patch if an old tick is stored, so it never comes back
+                unasked; with nothing stored the write is exactly today's.
             """
             body_in = self._read_json()
             device_id = _body_str(body_in, "deviceId")
@@ -5385,7 +5562,16 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._json(400, {"error": "deviceId is required"})
                 return
             value = _body_str(body_in, "visibility").lower()
-            if value not in ("public", "private"):
+            # ⛔ PRESENT IS NOT THE SAME AS TRUTHY. `false` is the whole OFF
+            # request, and a key sent as null is a malformed one, not an absent
+            # one — the rules would refuse the write it rode on.
+            has_all = "allowAll" in body_in
+            allow = body_in.get("allowAll")
+            if has_all and not isinstance(allow, bool):
+                self._json(400, {"reason": "allow_all_required",
+                                 "error": "say yes or no to letting anyone join"})
+                return
+            if value not in ("public", "private") and not (value == "" and has_all):
                 # ⛔ REFUSED HERE, BEFORE THE ROW IS EVEN READ. This is the one
                 # field on the device document whose VALUE the rules check, and a
                 # value they reject refuses the WHOLE update — so a typo would
@@ -5393,6 +5579,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # believes they made.
                 self._json(400, {"reason": "visibility_required",
                                  "error": "say public or private"})
+                return
+            if value == "private" and allow is True:
+                # ⛔ A CONTRADICTION, NOT A CHOICE TO MAKE FOR THEM. Allow all makes
+                # a computer public; a private one lets nobody in. Guessing which
+                # half was meant would either publish somebody's machine or quietly
+                # ignore the half that opens it.
+                self._json(400, {"reason": "allow_all_private",
+                                 "error": "a private computer can't let anyone "
+                                          "join — allow all makes it public"})
                 return
             acct = self._account()
             if acct is None:
@@ -5409,14 +5604,49 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # whose entire job is to close that door.
             current = _discovery_of(row)
             label = _public_label_of(row)
-            if value == current:
+            # `row` is decorated: its `allowAll` is the EFFECTIVE one, and the
+            # stored tick was read before the prune replaced it.
+            stored = self._stored_allow_all
+            current_all = row.get("allowAll") is True
+            want = "public" if allow is True else (value or current)
+            if want == "private":
+                want_all = False
+            elif has_all:
+                want_all = allow
+            else:
+                # ⛔ A FLAG-LESS "public" LEAVES AN ALLOW-ALL COMPUTER ALONE, and a
+                # private→public flip starts in approval mode whatever is stored.
+                want_all = current_all
+            # ⛔⛔ THE NO-OP COMPARES BOTH FIELDS. Comparing visibility alone
+            # answered "it is already public" to "stop letting anyone join" on a
+            # public computer — and never wrote, so the door stayed open.
+            if want == current and want_all == current_all:
+                if stored and not want_all:
+                    # ⭐ A private computer's leftover tick does nothing today, but
+                    # an old writer's re-publish would bring it back — so a request
+                    # that already holds, cleared quietly. Best effort: nothing the
+                    # person asked for depends on it.
+                    try:
+                        fs.set_device_allow_all(device_id, False)
+                    except (RevokedError, FirestoreError) as e:
+                        log.warning("could not clear a leftover allow-all: %s", e)
                 self._json(200, {"ok": True, "changed": False,
-                                 "visibility": current, "publicLabel": label,
-                                 "deviceId": device_id,
+                                 "visibility": current, "allowAll": current_all,
+                                 "publicLabel": label, "deviceId": device_id,
                                  "deviceName": row.get("name")})
                 return
             try:
-                fs.set_device_visibility(device_id, value)
+                if want == "private" or (want_all is False and not stored
+                                         and current == "private"):
+                    # Going private, or a plain publish with nothing stored: the
+                    # single-field write this bridge has always made.
+                    fs.set_device_visibility(device_id, want)
+                else:
+                    # ON (publishes in the same patch), OFF on a public computer
+                    # (`allowAll` alone), or a re-publish that must clear an old
+                    # tick in the same patch.
+                    fs.set_device_allow_all(device_id, want_all,
+                                            publish=want_all or current == "private")
             except RevokedError:
                 self._json(401, {"error": "session revoked — run /login again"})
                 return
@@ -5433,12 +5663,25 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                                       if refused else
                                       "could not confirm that change — it may or "
                                       "may not have been saved"),
-                            "visibility": current if refused else None})
+                            "visibility": current if refused else None,
+                            "allowAll": current_all if refused else None})
                 return
-            log.info("device visibility: %s on %s", value, device_id)
-            self._json(200, {"ok": True, "changed": True, "visibility": value,
-                             "publicLabel": label, "deviceId": device_id,
-                             "deviceName": row.get("name")})
+            if want == "private" and stored:
+                # ⛔⛔ THE SECOND WRITE, AND ONLY AFTER THE FIRST LANDED. The door is
+                # already shut — every reader gates on public — so a refusal here
+                # (a ruleset that has not learned `allowAll` yet) is logged, never
+                # reported: the hide the person asked for DID happen. What it
+                # prevents is a later Public-on reopening the door unasked.
+                try:
+                    fs.set_device_allow_all(device_id, False)
+                except (RevokedError, FirestoreError) as e:
+                    log.warning("hid %s, but could not clear its allow-all: %s",
+                                device_id, e)
+            log.info("device visibility: %s (allow all %s) on %s", want,
+                     "on" if want_all else "off", device_id)
+            self._json(200, {"ok": True, "changed": True, "visibility": want,
+                             "allowAll": want_all, "publicLabel": label,
+                             "deviceId": device_id, "deviceName": row.get("name")})
 
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,
                             fs: FirestoreRest) -> str | None:

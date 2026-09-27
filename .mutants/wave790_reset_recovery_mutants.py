@@ -133,7 +133,11 @@ DOCTOR = ('        _cred_actions = credential_remedy(credential_state_now())')
 VIS_STATE = ('        state = credential_state_now()\n'
              '        remedy = credential_remedy(state)')
 #: The verdict a person who asked for a change is owed.
-VIS_VERDICT = ('        if value != _VISIBILITY_SHOW:')
+# ⛔ RE-ANCHORED 2026-09-26 (wave 12). `--allow-all yes` arrives with `value`
+# still the show sentinel, so the verdict now asks whether EITHER flag carried a
+# word. W10 (`if False:`) and W11 (`if True:`) mean what they meant; the new
+# half of the condition has its own mutant, A11 in wave12_allow_all_machine.
+VIS_VERDICT = ('        if value != _VISIBILITY_SHOW or allow_all is not None:')
 #: The relink exit's supervisor question.
 RELINK_SUP = ('                if _supervisor_is_my_parent():')
 #: The once-only marker on the re-exec.

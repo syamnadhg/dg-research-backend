@@ -819,6 +819,49 @@ class FirestoreRest:
         self._request("PATCH", f"{target}?updateMask.fieldPaths=visibility",
                       json_body={"fields": {"visibility": to_value(value)}})
 
+    def set_device_allow_all(self, device_id: str, value: bool, *,
+                             publish: bool = False) -> None:
+        """Set whether anyone who asks joins this machine at once — `allowAll`.
+
+        ⛔⛔ ALLOW ALL ON ALWAYS PUBLISHES, IN THE SAME PATCH (owner, 2026-09-26:
+        "allow all would by default make it public"). A true `allowAll` on a
+        private computer does nothing — every reader gates on public first — so
+        switching it on without publishing would answer "done" over a door that
+        is still shut; and publishing in a SECOND request lets a lagging ruleset
+        land one half and refuse the other. One PATCH, two literal masks, is the
+        only shape where both land or neither does.
+
+        ⛔ `publish=True` WITH `False` IS THE RE-PUBLISH OF A COMPUTER THAT STILL
+        CARRIES AN OLD TICK. Going public again writes `allowAll: false` beside
+        `visibility` so an old writer's leftover can never come back unasked.
+        Plain `False` is the narrowing write — `allowAll` alone, so a ruleset that
+        has not learned the field refuses it rather than widening anything.
+
+        ⛔⛔ THE SAME TWO GUARDS AS `set_device_visibility`, FOR THE SAME REASON.
+        The field names are literals in the mask, never a parameter, so no caller
+        can rename a machine through this door; and the values are checked here,
+        nearest the wire, because a value the rules reject (`allowAllWriteIsValid`
+        wants a bool) refuses the WHOLE update — including the publish riding with
+        it. `bool` only: `1` and `"true"` are refused, not coerced.
+
+        ⛔ AND IT NEVER DELETES THE FIELD. The web may clear it with deleteField;
+        this writer and the machine's write `false`, which every reader treats the
+        same as absent — and which a rule's `is bool` check can see.
+        """
+        if not isinstance(value, bool) or not isinstance(publish, bool):
+            raise ValueError(
+                f"allowAll and publish must be booleans, not {value!r}/{publish!r}")
+        target = f"{config.FIRESTORE_BASE}/devices/{device_id}"
+        if value or publish:
+            self._request(
+                "PATCH", f"{target}?updateMask.fieldPaths=visibility"
+                         f"&updateMask.fieldPaths=allowAll",
+                json_body={"fields": {"visibility": to_value("public"),
+                                      "allowAll": to_value(value)}})
+        else:
+            self._request("PATCH", f"{target}?updateMask.fieldPaths=allowAll",
+                          json_body={"fields": {"allowAll": to_value(False)}})
+
     def update_research(self, uid: str, rid: str, patch: dict[str, Any], *,
                         delete_fields: list[str] | None = None) -> None:
         """PATCH users/{uid}/researches/{rid} with `patch` (top-level fields), and

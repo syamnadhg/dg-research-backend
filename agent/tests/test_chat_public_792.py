@@ -497,10 +497,13 @@ def test_the_skill_no_longer_promises_it_cannot_reach_anyone_elses_data():
     # positive half names all three. Asserted positively for the reason 7.9-2
     # recorded: "the false promise is absent" is satisfied by deleting the whole
     # bullet, and a mutant proved that.
+    # ⛔ WAVE 12: FOUR. Allow all lets any signed-in stranger onto the user's
+    # computer with no step between — the widest of them — so it is named with the
+    # other three, and the count moved with it.
     low = " ".join(_skill().lower().split())
     assert "you cannot reach anyone else's data" not in low
-    assert "three things reach past it" in low
-    for reach in ("**asking**", "**answering**", "**publishing**"):
+    assert "four things reach past it" in low
+    for reach in ("**asking**", "**answering**", "**publishing**", "**allow all**"):
         assert reach in low, reach
 
 

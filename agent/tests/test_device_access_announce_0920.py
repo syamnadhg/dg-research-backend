@@ -159,7 +159,9 @@ def test_the_ask_tells_the_bridge_which_chat_is_waiting(monkeypatch, capsys):
     chat made it."""
     seen = {}
 
-    def post(path, body=None):
+    # ⭐ `**_kw` SINCE WAVE 12: the ask passes its own fifty-second wait now, and a
+    # seam's stub has to be at least as tolerant as the thing it replaces.
+    def post(path, body=None, **_kw):
         seen["path"], seen["body"] = path, body
         return 200, {"ok": True, "deviceId": "dev1", "status": "pending"}
 
@@ -182,7 +184,7 @@ def test_a_terminal_ask_carries_no_origin_and_parks_nothing(monkeypatch):
     `agent device ask` behaves exactly as it did."""
     seen = {}
 
-    def post(path, body=None):
+    def post(path, body=None, **_kw):   # **_kw: see the test above (wave 12)
         seen["body"] = body
         return 200, {"ok": True, "deviceId": "dev1", "status": "pending"}
 

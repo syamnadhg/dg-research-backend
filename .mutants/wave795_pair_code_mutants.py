@@ -167,10 +167,12 @@ MUTANTS = [
      [('                for k in [k for k in d if k not in _DEVICE_PUBLIC_KEYS]:\n                    del d[k]\n            return devs', '                pass\n            return [{k: d[k] for k in _DEVICE_PUBLIC_KEYS if k in d} for d in devs]')]),
     ('P4', BRIDGE, 'over',
      '⛔⛔ `pairCode` JOINS THE ALLOW-LIST — the one field that hands over the machine',
-     [('_DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",\n                       "owned", "selected", "online", "visibility")', '_DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",\n                       "owned", "selected", "online", "visibility", "pairCode")')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the list gained `allowAll`; same defect.
+     [('_DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",\n                       "owned", "selected", "online", "visibility", "allowAll")', '_DEVICE_PUBLIC_KEYS = ("id", "name", "hostname", "machineName",\n                       "owned", "selected", "online", "visibility", "allowAll", "pairCode")')]),
     ('P5', BRIDGE, 'over',
      "⛔⛔ CROSS-VERIFY'S OWN WIDENING, verbatim: `logins`, `workers` and `queueOwners` join the list, publishing which AI accounts are signed in on the machine plus other people's uids and run ids. It left 16/16 GREEN before the expected set became a literal",
-     [('                       "owned", "selected", "online", "visibility")', '                       "owned", "selected", "online", "visibility",\n                       "logins", "workers", "queueOwners")')]),
+     # ⭐ RE-AIMED 2026-09-26 (wave 12): the list gained `allowAll`; same defect.
+     [('                       "owned", "selected", "online", "visibility", "allowAll")', '                       "owned", "selected", "online", "visibility", "allowAll",\n                       "logins", "workers", "queueOwners")')]),
     ('P6', BRIDGE, 'under',
      "⛔⛔ THE BROWSE RELAY LOSES ITS PRUNE and goes back to passing the web app's array through byte for byte — measured with a stubbed upstream to return a plaintext pair code whole",
      [('                "devices": [{k: d[k] for k in _PUBLIC_DEVICE_KEYS if k in d}\n                            for d in rows if isinstance(d, dict)],', '                "devices": rows,')]),
