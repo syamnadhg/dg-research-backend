@@ -70,12 +70,22 @@ def _sess(uid="u1", email="e@x.y"):
     return SimpleNamespace(uid=uid, email=email, id_token=lambda force=False: "tok")
 
 
+class _Server(ThreadingHTTPServer):
+    """⛔ A BACKLOG FOR THE CONCURRENT-POLLS TEST (2026-09-26). socketserver's
+    default `request_queue_size` is 5, and that test opens 8 connections at once:
+    macOS enforces the listen backlog and RESETS the extra connections, so it
+    failed on this Mac every time it ran alone ("Connection reset by peer") and
+    passed on Windows, which queues them. The race it measures is in the handler,
+    not in the accept queue."""
+    request_queue_size = 64
+
+
 def _live(monkeypatch, uid="u1"):
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     FakeFS.devices = []
     state = bridge.BridgeState()
     state.set_session(_sess(uid))
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
+    httpd = _Server(("127.0.0.1", 0), bridge._make_handler(state))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return f"http://127.0.0.1:{httpd.server_address[1]}", state, httpd
 

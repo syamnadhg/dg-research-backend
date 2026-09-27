@@ -314,6 +314,84 @@ def test_someone_who_picked_only_zero_gets_only_that(monkeypatch):
     assert "--machine" not in out
 
 
+# ── the same two promises on the OTHER route in (2026-09-26) ─────────────────
+#
+# ⛔⛔ EVERY TEST ABOVE SAYS `--runs 0`, AND `--runs 0` NEVER REACHES THE BRANCH
+# THEY WERE WRITTEN FOR. Wave 8 added an early return (`_agent_log_only_request`)
+# that catches an explicit "the log and nothing else" before the run list is
+# fetched, so those tests exercise the early return and its best-effort hint. The
+# send at the BOTTOM — reached when the run list comes back empty — is taken by
+# bare `--agent-log` ("everything that computer holds, and the log as well") and by
+# `--runs 0,all`, and until now no test drove either.
+
+@pytest.mark.parametrize("published", [True, False],
+                         ids=["holds-none-of-theirs", "published-no-list"])
+@pytest.mark.parametrize("spec", [{"agent_log": True}, {"runs": "0,all"}],
+                         ids=["--agent-log", "--runs 0,all"])
+def test_the_agent_log_goes_when_the_computer_lists_nothing_else(monkeypatch,
+                                                                  published, spec):
+    """⛔⛔ THEY ASKED FOR THE AGENT'S LOG, AND IT IS THE ONE THING LEFT TO SEND.
+    The research computer lists none of this person's runs (or has published no
+    list at all), so the runs half of the request is empty and the log is all that
+    remains. That is a complete request, and it has to be SENT under its own
+    support code — not answered "There's nothing to send" about the one thing they
+    picked.
+
+    ⭐ "Research computer:" is asserted because it is printed only on the run-list
+    route: it proves this reached the send at the bottom of `cmd_send_logs`, not the
+    early return that the `--runs 0` tests above go through.
+
+    Would this pass against the mutant? No: with the bottom branch removed (P7) the
+    command falls through to "There's nothing to send", exits 1 and makes no
+    upload call, so the exit code, the wire and the sentence assertions all fail."""
+    wire = _Wire(rows=[], owned=True, published=published)
+    rc, out = _run(monkeypatch, _args(**spec), wire)
+    assert "Research computer: Studio PC" in out, "the run-list route was not taken"
+    assert "There's nothing to send" not in out, (
+        "the one thing they picked was reported as nothing")
+    assert rc == 0, out
+    assert wire.posts == ["/logs/agent-log"], "no bundle, and the log itself went"
+    assert wire.bodies[-1] == {"standalone": True}
+    assert "Support code: SOLO7X2M" in out
+
+
+def test_a_sharer_saying_agent_log_with_no_listed_runs_is_not_sent_round_to_machine(
+        monkeypatch):
+    """⛔ THE CIRCLE, ON THE ROUTE THE `--runs 0` TESTS DO NOT TAKE. A person who
+    shares a research computer (does not own it) says `--agent-log`, and that
+    computer lists none of their runs. The log goes on its own — and the plan must
+    NOT tell them to "add --machine", because this very command refuses `--machine`
+    to anybody but the owner. Following the advice would only get them a refusal.
+
+    ⭐ THREE LEGS, SO THE ABSENCE MEANS SOMETHING: the sharer's plan was really
+    printed and the log really went (the branch was reached); the owner in the same
+    state IS offered `--machine` (so the check is looking for the text the offer
+    actually uses); and a sharer who adds `--machine` anyway is refused (so an
+    offer to them would be a circle, not a detour).
+
+    Would this pass against the mutant? No: X6 passes `offer_machine=True`
+    regardless of ownership, so the sharer's plan prints "If the trouble is
+    reaching Studio PC at all, add --machine …" and the `--machine`-absent
+    assertion fails."""
+    sharer = _Wire(rows=[], owned=False)
+    rc, out = _run(monkeypatch, _args(agent_log=True), sharer)
+    assert rc == 0, out
+    assert sharer.posts == ["/logs/agent-log"]
+    assert "You will get a support code of its own to quote." in out
+    assert "--machine" not in out, (
+        "a sharer was offered --machine, which the next call refuses them")
+
+    owner = _Wire(rows=[], owned=True)
+    _, owner_out = _run(monkeypatch, _args(agent_log=True), owner)
+    assert "If the trouble is reaching Studio PC at all, add --machine" in owner_out
+
+    retry = _Wire(rows=[], owned=False)
+    rc_retry, retry_out = _run(monkeypatch, _args(agent_log=True, machine=True), retry)
+    assert rc_retry == 1
+    assert "belong to whoever owns it" in retry_out
+    assert retry.posts == []
+
+
 # ── the parser no longer crashes on a token argparse accepts ─────────────────
 
 @pytest.mark.parametrize("token", ["²", "٣", "+-1", "1.0", "١"])

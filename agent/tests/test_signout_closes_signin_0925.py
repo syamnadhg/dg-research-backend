@@ -439,18 +439,26 @@ def test_ack_refuses_a_note_from_another_sign_in(monkeypatch):
 # ── (g) every step of the announce leaves a line ──────────────────────────────
 
 def test_the_announce_lifecycle_is_logged_at_info(monkeypatch, caplog):
+    # ⛔ A CHAT ID NOTHING ELSE CAN SPELL (2026-09-26 review). This used TG's "111"
+    # and searched `caplog.text`, whose format carries `file:lineno` — so a later
+    # edit that put a logging call on line 1110-1119, 2111, … failed it with "the
+    # raw chat id never goes to the log" though no chat id was logged. Only the
+    # messages are read now, for an id that cannot occur by accident.
+    raw = "chat-8c1f-raw"
+    origin = {"platform": "telegram", "chat_id": raw}
     caplog.set_level(logging.INFO, logger="facade")
     with _bridge(monkeypatch, _sess()) as (base, state):
-        _park(state, TG)
+        _park(state, origin)
         _updates(base, platform="telegram", chat="222", watchdog=1)     # not its chat
-        _updates(base, platform="telegram", chat="111", watchdog=1)     # its chat
+        _updates(base, platform="telegram", chat=raw, watchdog=1)       # its chat
     text = caplog.text
-    slug = bridge.push.origin_slug(TG)
+    slug = bridge.push.origin_slug(origin)
     assert f"sign-in note parked: ts=7000 for {slug}" in text
     assert "sign-in note put back: ts=7000" in text
     assert f"sign-in note ts=7000 taken by watchdog for {slug}" in text
     assert f"sign-in note ts=7000 delivered to watchdog for {slug} — committed" in text
-    assert "111" not in text.replace("7000", ""), "the raw chat id never goes to the log"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert raw not in messages, "the raw chat id never goes to the log"
 
 
 def test_a_failed_send_is_logged_as_rolled_back(monkeypatch, caplog):

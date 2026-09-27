@@ -1392,6 +1392,33 @@ def test_a_publish_request_is_not_a_pairing_request(said):
     assert "access code" not in " ".join(lines or []), (said, lines)
 
 
+@pytest.mark.parametrize("said", [
+    "add my computer to the public list",
+    "add my mac to the public directory",
+])
+def test_a_publish_request_gets_the_publish_confirm_not_the_devices_screen(chat, said):
+    """⛔ W14, ASSERTED POSITIVELY. "Add my computer to the public list" asks to
+    PUBLISH a machine, and the pairing rule — above everything, `add` in its verb
+    list — answered it with the devices screen. The guard above only says "access
+    code" is absent, which the devices screen satisfies too, so W14 survived the
+    10.10 close sweep. This runs the real chat entry (`sr.py do`) and requires the
+    one reply only the publish branch prints, with nothing sent to the bridge
+    before the person says yes.
+
+    Would this pass against the mutant? No: with the public guard never firing
+    the message falls into the pairing branch, `do` runs `devices`, which reads
+    GET /devices off this fake bridge and prints the device screen — the publish
+    confirm is never printed and a bridge call is recorded."""
+    rc = sr.main(["do", said])
+    out = " ".join(chat.out().split())
+    confirm = " ".join(sr._NL_CONFIRMS["device-visibility"]
+                       .format(name="that computer").split())
+    assert confirm in out, (said, out)
+    assert rc == 0
+    # The confirm is a question: nothing is read or written until the yes.
+    assert chat.calls == [], (said, chat.calls)
+
+
 @pytest.mark.parametrize("said,who", [
     ("grant access to sam", "sam"),
     ("approve access for jane", "jane"),

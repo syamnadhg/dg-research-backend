@@ -344,6 +344,39 @@ def test_a_session_that_ends_mid_answer_is_not_called_signed_in(monkeypatch, cap
     assert "Signed in" not in out and "Not signed in" in out, out
 
 
+def test_log_me_in_as_the_session_ends_starts_a_sign_in_not_a_claim_of_one(monkeypatch,
+                                                                          capsys):
+    """⛔ `login` IS THE THIRD READER OF THAT 401, and no test ran it (2026-09-26
+    review). `/status` said signed in, then the ack said the session had ended: the
+    person must get a sign-in link — never "You're already signed in as e@x.y — say
+    log out to switch accounts", with no link, for a session that is gone.
+
+    Would this pass against a `login` that ignored the ack's 401? No: it would print
+    the already-signed-in line and post nothing to /login/remote/start."""
+    posted: list = []
+
+    def _post(p, b=None, timeout=None):
+        posted.append(p)
+        if p == "/signin/ack":
+            return 401, {"error": "not signed in", "authed": False}
+        if p == "/login/remote/start":
+            return 200, {"verifyUrl": "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT",
+                         "code": "WDJB-MJHT", "expiresIn": 600}
+        return 200, {}
+
+    monkeypatch.setattr(sr, "_get", lambda p, timeout=None: (
+        200, {"authed": True, "email": "e@x.y"}))
+    monkeypatch.setattr(sr, "_post", _post)
+    # like every other `login` test here: never arm a real watcher from a shell
+    # that happens to carry a live Hermes chat's session variables
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: ([], {}, 0))
+    sr.main(["login"])
+    out = capsys.readouterr().out
+    assert "signed in as" not in out.lower(), out
+    assert "/login/remote/start" in posted, posted
+    assert "https://superresearch.io/connect?runtime=hermes&code=WDJB-MJHT" in out, out
+
+
 # ── 4. the routes ────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("said", [

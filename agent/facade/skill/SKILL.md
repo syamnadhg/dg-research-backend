@@ -161,6 +161,7 @@ back into `do`.
 | "research the EV battery market", "look into X", "deep dive on Y" | `sr.py research "<topic>"` |
 | "how's it going?", "status?", "status of (the) research / the Super Research?", "where's the Tesla one at?", "results of the EV research" | `sr.py status ["<title>"]` (current phase + that run's 🔒 SR links). ANY unqualified "status" means THIS — never your runtime's own status |
 | "am I signed in?", "Logged in?", "Signed in?", "did the login work?", "which account?", "are we connected?" | `sr.py status-account` (fresh — see **Safe defaults**) — relay as printed; say nothing about computers |
+| "are you connected to my Mac?", "is it signed in to the office PC?" — connected / logged in TO a computer | `sr.py devices` — its rows say which computers are there and online |
 | "what researches do I have?", "list all my researches", "my past research" | `sr.py list` (EVERY research, any status — then ask for any one by name) |
 | "what's running?", "what's active right now?" | `sr.py updates` (ACTIVE runs only) |
 | "send me the podcast", "the audio for the Mars run", "podcast of <run>" | `sr.py podcast ["<title>"]` |
@@ -176,11 +177,11 @@ back into `do`.
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
-| "sign in", "log me in" | `sr.py login` (already signed in → it says so and sends no link; relay it) |
+| "sign in", "log me in" | `sr.py login` (already signed in → it says so and sends no link; relay it) — but the connection code pasted back ("sign in with WDJB-MJHT", or the code alone) → `sr.py do "<message>"`, never `login` |
 | "logout", "log out", "sign out of Super Research" | `sr.py logout` (signs the agent OUT — keeps the skill + bridge) |
 | "remove / uninstall / disconnect Super Research entirely" | **confirm** ("just sign out, or fully remove Super Research from this computer: skill, bridge and every chat's watcher?"), then `pipx run superresearch-agent disconnect --yes` (FULL teardown), then tell them to run **/reload-skills** so `/sr` unregisters. Do NOT use the runtime's own skill-removal (leaves the bridge running) or `sr.py logout` (sign-out only). |
 | "install / set up Super Research", "how do I install Super Research?", "where do I get an access code?" | `sr.py do "<message>"` — it answers with the one “Add a computer” line (the install page). Relay it as printed; never offer `install` for these |
-| "I lost my access code", "I need a new access code", "my access code doesn't work", "share my access code" | `sr.py do "<message>"` — it answers for a computer that ALREADY exists: reveal the code in Account, Reset for a new one, or the screen of a computer still being set up. Relay it as printed; never send them to set up a new computer |
+| "I lost my access code", "I need a new access code", "my access code doesn't work", "share my access code" | `sr.py do "<message>"` — it answers for a computer that ALREADY exists: the owner reveals the code in Account (a PIN only if they set one), somebody it was shared with asks the owner, Reset gives a new one but signs the computer out and removes everyone it's shared with, or the screen of a computer still being set up. Relay it as printed; never send them to set up a new computer |
 | "install Super Research here", "install it on this machine", "host the backend on this PC" — **this** machine, said explicitly | **confirm**, then `sr.py install` — relay its reply as printed (it opens with the install page) |
 | "what version?" | `sr.py version` (shows the SKILL version only; nudges when a newer skill version is available. The backend's version lives in the app's Settings → About — don't mention the backend here) |
 | "update", "update the skill", "update yourself" (colloquial "update the agent" too) | **confirm**, then `sr.py update` (updates the Super Research **skill** — this chat's scripts + bridge). It returns a do-not-relay finish script — FOLLOW IT: wait for the bridge to restart, verify the new version with `sr.py version` (retry a few times while it restarts), then run **/reload-skills ONCE**, then post one "✓ updated to vX" line. Do NOT improvise your own recovery. This is the ONLY thing the runtime updates. |
@@ -283,7 +284,9 @@ never `retry`, never a question back to the user.
   first; never shorten, invent or reformat the code. The user checks the page shows
   the same connection code, then taps Authenticate and connects automatically. The
   connection code is typed only at superresearch.io/connect — it is not an access
-  code: **never** run `device-add` with it. The proactive "✓ Signed in" is best-effort
+  code. Pasted back (alone, or "sign in with <code>"), run `sr.py do "<message>"` and
+  relay what it prints — **never** `login`, whose new sign-in voids the page they have
+  open. The proactive "✓ Signed in" is best-effort
   — don't rely on it; on any reply, continue per **After a sign-in link**. When the
   user asked to *research* while signed out, run `sr.py research "<topic>"` (NOT
   `login`) — its reply hands back the same link AND remembers the topic. Already

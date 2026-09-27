@@ -126,14 +126,23 @@ _ADD_A_COMPUTER = (f"Add a computer: set one up at {_INSTALL_PAGE_URL}, then sen
 # (the page's setup ends in the pairing step, which mints a NEW computer and drops
 # everybody it was shared with). They reached the catch-all, and the assistant
 # improvised where a code lives. Three true places, checked against the web app:
-# the owner's tap-to-reveal on the computer's tile in Account (PIN-gated), Reset in
-# Settings → Manage devices (the new code is emailed), and — mid-setup — the screen
-# of the computer being set up.
-_LOST_CODE_REPLY = ("If the computer's already on your account, open Account in the "
-                    "web app and reveal the access code on that computer's tile "
-                    "(you'll enter your PIN). For a new one, use Reset in Settings → "
-                    "Manage devices and we'll email it to you. If you were still "
-                    "setting it up, the code is on that computer's screen.")
+# the owner's tap-to-reveal on the computer's tile in Account, Reset in Settings →
+# Manage devices (an Approve link and the new code are emailed), and — mid-setup —
+# the screen of the computer being set up.
+# ⛔⛔ AND THREE THINGS IT SAID WERE WRONG (2026-09-26, checked against the web app
+# again): the PIN is asked only if one was SET (the reveal prompts only with the
+# access-code lock on); only the OWNER can reveal or reset a code (the pair-code
+# route checks ownership), so somebody it was shared with must ask them; and Reset
+# is not free — it signs that computer out and clears everyone it's shared with,
+# for good (approving brings the computer back, not them).
+_LOST_CODE_REPLY = ("If it's your own computer, open Account in the web app and reveal "
+                    "the access code on that computer's tile (if you've set an "
+                    "access-code PIN, you'll enter it). If somebody shared the computer "
+                    "with you, ask its owner — only they can see or change its code. "
+                    "For a new code, use Reset in Settings → Manage devices: we'll email "
+                    "you an Approve link and the new code — but Reset also signs that "
+                    "computer out, and everyone it's shared with loses access. If you "
+                    "were still setting it up, the code is on that computer's screen.")
 
 # ⛔⛔ THE SAME CLAIM ON EVERY SCREEN THAT MAKES IT. The consent question was
 # corrected in 7.9-2 — the owner sees the NAME, and the email only when no name is
@@ -1666,7 +1675,12 @@ def cmd_devices(args) -> int:
         # and it goes silently wrong: every public computer would read private,
         # with no error anywhere.
             state = ", public" if d.get("visibility") == "public" else ", private"
-        lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state})")
+        # ⛔ AND WHETHER IT IS ONLINE (2026-09-26). SKILL.md now sends "are you
+        # connected to my Mac?" here, and a row that never said online or offline
+        # was read as "yes, connected" for a Mac that was switched off — the very
+        # answer that route replaced. The bridge sends `online` on every row.
+        presence = " · online" if d.get("online") else " · offline"
+        lines.append(f"  {mark} {_dev_label(d)}  ({kind}{state}){presence}")
     if not selected:
         lines.append("Tell me which one you’d like to use.")
     # ⛔⛔ A NO-CODE "add a device" NOW LANDS HERE TOO, so this branch has to
@@ -1782,6 +1796,15 @@ _PAIR_ERRORS = {
     "signin_code_used": "That’s your connection code — you’re already signed in with "
                         "it. It isn’t a computer’s access code.",
 }
+# …and one the bridge no longer recognises (restarted, or past the sign-in's life):
+# see `cmd_device_add`. ⛔ Only a signed-in person reaches it — signed out, the
+# bridge answers 401 before any claim — and ~2% of real access codes have the same
+# eight-consonant shape, so it says both, and promises no link (cross-verify r2).
+_STALE_CONNECTION_CODE = ("That looks like a connection code — you’re already signed in, "
+                          "and it doesn’t add a computer. If it’s a computer’s access code, "
+                          "check it against the code on that computer’s screen.")
+_SIGN_IN_ENDED = ("That sign-in has ended, so its connection code no longer works. Say "
+                  "log me in and I’ll send a fresh link and code.")
 
 # Friendly wording for the web app's UNPAIR-SELF route — the codes
 # `device-remove` can receive. All nine are worded, including the two the agent
@@ -1832,6 +1855,22 @@ def cmd_device_add(args) -> int:
             err = reason
         msg = _device_refusal_line(err, _PAIR_ERRORS, "add the device",
                                    body.get("retryAfterMs"))
+        # ⛔ A CONNECTION CODE THE BRIDGE NO LONGER KNOWS (2026-09-26). After a
+        # bridge restart, or past the sign-in's life, the bridge does not refuse the
+        # sign-in's own code: it goes to the claim route like any other and came back
+        # "No computer is waiting for that code" or "never use I, L, O" — about a code
+        # the person never had. A code in the connection code's shape (eight
+        # consonants) that the claim route does not know is answered as one. Not a
+        # table entry: the pair table is pinned to the claim route's own codes.
+        if (err in ("code_not_found", "invalid_code_format")
+                and _connection_shaped(str(args.code or ""))):
+            msg = _STALE_CONNECTION_CODE
+        # ⛔ …AND SIGNED OUT, THE SIGN-IN IT BELONGED TO HAS ENDED (cross-verify r3).
+        # A pending sign-in's code is refused before the session check, so a 401
+        # here means that flow expired or the bridge restarted. "Tell me to log you
+        # in" was true but blind; this says why, and what to say.
+        if code == 401 and _connection_shaped(str(args.code or "")):
+            msg = _SIGN_IN_ENDED
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
     action = body.get("action")
     name = body.get("deviceName") or "the new device"
@@ -4658,11 +4697,117 @@ def _stream_health_lines(runs: list) -> list[str]:
 # is relayed verbatim). Non-destructive intents run immediately; destructive
 # ones print the confirm question and the AI runs the real command on "yes".
 
-# Both alternatives REQUIRE a digit — every real access code has one, and
-# without it ordinary hyphenated words ("real-time", "high-tech") match the
-# dashed form and hijack the message into device-add.
+# Both alternatives REQUIRE a digit — without it ordinary hyphenated words
+# ("real-time", "high-tech") match the dashed form and hijack the message into
+# device-add. A code with NO digit is read separately, by `_digitless_code`.
 _NL_CODE_RE = re.compile(
     r"\b((?=[A-Z0-9-]*\d)[A-Z0-9]{4}-[A-Z0-9]{4})\b|\b((?=[A-Z]*\d)[A-Z0-9]{8})\b", re.I)
+
+# ⛔⛔ A CODE WITH NO DIGIT (2026-09-26). "Every real access code has one" was
+# false: the web app draws all eight characters uniformly from 31 (2-9, A-Z minus
+# I, L, O), so ~1 in 11 has none — pasted alone, it reached the catch-all. The
+# CONNECTION code the chat now prints never has one (8 of BCDFGHJKLMNPQRSTVWXZ):
+# pasted back as "sign in with WDJB-MJHT" it went to `login`, whose new sign-in
+# voided the page already open. Rule 1 reads them through `_digitless_code`, only
+# when the message holds no digit code (a digit code wins wherever it is — a
+# machine named STARGATE ahead of "code K7XQ-9B2M" is never paired instead), and
+# only in shapes and places a word does not take:
+#   · the connection code's eight CONSONANTS (no English word), any case, with a
+#     dash, an en or em dash, or nothing between the halves — a space only when
+#     the message says sign in, or the whole message is the code in capitals;
+#   · the access code's letters in CAPITALS (no I, L or O), dashed or not;
+#   · any case, right after "code", "code is", "code:", "code=" or "pair".
+# It pairs one only when the message IS the code (with at least five different
+# letters — not "hmmmmmmm" or "HAHAHAHA"), when "code" or "pair" comes RIGHT
+# BEFORE it, when the message says sign in (a connection-shaped code), or when it
+# pairs a machine ("add my computer KXMH-WRTQ"). Never inside quotes (a run
+# title), never in a research request, a question or a message about support
+# logs; "I lost my access code for THEBEAST" still gets the lost-code answer.
+# ⛔ FIRST VERSION, SAME DAY: a digitless alternative inside `_NL_CODE_RE` took the
+# LEFTMOST match — "pair my computer STARGATE with code K7XQ-9B2M" paired
+# STARGATE — and "code" anywhere made any word in capitals a code. Cross-verify.
+# Where a code goes is the bridge's call: /device/pair refuses the sign-in's own
+# code in its own words and claims anything else as the access code it may be.
+_DASHES = "-‐‑‒–—―−"                      # a hyphen, and every dash a phone substitutes
+_CONNECTION_LETTERS = "BCDFGHJ-NP-TV-XZ"   # BCDFGHJKLMNPQRSTVWXZ
+_ACCESS_LETTERS = "A-HJKMNP-Z"            # the access code's letters: no I, L, O
+_CONN = rf"[{_CONNECTION_LETTERS}]{{4}}(?:\s*[{_DASHES}]\s*|\s)?[{_CONNECTION_LETTERS}]{{4}}"
+_NL_CONNECTION_CODE_RE = re.compile(rf"\b({_CONN})\b", re.I)
+_NL_CAPS_CODE_RE = re.compile(rf"\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?[{_ACCESS_LETTERS}]{{4}})\b")
+# A sign-in INSTRUCTION, never the past tense: "I signed in with WDJB-MJHT" says the
+# sign-in is done, and goes on to `login-done` as it always did.
+_SIGN_IN_ASK = r"(?:(?:sign|log)\s?(?:me\s+|back\s+)?in|login|signin|authenticate)"
+_NL_CODE_NEAR_RE = re.compile(
+    rf"\b(?:{_SIGN_IN_ASK}|code|pair)\b[^\w\"“”]*(?:(?:with|using|is|the|my|connection|"
+    rf"code|please)\W+){{0,4}}({_CONN})\b"
+    rf"|\b({_CONN})\W+(?:\w+\W+){{0,2}}?(?:to\s+(?:sign|log)\s?in|(?:sign|log)\s+me\s+in)\b",
+    re.I)
+_NL_CAPS_CODE_NEAR_RE = re.compile(
+    rf"\b(?i:code)(?:\s+(?i:is))?\s*[:=]?\s*([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?"
+    rf"[{_ACCESS_LETTERS}]{{4}})\b"
+    rf"|\b(?i:pair)\s+([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\b")
+_NL_SIGNED_IN_ALREADY_RE = re.compile(
+    r"\b(?:i|i'm|i’m|im|i am|i've|i’ve|ive|i have)\b[^.?!]*\b(?:signed|logged)\s+in\b"
+    r"|\b(?:authenticated|tapped)\b")
+
+
+def _nl_code_key(tok: str) -> str:
+    """The token as the web app compares it: letters and digits only, upper case."""
+    return re.sub(r"[^A-Za-z0-9]", "", tok).upper()
+
+
+def _connection_shaped(tok: str) -> bool:
+    return re.fullmatch(rf"[{_CONNECTION_LETTERS}]{{8}}", _nl_code_key(tok), re.I) is not None
+
+
+def _digitless_code(t: str, low: str) -> "str | None":
+    """The code with no digit that rule 1 pairs, or None — see the note above."""
+    if _NL_RESEARCH_RE.match(t):
+        return None
+    if re.match(r"^(?:\W*)(?:status|state|check|show|list|progress|what|which|who|"
+                r"where|why|how|is|are|did|does|has|have)\b", low):
+        return None
+    if re.search(r"\b(?:support|logs|diagnostics)\b", low):   # not "log me in"
+        return None
+    if _NL_SIGNED_IN_ALREADY_RE.search(low):                  # a report, not an ask
+        return None
+    plain = _NL_QUOTED_RE.sub(" ", t)
+    whole = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", plain if plain.strip() else t)
+    # 1. The message IS the code. A connection-shaped one (eight consonants, never a
+    #    word) needs four different letters — not "hmmmmmmm" — and, split by a
+    #    space, capitals ("psst hmmm" is words); one in capitals with vowels needs
+    #    five — not "HAHAHAHA".
+    if (_NL_CONNECTION_CODE_RE.fullmatch(whole) and len(set(_nl_code_key(whole))) >= 4
+            and (" " not in whole or whole.isupper())):
+        return whole
+    if _NL_CAPS_CODE_RE.fullmatch(whole) and len(set(_nl_code_key(whole))) >= 5:
+        return whole
+    # 2. A connection-shaped code RIGHT NEXT TO a sign-in instruction or "code" /
+    #    "pair" — "sign in with WDJB-MJHT", "log me in: WDJB-MJHT", "WDJB-MJHT to
+    #    sign in", "the connection code is WDJB-MJHT".
+    m = _NL_CODE_NEAR_RE.search(plain)
+    if m:
+        return m.group(1) or m.group(2)
+    # 3. An access code in CAPITALS right after "code" — "my code is KAXE-WRTQ" —
+    #    or after "pair" with a dash ("pair STARGATE" is a machine's name).
+    #    Capitals only: "code research", "pair requests" are words.
+    m = _NL_CAPS_CODE_NEAR_RE.search(plain)
+    if m:
+        return m.group(1) or m.group(2)
+    # 4. A pairing verb and a machine noun, with a code that cannot be a name: eight
+    #    consonants, or capitals split by a dash ("add my computer KAXE-WRTQ", never
+    #    "add my Mac STARGATE") — and never a publish or a borrow.
+    if (re.search(r"\b(?:add|pair|connect|link)\b", low)
+            and re.search(rf"\b(?:{_MACHINE_NOUNS})\b", low)
+            and not re.search(r"\b(?:public|findable|discoverable|ask|request|borrow|"
+                              r"use|switch)\b", low)):
+        m = (re.search(rf"\b([{_CONNECTION_LETTERS}]{{4}}\s*[{_DASHES}]?\s*"
+                       rf"[{_CONNECTION_LETTERS}]{{4}})\b", plain, re.I)
+             or re.search(rf"\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\b",
+                          plain))
+        if m:
+            return m.group(1)
+    return None
 # Double quotes only (straight + curly). Apostrophes are NOT delimiters — a
 # contraction + possessive ("what's … Tesla's …") would otherwise extract the
 # garbage between them as a run title.
@@ -5952,6 +6097,13 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # is a question about a code rather than a pairing.
         if _bare or (_pairing and not _reading) or (_kw and not _existing):
             return ["device-add", tok], None
+    else:
+        # ⛔⛔ A CODE WITH NO DIGIT — ~1 in 11 access codes, and every connection
+        # code — read only where no digit code is, by the stricter rules above
+        # `_digitless_code` (2026-09-26).
+        _dtok = _digitless_code(t, low)
+        if _dtok:
+            return ["device-add", _dtok], None
     # ⛔ A PUBLISH REQUEST IS NOT A PAIRING REQUEST. "add my computer to the
     # public list" was answered with "paste the access code" — this rule sits
     # above everything and its verb list contains `add`.
@@ -6006,7 +6158,37 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # note. They are asked HERE, above every rule that can start a sign-in. A bare
     # "signed in" with no question mark stays where it was: after a sign-in link
     # it is a person saying they did it, not asking.
+    # ⛔⛔ UNLESS IT IS CONNECTED *TO A COMPUTER* (2026-09-26). Widening this to
+    # `are you` / `super research` took "are you connected to my mac?" — which had
+    # always listed the computers — and answered "✓ Signed in as …" alone: someone
+    # with no computer, or an offline one, read that as "yes, your Mac is
+    # connected". A QUESTION of this rule's own shape (are you / am i / is it …)
+    # whose object is a COMPUTER — connected / logged in / signed in TO, INTO or
+    # WITH a machine noun, a few words in ("the office pc") — gets the computer
+    # list instead.
+    # ⛔⛔ ANCHORED, AND THE OBJECT MUST BE A MACHINE NOUN (cross-verify, same day).
+    # The first version searched the phrase anywhere and took everything that was
+    # not a short list of account words: run control on a run titled "how the gut
+    # is connected to the brain" answered with the computer list, and so did "am
+    # I signed in with the right account?" and "I'm signed in with the wrong
+    # account" (a sign-out with its reason). "Signed in ON this computer" is still
+    # an account question.
+    # ⛔ A GREETING FIRST IS STILL THE QUESTION ("hey, are you connected to my
+    # mac?"), "signed INTO" is "signed in to", and the words between the verb and
+    # the machine noun may not be a preposition or "account" — "am I signed in
+    # with google ON this laptop?" and "logged in to my account on this mac" are
+    # account questions (cross-verify round 2).
+    _to_a_computer = re.match(
+        rf"^\W*(?:(?:hi|hey|hello|btw|wait|um|so|ok|okay|and)\W+)*{_NL_LEAD_IN}"
+        rf"(?:are (?:you|u|we)|am i|is it|is this|is super ?research)\b"
+        rf"[^.?!]*?\b(?:connected|logg?ed[ -]?in|signed?[ -]?in)(?:\s+(?:to|into|with)|to)\s+"
+        rf"(?:(?:my|the|our|your|this|that|a|any)\s+)?"
+        rf"(?:(?!(?:on|in|at|from|of|for|with|to|account|email|app)\b)[\w'’-]+\s+){{0,3}}?"
+        rf"(?:{_MACHINE_NOUNS})\b"
+        rf"(?!\s*['’]s\b|\s+(?:account|email|google|gmail|login|profile)\b)", low)
     _signin_q = _NL_SIGNIN_QUESTION.fullmatch(low)
+    if _to_a_computer:
+        return ["devices"], None
     if re.search(r"\b(am i|are (?:we|you)|is (it|this|the agent|super ?research))\b.*\b(signed?[ -]?in|logg?ed[ -]?in|connected|authenticated)\b", low) or \
             re.search(r"\b(which|what) account\b", low) or "account status" in low or \
             "connection status" in low or \
@@ -7727,6 +7909,16 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     if re.search(r"\b(sign|log)\s?(me\s)?out\b|\blogout\b", low):
         return None, [_NL_CONFIRMS["logout"]]
     if re.search(r"\b(sign|log)\s?(me\s)?in\b|\blogin\b|\bauthenticate\b", low):
+        # ⛔⛔ BUT NOT WITH THE CONNECTION CODE IN IT (cross-verify r3). Whatever
+        # else the message says — "WDJB-MJHT sign in", "sign in again with …", "how
+        # do I sign in with …?", the code in quotes — a fresh sign-in here voids
+        # the page the person has open. The code goes to the bridge's check
+        # instead, which answers for every state: pending, just connected, ended.
+        # Dashed or unbroken only: two acronyms ("HTTP SMTP") are not a code.
+        _conn = re.search(rf"\b([{_CONNECTION_LETTERS}]{{4}}(?:\s*[{_DASHES}]\s*)?"
+                          rf"[{_CONNECTION_LETTERS}]{{4}})\b", t, re.I)
+        if _conn:
+            return ["device-add", _conn.group(1)], None
         return ["login"], None
     if re.search(r"\b(i('m| am)? (signed|logged) in|i did it|signed in now)\b", low):
         return ["login-done"], None

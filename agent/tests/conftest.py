@@ -245,8 +245,19 @@ def _no_real_bridge(monkeypatch, _nobody_listens_port):
     checking it first — and a chat reply now POSTs `/signin/ack`, which TAKES the
     live parked sign-in note and seals the live watermark. So every test starts
     pointed at a port nothing listens on; a test that runs its own bridge sets the
-    variable itself, and monkeypatch applies in order, so its value wins."""
+    variable itself, and monkeypatch applies in order, so its value wins.
+
+    ⛔⛔ AND THE TERMINAL CLIENT, WHICH NEVER READ THE VARIABLE (2026-09-26 review).
+    `config.BRIDGE_PORT` is read ONCE, when config is imported, and
+    `config.bridge_origin()` — what cli.py's `_bridge_get` / `_bridge_post` use —
+    reads that frozen value. So a test driving `agent login` or `agent device`
+    unstubbed still reached the developer's live bridge on 9876: /login/remote/start
+    there drops the real parked sign-in note and replaces the real flow. The frozen
+    value is pointed at the same dead port (a test that runs its own bridge sets
+    `bridge_origin` or `BRIDGE_PORT` itself, after this, and wins)."""
     monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", str(_nobody_listens_port))
+    from facade import config as _config
+    monkeypatch.setattr(_config, "BRIDGE_PORT", _nobody_listens_port)
 
 
 @pytest.fixture(autouse=True)

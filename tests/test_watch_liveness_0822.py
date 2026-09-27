@@ -160,17 +160,21 @@ class TestWhatOneThrowDoesToAListener:
             seen["n"] += 1
             raise AttributeError("'NoneType' object has no attribute 'get'")
 
+        # ⛔ WELL PAST ANY PLAUSIBLE CAP (2026-09-26 review). Waiting for 4 throws
+        # let a guard that gives up after N consecutive errors (N ≥ 5 — a plausible
+        # circuit-breaker edit) pass; the old fixed 0.3 s saw ~60. The deadline
+        # still ends a real defect quickly.
         ran = _drive(research._guard_snapshot(always_raises, "start"),
-                     until=lambda _c, _r: seen["n"] > 3)
-        assert seen["n"] > 3, (
+                     until=lambda _c, _r: seen["n"] > 60)
+        assert seen["n"] > 60, (
             f"only {seen['n']} deliveries — the guard did not keep it running")
         assert ran.consumer_active is True, "the consumer thread should still be alive"
 
     def test_a_guarded_healthy_callback_is_untouched(self):
         seen = []
         ran = _drive(research._guard_snapshot(seen.append, "start"),
-                     until=lambda _c, _r: len(seen) > 3)
-        assert len(seen) > 3
+                     until=lambda _c, _r: len(seen) > 60)
+        assert len(seen) > 60
         assert ran.consumer_active is True
 
 

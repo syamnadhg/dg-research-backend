@@ -43,6 +43,12 @@ import pytest
 import requests
 
 from facade import bridge, cli
+from facade.session import RevokedError
+
+# The product's own claim helper, taken at import — before the suite-wide fixture in
+# conftest.py swaps it for a stub on every test — so a bridge whose session is dead
+# can answer with its real revoked relay rather than a scripted one.
+_REAL_FE_API_POST = bridge._fe_api_post
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "facade" / "skill" / "scripts"
 _SKILL = _SCRIPTS.parent / "SKILL.md"
@@ -235,13 +241,25 @@ class _FS:
 
 @contextmanager
 def _bridge(monkeypatch, *, signed_in: bool, flow_state: str | None = "pending",
-            verify_url: str = LINK, expires_in: float = 600):
+            verify_url: str = LINK, expires_in: float = 600, revoked: bool = False):
     """A real bridge on loopback with a sign-in in `flow_state` (None: no sign-in),
-    every claim recorded, and both clients pointed at it."""
+    every claim recorded, and both clients pointed at it.
+
+    `revoked`: the signed-in session's refresh token is dead — minting a token
+    raises `RevokedError` — and each claim goes through the product's own
+    `_fe_api_post`, so the reply is the bridge's real revoked relay (a 401 with
+    `reason: "revoked"`), not one this file wrote. No network is reached: the mint
+    fails before anything is sent."""
     claims: list = []
-    monkeypatch.setattr(bridge, "_fe_api_post", lambda sess, path, payload, **kw: (
-        claims.append((path, payload)) or (200, {"ok": True, "action": "initial-pair",
-                                                 "deviceId": "dev-new"})))
+    if revoked:
+        def _claim(sess, path, payload, **kw):
+            claims.append((path, payload))
+            return _REAL_FE_API_POST(sess, path, payload, **kw)
+        monkeypatch.setattr(bridge, "_fe_api_post", _claim)
+    else:
+        monkeypatch.setattr(bridge, "_fe_api_post", lambda sess, path, payload, **kw: (
+            claims.append((path, payload)) or (200, {"ok": True, "action": "initial-pair",
+                                                     "deviceId": "dev-new"})))
     monkeypatch.setattr(bridge, "FirestoreRest", _FS)
     sel = {"v": "dev-a"}
     monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: sel["v"])
@@ -249,8 +267,14 @@ def _bridge(monkeypatch, *, signed_in: bool, flow_state: str | None = "pending",
                         lambda d, uid: sel.__setitem__("v", d))
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: None)
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
+
+    def _token(force=False):
+        if revoked:
+            raise RevokedError("the refresh token was revoked")
+        return "tok"
+
     state = bridge.BridgeState()
-    state.set_session(NS(uid="u1", email="e@x.y", id_token=lambda force=False: "tok")
+    state.set_session(NS(uid="u1", email="e@x.y", id_token=_token)
                       if signed_in else None)
     if flow_state:
         flow = bridge.RemoteFlow("PT", CODE, verify_url, time.time() + expires_in)
@@ -349,6 +373,56 @@ def test_a_connected_sign_ins_code_is_claimed_like_any_other_once_it_has_expired
     assert claims == [("/api/devices/claim", {"code": CODE})], claims
 
 
+@pytest.mark.parametrize("error", ["code_not_found", "invalid_code_format"])
+@pytest.mark.parametrize("pasted", ["WDJB-MJHT", "wdjb-mjht", "WDJB–MJHT", "WDJB MJHT"])
+def test_a_connection_code_the_bridge_no_longer_knows_is_still_called_one(
+        monkeypatch, capsys, error, pasted):
+    """⛔ AFTER A BRIDGE RESTART, OR PAST THE SIGN-IN'S LIFE (2026-09-26), the
+    bridge has no flow to match, so the code goes to the claim route like any
+    other — which answered "No computer is waiting for that code" or "never use I,
+    L, O": about a code the person never had.
+
+    Would this pass against the code an hour ago? No: `device-add` printed the
+    claim route's own sentence."""
+    monkeypatch.setattr(sr, "_post", lambda path, body=None, **kw: (400, {"error": error}))
+    assert sr.main(["device-add", pasted]) == 1
+    out = capsys.readouterr().out
+    assert out.strip() == "✗ " + sr._STALE_CONNECTION_CODE, out
+
+
+@pytest.mark.parametrize("pasted", ["WDJB-MJHT", "wdjb mjht"])
+def test_a_connection_code_after_its_sign_in_ended_says_so(monkeypatch, capsys, pasted):
+    """⛔ SIGNED OUT, WITH THE SIGN-IN'S OWN CODE (cross-verify r3). A pending
+    sign-in's code is refused before the session check, so a 401 means the flow
+    it belonged to expired or the bridge restarted — say so, and what to say, not
+    the generic "tell me to log you in".
+
+    Would this pass against the code an hour ago? No: it printed the signed-out line."""
+    monkeypatch.setattr(sr, "_post", lambda path, body=None, **kw: (
+        401, {"error": "not signed in — run /login"}))
+    assert sr.main(["device-add", pasted]) == 1
+    assert capsys.readouterr().out.strip() == "✗ " + sr._SIGN_IN_ENDED
+
+
+def test_an_access_code_signed_out_keeps_the_signed_out_line(monkeypatch, capsys):
+    monkeypatch.setattr(sr, "_post", lambda path, body=None, **kw: (
+        401, {"error": "not signed in — run /login"}))
+    assert sr.main(["device-add", "K7XQ-9B2M"]) == 1
+    out = capsys.readouterr().out
+    assert sr._SIGN_IN_ENDED not in out and "log you in" in out, out
+
+
+def test_an_access_code_the_claim_route_does_not_know_keeps_its_own_sentence(
+        monkeypatch, capsys):
+    """…and only a connection-SHAPED code: a real access code that is not found
+    still gets the claim route's sentence."""
+    monkeypatch.setattr(sr, "_post", lambda path, body=None, **kw: (400, {"error": "code_not_found"}))
+    assert sr.main(["device-add", "K7XQ-9B2M"]) == 1
+    out = capsys.readouterr().out
+    assert sr._STALE_CONNECTION_CODE not in out
+    assert "No computer is waiting for that code" in out, out
+
+
 def test_both_clients_word_the_just_connected_refusal(monkeypatch, capsys):
     with _bridge(monkeypatch, signed_in=True, flow_state="connected") as (_base, claims):
         rc = sr.main(["device-add", "wdjb-mjht"])
@@ -394,11 +468,53 @@ def test_a_revoked_session_keeps_its_signed_out_sentence(monkeypatch, capsys):
     assert sr.main(["device-add", "K7XQ-9B2M"]) == 1
     assert "log you in" in capsys.readouterr().out
     monkeypatch.setattr(cli, "_bridge_post", lambda path, body=None, timeout=30.0: reply)
+    # ⛔⛔ AND THE BRIDGE IS "UP" HERE, NOT WHEREVER 9876 HAPPENS TO ANSWER. `cli`
+    # reads its port once at import, so the per-test port in conftest.py never
+    # reached it: this half asked the real 127.0.0.1:9876 whether a bridge was
+    # running. On a machine with none, `cmd_device` stopped at "Bridge isn't
+    # running. Run: agent serve then agent login" — which also says "agent login",
+    # so the old `in` check passed with `device add` never reached, and harness
+    # L8 survived on the Mac while the Windows box, with its own bridge up, killed it.
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
     monkeypatch.setattr(cli, "_redirect_if_wsl", lambda _hint: None)
     monkeypatch.setattr(cli.connect, "detect_targets", lambda *a, **k: [])
-    cli.cmd_device(NS(device_command="add", code="K7XQ-9B2M", runtime=None, dest=None,
-                      verbose=False))
-    assert "agent login" in _ANSI.sub("", capsys.readouterr().out)
+    assert cli.cmd_device(NS(device_command="add", code="K7XQ-9B2M", runtime=None,
+                             dest=None, verbose=False)) == 1
+    said = [ln for ln in _ANSI.sub("", capsys.readouterr().out).splitlines()
+            if ln.startswith("✗")]
+    assert said == ["✗ couldn't add device: not signed in — run:  agent login"], said
+
+
+def test_device_add_on_a_revoked_session_prints_the_bridges_sentence_not_revoked(
+        monkeypatch, capsys):
+    """⛔ `agent device add` on a computer whose sign-in was revoked (signed out
+    everywhere) must print the sentence the bridge sent, which names the repair —
+    never the bare identifier: "✗ couldn't add device: revoked" tells nobody what to
+    do. A REAL bridge on loopback, with a session whose refresh token is dead,
+    answers with its own revoked relay; the terminal's whole `device add` path runs.
+
+    Would this pass against the mutant? No: with `_pair_refusal_key` trusting any
+    `reason`, the key is "revoked", which the table does not word, so the terminal
+    prints "couldn't add device: revoked" instead of the bridge's sentence."""
+    with _bridge(monkeypatch, signed_in=True, flow_state=None, revoked=True) as (
+            base, claims):
+        # What the bridge itself answers, asked directly: the wire shape the
+        # terminal has to read.
+        wire = requests.post(base + "/device/pair", json={"code": "K7XQ-9B2M"},
+                             timeout=10)
+        assert wire.status_code == 401, wire.text
+        sentence = wire.json()["error"]
+        assert wire.json()["reason"] == "revoked", wire.json()
+        assert "login" in sentence and sentence != "revoked", sentence
+        del claims[:]
+        rc = cli.cmd_device(NS(device_command="add", code="K7XQ-9B2M", runtime=None,
+                               dest=None, verbose=False))
+    out = _ANSI.sub("", capsys.readouterr().out)
+    assert rc == 1, out
+    # The pair request reached the bridge's claim step — not "Bridge isn't running".
+    assert claims == [("/api/devices/claim", {"code": "K7XQ-9B2M"})], (claims, out)
+    said = [ln for ln in out.splitlines() if ln.startswith("✗")]
+    assert said == [f"✗ couldn't add device: {sentence}"], said
 
 
 # ── a connection code pasted into the chat ────────────────────────────────────
@@ -411,17 +527,44 @@ _PASTED = ["WDJB-MJHT", "wdjbmjht", "WDJB MJHT", "code WDJB-MJHT", "pair WDJB-MJ
 @pytest.mark.parametrize("said", _PASTED)
 def test_a_connection_code_pasted_in_chat_claims_nothing_through_the_router(
         monkeypatch, capsys, said):
-    """⛔⛔ THROUGH THE REAL ROUTER AND WHATEVER IT RUNS. Today `do` sends none of
-    these to `device-add` — its code pattern needs a digit, and a connection code
-    never has one — so the invariant is written so it survives a router that one
-    day does: nothing is claimed, and a `device-add` it runs answers `signin_code`."""
+    """⛔⛔ THROUGH THE REAL ROUTER AND WHATEVER IT RUNS. Since 2026-09-26 `do` reads
+    a connection code (it never has a digit, and the router used to need one) and
+    sends every one of these to `device-add`: nothing is claimed, and the answer is
+    the bridge's `signin_code` refusal."""
     argv, _lines = sr._nl_resolve(said)
     with _bridge(monkeypatch, signed_in=True) as (_base, claims):
         sr.main(["do", said])
         out = capsys.readouterr().out
     assert claims == [], (said, argv, out)
-    if argv and argv[0] == "device-add":
-        assert sr._PAIR_ERRORS["signin_code"] in out, (said, out)
+    assert argv and argv[0] == "device-add", (said, argv)
+    assert sr._PAIR_ERRORS["signin_code"] in out, (said, out)
+
+
+@pytest.mark.parametrize("said", ["sign in with WDJB-MJHT", "log me in with code WDJB-MJHT",
+                                  "login code WDJB-MJHT", "log in with wdjb-mjht",
+                                  "WDJB-MJHT", "WDJB MJHT"])
+def test_the_connection_code_pasted_back_never_starts_a_new_sign_in(monkeypatch, capsys,
+                                                                    said):
+    """⛔⛔ THE SIGN-IN THE PERSON IS FINISHING MUST SURVIVE THEIR PASTE (2026-09-26).
+    "sign in with WDJB-MJHT" went to `login`, which asked the bridge for a NEW
+    sign-in and replaced the pending one: the page already open still said
+    WDJB-MJHT, Authenticate there said "Authenticated", and the chat never signed
+    in. Driven through `do` against a live bridge with that sign-in pending and
+    nobody signed in — the usual case.
+
+    Would this pass against the code an hour ago? No: the first four posted
+    /login/remote/start, and the bare code never reached the bridge at all."""
+    posted: list = []
+    real = sr._post
+    monkeypatch.setattr(sr, "_post", lambda path, body=None, **kw: (
+        posted.append(path), real(path, body, **kw))[1])
+    with _bridge(monkeypatch, signed_in=False) as (_base, claims):
+        sr.main(["do", said])
+        out = capsys.readouterr().out
+    assert "/login/remote/start" not in posted, (said, posted)
+    assert "/device/pair" in posted, (said, posted)
+    assert sr._PAIR_ERRORS["signin_code"] in out, (said, out)
+    assert claims == [], claims
 
 
 @pytest.mark.parametrize("pasted", ["WDJB-MJHT", "wdjbmjht"])
@@ -453,7 +596,13 @@ def test_the_skill_relays_the_link_and_the_code_and_never_pairs_with_it():
         "never shorten, invent or reformat the code",
         "checks the page shows the same connection code, then taps Authenticate",
         "typed only at superresearch.io/connect",
-        "it is not an access code: **never** run `device-add` with it",
+        "it is not an access code. Pasted back (alone, or \"sign in with <code>\"), "
+        "run `sr.py do \"<message>\"` and relay what it prints — **never** `login`, "
+        "whose new sign-in voids the page they have open",
+        "but the connection code pasted back (\"sign in with WDJB-MJHT\", or the code "
+        "alone) → `sr.py do \"<message>\"`, never `login`",
+        "\"are you connected to my Mac?\", \"is it signed in to the office PC?\" — "
+        "connected / logged in TO a computer | `sr.py devices`",
         "send the user **one** message: the link and connection code lines the "
         "client returned, as printed",
     ):

@@ -823,3 +823,100 @@ def test_the_ask_surface_is_covered_by_the_negation_veto(verb):
     # and the un-negated ask still works
     argv, say = _r("ask to use the Lab Mac")
     assert argv is None and "Ask the owner" in say, (argv, say)
+
+
+# ==========================================================================
+# THREE SURVIVORS OF THE 10.10 CLOSE SWEEP, KILLED 2026-09-26 (N9b, Q9, X4).
+# Each mutant makes a real phrasing act wrongly, and no test in this harness's
+# selection fed a phrasing that moves. The phrasings below are the ones that
+# do: each was applied to the mutant and changed its answer.
+# ==========================================================================
+
+@pytest.mark.parametrize("phrase", [
+    "don't even hide my studio pc",
+    "i don't need to send the logs",
+    "don't just send the logs",
+    "never really pause the tesla run",
+    "please don't ever unlink my studio pc",
+    "don't even add device K7XQ-9B2M",
+    "don't carry on hiding my mac",
+])
+def test_a_negation_with_words_before_its_verb_still_vetoes(phrase):
+    """⛔⛔ A NEGATION WITH A WORD BETWEEN IT AND THE VERB IS STILL A NEGATION.
+    `don't even hide my studio pc` ran an UNCONFIRMED HIDE, `i don't need to
+    send the logs` SENT THE LOGS to support, and `don't even add device
+    K7XQ-9B2M` PAIRED THE COMPUTER — once the words allowed between the negator
+    and the verb shrank back to the pronouns. Every phrasing in
+    `test_a_negated_command_lands_on_the_catch_all` puts its negator right
+    against the verb, so none of them could see the list shrink.
+    ⭐ THE PHRASINGS ARE TYPED OUT, NOT DERIVED FROM `_NEG_FILLER`. A list read
+    from the module shrinks with the module and would pass on the defect.
+
+    Would this pass against the mutant? No: with the filler cut to
+    you/i/we/it/to/please the veto never matches, and each phrase reaches its
+    act branch instead of the catch-all — a hide, a log send, a pause, a pairing,
+    or the unlink confirm.
+    """
+    assert _is_catch_all(phrase), (phrase, _r(phrase))
+
+
+@pytest.mark.parametrize("phrase,name", [
+    ("remove my video phone", "video phone"),
+    ("remove my podcast phone", "podcast phone"),
+])
+def test_a_phone_named_after_a_phase_is_unlinked_not_skipped(phrase, name):
+    """⛔⛔ A PHONE IS A DEVICE ON THE SKIP BRANCH TOO. A machine called “video
+    phone” is a machine, and `remove my video phone` has to offer to UNLINK it,
+    behind its confirm — exactly as `remove my video PC` does. With `phone` out
+    of the skip branch's device noun, the sentence reads as "remove the video"
+    and SKIPS THE VIDEO PHASE of the live run. Skip is not confirm-gated, so
+    the person never gets a second chance, and the machine stays linked.
+
+    Would this pass against the mutant? No: with the device noun read from
+    `_MACHINE_NOUNS`, which has no `phone`, nothing bails the skip branch and it
+    returns ['skip', 'video'] / ['skip', 'podcast'] instead of the unlink confirm.
+    """
+    argv, say = _r(phrase)
+    assert argv is None, (phrase, argv)
+    assert say == sr._NL_CONFIRMS["device-remove"].format(name=f"“{name}”"), (phrase, say)
+
+
+@pytest.mark.parametrize("phrase", ["remove claude from my phone",
+                                    "remove chatgpt from my phone",
+                                    "drop gemini from my phone"])
+def test_removing_an_agent_from_a_phone_never_executes_a_skip(phrase):
+    """⛔⛔ `remove claude from my phone` talks about a PHONE, and it must never
+    EXECUTE a skip that switches Claude off the live run with no confirm. The
+    phone is the only device word in these sentences, so the skip branch's
+    device noun is the one thing that keeps them out of it.
+    ⭐ Only the absence of an executed act is pinned. Today the landing is an
+    unlink confirm naming “claude from my phone”, which nothing should depend on.
+
+    Would this pass against the mutant? No: without `phone` in the device noun
+    the skip branch takes the sentence and EXECUTES ['skip', 'claude'] (and
+    'chatgpt' / 'gemini'), so argv is not None.
+    """
+    argv, say = _r(phrase)
+    assert argv is None, (phrase, argv, say)
+
+
+@pytest.mark.parametrize("phrase", ["pause and skip the video",
+                                    "stop and no email",
+                                    "retry and no email",
+                                    "abort and skip claude",
+                                    "stop and without the video"])
+def test_a_dropped_run_control_never_becomes_a_silent_phase_skip(phrase):
+    """⛔⛔⛔ `pause and skip the video` NAMES TWO ACTS. The pause branch bails —
+    nothing in the sentence names a run — and the drop guard is the only thing
+    that stops the SKIP branch below it taking the message. Without it the video
+    phase was skipped on the live run with no confirm, and the pause the person
+    asked for first was silently dropped; `stop and no email` turned the email
+    off and dropped the STOP. The older test for this guard fed `pause and
+    switch to the Studio PC` and `stop and remove the video`, which a second
+    guard now catches, so it kept passing with this one gone.
+
+    Would this pass against the mutant? No: with `_runctl_dropped` forced False
+    the skip branch fires and each phrase EXECUTES ['skip', <phase or agent>]
+    instead of reaching the catch-all.
+    """
+    assert _is_catch_all(phrase), (phrase, _r(phrase))

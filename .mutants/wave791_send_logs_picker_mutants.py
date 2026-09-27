@@ -140,7 +140,8 @@ MUTANTS = [
        '        if body.isdigit():')]),
     ("P7", CLI, "under",
      "⛔⛔ THE AGENT-LOG-ONLY REFUSAL GOES, so somebody who picked exactly one "
-     "thing is told there is nothing to send",
+     "thing is told there is nothing to send — killed by "
+     "'test_the_agent_log_goes_when_the_computer_lists_nothing_else'",
      [('        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is\n            # refused for a non-owner a few lines above, so offering it to one\n            # sends them round the circle an earlier wave closed here.\n            return _send_agent_log_alone(args, offer_machine=owned, name=name)\n',
        '        if False:\n            pass\n')]),
     # ⛔⛔ P8 RETIRED 2026-09-16 (wave 8) — THE DEFECT IT MUTATED NO LONGER HAS A
@@ -491,7 +492,8 @@ MUTANTS = [
      [('log = logging.getLogger("facade.cli")', 'log = logging.getLogger(__name__)')]),
     ("X6", CLI, "under",
      "⛔ THE REFUSAL SENDS A NON-OWNER TO `--machine` AGAIN, which is refused four "
-     "lines higher — a sharer with no listed runs goes round in a circle",
+     "lines higher — a sharer with no listed runs goes round in a circle — killed "
+     "by 'test_a_sharer_saying_agent_log_with_no_listed_runs_is_not_sent_round_to_machine'",
      [('        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is\n            # refused for a non-owner a few lines above, so offering it to one\n            # sends them round the circle an earlier wave closed here.\n            return _send_agent_log_alone(args, offer_machine=owned, name=name)\n',
        '        if agent_log:\n            # ⛔ THE MACHINE OFFER SURVIVES AND IS STILL OWNER-ONLY. `--machine` is\n            # refused for a non-owner a few lines above, so offering it to one\n            # sends them round the circle an earlier wave closed here.\n            return _send_agent_log_alone(args, offer_machine=True, name=name)\n')]),
     ("X7", CLI, "over",

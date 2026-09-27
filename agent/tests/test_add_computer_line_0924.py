@@ -444,12 +444,20 @@ def test_the_lost_code_answer_is_the_owners_and_is_true():
     computer's tile in Account, Reset under Settings → Manage devices (the new
     code is emailed), and the screen of a computer still being set up."""
     said = sr._LOST_CODE_REPLY
-    assert said.startswith("If the computer's already on your account, open Account")
+    assert said.startswith("If it's your own computer, open Account")
     assert "reveal the access code on that computer's tile" in said
-    assert "(you'll enter your PIN)" in said
-    assert "Reset in Settings → Manage devices and we'll email it to you" in said
     assert "the code is on that computer's screen" in said
     assert "superresearch.io/install" not in said and "--pair" not in said
+    # ⛔⛔ THE THREE FACTS IT GOT WRONG UNTIL 2026-09-26, each against the web app:
+    # the PIN only if one was set (the reveal prompts only with the lock on) …
+    assert "(if you've set an access-code PIN, you'll enter it)" in said
+    assert "you'll enter your PIN)" not in said
+    # … only the owner can see or change a code (the route checks ownership) …
+    assert "If somebody shared the computer with you, ask its owner — only they can see or change its code." in said
+    # … and Reset signs the computer out and clears everyone it's shared with.
+    assert "use Reset in Settings → Manage devices" in said
+    assert "we'll email you an Approve link and the new code" in said
+    assert "Reset also signs that computer out, and everyone it's shared with loses access" in said
 
 
 @pytest.mark.parametrize("said,expect", [

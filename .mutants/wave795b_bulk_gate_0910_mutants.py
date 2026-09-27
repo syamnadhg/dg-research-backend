@@ -269,11 +269,11 @@ MUTANTS = [
       ('    out = re.sub(r"[\\s,;]+$", "", out).strip()\n    return out or whole\n',
        '    out = re.sub(r"[\\s,;]+$", "", out).strip()\n    return out\n')]),
     # ⛔⛔ N6's OLD EDIT, KEPT AS ITS OWN MUTANT. It is a real defect of its own:
-    # nothing pins the quoted-name escape at the visibility capture. ⛔ PENDING —
-    # its killing test is being written in the owner's Windows session (agent/ is
-    # theirs), so N6b SURVIVES until that lands; report it, never hide it.
+    # nothing pinned the quoted-name escape at the visibility capture until
+    # 2026-09-26, when the hide write and the publish confirm were both pinned
+    # through `sr.py do` against a fake bridge holding "Mac" AND "Mac, not the PC".
     ('N6b', SR, 'under',
-     '⛔⛔ A QUOTED NAME IS TRIMMED AT THE VISIBILITY CAPTURE. The visibility call takes the trim\'s inner half, which skips the quoted-name escape, so `hide "Mac, not the PC"` cuts the exclusion off the quoted name and hides a machine called \'Mac\' — quoting, the one way to be unambiguous, stops working on hide and publish. Killing test PENDING in the owner\'s Windows session (agent/ is theirs); survives until it lands',
+     '⛔⛔ A QUOTED NAME IS TRIMMED AT THE VISIBILITY CAPTURE. The visibility call takes the trim\'s inner half, which skips the quoted-name escape, so `hide "Mac, not the PC"` cuts the exclusion off the quoted name and hides a machine called \'Mac\' — quoting, the one way to be unambiguous, stops working on hide and publish. killed by \'test_a_quoted_name_hides_the_machine_called_exactly_that\' (and \'test_a_quoted_name_is_the_machine_the_publish_confirm_names\')',
      [('            _vis_obj = _trim_trailing_clause(_vis_obj, t)',
        '            _vis_obj = _trim_trailing_clause_inner(_vis_obj)')]),
     ('N7', SR, 'under',

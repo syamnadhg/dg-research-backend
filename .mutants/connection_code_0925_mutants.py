@@ -168,7 +168,8 @@ MUTANTS = [
      [("    if isinstance(reason, str) and reason in _PAIR_FAILURES:\n        return reason",
        "    if False:\n        return reason")]),
     ("L8", CLI, "⛔ `device add` TRUSTS ANY `reason` — \"revoked\" loses the signed-out "
-     "sentence and its `agent login`",
+     "sentence and its `agent login`; killed by "
+     "'test_device_add_on_a_revoked_session_prints_the_bridges_sentence_not_revoked'",
      [("    if isinstance(reason, str) and reason in _PAIR_FAILURES:\n        return reason",
        "    if isinstance(reason, str):\n        return reason")]),
     ("L9", CLI, "⛔ THE TERMINAL DROPS THE CHECK — nobody at the terminal is asked to compare "
@@ -285,11 +286,23 @@ MUTANTS = [
      [("    return re.sub(r\"[^A-Z0-9]\", \"\", str(value or \"\").upper())",
        "    return re.sub(r\"[^A-Z0-9]\", \"\", str(value or \"\"))")]),
     # ═══ K — SKILL.md ══════════════════════════════════════════════════════════
-    ("K1", SKILL, "⛔⛔ THE MODEL IS NO LONGER TOLD THE CONNECTION CODE ISN'T AN ACCESS CODE — "
-     "and the rest of the file sends any bare 8-character code to `device-add`",
+    ("K1", SKILL, "⛔⛔ THE MODEL IS NO LONGER TOLD WHAT TO DO WITH THE CONNECTION CODE PASTED "
+     "BACK — it runs `login`, whose new sign-in voids the page they have open (re-aimed "
+     "2026-09-26: the rule is `sr.py do`, never `login`)",
      [("  connection code is typed only at superresearch.io/connect — it is not an access\n"
-       "  code: **never** run `device-add` with it. The proactive",
+       "  code. Pasted back (alone, or \"sign in with <code>\"), run `sr.py do \"<message>\"` and\n"
+       "  relay what it prints — **never** `login`, whose new sign-in voids the page they have\n"
+       "  open. The proactive",
        "  connection code is typed only at superresearch.io/connect. The proactive")]),
+    ("K4", SKILL, "⛔⛔ THE ROUTING TABLE SENDS \"sign in with <connection code>\" TO `login` "
+     "again — the model never reaches `do`, and the open page is voided",
+     [(" — but the connection code pasted back (\"sign in with WDJB-MJHT\", or the code alone)"
+       " → `sr.py do \"<message>\"`, never `login` |", " |")]),
+    ("K5", SKILL, "⛔ \"are you connected to my Mac?\" has no row of its own — the model matches "
+     "\"are we connected?\" and answers with the account line alone",
+     [("| \"are you connected to my Mac?\", \"is it signed in to the office PC?\" — connected / "
+       "logged in TO a computer | `sr.py devices` — its rows say which computers are there and "
+       "online |\n", "")]),
     ("K2", SKILL, "⛔⛔ THE LOGIN NOTE SAYS \"relay the sign-in link\" AGAIN — the model drops "
      "the code lines the client printed",
      [("- **login** → relay the link AND the connection code exactly as it prints them, link\n"
@@ -330,6 +343,13 @@ if __name__ == "__main__":
     files = sorted({m[1] for m in MUTANTS})
     ORIGINALS = {f: (ROOT / f).read_bytes() for f in files}
     DIGESTS = {f: _digest(b) for f, b in ORIGINALS.items()}
+    # ⛔ A SIGTERM MUST RESTORE TOO (2026-09-26 review). Python's default SIGTERM
+    # ends the process without running `finally:`, so a timeout wrapper, a CI
+    # cancel or an ending session left the mutant in the product source — and the
+    # next gate measured mutated code. Raising SystemExit instead runs the
+    # `finally:` below that writes the original back. Here, never at import.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     only = set(sys.argv[1:])
     print("baseline… ", end="", flush=True)

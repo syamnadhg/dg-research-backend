@@ -353,6 +353,84 @@ def test_quoting_a_name_exempts_it_outright():
         assert not _refuses_as_a_set(said), said
 
 
+# ⭐ TWO OWNED MACHINES WHOSE NAMES DIFFER ONLY BY AN EXCLUSION-SHAPED TAIL, so a
+# trim that cuts “, not the PC” off a quoted name lands on a REAL other machine
+# instead of on nothing — the case where the wrong answer is silent.
+_QUOTED_TWIN_DEVICES = [
+    {"id": "dev-mac", "name": "Mac", "owned": True, "online": True},
+    {"id": "dev-mac-not-pc", "name": "Mac, not the PC", "owned": True,
+     "online": True},
+]
+
+
+@pytest.fixture()
+def quoted_twins(monkeypatch):
+    """A fake bridge holding `_QUOTED_TWIN_DEVICES`; records every POST and
+    answers a visibility write with the name of the machine it was aimed at."""
+    posts: list = []
+    by_id = {d["id"]: d for d in _QUOTED_TWIN_DEVICES}
+
+    def _get(path, timeout=None):
+        if path == "/devices":
+            return 200, {"devices": [dict(d) for d in _QUOTED_TWIN_DEVICES]}
+        return 200, {}
+
+    def _post(path, body=None, timeout=None):
+        posts.append((path, dict(body or {})))
+        dev = by_id.get((body or {}).get("deviceId"), {})
+        return 200, {"deviceName": dev.get("name", "?"), "changed": True,
+                     "visibility": (body or {}).get("visibility")}
+
+    monkeypatch.setattr(sr, "_get", _get)
+    monkeypatch.setattr(sr, "_post", _post)
+    return posts
+
+
+@pytest.mark.parametrize("said", ['hide "Mac, not the PC"',
+                                  "hide “Mac, not the PC”"])
+def test_a_quoted_name_hides_the_machine_called_exactly_that(quoted_twins,
+                                                            capsys, said):
+    """⛔⛔ N6b. Quoting is the one way to be unambiguous about a name, and hiding
+    runs with NO confirm — so if the visibility capture trims an exclusion-shaped
+    tail off a quoted name, `hide "Mac, not the PC"` silently hides the OTHER
+    machine, the one called "Mac". Driven through the real chat entry against a
+    fake bridge that holds both machines; the write that leaves must name the
+    quoted one.
+
+    Would this pass against the mutant? No: the mutant sends the capture through
+    the trim's inner half, which skips the quoted-name escape, so the name becomes
+    “Mac”, resolves exactly to dev-mac, and the POST hides the wrong machine."""
+    rc = sr.main(["do", said])
+    out = " ".join(capsys.readouterr().out.split())
+    assert quoted_twins == [("/device/visibility",
+                             {"deviceId": "dev-mac-not-pc",
+                              "visibility": "private"})], (said, quoted_twins)
+    assert "“Mac, not the PC” is now private" in out, out
+    assert rc == 0
+
+
+@pytest.mark.parametrize("said", ['make "Mac, not the PC" public',
+                                  "make “Mac, not the PC” public"])
+def test_a_quoted_name_is_the_machine_the_publish_confirm_names(quoted_twins,
+                                                               capsys, said):
+    """⛔⛔ N6b, THE PUBLISH HALF. Publishing is confirm-gated, and the confirm is
+    the one moment the person sees WHICH machine their yes will publish. A quoted
+    name trimmed there asks "Let other people find “Mac”…" — a yes then publishes
+    the wrong computer, name and all, to everyone signed in.
+
+    Would this pass against the mutant? No: the mutant trims the quoted capture to
+    “Mac”, so the confirm names “Mac” and the exact confirm for “Mac, not the PC”
+    is never printed."""
+    rc = sr.main(["do", said])
+    out = " ".join(capsys.readouterr().out.split())
+    want = " ".join(sr._NL_CONFIRMS["device-visibility"]
+                    .format(name="“Mac, not the PC”").split())
+    assert want in out, (said, out)
+    assert "find “Mac” and" not in out, out
+    assert rc == 0
+    assert quoted_twins == [], quoted_twins     # nothing is written before the yes
+
+
 def test_a_quoted_span_is_blanked_and_not_deleted():
     """⛔⛔ MY FIRST VERSION OF THIS TEST WAS DECORATIVE and a mutant proved it.
 

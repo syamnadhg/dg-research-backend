@@ -266,10 +266,14 @@ def test_requests_during_a_run_coalesce_into_ONE_follow_up_run(tmp_path, caplog)
     assert started.wait(10)
     for r in ("device-answered", "run-completed", "support-logs"):
         p.request(TG, reason=r)
+    # ⛔ WAIT FOR ALL THREE TO FOLD, NOT A FIXED 0.2 s (2026-09-26 review). On a
+    # loaded box one fan-out thread could reach `_enqueue` after the follow-up run
+    # had taken the list, got a third run, and failed this as broken coalescing —
+    # a failure from the clock. Each folded request logs one line.
     deadline = time.time() + 10
-    while time.time() < deadline and "folded into one" not in caplog.text:
+    while time.time() < deadline and caplog.text.count("folded into one") < 3:
         time.sleep(0.02)
-    time.sleep(0.2)                          # let every fan-out thread reach _enqueue
+    assert caplog.text.count("folded into one") == 3, caplog.text
     gate.set()
     deadline = time.time() + 10
     while time.time() < deadline and (p._inflight or len(calls) < 2):

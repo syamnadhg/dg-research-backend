@@ -49,14 +49,33 @@ MUTANTS = [
        r'            r"|give|share|sharing)\b", low):')]),
     ("L3", SR, "the answer stops offering Reset, so somebody who needs a NEW code is "
      "told only where the old one was",
-     [('"(you\'ll enter your PIN). For a new one, use Reset in Settings → "\n'
-       '                    "Manage devices and we\'ll email it to you. If you were still "',
-       '"(you\'ll enter your PIN). If you were still "')]),
+     [('                    "For a new code, use Reset in Settings → Manage devices: we\'ll email "\n'
+       '                    "you an Approve link and the new code — but Reset also signs that "\n'
+       '                    "computer out, and everyone it\'s shared with loses access. If you "\n',
+       '                    "If you "\n')]),
     ("L4", SR, "⛔⛔ THE ANSWER SENDS AN EXISTING COMPUTER'S OWNER TO SET UP A NEW ONE — "
      "whose pairing step drops everybody it was shared with",
-     [('_LOST_CODE_REPLY = ("If the computer\'s already on your account, open Account in the "',
-       '_LOST_CODE_REPLY = (f"{_ADD_A_COMPUTER} If the computer\'s already on your account, '
-       'open Account in the "')]),
+     [('_LOST_CODE_REPLY = ("If it\'s your own computer, open Account in the web app and reveal "',
+       '_LOST_CODE_REPLY = (f"{_ADD_A_COMPUTER} If it\'s your own computer, open Account in '
+       'the web app and reveal "')]),
+    # ═══ L5-L7 — the three facts it got wrong until 2026-09-26 ═══════════════════
+    ("L5", SR, "⛔ the PIN is promised on every reveal again, though it is asked only "
+     "when one was set — killed by 'the lost-code answer is the owner's and is true'",
+     [('"the access code on that computer\'s tile (if you\'ve set an "\n'
+       '                    "access-code PIN, you\'ll enter it). If somebody shared the computer "',
+       '"the access code on that computer\'s tile (you\'ll enter your PIN). "\n'
+       '                    "If somebody shared the computer "')]),
+    ("L6", SR, "⛔⛔ somebody a computer was shared with is sent to reveal a code only its "
+     "OWNER can see — killed by 'the lost-code answer is the owner's and is true'",
+     [('"access-code PIN, you\'ll enter it). If somebody shared the computer "\n'
+       '                    "with you, ask its owner — only they can see or change its code. "\n',
+       '"access-code PIN, you\'ll enter it). "\n')]),
+    ("L7", SR, "⛔⛔ Reset is offered as free — no word that it signs the computer out and "
+     "drops everyone it's shared with — killed by 'the lost-code answer is the owner's "
+     "and is true'",
+     [('"you an Approve link and the new code — but Reset also signs that "\n'
+       '                    "computer out, and everyone it\'s shared with loses access. If you "',
+       '"you an Approve link and the new code. If you "')]),
     # ═══ I — the invite on every list, the email half at the ask ════════════════
     ("I1", POLL, "the sign-in note's public list carries the email half again, unlike "
      "every other list (owner: one wording)",

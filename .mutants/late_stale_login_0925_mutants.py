@@ -13,7 +13,9 @@ queued copy had nothing left to stop it.
        leaves, the one-note-one-sign-in refusal, the ack's seal and its chat scope,
        the instant-delivery triggers and the re-checks they hand the push, the
        steady approval check, and the support-log watch that no longer ends in
-       silence — nor in a false "✓ Support has the logs".
+       silence — nor in a false "✓ Support has the logs". B20/B21 (2026-09-26):
+       `serve()` itself, the only place instant delivery is armed and the news
+       peek is started — no test ran it before.
   U* — instant delivery (push.py): re-checked before every spawn, one run per job,
        retried ONLY while the gateway holds the job, and off where it must be off.
   P* — the store (prefs.py): whose support-log record it is, and how long it lives.
@@ -80,7 +82,8 @@ AGENT_SUITES = ("tests/test_signout_closes_signin_0925.py "
                 "tests/test_login_answers_login_only_0925.py "
                 "tests/test_instant_push_0925.py tests/test_support_log_persist_0925.py "
                 "tests/test_device_ask_backoff_0921.py tests/test_signin_once_0901.py "
-                "tests/test_sr_stream.py tests/test_prefs.py")
+                "tests/test_sr_stream.py tests/test_prefs.py "
+                "tests/test_serve_arms_push_0926.py")
 # (cwd, suites) per mutated file — every target here is the agent's, so one tree,
 # one conftest, one suite set (and so ONE baseline per invocation).
 SUITES = {f: (AGENT, AGENT_SUITES) for f in (BRIDGE, PUSH, PREFS, SR, POLL, SKILL)}
@@ -190,6 +193,18 @@ MUTANTS = [
      "hair early is refused, and the owner's yes is announced a whole minute later "
      "(guard test added 2026-09-25: every check test stepped exactly 60.0 s)",
      [("_DEVICE_ASK_CHECK_SECONDS = 55.0", "_DEVICE_ASK_CHECK_SECONDS = 60.0")]),
+    ("B20", BRIDGE, "⛔⛔ `serve()` NEVER ARMS INSTANT DELIVERY — it is the only caller of "
+     "`push.arm()`, so every push is a silent \"not armed\" no-op and every sign-in, 🎉 "
+     "and owner's yes waits for the watcher's tick and Hermes's queue: the late "
+     "\"✓ Signed in\" of 2026-09-24, back on every real bridge (killed by "
+     "'test_serve_arms_instant_delivery_for_as_long_as_it_runs')",
+     [("    push.arm()\n    np_stop = threading.Event()\n",
+       "    np_stop = threading.Event()\n")]),
+    ("B21", BRIDGE, "⛔⛔ `serve()` NEVER STARTS THE NEWS PEEK — nothing notices a run "
+     "that finished or needs the person, an owner's answer or support's, so none of "
+     "them is ever pushed: each waits minutes for the watcher's tick and Hermes's "
+     "queue (killed by 'test_serve_starts_the_news_peek_and_stops_it_on_the_way_out')",
+     [("    np_thread.start()\n", "")]),
     # ═══ U — instant delivery ═════════════════════════════════════════════════
     ("U1", PUSH, "⛔⛔ NO RE-CHECK BEFORE THE SPAWN — the person logged out between the "
      "event and the run, and the watcher is run anyway",
@@ -348,6 +363,11 @@ if __name__ == "__main__":
     files = sorted({m[1] for m in MUTANTS})
     ORIGINALS = {f: (ROOT / f).read_bytes() for f in files}
     DIGESTS = {f: _digest(b) for f, b in ORIGINALS.items()}
+    # ⛔ A SIGTERM MUST RESTORE TOO (2026-09-26 review): Python's default SIGTERM
+    # skips `finally:`, so a timeout wrapper or an ending session left the mutant
+    # in the product source. SystemExit runs the restore. Here, never at import.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     only = set(sys.argv[1:])
     print("baseline… ", end="", flush=True)

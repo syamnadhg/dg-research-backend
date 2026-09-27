@@ -113,8 +113,16 @@ def test_skill_within_sanity_bound():
     # two did not. Trimming either to make room is the 0.1.14 mistake above. The
     # bound still catches unbounded growth; it is not a trim mandate and not a
     # target.
+    # ⛔ RAISED 555 → 560 ON 2026-09-26, FOR THREE LINES WITH A FACT IN EACH. The
+    # connection code pasted back went to `login` straight from the routing
+    # table, and its new sign-in voided the page the person had open; the table
+    # and the login note now send it to `sr.py do`, which the model cannot infer
+    # from "never run device-add with it". And "are you connected to my Mac?"
+    # matched the "are we connected?" row and got the account line alone — it has
+    # a row of its own. The bound still catches unbounded growth; it is not a trim
+    # mandate and not a target.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 555, f"SKILL.md grew to {n} lines — unexpectedly large"
+    assert n < 560, f"SKILL.md grew to {n} lines — unexpectedly large"
 
 
 def test_signin_handoff_continues_from_the_announce_topic():
