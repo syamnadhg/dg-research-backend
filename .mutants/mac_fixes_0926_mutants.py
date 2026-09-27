@@ -93,7 +93,8 @@ MUTANTS = [
        "    if (_NL_CONNECTION_CODE_RE.fullmatch(whole) and len(set(_nl_code_key(whole))) >= 1\n")]),
     ("C12", SR, "⛔ two lower-case words of consonants alone ('psst hmmm') are paired",
      [('            and (" " not in whole or whole.isupper())):\n', "            ):\n")]),
-    ("C13", SR, "⛔ 'HAHAHAHA', 'YESSSSSS' alone are paired (no five-different-letters rule)",
+    ("C13", SR, "⛔ 'HAHA-HAHA', 'YESS-SSSS' alone are paired (no five-different-letters rule; "
+     "re-aimed 2026-09-26: without a dash they can no longer pair at all)",
      [("    if _NL_CAPS_CODE_RE.fullmatch(whole) and len(set(_nl_code_key(whole))) >= 5:\n",
        "    if _NL_CAPS_CODE_RE.fullmatch(whole) and len(set(_nl_code_key(whole))) >= 1:\n")]),
     ("C14", SR, "⛔ a code inside a QUOTED run title is paired — 'pause \"sign in with "
@@ -107,8 +108,9 @@ MUTANTS = [
     ("C16", SR, "⛔ a support code in a send-logs message is paired as an access code",
      [('    if re.search(r"\\b(?:support|logs|diagnostics)\\b", low):   # not "log me in"\n'
        '        return None\n', "")]),
-    ("C17", SR, "⛔⛔ 'code'/'pair' before an ORDINARY word pairs it — 'the Claude Code "
-     "research', 'any pair requests?', 'my code is rejected'",
+    ("C17", SR, "⛔⛔ 'code'/'pair' before an ORDINARY dashed word pairs it — 'the code "
+     "tech-debt', 'pair hand-made gifts' (re-aimed 2026-09-26: undashed words need the "
+     "dash now)",
      [('[{_ACCESS_LETTERS}]{{4}})\\b")\n_NL_SIGNED_IN_ALREADY_RE',
        '[{_ACCESS_LETTERS}]{{4}})\\b", re.I)\n_NL_SIGNED_IN_ALREADY_RE')]),
     ("C18", SR, "⛔ the access code's letters take an L, so hyphenated words in capitals "

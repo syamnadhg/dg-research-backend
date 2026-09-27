@@ -160,6 +160,10 @@ def test_a_report_that_the_sign_in_is_done_still_reaches_login_done(said):
     ("hmmmmmmm", None),
     ("HAHAHAHA", None),
     ("YESSSSSS", None),
+    # …and with the dash, now that an access code needs one (Windows review,
+    # 2026-09-26): the five-different-letters rule is what keeps these out.
+    ("HAHA-HAHA", None),
+    ("YESS-SSSS", None),
     ("zzzzzzzz", None),
     ("SELF-HELP", None),                                  # an L: never an access code
     ("wdjb mjht", None),                                  # lower-case halves, alone
@@ -363,5 +367,15 @@ def test_a_dashed_word_in_lower_case_is_never_paired(said):
     """⛔ Only capitals read as an access code. Now that the dash is required, the
     words the capitals-only guard (mutant C19) protects are the DASHED ones: made
     case-blind, "hand-made" would be paired."""
+    argv, _said = sr._nl_resolve(said)
+    assert not (argv and argv[0] == "device-add"), (said, argv)
+
+
+@pytest.mark.parametrize("said", ["the code tech-debt is huge", "any code tech-debt?",
+                                  "pair hand-made gifts", "pair back-ends"])
+def test_a_dashed_word_in_lower_case_after_code_or_pair_is_never_paired(said):
+    """⛔ Capitals only after "code" / "pair" too (mutant C17). With the dash required,
+    the words that rule keeps out are the dashed ones: made case-blind, "the code
+    tech-debt" pairs "tech-debt"."""
     argv, _said = sr._nl_resolve(said)
     assert not (argv and argv[0] == "device-add"), (said, argv)
