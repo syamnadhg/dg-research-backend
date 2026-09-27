@@ -6,7 +6,8 @@
        connection code reaches the bridge's check and never `login`; words shaped
        like a code are never paired.
   R* — sr.py rule 2: connected / logged in TO a computer lists the computers; a
-       question about the account keeps the account answer.
+       question about the account keeps the account answer, and so does one about
+       the chat's app on a computer, in every spelling.
   D* — sr.py devices: every row says online or offline.
   S* — sr.py device-add: a connection code the bridge no longer knows is called one.
   A* — sr.py login: a session that ends mid-answer gets a sign-in link.
@@ -160,14 +161,60 @@ MUTANTS = [
        '        rf"\\S"\n        rf"(?!')]),
     ("R8", SR, "⛔ a machine noun that names an ACCOUNT ('my laptop's Google account') "
      "lists the computers",
-     # ⚠ RE-ANCHORED 2026-09-26: the lookahead now also excludes the app words.
-     [("        rf\"(?!\\s*['’]s\\b|\\s+(?:account|email|google|gmail|login|profile|apps?|version|\"\n"
-       "        rf\"client|browser|(?:web)?site)\\b)\", low)",
+     # ⚠ RE-ANCHORED 2026-09-26: the lookahead now also excludes the app words;
+     # and 2026-09-27, when they became `_app_words`, reached past model words.
+     [("        rf\"(?!\\s*['’]s\\b|\\s+(?:account|email|google|gmail|login|profile)\\b\"\n"
+       "        rf\"|(?:\\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\\s+{_app_words}\\b\"\n"
+       "        rf\"(?!\\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\\b))\", low)",
        "        rf\"\", low)")]),
     ("R9", SR, "⛔ 'am I signed in to the desktop APP?' lists the computers again — a "
      "sign-in question about this chat (Windows review, 2026-09-26)",
-     [("|login|profile|apps?|version|\"\n        rf\"client|browser|(?:web)?site)\\b)\", low)",
+     [("|login|profile)\\b\"\n        rf\"|(?:\\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\\s+{_app_words}\\b\"\n"
+       "        rf\"(?!\\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\\b))\", low)",
        "|login|profile)\\b)\", low)")]),
+    ("R15", SR, "⛔⛔ the lookahead reads one word past the machine noun again — 'am I "
+     "signed in to the Mac desktop app?' lists the computers (Windows review r2)",
+     [("|(?:\\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\\s+{_app_words}\\b\"",
+       "|\\s+{_app_words}\\b\"")]),
+    ("R17", SR, "⛔⛔ an app word that opens the next clause declines the computer — 'are "
+     "you connected to my mac mini app says its offline?' answers the account line alone",
+     [("\"\n        rf\"(?!\\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\\b))\", low)",
+       ")\", low)")]),
+    ("R10", SR, "⛔⛔ the app question in another spelling misses again — 'am I logged "
+     "into the mac app?' reaches the catch-all, '…into the Mac version?' prints the "
+     "version (Windows review r2, 2026-09-27)",
+     [("    if _to_its_app:\n        return [\"status-account\"], None\n",
+       "    if False:\n        return [\"status-account\"], None\n")]),
+    ("R11", SR, "⛔⛔ the app is asked before the computers — 'are you connected to the "
+     "client pc?' and '…to my laptop cuz app says offline?' answer the account line "
+     "alone, which reads as 'yes, connected' (the first cut of r2)",
+     [("    if _to_a_computer:\n        return [\"devices\"], None\n"
+       "    if _to_its_app:\n        return [\"status-account\"], None\n",
+       "    if _to_its_app:\n        return [\"status-account\"], None\n"
+       "    if _to_a_computer:\n        return [\"devices\"], None\n")]),
+    ("R12", SR, "⛔ the app by another name is a computer again — 'the desktop "
+     "application', 'the laptop program', 'the mac extension' list the computers",
+     [("(?:apps?|applications?|programs?|software|extensions?|version|client|\"",
+       "(?:apps?|version|client|\"")]),
+    ("R14", SR, "⛔ any three words describe the app — 'are u connected to my imac via "
+     "the app?' (a computer this router cannot name) and '…to my mac's wifi cuz app says "
+     "offline?' answer the account line alone",
+     [("(?!(?:the|a|an|my|your|our|his|her|its|their|this|that|which|where|on|in|at|\"\n"
+       "        rf\"from|of|for|with|via|to|into|onto|by|through|thru|over|using|and|or|but|nor|so|\"\n"
+       "        rf\"if|as|because|cuz|coz|cos|bc|since|while|when|tho|though|although|unless|until)\\b)\"",
+       "\"")]),
+    ("R16", SR, "⛔⛔ the app question is read across a machine noun — 'are u able to "
+     "see which computers are logged into the app' answers the account line alone",
+     [("_asker + rf\"(?:(?!\\b(?:{_MACHINE_NOUNS})\\b)[^.?!])*?\" + _to_it",
+       "_asker + r\"[^.?!]*?\" + _to_it")]),
+    ("R18", SR, "⛔ the app question stops at three words again — 'am I logged into the Mac "
+     "mini M4 Pro version?' prints the VERSION",
+     [("{{0,3}}?(?:(?:{_MACHINE_NOUNS}|{_model_words})\\s+)*{_app_words}\\b\", low)",
+       "{{0,3}}?{_app_words}\\b\", low)")]),
+    ("R13", SR, "⛔ 'are u' is not asked — 'are u signed in to the desktop app?' "
+     "reaches the catch-all",
+     [("(?:are (?:you|u|we)|am i|is it|is this|is super ?research)",
+       "(?:are (?:you|we)|am i|is it|is this|is super ?research)")]),
     ("R3", SR, "⛔ 'signed in ON this computer' — a question about this chat's sign-in — "
      "lists the computers",
      [('(?:\\s+(?:to|into|with)|to)\\s+"', '(?:\\s+(?:to|into|with|on)|to)\\s+"')]),

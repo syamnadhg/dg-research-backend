@@ -4741,8 +4741,11 @@ _NL_CONNECTION_CODE_RE = re.compile(rf"\b({_CONN})\b", re.I)
 # web app always shows an access code as XXXX-XXXX (pair-code.ts formatForDisplay),
 # so a pasted one carries its dash; an unbroken consonant-only code still pairs
 # through the connection-letter branches. One retyped WITHOUT its dash (and with a
-# vowel) is no longer guessed at here: the router hands it to the chat, which can
-# still run device-add — a missed fast path, where the guess cost a stop command.
+# vowel) is no longer guessed at here, and lands where the rest of its sentence
+# does: alone or after "code", the catch-all, and the chat can still run
+# device-add; "pair my PC, code …", the computers screen with its add line;
+# "login code …", the sign-in, which tells someone already signed in that they
+# are. Each is a missed fast path, where the guess cost a stop command.
 _NL_CAPS_CODE_RE = re.compile(rf"\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\b")
 # A sign-in INSTRUCTION, never the past tense: "I signed in with WDJB-MJHT" says the
 # sign-in is done, and goes on to `login-done` as it always did.
@@ -6140,8 +6143,11 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # ⭐ NOT A NEW SCREEN. `devices` renders the empty state on an empty
         # account and the code route on a populated one — the same move rule 6b
         # already made for "I don't have a computer".
-        # ⛔ A MESSAGE CARRYING A CODE NEVER REACHES HERE: rule 1 returned
+        # ⛔ A CODE RULE 1 PAIRED NEVER REACHES HERE: it returned
         # ["device-add", tok] above, before the `public` guard and this branch.
+        # One it declined does — a code inside a question ("how do I pair my
+        # mac? which code, K7XQ-9B2M?"), an access code retyped without its dash
+        # (see `_NL_CAPS_CODE_RE`) — and this screen's add line says where it goes.
         return ["devices"], None
 
     # 1b. ⛔⛤ "help" AND "what can you do?" REACHED THE CATCH-ALL, whose line opens
@@ -6192,18 +6198,54 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # ⛔ …nor the chat's own APP on that machine (Windows review, 2026-09-26): "am
     # I signed in to the desktop app / the Mac version / the laptop browser?" is
     # a sign-in question, and the owner's rule sends those to status-account.
-    _to_a_computer = re.match(
+    # ⛔⛔ …IN EVERY SPELLING, WITH THE COMPUTERS STILL ASKED FIRST (Windows review
+    # r2, 2026-09-27). Declined by the lookahead below, the app question fell to
+    # the broad test further down, which knows no "into" and no "are u": "am I
+    # logged into the mac app?" and "are u signed in to the desktop app?" reached
+    # the catch-all, "am I logged into the Mac version?" printed the VERSION, and
+    # a model word between the machine and its app ("the Mac desktop app", "the
+    # MacBook Pro app") listed the computers. The lookahead now steps over machine
+    # and model words to the app — but not to an app word that opens the next
+    # clause ("my mac mini app says it's offline" is about the Mac) — and
+    # `_to_its_app` asks what it declined, in the spellings the broad test lacks.
+    # ⛔⛔ SECOND, AND NEVER ACROSS A MACHINE NOUN. Asked first, it answered
+    # "✓ Signed in as …" alone to "are you connected to the client pc?", "…to my
+    # mac or only signed in to the app?" and "…to my laptop cuz app says
+    # offline?" — the reply this rule exists to prevent — and, read across a
+    # machine noun, to "are u able to see which computers are logged into the
+    # app" (the broad test below still reads across one; that predates this). A
+    # computer list for an app question is unhelpful; the account line for a
+    # computer question misleads. Its describing words are never an article,
+    # possessive, or one of the common prepositions and conjunctions ("my imac
+    # via the app", "my mac's wifi cuz app says offline").
+    _asker = (
         rf"^\W*(?:(?:hi|hey|hello|btw|wait|um|so|ok|okay|and)\W+)*{_NL_LEAD_IN}"
-        rf"(?:are (?:you|u|we)|am i|is it|is this|is super ?research)\b"
-        rf"[^.?!]*?\b(?:connected|logg?ed[ -]?in|signed?[ -]?in)(?:\s+(?:to|into|with)|to)\s+"
-        rf"(?:(?:my|the|our|your|this|that|a|any)\s+)?"
+        rf"(?:are (?:you|u|we)|am i|is it|is this|is super ?research)\b")
+    _to_it = (
+        r"\b(?:connected|logg?ed[ -]?in|signed?[ -]?in)(?:\s+(?:to|into|with)|to)\s+"
+        r"(?:(?:my|the|our|your|this|that|a|any)\s+)?")
+    _app_words = (r"(?:apps?|applications?|programs?|software|extensions?|version|client|"
+                  r"browser|(?:web)?site)")
+    _model_words = (r"(?:mini|pro|air|studio|max|ultra|m\d\w*|\d+|web|chrome|safari|edge|"
+                    r"firefox|super|research|sr)")
+    _to_a_computer = re.match(
+        _asker + r"[^.?!]*?" + _to_it +
         rf"(?:(?!(?:on|in|at|from|of|for|with|to|account|email|app)\b)[\w'’-]+\s+){{0,3}}?"
         rf"(?:{_MACHINE_NOUNS})\b"
-        rf"(?!\s*['’]s\b|\s+(?:account|email|google|gmail|login|profile|apps?|version|"
-        rf"client|browser|(?:web)?site)\b)", low)
+        rf"(?!\s*['’]s\b|\s+(?:account|email|google|gmail|login|profile)\b"
+        rf"|(?:\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\s+{_app_words}\b"
+        rf"(?!\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\b))", low)
+    _to_its_app = re.match(
+        _asker + rf"(?:(?!\b(?:{_MACHINE_NOUNS})\b)[^.?!])*?" + _to_it
+        + rf"(?:(?!(?:the|a|an|my|your|our|his|her|its|their|this|that|which|where|on|in|at|"
+        rf"from|of|for|with|via|to|into|onto|by|through|thru|over|using|and|or|but|nor|so|"
+        rf"if|as|because|cuz|coz|cos|bc|since|while|when|tho|though|although|unless|until)\b)"
+        rf"[\w'’-]+\s+){{0,3}}?(?:(?:{_MACHINE_NOUNS}|{_model_words})\s+)*{_app_words}\b", low)
     _signin_q = _NL_SIGNIN_QUESTION.fullmatch(low)
     if _to_a_computer:
         return ["devices"], None
+    if _to_its_app:
+        return ["status-account"], None
     if re.search(r"\b(am i|are (?:we|you)|is (it|this|the agent|super ?research))\b.*\b(signed?[ -]?in|logg?ed[ -]?in|connected|authenticated)\b", low) or \
             re.search(r"\b(which|what) account\b", low) or "account status" in low or \
             "connection status" in low or \

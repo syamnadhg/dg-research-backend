@@ -361,6 +361,96 @@ def test_a_sign_in_question_about_the_app_on_a_machine_is_about_sign_in(said):
     assert sr._nl_resolve(said)[0] == ["status-account"], said
 
 
+@pytest.mark.parametrize("said", [
+    # "into" and "are u", which the broad sign-in test does not know
+    "am I logged into the mac app?",
+    "am I logged into the Mac version?",
+    "am i signed into the desktop client?",
+    "is it logged into my laptop browser?",
+    "are u signed in to the desktop app?",
+    "are u logged into the mac app?",
+    "hey are u connected to the mac app?",
+    # a machine noun or a model word between the machine and its app
+    "am I signed in to the Mac desktop app?",
+    "am I signed in to the MacBook Pro app?",
+    "am I signed in to the laptop web version?",
+    # the app by another name
+    "am I signed in to the desktop application?",
+    "am I logged in to the laptop program?",
+    "am I signed in to the desktop software?",
+    "am I signed in to the mac extension?",
+    # model words between the machine and its app, and four or more words
+    "am I signed in to the Mac mini M4 Pro app?",
+    "am I signed in to the Super Research Mac desktop app?",
+    "are you logged in to the new Super Research desktop app?",
+    # …and in the spellings only `_to_its_app` reads, past three words
+    "am I logged into the Mac mini M4 Pro version?",
+    "are u signed in to the MacBook Pro M3 Max app?",
+])
+def test_every_spelling_of_the_app_question_is_about_sign_in(said):
+    """⛔⛔ Windows review r2 (2026-09-27). Declined by the computers rule's
+    lookahead, these fell to the broad sign-in test, which knows no "into" and no
+    "are u" — the catch-all, or for "…into the Mac version?" the VERSION — and
+    the lookahead read one word past the machine noun, so "the Mac desktop app"
+    listed the computers.
+
+    Would this pass against a3b4466? No: every line but "…the new Super Research
+    desktop app?" answered with the catch-all, `version` or `devices`."""
+    assert sr._nl_resolve(said)[0] == ["status-account"], said
+
+
+@pytest.mark.parametrize("said,expect", [
+    ("research why am I logged into the wrong app",
+     ["research", "why am I logged into the wrong app"]),
+    ('pause "are u signed in to the app"', ["pause", "are u signed in to the app"]),
+    ("switch to the laptop connected to my desktop app",
+     ["device-use", "laptop connected to my desktop app"]),
+])
+def test_the_app_question_is_anchored_like_the_computers_one(said, expect):
+    """⛔ Anchored to the question, as `_to_a_computer` is (cross-verify r1): a
+    research topic, a run title or a device command naming an app keeps its route."""
+    assert _argv(said) == expect, said
+
+
+@pytest.mark.parametrize("said", [
+    "are you connected to the pc running the app?",
+    "are you connected to my laptop that has the desktop app?",
+    "is it connected to my mac with the browser open?",
+    "are u connected to my mac via the app?",
+    # an app word naming the computer, or next to it in a run-on sentence
+    "are you connected to the client pc?",
+    "are you connected to my client's laptop?",
+    "are you connected to my laptop cuz app says offline?",
+    "are you connected to the pc through its browser?",
+    # the computer asked about first, the app after it
+    "are you connected to my mac or only signed in to the app?",
+    "are you connected to the mac that's logged into the app?",
+    # an app word that opens the next clause of a run-on sentence
+    "are you connected to my mac mini app says its offline?",
+    "are you connected to my laptop 2 app says offline?",
+])
+def test_a_computer_described_by_its_app_is_still_a_computer(said):
+    """⛔⛔ The computers are asked FIRST. With the app asked first (the first cut
+    of r2), the client, cuz, its and two-clause lines answered "✓ Signed in as …"
+    alone — the reply the Mac's fix removed because it reads as "yes, your
+    computer is connected" — and with the lookahead stepping over model words to
+    any app word (the second cut), so did the run-on lines."""
+    assert sr._nl_resolve(said) == (["devices"], None), said
+
+
+@pytest.mark.parametrize("said", [
+    "are u able to see which computers are logged into the app",
+    "is it still running on the mac logged into the app",
+    "are u connected to my imac via the app?",
+    "are u connected to my mac's wifi cuz app says offline?",
+])
+def test_the_app_question_is_never_read_across_a_computer(said):
+    """⛔ A machine noun before the sign-in verb, or a preposition before the app,
+    means the app is not what is asked about: "✓ Signed in as …" alone would
+    answer a question about computers (none of these did on a3b4466)."""
+    argv, _said = sr._nl_resolve(said)
+    assert argv != ["status-account"], (said, argv)
+
 
 @pytest.mark.parametrize("said", ["hand-made", "i want a hand-made gift", "we need a back-desk"])
 def test_a_dashed_word_in_lower_case_is_never_paired(said):
