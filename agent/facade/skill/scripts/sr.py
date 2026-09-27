@@ -4733,7 +4733,17 @@ _CONNECTION_LETTERS = "BCDFGHJ-NP-TV-XZ"   # BCDFGHJKLMNPQRSTVWXZ
 _ACCESS_LETTERS = "A-HJKMNP-Z"            # the access code's letters: no I, L, O
 _CONN = rf"[{_CONNECTION_LETTERS}]{{4}}(?:\s*[{_DASHES}]\s*|\s)?[{_CONNECTION_LETTERS}]{{4}}"
 _NL_CONNECTION_CODE_RE = re.compile(rf"\b({_CONN})\b", re.I)
-_NL_CAPS_CODE_RE = re.compile(rf"\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?[{_ACCESS_LETTERS}]{{4}})\b")
+# ⛔⛔ THE DASH IS REQUIRED FOR THE ACCESS LETTERS (Windows review, 2026-09-26). They
+# include vowels, so "8 capitals with an optional dash" took English words in
+# capitals — RESEARCH (the product's own noun), REJECTED, WHATEVER, FEEDBACK — and
+# "STOP THE CLAUDE CODE RESEARCH" paired "RESEARCH" instead of stopping the run,
+# each false pairing spending one of the claim route's 5 tries per 5 minutes. The
+# web app always shows an access code as XXXX-XXXX (pair-code.ts formatForDisplay),
+# so a pasted one carries its dash; an unbroken consonant-only code still pairs
+# through the connection-letter branches. One retyped WITHOUT its dash (and with a
+# vowel) is no longer guessed at here: the router hands it to the chat, which can
+# still run device-add — a missed fast path, where the guess cost a stop command.
+_NL_CAPS_CODE_RE = re.compile(rf"\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\b")
 # A sign-in INSTRUCTION, never the past tense: "I signed in with WDJB-MJHT" says the
 # sign-in is done, and goes on to `login-done` as it always did.
 _SIGN_IN_ASK = r"(?:(?:sign|log)\s?(?:me\s+|back\s+)?in|login|signin|authenticate)"
@@ -4743,7 +4753,7 @@ _NL_CODE_NEAR_RE = re.compile(
     rf"|\b({_CONN})\W+(?:\w+\W+){{0,2}}?(?:to\s+(?:sign|log)\s?in|(?:sign|log)\s+me\s+in)\b",
     re.I)
 _NL_CAPS_CODE_NEAR_RE = re.compile(
-    rf"\b(?i:code)(?:\s+(?i:is))?\s*[:=]?\s*([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?"
+    rf"\b(?i:code)(?:\s+(?i:is))?\s*[:=]?\s*([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]"
     rf"[{_ACCESS_LETTERS}]{{4}})\b"
     rf"|\b(?i:pair)\s+([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\b")
 _NL_SIGNED_IN_ALREADY_RE = re.compile(
@@ -4788,8 +4798,9 @@ def _digitless_code(t: str, low: str) -> "str | None":
     m = _NL_CODE_NEAR_RE.search(plain)
     if m:
         return m.group(1) or m.group(2)
-    # 3. An access code in CAPITALS right after "code" — "my code is KAXE-WRTQ" —
-    #    or after "pair" with a dash ("pair STARGATE" is a machine's name).
+    # 3. An access code in CAPITALS, with its dash, right after "code" — "my code is
+    #    KAXE-WRTQ" — or after "pair" ("pair STARGATE" is a machine's name, and
+    #    "MY CODE IS REJECTED" a complaint).
     #    Capitals only: "code research", "pair requests" are words.
     m = _NL_CAPS_CODE_NEAR_RE.search(plain)
     if m:
@@ -6178,6 +6189,9 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # the machine noun may not be a preposition or "account" — "am I signed in
     # with google ON this laptop?" and "logged in to my account on this mac" are
     # account questions (cross-verify round 2).
+    # ⛔ …nor the chat's own APP on that machine (Windows review, 2026-09-26): "am
+    # I signed in to the desktop app / the Mac version / the laptop browser?" is
+    # a sign-in question, and the owner's rule sends those to status-account.
     _to_a_computer = re.match(
         rf"^\W*(?:(?:hi|hey|hello|btw|wait|um|so|ok|okay|and)\W+)*{_NL_LEAD_IN}"
         rf"(?:are (?:you|u|we)|am i|is it|is this|is super ?research)\b"
@@ -6185,7 +6199,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         rf"(?:(?:my|the|our|your|this|that|a|any)\s+)?"
         rf"(?:(?!(?:on|in|at|from|of|for|with|to|account|email|app)\b)[\w'’-]+\s+){{0,3}}?"
         rf"(?:{_MACHINE_NOUNS})\b"
-        rf"(?!\s*['’]s\b|\s+(?:account|email|google|gmail|login|profile)\b)", low)
+        rf"(?!\s*['’]s\b|\s+(?:account|email|google|gmail|login|profile|apps?|version|"
+        rf"client|browser|(?:web)?site)\b)", low)
     _signin_q = _NL_SIGNIN_QUESTION.fullmatch(low)
     if _to_a_computer:
         return ["devices"], None

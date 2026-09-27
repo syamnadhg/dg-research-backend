@@ -116,8 +116,17 @@ MUTANTS = [
      [('_ACCESS_LETTERS = "A-HJKMNP-Z"', '_ACCESS_LETTERS = "A-HJ-NP-Z"')]),
     ("C19", SR, "⛔⛔ an ordinary word alone in lower case ('whatever', 'database') is paired "
      "— the capitals-only guard",
-     [('_NL_CAPS_CODE_RE = re.compile(rf"\\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?[{_ACCESS_LETTERS}]{{4}})\\b")',
-       '_NL_CAPS_CODE_RE = re.compile(rf"\\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?[{_ACCESS_LETTERS}]{{4}})\\b", re.I)')]),
+     # ⚠ RE-ANCHORED 2026-09-26: the dash is required now (Windows review).
+     [('_NL_CAPS_CODE_RE = re.compile(rf"\\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\\b")',
+       '_NL_CAPS_CODE_RE = re.compile(rf"\\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\\b", re.I)')]),
+    ("C25", SR, "⛔⛔ the dash turns optional again, so words in capitals — RESEARCH, "
+     "REJECTED, WHATEVER — are paired (Windows review, 2026-09-26)",
+     [('_NL_CAPS_CODE_RE = re.compile(rf"\\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}][{_ACCESS_LETTERS}]{{4}})\\b")',
+       '_NL_CAPS_CODE_RE = re.compile(rf"\\b([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?[{_ACCESS_LETTERS}]{{4}})\\b")')]),
+    ("C26", SR, "⛔ after 'code is', the dash turns optional again — 'MY CODE IS "
+     "REJECTED' pairs REJECTED",
+     [('    rf"\\b(?i:code)(?:\\s+(?i:is))?\\s*[:=]?\\s*([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]"',
+       '    rf"\\b(?i:code)(?:\\s+(?i:is))?\\s*[:=]?\\s*([{_ACCESS_LETTERS}]{{4}}[{_DASHES}]?"')]),
     ("C20", SR, "⛔ an en dash or a non-breaking hyphen between the halves — what phones "
      "substitute — is not read",
      [('_DASHES = "-‐‑‒–—―−"', '_DASHES = "-"')]),
@@ -149,8 +158,14 @@ MUTANTS = [
        '        rf"\\S"\n        rf"(?!')]),
     ("R8", SR, "⛔ a machine noun that names an ACCOUNT ('my laptop's Google account') "
      "lists the computers",
-     [("        rf\"(?!\\s*['’]s\\b|\\s+(?:account|email|google|gmail|login|profile)\\b)\", low)",
+     # ⚠ RE-ANCHORED 2026-09-26: the lookahead now also excludes the app words.
+     [("        rf\"(?!\\s*['’]s\\b|\\s+(?:account|email|google|gmail|login|profile|apps?|version|\"\n"
+       "        rf\"client|browser|(?:web)?site)\\b)\", low)",
        "        rf\"\", low)")]),
+    ("R9", SR, "⛔ 'am I signed in to the desktop APP?' lists the computers again — a "
+     "sign-in question about this chat (Windows review, 2026-09-26)",
+     [("|login|profile|apps?|version|\"\n        rf\"client|browser|(?:web)?site)\\b)\", low)",
+       "|login|profile)\\b)\", low)")]),
     ("R3", SR, "⛔ 'signed in ON this computer' — a question about this chat's sign-in — "
      "lists the computers",
      [('(?:\\s+(?:to|into|with)|to)\\s+"', '(?:\\s+(?:to|into|with|on)|to)\\s+"')]),

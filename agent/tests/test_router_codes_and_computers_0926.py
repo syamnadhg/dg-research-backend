@@ -315,3 +315,53 @@ def test_each_computer_row_says_online_or_offline(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "MacBook Pro  (owned, private) · offline" in out, out
     assert "Studio PC  (shared) · online" in out, out
+
+
+# ── words in capitals are not access codes (Windows review, 2026-09-26) ──────
+
+@pytest.mark.parametrize("said", [
+    "STOP THE CLAUDE CODE RESEARCH",
+    "PAUSE THE CLAUDE CODE RESEARCH",
+    "MY CODE IS REJECTED",
+    "TELL ME ABOUT CODE BREAKERS",
+    "WHATEVER",
+    "FEEDBACK",
+    "ANY UPDATE ON THE CODE RESEARCH",
+])
+def test_a_word_in_capitals_is_never_paired(said):
+    """⛔⛔ The access code's letters include vowels, so "8 capitals, dash optional"
+    took English words — RESEARCH above all — and paired them, spending one of the
+    claim route's 5 tries per 5 minutes on each. A pasted access code carries its
+    dash (the web app shows it XXXX-XXXX)."""
+    argv, _said = sr._nl_resolve(said)
+    assert not (argv and argv[0] == "device-add"), (said, argv)
+
+
+def test_stop_and_pause_in_capitals_keep_their_meaning():
+    assert sr._nl_resolve("PAUSE THE CLAUDE CODE RESEARCH")[0] == ["pause", "CLAUDE CODE"]
+    argv, said = sr._nl_resolve("STOP THE CLAUDE CODE RESEARCH")
+    assert argv != ["device-add", "RESEARCH"], (argv, said)
+
+
+@pytest.mark.parametrize("said", [
+    "am I signed in to the desktop app?",
+    "are you logged in to the mac app?",
+    "am i signed in to the Mac version?",
+    "am i logged in to the desktop client?",
+    "is it logged in to my laptop browser?",
+    "are you signed in to the computer version of the app?",
+])
+def test_a_sign_in_question_about_the_app_on_a_machine_is_about_sign_in(said):
+    """⛔ The owner's rule: sign-in questions go to status-account. "connected to my
+    Mac" lists the computers; "signed in to the desktop APP" asks about this chat."""
+    assert sr._nl_resolve(said)[0] == ["status-account"], said
+
+
+
+@pytest.mark.parametrize("said", ["hand-made", "i want a hand-made gift", "we need a back-desk"])
+def test_a_dashed_word_in_lower_case_is_never_paired(said):
+    """⛔ Only capitals read as an access code. Now that the dash is required, the
+    words the capitals-only guard (mutant C19) protects are the DASHED ones: made
+    case-blind, "hand-made" would be paired."""
+    argv, _said = sr._nl_resolve(said)
+    assert not (argv and argv[0] == "device-add"), (said, argv)
