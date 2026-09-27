@@ -324,9 +324,11 @@ MUTANTS = [
      "⛔⛔ THE CATEGORY GUARD REVERTS AND \"ask for a public mac\" RAISES THE "
      "DISCLOSING CONSENT QUESTION about a machine called “public mac”. That is "
      "the 7.9-2 defect whose repair comment sits thirty lines above it",
+     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 1): "one of the …" joined the category
+     # test after these two, so they go and the chain continues (`or False`).
      [('        or re.fullmatch(rf"{_CATEGORY_DET}+(?:{_MACHINE_NOUNS})", _ask_obj, re.I)\n'
        '        or (re.fullmatch(rf"(?:{_MACHINE_NOUNS})", _ask_obj, re.I)\n'
-       '            and _ask_obj_generic_det))', '        )')]),
+       '            and _ask_obj_generic_det)', '        or False')]),
     ("R7", SR, "under",
      "the ASK branch's leading-noun strip goes, so a category ask carries the "
      "noun into the name it quotes back",
@@ -371,8 +373,9 @@ MUTANTS = [
      "⛔⛔ THE DETERMINER CHECK GOES, so \"ask for a mac\" is a NAME again and "
      "raises the consent question about a machine called “mac”. The capture has "
      "already eaten the determiner, which is why this has to read the message",
+     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 1): as R6 — the chain continues.
      [('        or (re.fullmatch(rf"(?:{_MACHINE_NOUNS})", _ask_obj, re.I)\n'
-       '            and _ask_obj_generic_det))', '        )')]),
+       '            and _ask_obj_generic_det)', '        or False')]),
     ("R15", SR, "over",
      "⛔⛔ THE AMBIGUOUS NOUNS GO IN FLAT and a NAMED ask answers with everybody "
      "else's machines: \"request access to that Mac\" points at one row, and "

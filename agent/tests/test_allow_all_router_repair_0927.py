@@ -1,0 +1,398 @@
+"""The chat router's Allow-all arm, repaired by narrowing (wave 12 repair, 2026-09-27).
+
+⛔⛔ CROSS-VERIFY FOUND THE FIRST ARM ACTING ON GUESSES, and every guess came from
+reading the WHOLE message. Driven through `sr._nl_resolve` at the wave-12 commit:
+
+  · `turn on allow all so I stop getting requests for my mac` switched Allow all
+    OFF, unconfirmed — the `stop` of a purpose clause read as the direction;
+  · `uncheck allow all for my mac`, `allow all no for my mac` and eleven more OFF
+    phrasings raised the ON confirm — a yes publishes and opens the computer;
+  · `list public computers that let anyone join` — a JOINER looking for a way in
+    — raised the confirm that opens the asker's own computer;
+  · `take my mac off the public list and turn off allow all` left it listed;
+  · `join K7XQ-9B2M` asked the owner of a computer called “K7XQ-9B2M”, `don't
+    join the Studio PC` and `did I join…` reached the ask confirm, `sign in to
+    join the Studio PC` stopped being a sign-in.
+
+⭐ The arm now ACTS only when an allow-all phrase is present, the subject is the
+person's OWN computer, and the words governing the phrase give one direction.
+Everything else goes to the clause that owns it — and nothing here reads source:
+every test drives the router, or the command with the bridge stubbed.
+"""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+_SCRIPTS = Path(__file__).resolve().parents[1] / "facade" / "skill" / "scripts"
+
+
+def _load(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, _SCRIPTS / filename)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+sr = _load("sr_allow_all_router_repair_0927", "sr.py")
+
+# The three confirms' first words, read off the router's own table so a wording
+# change after the name cannot break a ROUTING pin.
+_ON = sr._NL_CONFIRMS["device-allow-all"].split("{name}")[0].strip()
+_OFF = ["device-allow-all", "no"]
+_ASK = sr._NL_CONFIRMS["device-ask"].split("{name}")[0].strip()
+_PUBLISH = sr._NL_CONFIRMS["device-visibility"].split("{name}")[0].strip()
+assert _ON and _ASK and _PUBLISH
+
+
+def _said(text):
+    return sr._nl_resolve(text)
+
+
+def _line(text) -> str:
+    return " ".join(_said(text)[1] or [])
+
+
+# ── F9: a purpose clause never flips ON to OFF ────────────────────────────────
+
+_ON_WITH_A_STOP_WORD = [
+    "turn on allow all so I stop getting requests for my mac",
+    "turn on allow all so I don't have to approve people on my mac",
+    "turn on allow all for my mac so I never have to approve anyone",
+    "auto-approve requests for my mac so I stop getting pinged",
+    "turn on allow all for my mac, stop asking me",
+    "let anyone join my mac, no more approvals",
+    "enable auto-approve for my mac so I don't have to keep approving",
+    "keep allow all on for my mac so I stop getting requests",
+]
+
+
+@pytest.mark.parametrize("text", _ON_WITH_A_STOP_WORD)
+def test_an_on_request_with_a_stop_word_elsewhere_asks_to_switch_on(text):
+    """⛔⛔ Every one of these POSTed allowAll:false with no confirm — the `stop`,
+    `don't`, `never` or `no more` of a PURPOSE clause read as the direction. The
+    direction is the verb governing the phrase: `turn on`, `enable`, `keep … on`."""
+    argv, lines = _said(text)
+    assert argv is None, f"{text!r} ran {argv} without a confirm"
+    assert " ".join(lines).startswith(_ON), lines
+
+
+@pytest.mark.parametrize("text", _ON_WITH_A_STOP_WORD + [
+    "turn off approval for my mac", "make it public and allow all",
+    "let anyone join my mac and don't ask me"])
+def test_no_on_phrasing_ever_switches_allow_all_off(text):
+    assert _said(text)[0] != _OFF
+
+
+# ── F19: the OFF words people actually use ────────────────────────────────────
+
+_OFF_PHRASINGS = [
+    "allow all no for my mac", "uncheck allow all for my mac",
+    "untick allow all for my mac", "clear allow all for my mac",
+    "remove allow all from my mac", "set allow all to no for my mac",
+    "allow all false for my mac", "get rid of allow all on my mac",
+    "drop allow all on my mac", "kill allow all on my mac",
+    "end allow all on my mac", "pause allow all on my mac",
+    "remove auto-approve from my mac", "turn allow all on my mac off",
+]
+
+
+@pytest.mark.parametrize("text", _OFF_PHRASINGS)
+def test_the_checkbox_and_command_line_off_words_switch_it_off(text):
+    """⛔⛔ These raised the ON confirm, and the yes — run as the real command —
+    POSTed {allowAll: true, visibility: public}: the opposite of the ask, on the
+    widest door this surface has. `uncheck` is the web checkbox's word and
+    `to no` the command line's; `remove allow all from my mac` was an UNLINK."""
+    assert _said(text) == (_OFF, None)
+
+
+@pytest.mark.parametrize("text", _OFF_PHRASINGS + [
+    "turn off allow all for my mac", "stop letting anyone join my mac",
+    "don't let anyone join my mac", "I don't want to let anyone join my mac",
+    "require approval again for my mac", "I want to approve people on my mac again"])
+def test_no_off_phrasing_ever_raises_the_on_confirm(text):
+    assert not _line(text).startswith(_ON), text
+
+
+def test_a_negated_governing_verb_is_not_a_direction():
+    """`never enable allow all` / `don't stop letting anyone join` name no single
+    direction; guessing either one acts on a guess. Nothing changes."""
+    for text in ("never enable allow all for my mac",
+                 "don't stop letting anyone join my mac"):
+        argv, lines = _said(text)
+        assert argv is None, (text, argv)
+        assert not " ".join(lines).startswith(_ON), text
+
+
+def test_on_and_off_together_is_asked_back_never_acted_on():
+    argv, lines = _said("turn on allow all for my mac and turn off auto approve")
+    assert argv is None
+    said = " ".join(lines)
+    assert said.startswith("Should Allow all be on or off?"), said
+    # and both examples it offers route back to one direction each
+    assert _line("turn on Allow all").startswith(_ON)
+    assert _said("turn off Allow all") == (_OFF, None)
+
+
+# ── F8 / F11: somebody else's computers are the browse list ───────────────────
+
+_JOINER = [
+    "list public computers that let anyone join",
+    "show me public computers that let anyone join",
+    "show public computers anyone can join",
+    "find me a public computer that lets anyone join",
+    "list the public macs where anyone can join",
+    "join a public computer that lets anyone in",
+    "list public computers with allow all",
+    "show public computers that auto accept",
+    "find a computer that lets anyone join",
+    "show me machines that auto-approve",
+    "ask to use a public computer that lets anyone join",
+    "which public computers let anyone join",               # F11
+    "are there any computers that let anyone join?",
+]
+
+
+@pytest.mark.parametrize("text", _JOINER)
+def test_looking_for_computers_that_let_anyone_join_lists_them(text):
+    """⛔⛔ The joiner half of this wave — and wave 11's fleet way in — answered
+    with the OWNER's ON confirm; the yes published the asker's own computer and
+    let anyone in (executed: POST {deviceId: dev1, allowAll: true, visibility:
+    public}). `which public computers…` listed the asker's OWN computers."""
+    assert _said(text) == (["devices-public"], None)
+
+
+@pytest.mark.parametrize("text", _JOINER)
+def test_no_joiner_request_ever_opens_the_askers_computer(text):
+    argv, lines = _said(text)
+    assert (argv or [""])[0] != "device-allow-all", argv
+    assert not " ".join(lines or []).startswith(_ON)
+
+
+# ── F7: a hide beside Allow all off is a hide ─────────────────────────────────
+
+@pytest.mark.parametrize("text", [
+    "take my mac off the public list and turn off allow all",
+    "take my mac off the public list and disable allow all",
+    "remove my mac from the public list and turn off allow all",
+    "stop sharing my mac and turn off allow all",
+    "stop offering my mac and turn allow all off",
+    "turn off sharing on my mac and turn off allow all",
+    "no longer share my mac and stop allowing anyone to join",
+    "my mac should not be public, and turn off allow all",
+    "undo making my mac public and turn off allow all",
+])
+def test_hiding_and_switching_allow_all_off_hides(text):
+    """⛔⛔ These ran `device-allow-all no` with no confirm: the bridge wrote only
+    allowAll:false and the computer stayed LISTED, under a reply with a ✓. The
+    hide is resolved from what the message asks once the allow-all words are
+    gone — so the name is not welded to "and turn off allow all" either (the
+    base revision hid a machine called “mac and turn off allow all”)."""
+    assert _said(text) == (["device-visibility", "private"], None)
+
+
+@pytest.mark.parametrize("text", [
+    "make my mac public but require my approval",
+    "publish my mac but ask me first",
+    "make my mac public but make people ask",
+    "list my mac publicly but require approval",
+    "make my mac public without allow all",
+])
+def test_public_but_approve_each_person_is_a_plain_publish(text):
+    """The mirror: a request to be FOUND in approval mode ran `device-allow-all
+    no`, which publishes nothing. It is the plain publish confirm — and `publish
+    my mac but ask me first` no longer names a computer “mac but ask me first”."""
+    argv, lines = _said(text)
+    assert argv is None, (text, argv)
+    said = " ".join(lines)
+    assert said.startswith(f"{_PUBLISH} that computer "), said
+
+
+# ── F12 / F13 / F14 ──────────────────────────────────────────────────────────
+
+def test_a_pronoun_subject_publishes_and_allows_all_in_one_confirm():
+    """⛔ `make it public and allow all` got the plain publish confirm, whose yes
+    publishes in approval mode and drops the Allow all that was asked for."""
+    assert _line("make it public and allow all").startswith(_ON)
+
+
+@pytest.mark.parametrize("text", [
+    "keep it public and let anyone join",      # the pronoun is the only subject
+    "publish LABPC001 and allow all",          # the publish names the only subject
+])
+def test_each_road_to_a_subject_is_its_own(text):
+    """Two roads to the person's own computer that nothing else in the message
+    supplies: a pronoun the visibility clause resolves, and a publish of a named
+    computer. Each is pinned alone, so neither can go dead unnoticed."""
+    assert _line(text).startswith(_ON), text
+
+
+def test_a_negation_before_a_phrase_but_not_governing_it_is_not_a_direction():
+    """⛔ `I don't mind: let anyone join my mac` switched Allow all OFF — a
+    negation earlier in the message is not the verb governing the phrase."""
+    assert _line("I don't mind: let anyone join my mac").startswith(_ON)
+
+
+def test_joins_at_once_alone_is_a_row_of_the_list_not_a_request():
+    argv, lines = _said("joins at once")
+    assert argv is None and not " ".join(lines).startswith(_ON)
+
+
+def test_an_artefact_request_keeps_its_own_route():
+    """The artefact rules own `podcast: …` — the allow-all words inside it are the
+    podcast's business, and a catch-all here would lose the podcast."""
+    assert _said("podcast: allow all requests") == (["podcast"], None)
+
+
+def test_approval_off_is_allow_all_on_and_never_a_hide():
+    """⛔⛔ `turn off approval for my mac` made the computer PRIVATE with no
+    confirm — the hide arm's turn…off — and cleared Allow all with it."""
+    argv, lines = _said("turn off approval for my mac")
+    assert argv is None, argv
+    assert " ".join(lines).startswith(_ON)
+
+
+@pytest.mark.parametrize("text", ["turn on approval for my mac",
+                                  "turn approval back on for my mac"])
+def test_approval_on_is_allow_all_off(text):
+    """The same switch the other way round: approval ON means each person waits."""
+    assert _said(text) == (_OFF, None)
+
+
+def test_a_negation_on_the_checkbox_verb_is_asked_back():
+    """`don't tick allow all` switched it OFF on the first arm's whole-message read;
+    a negated governing verb names no single direction."""
+    assert _line("don't tick allow all for my mac").startswith("Should Allow all be on or off?")
+
+
+def test_approving_people_again_is_allow_all_off_never_the_approve_confirm():
+    """⛔⛔ It raised "Say yes to that request?", whose nameless yes admits the one
+    waiting stranger (`_resolve_asker("")` takes the sole row) — and Allow all
+    stayed on."""
+    assert _said("I want to approve people on my mac again") == (_OFF, None)
+    assert not _line("I want to approve people on my mac again").startswith("Say yes to")
+
+
+# ── F5 / F10 / F15 / F21: `join` ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("text, code", [
+    ("join K7XQ-9B2M", "K7XQ-9B2M"), ("please join K7XQ-9B2M", "K7XQ-9B2M"),
+    ("can I join K7XQ-9B2M", "K7XQ-9B2M"), ("join BCDF-GHJK", "BCDF-GHJK"),
+    ("join KAXE-WRTQ", "KAXE-WRTQ"),
+])
+def test_join_an_access_code_pairs_it(text, code):
+    """⛔⛔ The code was POSTed to /device/ask as a device id — one of five asks an
+    hour spent on "isn't offered publicly any more" — and never paired."""
+    assert _said(text) == (["device-add", code], None)
+    assert _ASK not in _line(text)
+
+
+@pytest.mark.parametrize("text", ["don't join the Studio PC", "did I join the Studio PC",
+                                  "never join the Studio PC"])
+def test_a_negated_or_past_join_is_not_an_ask(text):
+    """⛔ `join` was missing from the negation guard's verbs, and a question about
+    joining read as a request to — both reached the ask confirm, whose yes can
+    instant-join a stranger's computer."""
+    argv, lines = _said(text)
+    assert argv is None
+    assert not " ".join(lines).startswith(_ASK), text
+
+
+def test_join_one_of_the_public_computers_is_the_list():
+    """It was refused as a set ("I ask one owner at a time") — a round trip where
+    the list used to be."""
+    assert _said("join one of the public computers") == (["devices-public"], None)
+
+
+@pytest.mark.parametrize("text", ["sign in to join the Studio PC",
+                                  "sign in and join the Studio PC",
+                                  "log in to join the Studio PC"])
+def test_signing_in_to_join_stays_a_sign_in(text):
+    """⛔ e567704: a sign-in stays a sign-in. The join capture took these to the
+    ask confirm, so somebody signed out was asked to disclose themselves first."""
+    assert _said(text) == (["login"], None)
+
+
+def test_join_a_named_computer_is_still_the_ask():
+    assert _line("join the Studio PC").startswith(f"{_ASK} “Studio PC”")
+
+
+# ── what the narrowing must not lose ──────────────────────────────────────────
+
+@pytest.mark.parametrize("text", ["✓ Allow all is off (“Studio PC” is private).",
+                                  "allow all is on for my mac"])
+def test_a_statement_of_state_changes_nothing(text):
+    argv, lines = _said(text)
+    assert argv in (None, ["devices"]), argv
+    assert not " ".join(lines or []).startswith(_ON)
+
+
+def test_off_passes_a_quoted_name_through():
+    assert _said("stop letting anyone join “Studio Mac”") == (_OFF + ["Studio Mac"], None)
+
+
+@pytest.mark.parametrize("text", ["keep my mac public but turn off allow all",
+                                  "turn off allow all but keep my mac public"])
+def test_keeping_it_public_while_switching_off_is_off_not_a_publish(text):
+    """OFF leaves the computer public — which is what "keep it public" asks. Read
+    as a publish, it would raise the plain publish confirm instead of acting."""
+    assert _said(text) == (_OFF, None)
+
+
+def test_a_joiner_naming_a_computer_gets_the_ask_with_its_name_alone():
+    """`join the Studio PC, it lets anyone in` raised the OWNER's ON confirm naming
+    “Studio PC” — a yes opens the asker's own computer. It is the ask, and the
+    allow-all words are not welded onto the name."""
+    assert _line("join the Studio PC, it lets anyone in").startswith(f"{_ASK} “Studio PC” ")
+
+
+def test_a_joiner_naming_a_code_pairs_it():
+    """`join K7XQ-9B2M, it lets anyone in` raised the ON confirm for the asker's own
+    computer; the code is the thing to pair."""
+    assert _said("join K7XQ-9B2M, it lets anyone in") == (["device-add", "K7XQ-9B2M"], None)
+
+
+def test_check_if_is_a_question_and_check_alone_is_the_checkbox():
+    assert _said("check if allow all is on for my mac") == (["devices"], None)
+    assert _line("check allow all for my mac").startswith(_ON)
+
+
+# ── F20: the OFF picker suggests OFF ──────────────────────────────────────────
+
+_OWNED = [{"id": "dev-a1", "name": "Studio PC", "owned": True, "visibility": "public",
+           "allowAll": True},
+          {"id": "dev-a2", "name": "Lab PC", "owned": True, "visibility": "public",
+           "allowAll": True}]
+
+
+@pytest.fixture()
+def two_owned(monkeypatch, capsys):
+    posts: list = []
+    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (200, {"devices": _OWNED}))
+    monkeypatch.setattr(sr, "_post",
+                        lambda path, body=None, timeout=None: posts.append(body) or (200, {}))
+    return SimpleNamespace(posts=posts, out=lambda: capsys.readouterr().out)
+
+
+def _example(out: str) -> str:
+    line = next(ln for ln in out.splitlines() if ln.startswith("Say for example: "))
+    return line[len("Say for example: "):].rstrip(".")
+
+
+def test_the_off_picker_suggests_a_phrase_that_switches_off(two_owned):
+    """⛔⛔ `device-allow-all no` with two owned computers suggested “let anyone join
+    “Studio PC””; said back, that is the ON confirm, and a yes opens the door the
+    person was closing. The example is executed through the router here."""
+    sr.cmd_device_allow_all(SimpleNamespace(value="no", device="", json=False))
+    example = _example(two_owned.out())
+    assert two_owned.posts == []
+    assert _said(example) == (_OFF + ["Studio PC"], None), example
+
+
+def test_the_on_picker_still_suggests_a_phrase_that_asks_to_switch_on(two_owned):
+    sr.cmd_device_allow_all(SimpleNamespace(value="yes", device="", json=False))
+    example = _example(two_owned.out())
+    assert _line(example).startswith(f"{_ON} “Studio PC”"), example

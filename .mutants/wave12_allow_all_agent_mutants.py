@@ -48,8 +48,9 @@ SUITES = {
     BRIDGE: (AGENT, "tests/test_allow_all_bridge_0926.py tests/test_device_projection_795.py "
                     "tests/test_crossverify_fixes_795.py"),
     FSR: (AGENT, "tests/test_allow_all_bridge_0926.py tests/test_app_plane_unchanged.py"),
+    # ⛔ + the repair's pins (2026-09-27): R10 and R18 are measured there now.
     SR: (AGENT, "tests/test_allow_all_clients_0926.py tests/test_allow_all_router_0926.py "
-                "tests/test_chat_owner_793.py"),
+                "tests/test_chat_owner_793.py tests/test_allow_all_router_repair_0927.py"),
     CLI: (AGENT, "tests/test_allow_all_clients_0926.py"),
     SKILL: (AGENT, "tests/test_chat_owner_793.py tests/test_chat_public_792.py"),
 }
@@ -306,26 +307,32 @@ MUTANTS = [
        '(_ALLOW_ALL_MEANS + " Say yes and I’ll switch it on."),')]),
 
     # ═══ R — the router ════════════════════════════════════════════════════════
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 1). The arm was rebuilt by NARROWING —
+    # phrase + own computer + the words governing the phrase (`_allow_all_read`),
+    # with a hide / publish / ask resolved from what the message asks once the
+    # allow-all words are blanked — so R1-R6, R9, R10, R12-R15 and R17-R25 lost
+    # their anchors. Each is re-aimed at the new code for the SAME defect; R7, R8,
+    # R11 and R16 still match as written. The repair's own mutants are in
+    # wave12_repair1_router_mutants.py.
     ("R1", SR, "⛔⛔ THE MEASURED MISROUTES: no arm — 'turn off allow all for my mac' HIDES "
      "the computer unconfirmed, 'let anyone use my computer' raises the APPROVE confirm",
-     [('    if (_aa_kw or (_aa_use and not _aa_off)\n',
-       '    if False and (_aa_kw or (_aa_use and not _aa_off)\n')]),
+     [('    if _aa_found and not _unlink_kw and not (_artefact_kw and not _machine_kw):\n',
+       '    if False and _aa_found and not _unlink_kw and not (_artefact_kw and not _machine_kw):\n')]),
     ("R2", SR, "⛔ OFF asks the ON confirm",
-     [('        if _aa_off:\n            return (["device-allow-all", "no"]',
+     [('        if _aa_pol == "off":\n            return (["device-allow-all", "no"]',
        '        if False:\n            return (["device-allow-all", "no"]')]),
     ("R3", SR, "⛔⛔ ON switches allow-all on with NO confirm",
-     [('        if _aa_off:\n            return (["device-allow-all", "no"]',
-       '        if True:\n            return (["device-allow-all", "no" if _aa_off else "yes"]')]),
+     [('        if _aa_pol == "off":\n            return (["device-allow-all", "no"]',
+       '        if True:\n            return (["device-allow-all", "no" if _aa_pol == "off" else "yes"]')]),
     ("R4", SR, "⛔⛔ 'make it private and turn off allow all' leaves the computer public",
-     [('and not _aa_hides and not _unlink_kw and not _aa_publish_only \\',
-       'and not _unlink_kw and not _aa_publish_only \\')]),
+     [('        if _aa_rest_argv[:2] == ["device-visibility", "private"]:\n'
+       '            return _aa_rest_said\n', '')]),
     ("R5", SR, "⛔ 'make my mac public without allow all' raises the ON confirm, or "
      "answers a publish with allow-all off",
-     [('and not _aa_hides and not _unlink_kw and not _aa_publish_only \\',
-       'and not _aa_hides and not _unlink_kw \\')]),
+     [('        if _aa_pol == "off" and _aa_rest_publishes:\n            return _aa_rest_said\n',
+       '')]),
     ("R6", SR, "⛔ 'is allow all on for my mac?' ACTS instead of listing",
-     [('        if _aa_question:\n            return ["devices"], None\n',
-       '        if False:\n            return ["devices"], None\n')]),
+     [('        if _aa_question or any(re.match(', '        if any(re.match(')]),
     ("R7", SR, "⛔ 'can you let anyone join my mac' is read as a question",
      [('                    and not re.match(_NL_LEAD_IN + r"(?:can|could|would|will|please|do)"\n'
        '                                     r"\\s+(?:you\\s+)?(?:please\\s+)?(?:turn|switch|set|put|"\n'
@@ -336,63 +343,74 @@ MUTANTS = [
      [('if _SET_SIGNAL_PLURAL.search(_aa_set_src) \\\n'
        '                or _SET_SIGNAL_QUANTIFIED.search(_aa_set_src):',
        'if False:')]),
+    # ⛔ R9 / R10 RE-AIMED 2026-09-27: there is no "neutral phrase" strip any more —
+    # polarity is the verb right before a phrase or the word right after it. The
+    # defect both measured is a negation that does NOT govern the phrase deciding
+    # it: R9 a negation AFTER it (`…and don't ask me`), R10 one anywhere BEFORE it
+    # (`I don't mind: let anyone join my mac`).
     ("R9", SR, "⛔ polarity read BEFORE the 'on' phrases are removed — '…and don't ask me' "
      "and 'without asking' read as OFF",
-     [('r"|\\bno\\s+(?:allow|auto)", _aa_neutral))', 'r"|\\bno\\s+(?:allow|auto)", _aa_low))')]),
+     [('        b = _AA_BEFORE.search(before)\n',
+       '        b = _AA_BEFORE.search(before) or re.search(\n'
+       '            rf"\\b(?P<off>{_AA_NEG})\\b(?P<on>(?!))?", src[m.end():], re.I)\n')]),
     ("R10", SR, "⛔ 'let anyone join my mac and don't ask me' switches allow-all OFF",
-     [('                         r"approval\\s+needed)\\b"\n'
-       "                         r\"|\\bdon['’]?t\\s+(?:need\\s+to\\s+|have\\s+to\\s+)?ask(?:\\s+me)?\\b\",\n",
-       '                         r"approval\\s+needed)\\b",\n')]),
+     [('                        rf"{_AA_FILL}\\s*$", re.I)', '                        rf"{_AA_FILL}", re.I)')]),
     ("R11", SR, "⛔ 'require my approval on my mac' names a computer 'approval on my mac'",
      [('                              rf"(?:(?!(?:the|my|our|this|that|on|in|at|for|of|to|"\n'
        "                              rf\"from|with|about)\\b)[\\w'’-]+\\s+){{0,3}}?\"",
        "                              rf\"(?:[\\w'’-]+\\s+){{0,3}}?\"")]),
     ("R12", SR, "⛔ 'let people join the call' raises the ON confirm; 'stop letting…' "
      "switches allow-all off",
-     [('                   or (re.search(rf"\\b{_aa_who}\\b", _aa_low)\n'
-       '                       and not re.search(r"\\b(?:join\\w*|in|onto|use|using)\\s+(?:the|a|an|"\n'
-       '                                         r"our|their|his|her|this|that)\\s+\\w", _aa_low))',
-       '                   or re.search(rf"\\b{_aa_who}\\b", _aa_low)')]),
+     [('            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t) or _aa_bare\n',
+       '            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t) or _aa_bare\n'
+       '            or re.search(rf"\\b{_AA_WHO}\\b", _aa_src, re.I)\n')]),
     ("R13", SR, "⛔⛔ 'stop allowing people to use my mac' — a HIDE since 7.9-3 — switches "
      "allow-all off and leaves it listed",
-     [('    if (_aa_kw or (_aa_use and not _aa_off)\n', '    if (_aa_kw or _aa_use\n')]),
+     [('        elif kind == "use" and said == {"off"}:\n', '        elif False:\n')]),
     ("R14", SR, "⛔ 'join the Studio PC' reaches the catch-all (join is not an ask verb)",
-     [('_join_kw = re.search(r"\\bjoin\\b", low) and not _mine_kw', '_join_kw = None')]),
+     [('    _join_kw = (re.search(r"\\bjoin\\b", low) and not _mine_kw\n',
+       '    _join_kw = (None and not _mine_kw\n')]),
     ("R15", SR, "⛔ 'join my mac' files an ask for the asker's OWN computer",
-     [('_join_kw = re.search(r"\\bjoin\\b", low) and not _mine_kw',
-       '_join_kw = re.search(r"\\bjoin\\b", low)')]),
+     [('    _join_kw = (re.search(r"\\bjoin\\b", low) and not _mine_kw\n',
+       '    _join_kw = (re.search(r"\\bjoin\\b", low)\n')]),
     ("R16", SR, "⛔ `join <machine>` has no capture — nothing to ask for",
      [('           or re.search(r"\\bjoin\\s+(.+)$", t, flags=re.I))', '           )')]),
     ("R17", SR, "⛔ no computer in view is needed — 'allow all cookies' is a switch",
-     [('            and _aa_subject and not _aa_question_off_topic \\\n',
-       '            and not _aa_question_off_topic \\\n')]),
+     [('        if not (_aa_own or _aa_rest_publishes):\n            return None, [_NL_CATCH_ALL]\n',
+       '')]),
+    # ⛔ R18 RE-AIMED 2026-09-27: with no subject the arm now lands on the
+    # catch-all, which the old pin also accepted — so it is measured by the
+    # podcast keeping its OWN route (test_allow_all_router_repair_0927).
     ("R18", SR, "⛔ an artefact request with an audience in it ('email me the brief when "
      "anyone can join') is a switch",
-     [(' \\\n            and not (_artefact_kw and not _machine_kw):', ':')]),
+     [('    if _aa_found and not _unlink_kw and not (_artefact_kw and not _machine_kw):\n',
+       '    if _aa_found and not _unlink_kw:\n')]),
     ("R19", SR, "⛔ a computer NAMED “Allow All Lab” is read as a request",
-     [('    _aa_low = _outside_quoted_names(low)\n', '    _aa_low = low\n')]),
+     [('    _aa_src = _SET_QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), t)\n',
+       '    _aa_src = t\n')]),
     ("R20", SR, "⛔ 'without asking' with no audience ('restart my mac without asking me') "
      "raises the ON confirm",
-     [('rf"|\\b{_aa_who}\\b[^.?!]{{0,40}}\\bwithout\\s+(?:asking|approv\\w*|"',
-       'rf"|\\bwithout\\s+(?:asking|approv\\w*|"')]),
+     [('    rf"|\\b{_AA_WHO}\\b[^.?!]{{0,40}}\\bwithout\\s+(?:asking|approv\\w*|"\n',
+       '    rf"|\\bwithout\\s+(?:asking|approv\\w*|"\n')]),
     ("R21", SR, "⛔ 'require approval again for my mac' — an OFF phrase with no allow-all "
      "word — is not read",
-     [('            or (_aa_off_phrase and (_machine_kw or _aa_off_bare))) \\',
-       '            or False) \\')]),
+     [('    r"|(?P<off>\\brequir\\w*\\s+(?:my\\s+)?approval(?:\\s+(?:again|back))?\\b"\n',
+       '    r"|(?P<off>\\bNEVER_R21\\b"\n')]),
     ("R22", SR, "⛔ a bare 'allow all' / 'turn off auto approve' has no subject and falls "
      "through",
-     [('_aa_subject = (_machine_kw or _request_kw or _aa_bare or _aa_off_bare\n',
-       '_aa_subject = (_machine_kw or _request_kw or _aa_off_bare\n')]),
+     [('            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t) or _aa_bare\n',
+       '            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t)\n')]),
     ("R23", SR, "⛔ 'require approval again' — the phrasing SKILL.md teaches for OFF — said "
      "alone reaches the catch-all",
-     [('            or (_aa_off_phrase and (_machine_kw or _aa_off_bare))) \\',
-       '            or (_aa_off_phrase and _machine_kw)) \\')]),
+     [('                 if p[0] not in ("off_machine", "joins")\n',
+       '                 if p[0] not in ("off_machine", "joins", "off")\n')]),
     ("R24", SR, "⛔ 'ask me first' alone — or any OFF phrase alone — switches allow-all off",
-     [('    _aa_off_bare = re.fullmatch(\n', '    _aa_off_bare = _aa_off_phrase or re.fullmatch(\n')]),
+     [('                 if p[0] not in ("off_machine", "joins")\n',
+       '                 if p[0] not in ("joins",)\n')]),
     ("R25", SR, "⛔ a question about the world ('how open source projects let anyone "
      "join') is answered with this account's device list",
-     [('            and _aa_subject and not _aa_question_off_topic \\\n',
-       '            and _aa_subject \\\n')]),
+     [('            return (["devices"], None) if _aa_own else (None, [_NL_CATCH_ALL])\n',
+       '            return ["devices"], None\n')]),
 
     # ═══ T — the terminal ══════════════════════════════════════════════════════
     ("T1", CLI, "⛔⛔ a terminal join says 'Asked. Its owner decides'",

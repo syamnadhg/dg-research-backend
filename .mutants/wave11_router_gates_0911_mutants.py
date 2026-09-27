@@ -197,8 +197,10 @@ MUTANTS = [
        '    bare = _NEG_IN_NAME.sub(r"\\1", text or "")')]),
     ('N8', SR, 'under',
      '⛔ THE READ VERBS LEAVE THE NEGATION VOCABULARY, so `stop trying to fetch the podcast` FETCHES IT — the veto never fires and the message reaches the podcast branch',
-     [('              rf"switch\\s+to|ask|request|borrow|apply)")',
-       '              rf")")')]),
+     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 1): `join` joined the list on its own
+     # line, so the tail no longer closes the group. The same five words go.
+     [('              rf"switch\\s+to|ask|request|borrow|apply|"',
+       '              rf""')]),
     ('N9', SR, 'over',
      '⛔ THE INTERVENING-WORD LIST BECOMES A WILDCARD, so a negation vetoes any verb later in the same clause — `I don\'t have an update on my machine`, a status ask, is refused on the word `update`. A free span here is how the OLD 40-character negation arm came to read a machine NAME as a negation',
      # ⛔⛔ RESTORED 2026-09-24 TO THE WILDCARD THESE WORDS DESCRIBE. When `keep`
@@ -347,7 +349,9 @@ MUTANTS = [
      [('    rf"(?<!\\bis )(?<!\\bare )(?<!\\bwas )(?<!\\bwere )(?<!\\bisn\'t )(?<!\\baren\'t )"\n', '')]),
     ('X6', SR, 'under',
      "⛔⛔ THE ASK SURFACE LEAVES THE NEGATION VOCABULARY — the hand-written list going short, which this file already records happening TWICE. `don't ask to use the Lab Mac` and `never request access to LABPC001` still reached the ask confirm, and that is the ONE verb on this surface that hands the owner this person's name and email, spends one of five asks an hour, and arms a seven-day refusal if the answer is no",
-     [('              rf"switch\\s+to|ask|request|borrow|apply)")', '              rf")")')]),
+     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 1): `join` joined the list on its own
+     # line; the ask surface's five words go, exactly as before.
+     [('              rf"switch\\s+to|ask|request|borrow|apply|"', '              rf""')]),
 ]
 
 def sh(args, **kw):

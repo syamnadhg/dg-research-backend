@@ -2630,7 +2630,8 @@ def cmd_device_allow_all(args) -> int:
     payload: dict = {"allowAll": value == "yes"}
     if value == "yes":
         payload["visibility"] = "public"
-    return _set_device_visibility(args, payload, "let anyone join “{name}”")
+    return _set_device_visibility(args, payload, "let anyone join “{name}”" if value == "yes"
+                                  else "stop letting anyone join “{name}”")
 
 
 def _set_device_visibility(args, payload: dict, example: str) -> int:
@@ -5660,7 +5661,10 @@ _MUTATING_VERBS = (rf"(?:{_VIS_SETTERS[3:-1]}|{_VIS_HIDE_ALL[3:-1]}|"
                    rf"approve|accept|allow|grant|deny|refuse|reject|block|"
                    rf"research|look\s+into|investigate|start|run|use|update|install|"
                    rf"uninstall|reset|rename|sign\s+out|log\s+out|logout|"
-                   rf"switch\s+to|ask|request|borrow|apply)")
+                   rf"switch\s+to|ask|request|borrow|apply|"
+                   # ⛔ `join` IS AN ASK VERB SINCE WAVE 12, so its negation is a
+                   # negation: `don't join the Studio PC` reached the ask confirm.
+                   rf"join)")
 # ⛔ THE READ VERBS. `don'?t ask to use the Lab Mac` still offered to hand the
 # owner the person's name and email, because the ask surface was missing entirely.
 _READING_VERBS = (r"(?:fetch|get|show|list|tell|display|download|open|play|"
@@ -6247,6 +6251,109 @@ _NL_LOGIN_CHECK = re.compile(
     r"|(?:has|is) (?:the |my )?(?:log ?in|sign[ -]?in) (?:worked|done|complete|completed"
     r"|finished|gone through|succeeded|working|ok|okay))(?: [^.?!]{1,40})?"
     r")(?: (?:yet|now|please|for me))?")
+
+
+# ⭐⭐ ALLOW ALL IS READ BY THE WORDS THAT GOVERN IT (wave 12 repair, 2026-09-27).
+# ⛔⛔ THE FIRST ARM SCANNED THE WHOLE MESSAGE FOR "OFF" WORDS, and three review
+# rounds on this router say what that costs: `turn on allow all so I stop getting
+# requests for my mac` switched Allow all OFF (the `stop` of a purpose clause),
+# `uncheck allow all for my mac` raised the ON confirm (no OFF word it knew), and
+# `list public computers that let anyone join` offered to open the asker's OWN
+# computer. So the polarity now comes only from the verb right before a phrase or
+# the word right after it, and a phrase nothing governs is ON.
+_AA_WHO = (r"(?:anyone|anybody|everyone|everybody|people|strangers|others|"
+           r"folks|whoever\s+asks)")
+_AA_PHRASE = re.compile(
+    # the setting's own names — ON unless an OFF word governs them
+    r"\ballow[- ]?all\b"
+    r"|\bauto(?:matically)?[- ]?(?:approv|accept|admit|join)\w*"
+    rf"|\blet(?:s|ting)?\s+{_AA_WHO}\s+(?:straight\s+)?(?:join|in|onto)\b"
+    rf"|\ballow(?:s|ing)?\s+{_AA_WHO}\s+to\s+join\b"
+    rf"|\b{_AA_WHO}\s+(?:can|could|may)\s+join\b"
+    rf"|\b(?:can|could|may)\s+{_AA_WHO}\s+join\b"
+    r"|\bapprov\w*\s+(?:\w+\s+){0,2}automatically\b"
+    # "without asking" only beside an audience: "stop the run without asking me"
+    rf"|\b{_AA_WHO}\b[^.?!]{{0,40}}\bwithout\s+(?:asking|approv\w*|"
+    r"my\s+(?:ok|okay|approval|permission)|permission)\b"
+    # descriptive — "joins at once" alone is a row of the list, not a request
+    r"|(?P<joins>\bjoins?\s+(?:at\s+once|instantly|straight\s+away|automatically|"
+    r"without\s+asking)\b)"
+    # ⛔ `use` only ever means ON: `stop allowing people to use my mac` is a hide
+    rf"|(?P<use>\blet(?:s|ting)?\s+{_AA_WHO}\s+use\b"
+    rf"|\ballow(?:s|ing)?\s+{_AA_WHO}\s+to\s+use\b)"
+    # the approval step itself — the same switch the other way round, and only
+    # when a word governs it: `turn off approval` is ON, `no approvals` is ON
+    r"|(?P<approval>\bapprovals?\b)"
+    # OFF whatever surrounds them
+    r"|(?P<off>\brequir\w*\s+(?:my\s+)?approval(?:\s+(?:again|back))?\b"
+    r"|\bapprov(?:e|ing)\s+(?:people|each\s+person|every\s+person|everyone|everybody|"
+    r"them)\b[^.?!,;]{0,30}?\b(?:again|myself)\b)"
+    # OFF, but only about a computer: "ask me first" alone is how people talk
+    r"|(?P<off_machine>\bask\s+me\s+first\b"
+    r"|\b(?:make|have)\s+(?:people|everyone|everybody|them)\s+ask\b)", re.I)
+_AA_NEG = (r"(?:don['’]?t|do\s+not|never|no\s+longer|not|no|without|cannot|can['’]?t|"
+           r"won['’]?t|shouldn['’]?t)")
+_AA_OFF_VERB = (r"(?:(?:turn|switch|shut|flip|set|toggle)(?:s|ed|ing)?\s+off|disabl\w*|"
+                r"deactivat\w*|uncheck\w*|untick\w*|clear\w*|remov\w*|drop\w*|stop\w*|"
+                r"paus\w*|end|ends|ending|cancel\w*|revok\w*|undo|unset|kill|"
+                r"get\s+rid\s+of|quit|no\s+more)")
+_AA_ON_VERB = (r"(?:(?:turn|switch|flip|set|put)(?:s|ed|ing)?\s+(?:back\s+)?on|enabl\w*|"
+               r"activat\w*|tick|check|start(?:s|ed|ing)?)")
+_AA_FILL = (r"(?:\s+(?:the|my|your|want(?:\s+to)?|need(?:\s+to)?|ever|even|just|really|"
+            r"to|keep|anymore|any\s+more))*")
+# The verb RIGHT BEFORE a phrase — `turn off allow all`, `don't let anyone join`.
+_AA_BEFORE = re.compile(rf"\b(?:(?P<off>{_AA_NEG}|{_AA_OFF_VERB})|(?P<on>{_AA_ON_VERB}))"
+                        rf"{_AA_FILL}\s*$", re.I)
+# The word RIGHT AFTER one — `turn allow all off`, `set allow all to no`, and past a
+# short object (`turn allow all on my mac off`). ⛔ `on my mac` is a preposition.
+_AA_AFTER = re.compile(
+    r"^\s*(?:(?:on|for|of)\s+(?:my|the|this|our|that)\s+(?:[\w'’-]+\s+){0,2}?"
+    rf"(?:{_MACHINE_NOUNS_SAID})\s+)?(?:(?:setting|mode|box|option)\s+)?(?:(?:to|=|:)\s*)?"
+    r"(?:(?P<off>off|no(?!\s+(?:need|more|longer|one|approvals?|questions?))|false|"
+    r"disabled|unchecked|unticked)"
+    r"|(?P<on>(?:back\s+)?on(?=\s*(?:$|[,.;!?]|(?:for|please|again|now|so|and|then|"
+    r"thanks)\b))|yes|true|enabled|checked|ticked))\b", re.I)
+
+
+def _allow_all_read(src: str) -> "list[tuple[str, str, int, int]]":
+    """Every allow-all phrase in `src` as (kind, polarity, start, end).
+
+    `src` is the message with quoted names blanked to the SAME LENGTH, so the spans
+    index the message itself. Polarity is "on", "off", or "?" when the words that
+    govern it disagree or a negation governs a verb (`never enable allow all`).
+    The span covers the phrase and the words governing it — what a caller blanks
+    to see what ELSE the message asks.
+    """
+    out = []
+    for m in _AA_PHRASE.finditer(src or ""):
+        kind = m.lastgroup or "setting"
+        before = src[:m.start()]
+        b = _AA_BEFORE.search(before)
+        a = _AA_AFTER.match(src[m.end():])
+        said = {g for g in (("on" if b.group("on") else "off") if b else None,
+                            ("on" if a.group("on") else "off") if a else None) if g}
+        # ⛔ A NEGATION ON THE GOVERNING VERB IS NOT A DIRECTION: `don't disable
+        # allow all`, `stop turning off auto join`. Nothing acts on a guess.
+        doubled = bool(b and _AA_BEFORE.search(before[:b.start()]))
+        if kind in ("off", "off_machine"):
+            pol = "?" if b else "off"
+        elif doubled or len(said) > 1:
+            pol = "?"
+        elif kind == "approval":
+            if not said:
+                continue          # a bare "approval" is a word, not the setting
+            pol = "on" if said == {"off"} else "off"
+        elif kind == "use" and said == {"off"}:
+            continue              # `stop letting people use my mac` stays a hide
+        else:
+            pol = said.pop() if said else "on"
+        # A neutral verb in front belongs to the phrase too (`turn allow all off`),
+        # or blanking the phrase leaves "…and turn" welded to a machine's name.
+        nb = None if b else re.search(r"\b(?:turn|switch|set|put|keep|flip|toggle)"
+                                      r"(?:s|ed|ing)?(?:\s+(?:the|my))?\s+$", before, re.I)
+        out.append((kind, pol, b.start() if b else nb.start() if nb else m.start(),
+                    m.end() + (a.end() if a else 0)))
+    return out
 
 
 def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
@@ -6978,112 +7085,118 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # narrowing change teaches people to click through the confirms that matter;
     # the visibility clause's own rule for hiding.
     # ⛔ QUOTED NAMES ARE BLANKED BEFORE A WORD IS READ, so a machine somebody
-    # called “Allow All Lab” is not a request.
-    _aa_low = _outside_quoted_names(low)
-    _aa_who = (r"(?:anyone|anybody|everyone|everybody|people|strangers|others|"
-               r"folks|whoever\s+asks)")
-    _aa_kw = re.search(
-        r"\ballow[- ]?all\b"
-        r"|\bauto(?:matically)?[- ]?(?:approv|accept|admit|join)\w*"
-        # ⛔ `let <nobody in particular> join|in`. `let them use my computer`
-        # names a PERSON who is waiting and stays the decide clause's; `let
-        # people FIND my mac` is a publish and stays the visibility clause's.
-        rf"|\blet(?:s|ting)?\s+{_aa_who}\s+(?:straight\s+)?(?:join|in|onto)\b"
-        rf"|\ballow(?:s|ing)?\s+{_aa_who}\s+to\s+join\b"
-        rf"|\b{_aa_who}\s+(?:can|could|may)\s+join\b"
-        # the same words as a question — answered below with the computer list
-        rf"|\b(?:can|could|may)\s+{_aa_who}\s+join\b"
-        r"|\bapprov\w*\s+(?:\w+\s+){0,2}automatically\b"
-        # ⛔ "without asking" ONLY WITH AN AUDIENCE. On its own it is how people
-        # say "stop the run without asking me", which is not this.
-        rf"|\b{_aa_who}\b[^.?!]{{0,40}}\bwithout\s+(?:asking|approv\w*|"
-        r"my\s+(?:ok|okay|approval|permission)|permission)\b"
-        r"|\bjoins?\s+(?:at\s+once|instantly|straight\s+away|automatically)\b",
-        _aa_low)
-    # ⛔⛔ `use` COUNTS ONLY TOWARD "ON". `let anyone use my computer` raised the
-    # APPROVE confirm and belongs here; but `stop allowing people to use my mac` has
-    # been a HIDE since 7.9-3 (test_chat_owner_793 pins it), and "stop people using
-    # it" is no more a request about allow-all than about being found — so a `use`
-    # phrase with an "off" word keeps the route it had.
-    _aa_use = re.search(rf"\blet(?:s|ting)?\s+{_aa_who}\s+use\b"
-                        rf"|\ballow(?:s|ing)?\s+{_aa_who}\s+to\s+use\b", _aa_low)
-    # ⛔ THE PHRASES THAT MEAN "OFF" ON THEIR OWN. None of them is a decide: an
-    # owner who wants to approve people again is not answering somebody.
-    _aa_off_phrase = re.search(
-        r"\brequir\w*\s+(?:my\s+)?approval\b|\bask\s+me\s+first\b"
-        r"|\b(?:make|have)\s+(?:people|everyone|everybody|them)\s+ask\b", _aa_low)
-    # ⛔⛔ POLARITY IS READ AFTER THE PHRASES THAT MEAN "ON" ARE REMOVED. "let anyone
-    # join WITHOUT asking" and "no approval needed" carry negative words and ask
-    # for allow-all; left in, they read as "off". ⛔ "DON'T ASK ME" TOO: `let anyone
-    # join my mac and don't ask me` switched allow-all OFF.
-    _aa_neutral = re.sub(r"\bwithout\s+\w+(?:\s+\w+)?|\bno\s+(?:need|questions|"
-                         r"approval\s+needed)\b"
-                         r"|\bdon['’]?t\s+(?:need\s+to\s+|have\s+to\s+)?ask(?:\s+me)?\b",
-                         " ", _aa_low)
-    _aa_off = bool(_aa_off_phrase or re.search(
-        r"\b(?:off|disabl\w*|deactivat\w*|stop\w*|no\s+more|no\s+longer|"
-        r"don['’]?t|do\s+not|never|cancel\w*|revok\w*|undo|unset)\b"
-        r"|\bno\s+(?:allow|auto)", _aa_neutral))
-    # A bare "allow all" / "turn allow all off" / "disable auto join" names the
-    # setting and nothing else — its own subject; the command picks the machine.
-    _aa_bare = re.fullmatch(
-        r"(?:please\s+)?(?:(?:turn|switch|set|put)\s+)?(?:(?:on|off)\s+)?"
-        r"(?:(?:disable|enable|stop)\s+)?(?:the\s+)?"
-        r"(?:allow[- ]?all|auto[- ]?(?:approve|accept|join))"
-        r"(?:\s+(?:on|off|back\s+on|again|mode|setting))?(?:\s+please)?", _aa_low)
-    # ⛔ AND "REQUIRE APPROVAL AGAIN" SAID ALONE — the phrasing SKILL.md teaches for
-    # OFF. With no machine word it reached the catch-all. Only the whole message:
-    # "ask me first" inside a longer one is how people talk about anything.
-    _aa_off_bare = re.fullmatch(
-        r"(?:please\s+)?(?:require|requiring)\s+(?:my\s+)?approval"
-        r"(?:\s+(?:again|back))?(?:\s+please)?", _aa_low)
-    # ⛔ A COMPUTER HAS TO BE IN VIEW — a machine word, a quoted name, the queue,
-    # or an audience that can only be joining one. "allow all cookies" is not
-    # about a research computer and falls through untouched.
-    # ⛔ AN AUDIENCE ALONE COUNTS ONLY WHEN THE JOIN HAS NO OTHER OBJECT. `let
-    # people join the call` raised the ON confirm and `stop letting people join the
-    # call` switched Allow all off on the one computer this account owns. "let
-    # anyone join" / "let everyone in" name nothing else, so they stay this arm's.
-    _aa_subject = (_machine_kw or _request_kw or _aa_bare or _aa_off_bare
-                   or (re.search(rf"\b{_aa_who}\b", _aa_low)
-                       and not re.search(r"\b(?:join\w*|in|onto|use|using)\s+(?:the|a|an|"
-                                         r"our|their|his|her|this|that)\s+\w", _aa_low))
-                   or re.search(_QUOTED_SPAN, t))
-    # ⛔ A HIDE WORD MEANS THE VISIBILITY CLAUSE: going private clears allow-all
-    # anyway, and "make it private and turn off allow all" must hide, not leave it
-    # public. `disable` is deliberately NOT here — it is how people say "off".
-    _aa_hides = re.search(rf"\b{_HIDE_POLARITY}\b|\b(?:hide|hides|hiding|"
-                          r"unlist\w*|unpublish\w*|delist\w*)\b", _pol_low)
-    # ⛔ "PUBLIC WITHOUT ALLOW ALL" IS A PLAIN PUBLISH. Taken here, `make my mac
-    # public without allow all` raised the ON confirm, and `…but not allow all`
-    # answered a request to be FOUND with `device-allow-all no`, which publishes
-    # nothing. A plain publish starts in approval mode, so the visibility clause
-    # below already does exactly what was asked.
-    _aa_publish_only = (_public_kw or _offering_kw) and re.search(
-        r"\b(?:without|not|no|never)\s+(?:the\s+|any\s+)?"
-        r"(?:allow[- ]?all|auto[- ]?(?:approv|accept|admit|join)\w*)", _aa_low)
+    # called “Allow All Lab” is not a request. Blanked to the SAME LENGTH, so the
+    # spans `_allow_all_read` returns index the message itself.
+    # ⛔⛔ REPAIRED BY NARROWING (wave 12 repair, 2026-09-27). Cross-verify found
+    # twelve ways the first arm acted on a guess, every one from reading the WHOLE
+    # message: a purpose clause's `stop` flipped ON to OFF, `uncheck` read as ON,
+    # a list of strangers' computers offered to open the asker's own, and `take my
+    # mac off the public list and turn off allow all` left it listed. The arm now
+    # ACTS only when all three hold — an allow-all phrase, the person's OWN
+    # computer, and one direction from the words governing the phrase — and hands
+    # everything else to the clause that owns it. Nothing it declines falls to a
+    # later act branch: `allow` and `let anyone in` are the decide clause's yes
+    # words, and a yes there lets the one waiting stranger in.
+    _aa_src = _SET_QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), t)
+    _aa_found = [p for p in _allow_all_read(_aa_src)
+                 # "ask me first", "make people ask" and "joins at once" are about a
+                 # computer only when one is in view
+                 if p[0] not in ("off_machine", "joins")
+                 or _machine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t)]
     # ⛔ A QUESTION CHANGES NOTHING — the row says it ("public, anyone can join").
     # A polite imperative is not a question: "can you let anyone join my mac" is
-    # the commonest way anybody asks.
+    # the commonest way anybody asks. ⛔ `check` IS THE CHECKBOX'S OWN VERB, so it
+    # opens a question only as "check if / whether".
     _aa_question = (re.match(_NL_LEAD_IN + r"(?:is|are|does|do|did|can|could|who|what|"
                              r"which|how|why|when|will|has|have|tell me (?:if|whether)|"
-                             r"check)\b", low)
+                             r"check\s+(?:if|whether))\b", low)
                     and not re.match(_NL_LEAD_IN + r"(?:can|could|would|will|please|do)"
                                      r"\s+(?:you\s+)?(?:please\s+)?(?:turn|switch|set|put|"
                                      r"make|let|allow|enable|disable|stop|start|auto\w*|"
                                      r"require)\b", low))
-    # ⛔ AND A QUESTION ANSWERS WITH THE COMPUTERS ONLY WHEN ONE IS IN VIEW.
-    # `how open source projects let anyone join` is a question about the world,
-    # and it was answered with this account's device list.
-    _aa_question_off_topic = _aa_question and not (
-        _machine_kw or _request_kw or re.search(_QUOTED_SPAN, t))
-    if (_aa_kw or (_aa_use and not _aa_off)
-            or (_aa_off_phrase and (_machine_kw or _aa_off_bare))) \
-            and _aa_subject and not _aa_question_off_topic \
-            and not _aa_hides and not _unlink_kw and not _aa_publish_only \
-            and not (_artefact_kw and not _machine_kw):
-        if _aa_question:
-            return ["devices"], None
+    if _aa_found and not _unlink_kw and not (_artefact_kw and not _machine_kw):
+        _aa_pols = {p[1] for p in _aa_found}
+        _aa_pol = next(iter(_aa_pols)) if len(_aa_pols) == 1 else "?"
+        # ⭐ WHAT ELSE THE MESSAGE ASKS is the message with the phrases, the words
+        # governing them and the conjunction before them blanked — and the router
+        # itself answers it. That is how a hide or a publish reaches the clause
+        # that owns it, with a name that is not welded to "and turn off allow all".
+        _aa_keep = [True] * len(t)
+        for _k, _p, _s, _e in _aa_found:
+            _cj = re.search(r"(?:\s*(?:,|;|\band\b|\bbut\b|\bthen\b|\bplus\b|\balso\b))+"
+                            r"(?:\s*\b(?:it|this|that|which)\b)?\s*$", t[:_s], re.I)
+            for _i in range(_cj.start() if _cj else _s, _e):
+                _aa_keep[_i] = False
+        _aa_rest = " ".join("".join(c if k else " " for c, k in zip(t, _aa_keep)).split())
+        # (It ends: every level has at least one phrase fewer to blank.)
+        _aa_rest_said = _nl_resolve(_aa_rest)
+        _aa_rest_argv = _aa_rest_said[0] or []
+        _aa_rest_line = " ".join(_aa_rest_said[1] or [])
+        # ⛔ `keep my mac public but turn off allow all` KEEPS it public — OFF does
+        # exactly that; it is not a request to publish.
+        _aa_rest_publishes = (not _aa_rest_argv and _aa_rest_line.startswith(
+            _NL_CONFIRMS["device-visibility"].split("{name}")[0]) and not re.search(
+                r"\b(?:keep|keeps|leave|leaves|stay|stays|remain|remains)\b[^.?!,;]{0,30}"
+                r"\bpublic(?:ly)?\b", _aa_rest, re.I))
+        _aa_rest_low = _aa_rest.lower()
+        # THE SUBJECT: the person's own computer — `my/our/this <machine>`, a quoted
+        # name, a pronoun the visibility clause resolves, `the <name> <machine>` —
+        # or nothing at all but the setting (`allow all`, `turn allow all off`),
+        # which leaves the command's picker to take the one computer they own.
+        _aa_bare = re.fullmatch(
+            r"(?:\W*\b(?:please|pls|can|could|would|will|you|just|now|thanks|thank|ok|"
+            r"okay|hey|so|and|the|setting|mode|box|option|again|back|for|me|i|i['’]d|"
+            r"want|to|like|turn|switch|set|put|keep|make|it|mine|requests?|everyone|"
+            r"anyone|anybody|everybody|people)\b)*\W*", _outside_quoted_names(_aa_rest_low))
+        _aa_own = bool(
+            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t) or _aa_bare
+            or re.search(rf"\b(?:the|that)\s+(?:(?!(?:public|shared|open|other|others|any|"
+                         rf"some|same|one|ones)\b)[\w'’-]+\s+){{0,3}}{_MACHINE_SINGULAR}\b",
+                         _aa_src, re.I))
+        # ⛔⛔ SOMEBODY ELSE'S COMPUTERS. `list public computers that let anyone join`
+        # is a JOINER looking for a way in — the fleet's instant door — and it was
+        # answered with the confirm that opens the asker's own computer.
+        _aa_others = re.search(
+            rf"\b(?:public|shared|open|other\s+people['’]?s?|some(?:one|body)\s+else['’]?s?|"
+            rf"strangers['’]?|another|a|an|any|some|which|what)\s+(?:[\w'’-]+\s+){{0,2}}?"
+            rf"(?:{_MACHINE_NOUNS_SAID})\b"
+            rf"|\b(?:{_MACHINE_NOUNS_SAID.replace('s?', 's')}|ones)\b"
+            rf"|\bones?\s+(?:that|which|where)\b|\bone\s+of\b|\bare\s+there\b", _aa_src, re.I)
+        # A joiner's own verb, left once the phrases are gone: `join a public computer
+        # that lets anyone in`, `ask to use one that lets anyone join`.
+        _aa_joiner = re.search(r"\bjoin\b|\bask\s+(?:to\s+use|for|the\s+owner)\b"
+                               r"|\bborrow\b|\brequest\s+access\b", _aa_rest_low)
+        # ⛔ A PHRASE FOLLOWED BY A COPULA IS A STATEMENT OF STATE, like a question:
+        # `✓ Allow all is off (“Studio PC” is private)` raised the ON confirm.
+        if _aa_question or any(re.match(r"\s+(?:is|are|was|were|isn['’]?t|aren['’]?t|"
+                                        r"wasn['’]?t|weren['’]?t|stays?|remains?)\b",
+                                        _aa_src[p[3]:], re.I) for p in _aa_found):
+            if _aa_joiner or (_aa_others and not _mine_kw):
+                return ["devices-public"], None
+            return (["devices"], None) if _aa_own else (None, [_NL_CATCH_ALL])
+        # ⛔ A HIDE WINS, whichever way the phrase points: going private clears
+        # Allow all anyway, and it is the narrowing half.
+        if _aa_rest_argv[:2] == ["device-visibility", "private"]:
+            return _aa_rest_said
+        if _aa_joiner:
+            if _aa_others:
+                return ["devices-public"], None
+            # `join the Studio PC — it lets anyone in` is the ask clause's.
+            if _aa_rest_argv[:1] == ["device-add"] or _aa_rest_line.startswith(
+                    _NL_CONFIRMS["device-ask"].split("{name}")[0]):
+                return _aa_rest_said
+            return None, [_NL_CATCH_ALL]
+        if not _aa_own and _aa_others:
+            return ["devices-public"], None
+        if not (_aa_own or _aa_rest_publishes):
+            return None, [_NL_CATCH_ALL]
+        if _aa_pol == "?":
+            return None, ["Should Allow all be on or off? Say “turn on Allow all” or "
+                          "“turn off Allow all” — nothing changes until you do."]
+        # ⛔ PUBLIC PLUS "APPROVE EACH PERSON" IS A PLAIN PUBLISH: `make my mac public
+        # but require my approval`, `…without allow all`. It starts in approval mode.
+        if _aa_pol == "off" and _aa_rest_publishes:
+            return _aa_rest_said
         # ⛔ THE MACHINE IS A HINT THE COMMAND VALIDATES, NEVER A NAME INVENTED
         # HERE — a quoted name verbatim, or a determiner-led phrase ending in a
         # machine word. Anything else, and every bare noun, goes to the picker:
@@ -7103,7 +7216,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             if _aa_m:
                 _aa_obj = _strip_leading_noun(_aa_m.group(1).strip())
                 if _is_bare_machine_noun(_aa_obj) or re.search(
-                        rf"\b(?:allow|all|auto\w*|{_aa_who[3:-1]}|public|private)\b",
+                        rf"\b(?:allow|all|auto\w*|{_AA_WHO[3:-1]}|public|private)\b",
                         _aa_obj, flags=re.I):
                     _aa_obj = ""
         # ⛔⛔ A SET OF MACHINES IS REFUSED, AND ONLY MACHINES COUNT. The shared
@@ -7116,7 +7229,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                 or _SET_SIGNAL_QUANTIFIED.search(_aa_set_src):
             return None, ["I switch Allow all one computer at a time. Ask me to list "
                           "them and name the one — nothing changes until you do."]
-        if _aa_off:
+        if _aa_pol == "off":
             return (["device-allow-all", "no"] + ([_aa_obj] if _aa_obj else []),
                     None)
         return None, [_NL_CONFIRMS["device-allow-all"].format(
@@ -7640,7 +7753,11 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                      _ask_obj, re.I)
         or re.fullmatch(rf"{_CATEGORY_DET}+(?:{_MACHINE_NOUNS})", _ask_obj, re.I)
         or (re.fullmatch(rf"(?:{_MACHINE_NOUNS})", _ask_obj, re.I)
-            and _ask_obj_generic_det))
+            and _ask_obj_generic_det)
+        # ⛔ "one of the public computers" names the list, not one row — `join one
+        # of the public computers` was refused as a SET ("I ask one owner at a
+        # time") where it used to show the list (wave 12 repair).
+        or re.match(r"(?:any\s+|some\s+|just\s+)?one\s+of\b", _ask_obj, re.I))
     # ⛔⛔ AND THE MESSAGE HAS TO BE ABOUT A MACHINE. The first draft accepted any
     # single word of six characters or more as "an id", so "ask for feedback",
     # "ask about pricing" and "request refund" all raised the consent question
@@ -7672,7 +7789,22 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # it. The object tests below apply to it unchanged — "join a public computer"
     # is still the category and still the browse list. ⛔ And never the asker's
     # OWN machine: "join my mac" is not a request to a stranger.
-    _join_kw = re.search(r"\bjoin\b", low) and not _mine_kw
+    # ⛔ AND NEVER A SIGN-IN OR A QUESTION (wave 12 repair). `sign in to join the
+    # Studio PC` went to `login` until `join` became an ask verb, and then raised
+    # the ask confirm — overriding e567704's "a sign-in stays a sign-in". `did I
+    # join the Studio PC` is asking what happened, not asking to.
+    _join_kw = (re.search(r"\bjoin\b", low) and not _mine_kw
+                and not re.search(rf"\b{_SIGN_IN_ASK}\b", low)
+                and not re.match(_NL_LEAD_IN + r"(?:did|do|does|have|has|had|was|were|is|"
+                                 r"are|am|why|when|what|which|who|how|where)\b", low))
+    # ⛔⛔ A CODE AFTER `join` IS A CODE. `join K7XQ-9B2M` asked the owner of a
+    # computer called “K7XQ-9B2M” — posting the access code as a device id,
+    # spending one of five asks an hour — and never paired it. The object has to
+    # BE the code, in a shape rule 1 already pairs.
+    if _join_kw and _ask_obj and (_NL_CODE_RE.fullmatch(_ask_obj)
+                                  or _NL_CONNECTION_CODE_RE.fullmatch(_ask_obj)
+                                  or _NL_CAPS_CODE_RE.fullmatch(_ask_obj)):
+        return ["device-add", _ask_obj], None
     if (_ask_kw or _join_kw) and _ask_obj and _ask_is_about_a_machine \
             and not _ask_obj_is_thing \
             and not _ask_obj_is_pronoun and not _ask_obj_is_category \
