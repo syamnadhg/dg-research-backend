@@ -158,7 +158,8 @@ VALIDATE = ('        if _vis != _VISIBILITY_SHOW and _vis not in _VISIBILITY_VAL
 # "already set") and writes it from a single site. V3/V4 moved onto the two
 # shortcuts that replaced `if value == current:`, and V5/O1/O2 onto the new
 # write site. Each mutation means what it meant; wave12_allow_all_machine
-# measures the new allow-all guards on the same lines.
+# measures the new allow-all guards on the same lines. (That claim was false of
+# V4, which then measured the close only — split into V4a/V4b 2026-09-27.)
 #: The single write site.
 WRITE = '    if patch and not _pair_patch_device(device_id, patch):'
 #: The private "already set" shortcut — a close only when there is one to make.
@@ -282,13 +283,26 @@ MUTANTS = [
      "for no change at all",
      [(CLOSE_SHORTCUT, '        patch = {"visibility": "private"}'),
       (PUBLIC_SHORTCUT, "")]),
-    ("V4", "under",
-     "⛔⛔ the shortcut inverts, so the write happens ONLY when it would change "
-     "nothing — every real change is silently reported as already set",
+    # ⛔ SPLIT 2026-09-27 (wave 12 repair, cross-verify F18). V4 was one
+    # `if value == current:` inverted, which broke BOTH directions. Wave 12's
+    # re-aim put it on the two shortcuts that replaced that line, but its second
+    # edit (`want != allow_now`) only fires on a computer that is ALREADY public —
+    # so private→public still wrote, and only the close was measured (executed:
+    # private→public patched; public→private said "Already set"). Now one mutant
+    # per direction, each the same inversion: the write happens only when it would
+    # change nothing.
+    ("V4a", "under",
+     "⛔⛔ the OPEN inverts: `--visibility public` on a private computer is "
+     "answered \"Already set\" and never writes, while a public one is written to "
+     "for nothing",
+     [(PUBLIC_SHORTCUT,
+       '    elif current != "public" and want == allow_now:\n        patch = {}\n')]),
+    ("V4b", "under",
+     "⛔⛔ the CLOSE inverts: `--visibility private` on a listed computer is "
+     "answered \"Already set\" and never writes — the door stays open — while a "
+     "private one is written to for nothing",
      [(CLOSE_SHORTCUT,
-       '        patch = {"visibility": "private"} if current == "private" else {}'),
-      (PUBLIC_SHORTCUT,
-       '    elif current == "public" and want != allow_now:\n        patch = {}\n')]),
+       '        patch = {"visibility": "private"} if current == "private" else {}')]),
     ("V5", "under",
      "⛔ a refused write reports success. `--visibility public` then exits 0 "
      "having changed nothing, which is the answer a script reads",

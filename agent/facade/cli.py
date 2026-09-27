@@ -1201,8 +1201,16 @@ _ASK_FAILURES = {
     # ⛔⛔ THE BRIDGE'S OWN CODE (wave 12). On a computer that lets anyone join the
     # ask IS the join, so an answer that never came may sit on a membership that
     # landed — and asking again answers "you can already use that computer".
+    # ⛔ AND IT POINTS AT THE LIST WHERE AN ASK WAITS (wave 12 repair,
+    # 2026-09-27): `agent device` shows only a join; an ordinary ask that went
+    # through waits in `agent device requests`, which this used to leave out.
     "ask_unconfirmed": "the app did not answer in time — that may have gone "
-                       "through; check `agent device` before asking again",
+                       "through; check `agent device requests` (still waiting) "
+                       "and `agent device` (let straight in) before asking again",
+    # ⛔ THE BRIDGE'S OTHER CODE: the sign-in could not be refreshed, so the ask
+    # never left — an ordinary failure, and saying so is the whole point.
+    "ask_not_sent": "this agent could not refresh its sign-in, so nothing was "
+                    "sent — it is safe to ask again in a moment",
 }
 
 # ⛔⛔ ANSWERING A REQUEST HAS ITS OWN TABLE AND IT IS NOT `_ASK_FAILURES`.
@@ -1280,9 +1288,19 @@ _PUBLIC_JOIN_INVITE_T = ("     Ones marked (joins at once) let you straight in; 
 # ⭐ WAVE 12: what Allow all costs the owner, in the chat client's words
 # (`_ALLOW_ALL_MEANS`) — said under every reply that leaves a computer letting
 # anyone join, so what was done and what it means sit on one screen.
+# ⛔⛔ THE MIDDLE LINE IS THE CANONICAL DISCLOSURE, WORD FOR WORD AND UNBROKEN
+# (wave 12 repair, 2026-09-27) — the web's checkbox line and the machine's said
+# what a joiner can SEE and this said only that they run research. One sentence
+# on every surface, on a line of its own so no wrap can split it.
 _ALLOW_ALL_MEANS_T = ("     Anyone signed in can join it at once — up to 25 people — "
-                      "without asking you,\n     and run research on your AI "
-                      "accounts. People you removed stay out.")
+                      "without asking you.\n"
+                      "     They run research on your AI accounts and can see your "
+                      "email, who else is on it, and what's running on it.\n"
+                      "     People you removed stay out.")
+# ⛔ WHAT CLOSING THE DOOR DOES NOT DO, in the machine's own words — after Allow
+# all goes off, and after an allow-all computer goes private (wave 12 repair).
+_JOINED_KEEP_ACCESS_T = ("     Anyone who already joined keeps access — remove "
+                         "people in the web app (Shared with).")
 
 _PLAIN_VERBS = {
     "looked for public computers": "look for public computers",
@@ -2076,8 +2094,7 @@ def _device_switch(device_id: str, payload: dict, asked_all) -> int:
                   f"person again.")
             # ⛔ WHAT OFF DOES NOT DO: nobody who joined is removed. That is
             # Remove, in the web app — and it is a ban.
-            print("     Anyone who already joined keeps access — remove people in "
-                  "the web app (Shared with).")
+            print(_JOINED_KEEP_ACCESS_T)
         else:
             print(f"{_OK} {name} already asks you about each person. Nothing to "
                   f"change.")
@@ -2091,6 +2108,10 @@ def _device_switch(device_id: str, payload: dict, asked_all) -> int:
     else:
         print(f"{_OK} {name} is now {word}.")
     _print_visibility_meaning(state, body.get("publicLabel"), everyone)
+    # ⛔ GOING PRIVATE SWITCHES ALLOW ALL OFF, AND THAT IS NOT A REMOVAL (wave 12
+    # repair, 2026-09-27) — said only when the bridge says the door WAS open.
+    if state == "private" and changed and body.get("allowAllWas") is True:
+        print(_JOINED_KEEP_ACCESS_T)
     return 0
 
 

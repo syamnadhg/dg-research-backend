@@ -161,10 +161,13 @@ MUTANTS = [
      "and never writes",
      [('    if value == _VISIBILITY_SHOW and allow_all is None:',
        '    if value == _VISIBILITY_SHOW:')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair, cross-verify F6/F24): the sentence
+    # moved into the constant `_ALLOW_ALL_SEES` (the canonical disclosure, which
+    # gained "and what's running on it"), and this line prints it. Same defect —
+    # the print gone. The wording itself is D3 in wave12_repair1_agent_mutants.
     ("A24", RESEARCH, "⛔ turning it on never says what a joiner gets — your AI "
      "accounts, your email, who else is on it",
-     [("        print(f\"  {_c(_DIM, '     They run research on your AI accounts and can "
-       "see your email and who else is on it.')}\")\n", "")]),
+     [("        print(f\"  {_c(_DIM, '     ' + _ALLOW_ALL_SEES)}\")\n", "")]),
     ("A25", RESEARCH, "⛔ turning it off never says everyone who joined keeps access, so "
      "'off' reads as 'they are gone'",
      [('    elif allow_now:\n', '    elif False:\n')]),

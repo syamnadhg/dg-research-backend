@@ -179,9 +179,22 @@ _PUBLIC_JOIN_INVITE = ("Tell me which one you want. Ones marked “joins at once
 # agreed to and what they are told they did are one text. Twenty-five is the
 # sharing cap — a token-size limit, not a setting — and "people you removed stay
 # out" is the one protection that survives: Remove is a ban.
+# ⛔⛔ THE MIDDLE SENTENCE IS THE CANONICAL DISCLOSURE, WORD FOR WORD (wave 12
+# repair, 2026-09-27). The web's checkbox line and the machine's `--allow-all yes`
+# said what a joiner can SEE — the owner's email, who else is on it — and this
+# confirm said only that they run research, so the chat asked for consent to less
+# than the other two surfaces disclosed. Every surface now carries the same
+# sentence, including what is running on it: a joiner reads the whole device
+# document, run titles and queue included.
 _ALLOW_ALL_MEANS = ("Anyone signed in can join {name} at once — up to 25 people — "
-                    "without asking you, and run research on your AI accounts. "
-                    "People you removed stay out.")
+                    "without asking you. They run research on your AI accounts and "
+                    "can see your email, who else is on it, and what's running on "
+                    "it. People you removed stay out.")
+# ⛔ WHAT CLOSING THE DOOR DOES NOT DO, in the machine's own words — said after
+# Allow all goes off AND after an allow-all computer goes private (wave 12 repair,
+# 2026-09-27), from this one place so the two replies cannot drift apart.
+_JOINED_KEEP_ACCESS = ("Anyone who already joined keeps access — remove people in "
+                       "the web app (Shared with).")
 
 # ⛔ ONE EXPLANATION OF AN EMPTY PUBLIC LIST. The two screens ask different
 # questions — "are there any?" and "I have none, is there another way?" — so the
@@ -2038,8 +2051,17 @@ _ASK_ERRORS = {
     # membership that landed — "couldn't ask" would be a claim about something
     # that may well have happened, and asking again answers "you can already use
     # that computer" with nothing selected and nothing started.
+    # ⛔ AND IT POINTS AT THE LIST WHERE AN ASK WAITS (wave 12 repair,
+    # 2026-09-27). "Your computers" shows only the join; an ordinary ask that
+    # went through waits in your requests, and was sent to the wrong list.
     "ask_unconfirmed": "The app didn’t answer in time — that may have gone through. "
-                       "Ask me for your computers before asking again.",
+                       "Ask me for your requests before asking again: it’s either "
+                       "waiting there, or it let you in and it’s one of your "
+                       "computers.",
+    # ⛔ THE BRIDGE'S OTHER CODE: the sign-in could not be refreshed, so the ask
+    # never left — an ordinary failure, and saying so is the whole point.
+    "ask_not_sent": "This agent couldn’t refresh its sign-in, so nothing was sent. "
+                    "It’s safe to ask again in a moment.",
 }
 
 # ⛔⛔ THE TWO LIST ROUTES HAD NO TABLE AT ALL, so `rate_limited`, `unauthorized`
@@ -2681,8 +2703,7 @@ def _visibility_lines(body: dict, dev: dict, asked_all) -> "list[str]":
         # joined is removed — that is Remove, in the web app, and it is a ban.
         lines = ([f"✓ “{name}” no longer lets anyone join — you approve each "
                   f"person again.",
-                  "Anyone who already joined keeps access — remove people in the "
-                  "web app (Shared with)."] if changed
+                  _JOINED_KEEP_ACCESS] if changed
                  else [f"✓ “{name}” already asks you about each person. Nothing "
                        f"to change."])
     elif asked_all is False:
@@ -2698,9 +2719,17 @@ def _visibility_lines(body: dict, dev: dict, asked_all) -> "list[str]":
     else:
         head = (f"✓ “{name}” is now {state}." if changed
                 else f"✓ “{name}” is already {state}. Nothing to change.")
-        return [head,
-                "Nobody can find it. An access code still lets someone in without "
-                "asking you."]
+        lines = [head,
+                 "Nobody can find it. An access code still lets someone in without "
+                 "asking you."]
+        # ⛔ GOING PRIVATE SWITCHES ALLOW ALL OFF, AND THAT IS NOT A REMOVAL (wave
+        # 12 repair, 2026-09-27). Everyone who joined while the door was open is
+        # an ordinary sharer now; an owner who reads "private" as "they are gone"
+        # never goes and looks. The machine's own line, said only when the bridge
+        # says the door WAS open.
+        if changed and body.get("allowAllWas") is True:
+            lines.append(_JOINED_KEEP_ACCESS)
+        return lines
     # ⛔⛔ THE PUBLISHED NAME IS THE DISCLOSURE, not decoration: a computer
     # nobody has renamed reports a hostname that often carries its owner's
     # own name, and this is where that becomes visible to strangers.

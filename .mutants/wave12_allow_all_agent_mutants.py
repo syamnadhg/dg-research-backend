@@ -8,9 +8,10 @@
        best-effort clear only if a tick was stored; a re-publish never brings an
        old tick back; the no-op compares BOTH fields.
   J* — bridge `/device/ask` answered "joined": never parked for the watcher,
-       clears a parked ask for THAT computer, selects it only when nothing live is
-       selected, starts a held topic (claimed first, restored on failure), a stable
-       reply for the fleet, the long wait, and an unconfirmed timeout.
+       clears a parked ask for THAT computer, selects it only when nothing was
+       routable before the join (repair 1, 2026-09-27 — see J4-J6's note), starts
+       a held topic (claimed first, restored on failure), a stable reply for the
+       fleet, the long wait, and an unconfirmed timeout.
   F* — firestore_rest `set_device_allow_all`: literal masks, bool values.
   S* — sr.py: the joined reply, the rows, the invite, the two owner switches, the
        owner half of device-requests, the ask confirm and the ask table.
@@ -161,18 +162,24 @@ MUTANTS = [
      "never announced",
      [('if isinstance(parked, dict) and str(parked.get("deviceId") or "") == device_id:',
        'if isinstance(parked, dict):')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair, cross-verify F3) — J4, J5 AND J6. The
+    # `if not saved or gone:` rule and its `gone` flag were replaced: the joined
+    # computer is now selected only when `_pick_device_from` finds nothing routable
+    # on the list as it was before the join, and a saved choice still on that list
+    # is `kept`. Each mutant keeps its original defect on the new lines; the new
+    # rule's own mutants are B1-B4 in wave12_repair1_agent_mutants.
     ("J4", BRIDGE, "⛔⛔ a join replaces a LIVE selection — research moves to a stranger's "
      "computer without anyone asking",
-     [('            if not saved or gone:\n', '            if True:\n')]),
+     [('                if not kept and routed is None:\n', '                if True:\n')]),
     ("J5", BRIDGE, "⛔ a selection that no longer exists is kept — the next research asks "
      "'which computer?' of somebody who just joined one",
-     [('gone = devs is not None and bool(saved) and not any(',
-       'gone = False and not any(')]),
+     [('kept = bool(saved) and any(d.get("id") == saved for d in before)',
+       'kept = bool(saved)')]),
     ("J6", BRIDGE, "⛔ a list that could not be READ counts as the selection being gone",
-     [('gone = devs is not None and bool(saved) and not any(\n'
-       '                d.get("id") == saved for d in devs)',
-       'gone = bool(saved) and not any(\n'
-       '                d.get("id") == saved for d in (devs or []))')]),
+     [('            if devs is not None:\n'
+       '                before = [d for d in devs if d.get("id") != device_id]\n',
+       '            if True:\n'
+       '                before = [d for d in (devs or []) if d.get("id") != device_id]\n')]),
     ("J7", BRIDGE, "⛔⛔ a held topic is never started on the joined computer — it sits "
      "held on a computer the person can already use",
      [('                if usable:\n                    # ⛔⛔ CLAIMED BEFORE THE ENQUEUE',
@@ -278,10 +285,12 @@ MUTANTS = [
      "public' on an allow-all computer says 'You still approve every person'",
      [('everyone = state == "public" and body.get("allowAll") is True',
        'everyone = asked_all is True')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair): the sentence became the constant
+    # `_JOINED_KEEP_ACCESS`, shared with the going-private reply. Same defect.
     ("S18", SR, "⛔ OFF never says that people who joined keep access",
-     [('                  "Anyone who already joined keeps access — remove people in the "\n'
-       '                  "web app (Shared with)."] if changed',
-       '                  ] if changed')]),
+     [('                  f"person again.",\n'
+       '                  _JOINED_KEEP_ACCESS] if changed',
+       '                  f"person again."] if changed')]),
     ("S19", SR, "⛔⛔ device-requests says 'Nobody is waiting' to an allow-all owner and "
      "nothing else",
      [('    lines += _allow_all_owner_lines(incoming)\n', '')]),
@@ -292,9 +301,13 @@ MUTANTS = [
        'if isinstance(d, dict) and d.get("allowAll") is True')]),
     ("S22", SR, "⛔ the picker's example names the other switch",
      [('dev, fail = _pick_owned_device(example)', 'dev, fail = _pick_owned_device()')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair, cross-verify F23): the sentence now
+    # points at the requests list. Same defect — the row gone.
     ("S23", SR, "⛔ ask_unconfirmed has no sentence — 'Couldn’t ask … ask_unconfirmed'",
      [('    "ask_unconfirmed": "The app didn’t answer in time — that may have gone through. "\n'
-       '                       "Ask me for your computers before asking again.",\n', '')]),
+       '                       "Ask me for your requests before asking again: it’s either "\n'
+       '                       "waiting there, or it let you in and it’s one of your "\n'
+       '                       "computers.",\n', '')]),
     ("S24", SR, "⛔⛔ the ask confirm still promises 'They decide' — false of a computer "
      "that lets anyone in",
      [('"If its owner lets anyone in, you join straight away; otherwise "\n'
@@ -443,12 +456,18 @@ MUTANTS = [
     ("T10", CLI, "⛔ the terminal invite keeps 'once the request is accepted'",
      [('return (_PUBLIC_JOIN_INVITE_T if any(_joins_at_once(d) for d in rows)',
        'return (_PUBLIC_JOIN_INVITE_T if False')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair): T11's sentence became the constant
+    # `_JOINED_KEEP_ACCESS_T` (the going-private reply prints it too), and T12's
+    # now points at `agent device requests` (cross-verify F23). Same defects.
     ("T11", CLI, "⛔ OFF never says that people who joined keep access",
-     [('            print("     Anyone who already joined keeps access — remove people in "\n'
-       '                  "the web app (Shared with).")\n', '')]),
+     [('            # Remove, in the web app — and it is a ban.\n'
+       '            print(_JOINED_KEEP_ACCESS_T)\n',
+       '            # Remove, in the web app — and it is a ban.\n')]),
     ("T12", CLI, "⛔ ask_unconfirmed has no terminal sentence",
      [('    "ask_unconfirmed": "the app did not answer in time — that may have gone "\n'
-       '                       "through; check `agent device` before asking again",\n', '')]),
+       '                       "through; check `agent device requests` (still waiting) "\n'
+       '                       "and `agent device` (let straight in) before asking again",\n',
+       '')]),
     ("T13", CLI, "⛔ the owner line reports on a computer this account only shares",
      [('if (isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True',
        'if (isinstance(d, dict) and d.get("allowAll") is True')]),

@@ -44,6 +44,14 @@ PUB_OPEN = {"deviceId": "dev-j9", "label": "DG shared", "osFamily": "linux",
             "online": True, "full": False, "allowAll": True}
 PUB_OPEN_FULL = dict(PUB_OPEN, deviceId="dev-j8", label="DG full", full=True)
 
+# ⛔⛔ THE CANONICAL DISCLOSURE (wave 12 repair, cross-verify F24 + F6) — the one
+# second sentence the web's checkbox line, the machine, the chat and the agent
+# terminal all say, word for word. Before the repair the chat and the terminal
+# said only that joiners run research; the web and the machine also said what
+# they can SEE.
+CANON = ("They run research on your AI accounts and can see your email, who else "
+         "is on it, and what's running on it.")
+
 
 def _ns(**kw):
     kw.setdefault("json", False)
@@ -95,11 +103,22 @@ def test_allow_all_yes_asks_for_public_and_allow_all_together(chat):
         {"deviceId": "dev-a1", "visibility": "public", "allowAll": True}]
     out = chat.out()
     assert "✓ “Studio PC” now lets anyone join at once." in out
+    # ⛔ RE-PINNED 2026-09-27 (wave 12 repair): the middle sentence is CANON now.
     assert ("Anyone signed in can join “Studio PC” at once — up to 25 people — "
-            "without asking you, and run research on your AI accounts. People you "
-            "removed stay out.") in out
+            f"without asking you. {CANON} People you removed stay out.") in out
     assert "They see it as “Studio PC”." in out
     assert "You still approve every person yourself" not in out
+
+
+@pytest.mark.parametrize("text", ["turn on allow all", "let anyone join my mac"])
+def test_the_chat_asks_consent_to_the_whole_disclosure(text):
+    """⛔⛔ THE CONFIRM IS THE CONSENT MOMENT (cross-verify F24). It asked for less
+    than the web and the machine disclose — nothing about the owner's email, the
+    other members or what is running. Driven through the router `do` runs."""
+    argv, lines = sr._nl_resolve(text)
+    assert argv is None, argv
+    said = " ".join(lines or [])
+    assert CANON in said, said
 
 
 def test_allow_all_no_sends_no_visibility_and_says_who_keeps_access(chat):
@@ -169,6 +188,33 @@ def test_visibility_public_with_allow_all_sends_both(chat):
     assert _posted(chat, "/device/visibility") == [
         {"deviceId": "dev-a1", "visibility": "public", "allowAll": True}]
     assert "now lets anyone join at once" in chat.out()
+
+
+def test_going_private_on_an_open_computer_says_who_keeps_access(chat):
+    """⛔ WAVE 12 REPAIR (cross-verify F26). Going private switches Allow all off
+    as well; the machine says everyone who joined keeps access, and the chat said
+    nothing — so an owner could believe the people were gone. The machine's own
+    line, only when the bridge says the door WAS open."""
+    chat.posts["/device/visibility"] = (200, {"ok": True, "changed": True,
+                                              "visibility": "private",
+                                              "allowAll": False, "allowAllWas": True,
+                                              "deviceName": "Studio PC"})
+    sr.cmd_device_visibility(_ns(value="private", device="", allow_all=False))
+    out = chat.out()
+    assert "✓ “Studio PC” is now private." in out
+    assert ("Anyone who already joined keeps access — remove people in the web app "
+            "(Shared with).") in out
+
+
+@pytest.mark.parametrize("extra", [{"changed": True, "allowAllWas": False},
+                                   {"changed": True},        # an older bridge
+                                   {"changed": False, "allowAllWas": True}])
+def test_going_private_says_nothing_about_joiners_when_nobody_could_join(chat, extra):
+    chat.posts["/device/visibility"] = (200, {"ok": True, "visibility": "private",
+                                              "allowAll": False,
+                                              "deviceName": "Studio PC", **extra})
+    sr.cmd_device_visibility(_ns(value="private", device="", allow_all=False))
+    assert "keeps access" not in chat.out()
 
 
 def test_visibility_private_with_allow_all_is_refused_before_the_bridge(chat):
@@ -376,6 +422,21 @@ def test_an_unconfirmed_ask_says_it_may_have_gone_through(chat):
     out = chat.out()
     assert "may have gone through" in out
     assert "Couldn’t ask" not in out
+    # ⛔ WAVE 12 REPAIR (cross-verify F23): an ask that went through waits in the
+    # REQUESTS list — "your computers" alone showed only the join.
+    assert "Ask me for your requests before asking again" in out
+
+
+def test_an_ask_that_was_never_sent_says_so(chat):
+    """⛔⛔ WAVE 12 REPAIR (cross-verify F23). A sign-in refresh that failed before
+    the ask left was answered "that may have gone through"; the bridge now tells
+    the two apart, and this is the sentence for the one where nothing went out."""
+    chat.posts["/device/ask"] = (502, {"reason": "ask_not_sent",
+                                       "error": "ask_not_sent"})
+    assert sr.cmd_device_ask(_ns(device="dev-j9-0000")) != 0
+    out = chat.out()
+    assert "nothing was sent" in out
+    assert "may have gone through" not in out and "ask_not_sent" not in out
 
 
 # ── sr.py device-requests, owner half ─────────────────────────────────────────
@@ -424,6 +485,7 @@ def test_a_failed_second_look_adds_nothing_and_breaks_nothing(chat):
 
 def test_both_clients_word_ask_unconfirmed():
     assert "ask_unconfirmed" in sr._ASK_ERRORS and "ask_unconfirmed" in cli._ASK_FAILURES
+    assert "ask_not_sent" in sr._ASK_ERRORS and "ask_not_sent" in cli._ASK_FAILURES
     assert set(sr._ASK_ERRORS) == set(cli._ASK_FAILURES)
 
 
@@ -461,6 +523,8 @@ def test_terminal_allow_all_yes_posts_both_and_prints_what_it_means(term):
     out = term.out()
     assert "Studio PC now lets anyone join at once." in out
     assert "Anyone signed in can join it at once — up to 25 people" in out
+    # ⛔ WAVE 12 REPAIR (cross-verify F24): the canonical sentence, on one line.
+    assert f"     {CANON}\n" in out
     assert "You still approve" not in out
 
 
@@ -559,6 +623,52 @@ def test_terminal_join_says_joined_and_waits_fifty(term):
     assert "owner decides" not in out
     asks = [c for c in term.calls if c[1] == "/device/ask"]
     assert asks[0][3] == 50.0
+
+
+def test_terminal_unconfirmed_ask_points_at_the_requests_list(term):
+    """⛔ WAVE 12 REPAIR (cross-verify F23): an ask that went through waits in
+    `agent device requests`; `agent device` alone shows only a join."""
+    term.box["post"]["/device/ask"] = (502, {"reason": "ask_unconfirmed",
+                                             "error": "ask_unconfirmed"})
+    ns = _run(["device", "ask", "dev-j9"])
+    assert ns.func(ns) == 1
+    out = term.out()
+    assert "may have gone through" in out and "`agent device requests`" in out
+
+
+def test_terminal_ask_never_sent_says_so(term):
+    term.box["post"]["/device/ask"] = (502, {"reason": "ask_not_sent",
+                                             "error": "ask_not_sent"})
+    ns = _run(["device", "ask", "dev-j9"])
+    assert ns.func(ns) == 1
+    out = term.out()
+    assert "nothing was sent" in out
+    assert "may have gone through" not in out and "ask_not_sent" not in out
+
+
+def test_terminal_going_private_on_an_open_computer_says_who_keeps_access(term):
+    """⛔ WAVE 12 REPAIR (cross-verify F26), the terminal's copy of the chat line."""
+    term.box["post"]["/device/visibility"] = (200, {
+        "ok": True, "changed": True, "visibility": "private", "allowAll": False,
+        "allowAllWas": True, "deviceName": "Studio PC"})
+    ns = _run(["device", "visibility", "dev-a1", "private"])
+    assert ns.func(ns) == 0
+    out = term.out()
+    assert "Studio PC is now private." in out
+    assert ("Anyone who already joined keeps access — remove people in the web app "
+            "(Shared with).") in out
+
+
+@pytest.mark.parametrize("extra", [{"changed": True, "allowAllWas": False},
+                                   {"changed": True},
+                                   {"changed": False, "allowAllWas": True}])
+def test_terminal_going_private_is_silent_about_joiners_when_nobody_could_join(term, extra):
+    term.box["post"]["/device/visibility"] = (200, {
+        "ok": True, "visibility": "private", "allowAll": False,
+        "deviceName": "Studio PC", **extra})
+    ns = _run(["device", "visibility", "dev-a1", "private"])
+    ns.func(ns)
+    assert "keeps access" not in term.out()
 
 
 def test_terminal_requests_tell_an_allow_all_owner_why_nobody_waits(term):

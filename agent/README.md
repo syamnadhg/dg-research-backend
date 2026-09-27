@@ -157,14 +157,16 @@ and nothing happens on their machine until they say yes.
 
 **Allow all** is the one exception, and it is about access. `device-allow-all
 yes` (confirmed first) lets anyone signed in join a public computer you own at
-once — up to 25 people, running research on your AI accounts; people you removed
-stay out — and makes it public too if it wasn't; `device-visibility public
+once — up to 25 people. They run research on your AI accounts and can see your
+email, who else is on it, and what's running on it. People you removed stay out.
+It makes the computer public too if it wasn't; `device-visibility public
 --allow-all` is the same step. `device-allow-all no` goes back to approving each
 person (the computer stays public, and anyone who already joined keeps access);
-going private switches it off as well. On the other side, a public row marked
-*joins at once* lets `device-ask` in straight away: the reply says you're in,
-selects it when nothing else is selected, and starts a held research topic —
-nothing arrives later.
+going private switches it off as well (and there too, anyone who joined keeps
+access). On the other side, a public row marked *joins at once* lets `device-ask`
+in straight away: the reply says you're in, selects it only when none of your
+computers would have taken your research (it never moves your research off a
+computer of your own), and starts a held research topic — nothing arrives later.
 
 **Where that setting starts is not here.** The machine's own `--pair` asks it
 during setup, in a step of its own, and the answer defaults to *no*; a computer

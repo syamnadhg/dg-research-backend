@@ -14,6 +14,7 @@ web app — nothing reads the source to decide what the code does.
 from __future__ import annotations
 
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -22,6 +23,11 @@ import requests
 
 from facade import bridge
 from facade.firestore_rest import FirestoreError, FirestoreRest
+
+# The REAL helper, taken before conftest's autouse stub replaces it for every test
+# (the pattern test_connection_code_0925 uses). The two F23 tests below drive it,
+# with `config.FE_BASE` still pointed at conftest's dead port.
+_REAL_FE_API_POST = bridge._fe_api_post
 
 
 class FakeFS:
@@ -95,8 +101,9 @@ def live(monkeypatch):
         return "run-1", "q-1"
     monkeypatch.setattr(bridge, "_enqueue_research_run", _enqueue)
     state = bridge.BridgeState()
-    state.set_session(SimpleNamespace(uid="u1", email="e@x.y",
-                                      id_token=lambda force=False: "tok"))
+    # Held so a test can make the sign-in refresh fail (wave 12 repair).
+    sess = SimpleNamespace(uid="u1", email="e@x.y", id_token=lambda force=False: "tok")
+    state.set_session(sess)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
     port = httpd.server_address[1]
     # A short poll, so `shutdown()` returns in 50 ms rather than the default half
@@ -104,7 +111,7 @@ def live(monkeypatch):
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05},
                      daemon=True).start()
     try:
-        yield SimpleNamespace(base=f"http://127.0.0.1:{port}", box=box)
+        yield SimpleNamespace(base=f"http://127.0.0.1:{port}", box=box, sess=sess)
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -178,6 +185,25 @@ def test_going_private_with_no_stored_tick_makes_exactly_todays_write(live):
     r = _vis(live, visibility="private")
     assert r.status_code == 200, r.text
     assert FakeFS.writes == [("visibility", "dev-a1", "private")]
+
+
+@pytest.mark.parametrize("fields, was", [
+    ({"visibility": "public", "allowAll": True}, True),
+    ({"visibility": "public"}, False),
+    ({"visibility": "public", "allowAll": "true"}, False),   # strict, as every reader
+])
+def test_going_private_says_whether_the_door_was_open(live, fields, was):
+    """⛔ WAVE 12 REPAIR (cross-verify F26). Going private switches Allow all off
+    as well, and an owner reads that as "everyone who joined is gone" — the
+    machine says they keep access, the chat could not, because nothing in the
+    reply said the door had been open. `allowAllWas` is the EFFECTIVE setting
+    before the change, read from the row, not from what was asked."""
+    _owned(**fields)
+    r = _vis(live, visibility="private")
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["changed"] is True and got["visibility"] == "private"
+    assert got["allowAllWas"] is was
 
 
 def test_a_failed_clear_after_going_private_does_not_fail_the_hide(live):
@@ -431,6 +457,120 @@ def test_a_failed_list_never_replaces_a_saved_selection(live, monkeypatch):
     r = _ask(live, monkeypatch)
     assert r.status_code == 200
     assert r.json()["selected"] is False and live.box["sel"] == "dev-a1"
+
+
+# ── wave 12 repair (cross-verify F3): a working default is never moved ───────
+# ⛔⛔ "NOTHING SAVED" IS NOT "NOTHING ROUTABLE". Somebody who owns one computer
+# has no saved choice because the sole-device rung sends every unnamed research
+# there; selecting the joined computer moved all of it onto a stranger's machine.
+# Executed against the wave's code: the router picked dev-a1 before the join and
+# dev-j9 after it.
+
+def _online(d):
+    return dict(d, lastHeartbeat=int(time.time() * 1000))
+
+
+def test_a_join_never_moves_research_off_the_joiners_own_sole_computer(live, monkeypatch):
+    FakeFS.devices = [dict(OWNED), dict(JOINED)]
+    r = _ask(live, monkeypatch)
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["status"] == "joined" and got["selected"] is False
+    assert live.box["sel"] is None
+
+
+def test_a_join_never_takes_the_one_online_computer_the_router_would_use(live, monkeypatch):
+    """Two computers of the person's own, one switched on: the sole-online rung
+    routes every unnamed research to it. That is a working default too."""
+    FakeFS.devices = [_online(OWNED), dict(SHARED), _online(JOINED)]
+    got = _ask(live, monkeypatch).json()
+    assert got["selected"] is False and live.box["sel"] is None
+
+
+def test_a_gone_selection_beside_a_computer_that_would_run_it_is_not_replaced(live, monkeypatch):
+    """A saved choice that no longer exists is dropped by the run path, which then
+    routes to the sole computer left — the person's own. The join must not step in
+    between with a stranger's."""
+    FakeFS.devices = [dict(OWNED), dict(JOINED)]
+    live.box["sel"] = "dev-gone"
+    got = _ask(live, monkeypatch).json()
+    assert got["selected"] is False and live.box["sel"] != "dev-j9"
+
+
+def test_an_unread_list_selects_nothing_even_with_nothing_saved(live, monkeypatch):
+    """⛔ UNKNOWN IS NOT EMPTY. A list that could not be read cannot say whether
+    the person had a computer of their own, so the join answers — and selects
+    nothing."""
+    FakeFS.list_error = FirestoreError("boom", status=503)
+    r = _ask(live, monkeypatch)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "joined" and r.json()["selected"] is False
+    assert live.box["sel"] is None
+
+
+def test_a_saved_choice_part_way_through_a_reset_is_kept(live, monkeypatch):
+    """Still the person's machine and still their choice (the picker's own rule),
+    even though it cannot take work this minute."""
+    FakeFS.devices = [dict(OWNED, pairState="awaiting-re-pair"), dict(JOINED)]
+    live.box["sel"] = "dev-a1"
+    got = _ask(live, monkeypatch).json()
+    assert got["selected"] is False and live.box["sel"] == "dev-a1"
+
+
+def test_a_fleet_box_with_no_computer_gets_the_joined_one_and_its_topic(live, monkeypatch):
+    """⭐ THE SPEC'S FLEET CASE, UNCHANGED: nothing was routable, so the joined
+    computer is selected and the topic held for it starts there."""
+    FakeFS.devices = [dict(JOINED)]
+    live.box["held"] = {"topic": "Mars", "origin": ORIGIN, "at": 1.0}
+    got = _ask(live, monkeypatch).json()
+    assert got["selected"] is True and live.box["sel"] == "dev-j9"
+    assert got["autoStarted"] is True
+    assert live.box["enq"][0]["deviceId"] == "dev-j9"
+
+
+# ── wave 12 repair (cross-verify F23): unconfirmed only if something was sent ─
+
+def test_a_sign_in_that_could_not_refresh_sent_nothing_and_says_so(live, monkeypatch):
+    """⛔⛔ THE REAL HELPERS, NOTHING STUBBED BUT THE SIGN-IN. A refresh that fails
+    before the request leaves came back from `_fe_api_post` as status 0 — the same
+    status as a timeout — and was answered "that may have gone through", sending
+    somebody to look for an ask that was never made. It is an ordinary failure
+    now, with its own code, and nothing reaches the web app."""
+    monkeypatch.setattr(bridge, "_fe_api_post", _REAL_FE_API_POST)
+
+    def _boom(force=False):
+        raise ConnectionError("token endpoint unreachable")
+    live.sess.id_token = _boom
+    to_app: list = []
+    real_post = requests.post
+
+    def _spy(url, *a, **kw):
+        if str(url).startswith(bridge.config.FE_BASE):
+            to_app.append(url)
+        return real_post(url, *a, **kw)
+    monkeypatch.setattr(requests, "post", _spy)
+    r = real_post(live.base + "/device/ask", json={"deviceId": "dev-j9",
+                                                   "origin": ORIGIN})
+    assert r.status_code == 502, r.text
+    assert r.json() == {"reason": "ask_not_sent", "error": "ask_not_sent"}
+    assert to_app == []
+    assert live.box["ask"] is None
+
+
+def test_a_timeout_after_the_request_left_is_still_unconfirmed(live, monkeypatch):
+    """The other half, through the same real helper: the request went out and the
+    answer did not come back, so it may sit on a committed join."""
+    monkeypatch.setattr(bridge, "_fe_api_post", _REAL_FE_API_POST)
+    real_post = requests.post
+
+    def _timeout(url, *a, **kw):
+        if str(url).startswith(bridge.config.FE_BASE):
+            raise requests.ReadTimeout("slow")
+        return real_post(url, *a, **kw)
+    monkeypatch.setattr(requests, "post", _timeout)
+    r = real_post(live.base + "/device/ask", json={"deviceId": "dev-j9"})
+    assert r.status_code == 502, r.text
+    assert r.json()["reason"] == "ask_unconfirmed"
 
 
 def test_a_join_starts_the_held_topic_on_the_joined_computer(live, monkeypatch):

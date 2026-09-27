@@ -701,6 +701,33 @@ def test_every_new_confirm_lands_in_all_three_lists(verb):
         assert verb in block, f"{verb} missing from the {where} enumeration"
 
 
+def test_the_allow_all_confirm_names_the_opening_direction_in_all_three_lists():
+    """⛔⛔ WAVE 12 REPAIR (cross-verify F17): THE VERB ALONE CARRIES NO DIRECTION.
+    The test above asks only whether `device-allow-all` appears, so a list naming
+    `device-allow-all no` satisfied it — and flipping yes to no in the handoff and
+    Safety lists (the model then runs OFF after a yes to the ON confirm) left the
+    whole agent suite green. So each enumeration must name the opening direction
+    and must NOT name the closing one, read as the enumeration itself (the same
+    three slices as above), whitespace-normalised so a wrap cannot hide either."""
+    text = _skill()
+
+    def _enumeration(after: str, upto: str) -> str:
+        start = text.index(after)
+        return text[start:text.index(upto, start)]
+
+    handoff = _enumeration("run the REAL command it described", ", with the")
+    marker = "**Confirm before\n"
+    start = text.index(marker) + len(marker)
+    safe = text[start:text.index("**", start)]
+    safety = _enumeration("- **Confirm before** `stop`", "(briefly restarts")
+    for where, block in (("handoff", handoff), ("safe-defaults", safe),
+                         ("safety", safety)):
+        flat = " ".join(block.split())
+        assert "device-allow-all yes" in flat, f"the {where} list lost the ON direction"
+        assert "device-allow-all no" not in flat, (
+            f"the {where} list names the OFF direction as a confirm")
+
+
 def test_the_skill_says_hiding_needs_no_confirmation():
     """⛔ Both confirm lists carry `device-visibility public`, so both have to say
     which direction they mean, or the file gates a strictly narrowing change.

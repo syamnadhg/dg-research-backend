@@ -1827,6 +1827,15 @@ def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict
     ⛔ AND IT NAMES THE RIGHT HOST. A refresh failure is Google's endpoint, not
     the web app's — reporting it as "could not reach {FE_BASE}" sent people to
     look at a service that was answering.
+
+    ⛔⛔ `sent: False` SAYS NOTHING WENT OUT (wave 12 repair, 2026-09-27). Both
+    FE helpers return status 0 for a mint failure AND for a transport failure,
+    and only the second can sit on a request the web app acted on. `/device/ask`
+    tells them apart by this flag: without it a refresh that failed before any
+    request left was answered "that may have gone through". Positive and only
+    here — ABSENT means "unknown", the direction that never claims nothing
+    happened. (On the retry after a 401 one request did go out, but a 401 is
+    refused before any work, so nothing was done either way.)
     """
     try:
         return sess.id_token(force=force), {}
@@ -1835,7 +1844,7 @@ def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict
                       "error": "this agent's session was rejected — run login again"}
     except Exception as e:  # noqa: BLE001 - a mint failure must not escape
         return None, {"error": f"could not refresh this agent's sign-in "
-                               f"({type(e).__name__})"}
+                               f"({type(e).__name__})", "sent": False}
 
 
 # ⛔⛔ FIFTEEN SECONDS, AND THE NUMBER IS SET BY THE RETRY, NOT BY THE ROUTE. It
@@ -5041,6 +5050,18 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # a transport failure is unconfirmed. A bare code, which both clients
             # word in their ask tables.
             if status == 0 and body.get("reason") != "revoked":
+                # ⛔⛔ BUT ONLY A FAILURE AFTER THE REQUEST LEFT (wave 12 repair,
+                # 2026-09-27). A sign-in refresh that failed first sent nothing
+                # (`sent: False`, see `_mint_bearer`), and "that may have gone
+                # through" over it sent somebody looking for an ask that never
+                # existed. An ordinary failure, with its own bare code that says
+                # nothing was sent.
+                if body.get("sent") is False:
+                    log.warning("device ask: not sent — the sign-in could not be "
+                                "refreshed")
+                    self._json(502, {"reason": "ask_not_sent",
+                                     "error": "ask_not_sent"})
+                    return
                 log.warning("device ask: no answer — outcome unknown")
                 self._json(502, {"reason": "ask_unconfirmed",
                                  "error": "ask_unconfirmed"})
@@ -5103,10 +5124,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             never parks the watcher:
               • CLEAR a parked ask for THIS computer — an earlier pending ask that
                 the join converted would otherwise be announced a minute later.
-              • SELECT it when nothing is selected or the saved choice is gone —
-                never over a live selection (pairing's rule, one rung wider: a
-                fleet box whose code-shared computer was taken away still points
-                at it, and would answer the next research with "which computer?").
+              • SELECT it only when nothing was routable before the join — never
+                over a live selection, and never over the computer an unnamed
+                research would have gone to anyway (see below). A fleet box with
+                no computer, or whose code-shared one was taken away, gets it.
               • START a held topic on it, pinned to this computer, only when the
                 ask came from a chat and the machine can take work.
             """
@@ -5122,14 +5143,28 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 devs = None
             row = next((d for d in (devs or []) if d.get("id") == device_id), None)
             saved = prefs.get_selected_device(sess.uid)
-            # ⛔ UNKNOWN IS NOT STALE. A list that could not be read proves nothing
-            # about the saved choice, so it is replaced only when it was READ and
-            # is not there.
-            gone = devs is not None and bool(saved) and not any(
-                d.get("id") == saved for d in devs)
-            if not saved or gone:
-                prefs.set_selected_device(device_id, sess.uid)
-                saved = device_id
+            # ⛔⛔ A WORKING DEFAULT IS NEVER MOVED ONTO A STRANGER'S COMPUTER (wave
+            # 12 repair, 2026-09-27). "Nothing saved" is not "nothing routable":
+            # somebody who owns one computer has no saved choice because the
+            # sole-device rung routes every unnamed research to it — and selecting
+            # the joined one here moved all of it onto a stranger's machine. So the
+            # question is the router's own, asked of the list AS IT WAS BEFORE THE
+            # JOIN (the joined computer taken out): only when `_pick_device_from`
+            # finds nothing there — no computer, none that can run, several and no
+            # obvious one, or a saved choice that is gone with nothing else to
+            # route to — is the joined computer selected.
+            # ⛔ A SAVED CHOICE STILL ON THE LIST IS KEPT even when it cannot run
+            # right now: part-way through a Reset it is still the person's machine
+            # and still their choice (the picker's own rule).
+            # ⛔ UNKNOWN IS NOT EMPTY. A list that could not be read proves nothing
+            # about what was routable, so nothing is selected on it.
+            if devs is not None:
+                before = [d for d in devs if d.get("id") != device_id]
+                kept = bool(saved) and any(d.get("id") == saved for d in before)
+                routed, _why, _stale = _pick_device_from(before, saved)
+                if not kept and routed is None:
+                    prefs.set_selected_device(device_id, sess.uid)
+                    saved = device_id
             # ⛔ READ BEFORE ANYTHING DECORATES THE ROW. `pair_state_usable` needs
             # `pairState`, which the prune removes; and liveness is computed the
             # way every own row computes it, never read off the document.
@@ -5679,8 +5714,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                                 device_id, e)
             log.info("device visibility: %s (allow all %s) on %s", want,
                      "on" if want_all else "off", device_id)
+            # ⛔ `allowAllWas` — WHETHER THE DOOR WAS OPEN BEFORE THIS (wave 12
+            # repair, 2026-09-27). Going private switches Allow all off too, and an
+            # owner reads that as "everyone who joined is gone"; they are not —
+            # removing people is the web app's Shared with. The reply can only say
+            # so if it knows the door was open: the machine says it from its own
+            # read, and the clients have only this.
             self._json(200, {"ok": True, "changed": True, "visibility": want,
-                             "allowAll": want_all, "publicLabel": label,
+                             "allowAll": want_all, "allowAllWas": current_all,
+                             "publicLabel": label,
                              "deviceId": device_id, "deviceName": row.get("name")})
 
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,

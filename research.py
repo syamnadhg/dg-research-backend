@@ -86397,6 +86397,16 @@ def _allow_all_of(meta: dict) -> bool:
     return meta.get("allowAll") is True and _discovery_of(meta) == "public"
 
 
+# ⛔⛔ WHAT A JOINER GETS, IN THE ONE SENTENCE EVERY SURFACE SAYS (wave 12 repair,
+# 2026-09-27) — the web's checkbox line, the chat's confirm, the agent terminal
+# and this screen, word for word. It used to stop at "who else is on it", but a
+# joiner reads the whole device document, run titles and queue included, so what
+# is running on it is part of what they see. A constant because the apostrophe
+# cannot sit inside the f-string's quoted expression on Python 3.11.
+_ALLOW_ALL_SEES = ("They run research on your AI accounts and can see your email, "
+                   "who else is on it, and what's running on it.")
+
+
 def run_visibility(value: str, allow_all: "str | None" = None,
                    ignored_topic: "str | None" = None) -> int:
     """`--visibility [public|private]` and `--allow-all [yes|no]` — show or set
@@ -86650,7 +86660,7 @@ def run_visibility(value: str, allow_all: "str | None" = None,
         # ⛔ THE SAME WORDS THE WEB'S CHECKBOX PUTS UNDER ITSELF. With approval
         # the owner looked at each of these people; now any signed-in account
         # can join, and this is the moment to say what that account gets.
-        print(f"  {_c(_DIM, '     They run research on your AI accounts and can see your email and who else is on it.')}")
+        print(f"  {_c(_DIM, '     ' + _ALLOW_ALL_SEES)}")
         print(f"  {_c(_DIM, '     People you removed stay out.')}")
     elif allow_now:
         # ⛔ OFF IS NOT A REMOVAL. Everyone who joined while it was on is an

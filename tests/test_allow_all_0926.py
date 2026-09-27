@@ -48,8 +48,12 @@ REPO = Path(__file__).resolve().parents[1]
 ON = "Allow all: on — anyone who asks joins at once"
 OFF = "Allow all: off — you approve each person"
 PRIVATE_OFF = "Allow all is off (this computer is private)"
-DISCLOSURE = ("They run research on your AI accounts and can see your email and "
-              "who else is on it.")
+# ⛔ RE-PINNED 2026-09-27 (wave 12 repair, cross-verify F6/F24): the canonical
+# sentence every surface says word for word — the web's checkbox line, the chat's
+# confirm, the agent terminal and this screen. It used to stop at "who else is on
+# it", but a joiner reads the whole device document, run titles included.
+DISCLOSURE = ("They run research on your AI accounts and can see your email, who "
+              "else is on it, and what's running on it.")
 
 
 # ── run_visibility, driven ───────────────────────────────────────────────────
