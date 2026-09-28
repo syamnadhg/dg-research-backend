@@ -106,8 +106,11 @@ MUTANTS = [
      [('    "ask_not_sent": "This agent couldn’t refresh its sign-in, so nothing was sent. "\n'
        '                    "It’s safe to ask again in a moment.",\n', '')]),
     ("C5", CLI, "⛔ ask_not_sent has no terminal sentence",
-     [('    "ask_not_sent": "this agent could not refresh its sign-in, so nothing was "\n'
-       '                    "sent — it is safe to ask again in a moment",\n', '')]),
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H18): the sentence
+     # names both causes now. Same defect: the row is gone.
+     [('    "ask_not_sent": "this agent could not reach the app or refresh its sign-in, so "\n'
+       '                    "nothing was sent — it is safe to ask again in a moment",\n',
+       '')]),
     ("C6", SR, "⛔ an unconfirmed ask sends the person to 'your computers' — an ordinary "
      "ask that went through is waiting in the requests list",
      [('                       "Ask me for your requests before asking again: it’s either "\n'

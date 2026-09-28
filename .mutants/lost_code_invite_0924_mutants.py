@@ -90,7 +90,9 @@ MUTANTS = [
        'use that computer. "')]),
     ("I3", CLI, "⛔ the terminal's ASK drops the email half — the one moment an email is "
      "actually sent, and now the only place the terminal says it",
-     [('    print("     They see your name — or your email, if you have not set one.")',
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H22): the ask prints
+     # "The owner sees your name and email." from `_OWNER_SEES_T`. Same defect.
+     [('    print(f"     {_OWNER_SEES_T}")',
        '    print("     They see your name.")')]),
     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H22): the chat's pending
     # reply now says the confirm's own sentence, "The owner sees your name and

@@ -534,7 +534,12 @@ def test_the_terminal_says_what_it_discloses_on_the_ask_itself(term):
     term.box["post"]["/device/ask"] = (200, {"ok": True})
     _run(device_command="ask", deviceId="dev-a1")
     out = term.out()
-    assert "or your email, if you have not set one" in out
+    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 3, cross-verify H22): "your name — or
+    # your email, if you have not set one" described the ask notice alone; the
+    # owner's Shared with shows the name AND the email once somebody is on the
+    # computer. The disclosure stays on the ask itself — in the one true sentence.
+    assert "The owner sees your name and email." in out
+    assert "or your email" not in out
 
 
 def test_the_terminal_requests_screen_does_not_promise_to_read_back_a_yes(term):

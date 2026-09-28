@@ -13,6 +13,8 @@ web app — nothing reads the source to decide what the code does.
 
 from __future__ import annotations
 
+import datetime
+import socket
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -561,7 +563,26 @@ def test_a_fleet_box_with_no_computer_gets_the_joined_one_and_its_topic(live, mo
 # Built inside the test: a heartbeat stamped at collection could age out of the
 # online window before a long suite reached it.
 
+# The person's own computer part-way through a Reset (awaiting its re-pair), with
+# no deadline on the record — which the web app reads as a window still open.
+OWNED_RESET = dict(OWNED, pairState="awaiting-re-pair")
+# A second computer of the person's own, ready to run.
+OWNED_TWO = {"id": "dev-a3", "name": "Old laptop", "ownerUid": "u1",
+             "pairConfirmedAt": True, "lastHeartbeat": 0}
+
 _G8_ROWS = [
+    # ⛔⛔ wave 12 repair 3 (cross-verify H9): the sole owner mid-Reset routes to
+    # nothing before the join, and the join saved the stranger's computer — which
+    # stayed their choice after the re-pair. Their own is held, as the web app's
+    # `heldThroughReset` holds it: until the re-pair the next research is refused
+    # by name (None), never sent to the joined computer.
+    ("sole-owner-mid-reset", [(OWNED_RESET, True), (JOINED, True)], None, None, False),
+    ("sole-owner-mid-reset-both-asleep", [(OWNED_RESET, False), (JOINED, False)], None,
+     None, False),
+    # …and the hold is only for when nothing routed: a computer of theirs that CAN
+    # run is the router's pick, and is saved, over the one waiting on its re-pair
+    ("own-mid-reset-beside-own-ready", [(OWNED_RESET, False), (OWNED_TWO, False),
+                                        (JOINED, True)], None, "dev-a3", False),
     # the sole owner — the case the finding names, in every power state
     ("sole-owner-online", [(OWNED, True), (JOINED, True)], None, "dev-a1", False),
     ("sole-owner-asleep-joined-online", [(OWNED, False), (JOINED, True)], None,
@@ -597,6 +618,82 @@ def test_after_a_join_the_router_sends_research_where_it_went_before(
     got = r.json()
     assert got["status"] == "joined"
     assert _routed_after_join(live) == want
+    assert got["selected"] is selected
+
+
+# ── wave 12 repair 3 (cross-verify H9): a join inside the person's own Reset ─
+# ⛔⛔ THE FINDING'S OWN MEASUREMENT IS AFTER THE RE-PAIR. Executed against repair
+# 2: with no join the router went to dev-a1 once the re-pair landed; with the
+# join it went to dev-j9, because the join had saved the stranger's computer.
+
+def test_a_join_during_the_owners_reset_leaves_their_research_on_their_computer(
+        live, monkeypatch):
+    FakeFS.devices = [dict(OWNED_RESET), _online(JOINED)]
+    got = _ask(live, monkeypatch).json()
+    assert got["status"] == "joined" and got["selected"] is False
+    assert live.box["sel"] == "dev-a1"
+    # Until the re-pair, an unnamed research is refused by name — never moved.
+    assert bridge._pick_device_from([dict(d) for d in FakeFS.devices],
+                                    live.box["sel"]) == (None, "selection_not_ready", False)
+    # The re-pair lands: the person's computer is active again, and both are awake.
+    FakeFS.devices = [_online(OWNED), _online(JOINED)]
+    assert _routed_after_join(live) == "dev-a1"
+
+
+def test_a_saved_shared_choice_part_way_through_a_reset_is_kept(live, monkeypatch):
+    """The saved choice is kept whoever owns it — a computer somebody shared, being
+    Reset by its owner, is still the one this person chose. (Keeps wave 12 repair
+    1's B4 measurable: the hold below finds only the person's OWN computers.)"""
+    FakeFS.devices = [dict(SHARED, pairState="awaiting-re-pair"), _online(JOINED)]
+    live.box["sel"] = "dev-b2"
+    got = _ask(live, monkeypatch).json()
+    assert got["selected"] is False and live.box["sel"] == "dev-b2"
+
+
+def _rfc3339(offset_ms):
+    """A Firestore REST timestamp `offset_ms` from now, as `from_value` hands it
+    over: the RFC 3339 string."""
+    at = datetime.datetime.fromtimestamp(time.time() + offset_ms / 1000,
+                                         tz=datetime.timezone.utc)
+    return at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+_MIN = 60_000
+
+# ⭐ THE WEB APP'S HOLD, RULE FOR RULE (`heldThroughReset` / `isResetWindowOpen`):
+# only a computer the person OWNS, only `awaiting-re-pair`, only while the window
+# is open — two minutes' grace past the deadline for a fast clock, and a missing
+# or unreadable deadline counts as open. Past it, a Reset nobody re-paired is not
+# held, and the joined computer is chosen as it would be with nothing routable.
+# Rows: (the person's computer, its pairState, its deadline or None, what the
+# join must save, whether the reply says the joined one is selected).
+_RESET_HOLD_ROWS = [
+    ("deadline-ahead", OWNED, "awaiting-re-pair", 10 * _MIN, "dev-a1", False),
+    ("deadline-passed-inside-the-grace", OWNED, "awaiting-re-pair", -1 * _MIN,
+     "dev-a1", False),
+    ("deadline-passed", OWNED, "awaiting-re-pair", -10 * _MIN, "dev-j9", True),
+    ("unreadable-deadline-counts-open", OWNED, "awaiting-re-pair", "not a time",
+     "dev-a1", False),
+    ("someone-elses-computer-mid-reset", SHARED, "awaiting-re-pair", None,
+     "dev-j9", True),
+    ("first-pairing-is-not-a-reset", OWNED, "awaiting-initial-claim", None,
+     "dev-j9", True),
+]
+
+
+@pytest.mark.parametrize("base,pair_state,deadline,want,selected",
+                         [r[1:] for r in _RESET_HOLD_ROWS],
+                         ids=[r[0] for r in _RESET_HOLD_ROWS])
+def test_the_join_holds_a_reset_exactly_as_the_web_app_does(
+        live, monkeypatch, base, pair_state, deadline, want, selected):
+    mine = dict(base, pairState=pair_state)
+    if deadline is not None:
+        mine["pairCodeExpiresAt"] = (_rfc3339(deadline) if isinstance(deadline, int)
+                                     else deadline)
+    FakeFS.devices = [mine, _online(JOINED)]
+    got = _ask(live, monkeypatch).json()
+    assert got["status"] == "joined"
+    assert live.box["sel"] == want
     assert got["selected"] is selected
 
 
@@ -641,6 +738,95 @@ def test_a_timeout_after_the_request_left_is_still_unconfirmed(live, monkeypatch
         return real_post(url, *a, **kw)
     monkeypatch.setattr(requests, "post", _timeout)
     r = real_post(live.base + "/device/ask", json={"deviceId": "dev-j9"})
+    assert r.status_code == 502, r.text
+    assert r.json()["reason"] == "ask_unconfirmed"
+
+
+# ── wave 12 repair 3 (cross-verify H18): a connection that never opened ──────
+# ⛔⛔ A REFUSED PORT, A NAME THAT DID NOT RESOLVE AND A CONNECT TIMEOUT SEND
+# NOTHING, and all three were answered "that may have gone through". Executed
+# against repair 2: the real `_fe_api_post` at conftest's dead port gave 502
+# ask_unconfirmed. Everything below goes through the REAL helper, the real
+# `requests` and the real urllib3; where the network's answer cannot be had
+# deterministically (a DNS failure, a connect timeout) only the OS call urllib3
+# makes is answered, for the web app's host alone, so the library builds the
+# exception exactly as it would in the field.
+
+_NOT_SENT = {"reason": "ask_not_sent", "error": "ask_not_sent"}
+
+
+def _real_ask(live, monkeypatch, fe_base=None):
+    monkeypatch.setattr(bridge, "_fe_api_post", _REAL_FE_API_POST)
+    if fe_base is not None:
+        monkeypatch.setattr(bridge.config, "FE_BASE", fe_base)
+    return requests.post(live.base + "/device/ask",
+                         json={"deviceId": "dev-j9", "origin": ORIGIN})
+
+
+def _answer_connect_for(monkeypatch, host, exc):
+    """urllib3's own connect call raises `exc` for `host` only — the bridge's
+    loopback port keeps working."""
+    import urllib3.util.connection as u3conn
+    real = u3conn.create_connection
+
+    def _fake(address, *a, **kw):
+        if address[0] == host:
+            raise exc
+        return real(address, *a, **kw)
+    monkeypatch.setattr(u3conn, "create_connection", _fake)
+
+
+def test_a_refused_connection_sent_nothing_and_says_so(live, monkeypatch):
+    """Conftest's dead port, a real refusal from this machine's own stack."""
+    r = _real_ask(live, monkeypatch)
+    assert r.status_code == 502, r.text
+    assert r.json() == _NOT_SENT
+    assert live.box["ask"] is None
+
+
+def test_a_name_that_did_not_resolve_sent_nothing_and_says_so(live, monkeypatch):
+    _answer_connect_for(monkeypatch, "sr-app.invalid",
+                        socket.gaierror(8, "nodename nor servname provided"))
+    r = _real_ask(live, monkeypatch, fe_base="http://sr-app.invalid")
+    assert r.status_code == 502, r.text
+    assert r.json() == _NOT_SENT
+
+
+def test_a_connect_timeout_sent_nothing_and_says_so(live, monkeypatch):
+    _answer_connect_for(monkeypatch, "sr-app.invalid", socket.timeout("timed out"))
+    r = _real_ask(live, monkeypatch, fe_base="http://sr-app.invalid")
+    assert r.status_code == 502, r.text
+    assert r.json() == _NOT_SENT
+
+
+def test_a_server_that_took_the_ask_and_hung_up_is_still_unconfirmed(live, monkeypatch):
+    """⛔⛔ THE OTHER SIDE OF THE LINE, WITH A REAL SOCKET. `requests` calls this a
+    ConnectionError too — but the request LEFT, and on a computer that lets
+    anyone join it may sit on a committed join. Only a connection that never
+    opened is "not sent"."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    srv.settimeout(10)
+    got: list = []
+
+    def _take_and_hang_up():
+        try:
+            conn, _ = srv.accept()
+            with conn:
+                conn.settimeout(10)
+                got.append(conn.recv(65536))
+        except OSError:
+            pass
+    t = threading.Thread(target=_take_and_hang_up, daemon=True)
+    t.start()
+    try:
+        r = _real_ask(live, monkeypatch,
+                      fe_base=f"http://127.0.0.1:{srv.getsockname()[1]}")
+    finally:
+        t.join(10)
+        srv.close()
+    assert got and got[0].startswith(b"POST /api/devices/access-request"), got
     assert r.status_code == 502, r.text
     assert r.json()["reason"] == "ask_unconfirmed"
 

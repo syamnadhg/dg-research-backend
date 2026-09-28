@@ -664,8 +664,14 @@ def test_the_watcher_says_the_chat_invites_words_and_the_ask_keeps_the_email_hal
     assert ("The owner sees your name and email."
             in code_only(inspect.getsource(sr.cmd_device_ask)))
     assert "or your email" not in code_only(inspect.getsource(sr.cmd_device_ask))
-    assert ("or your email, if you have not set one"
-            in code_only(inspect.getsource(cli._device_ask)))
+    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 3, cross-verify H22): the terminal's
+    # ask says what the owner sees in the join surfaces' one sentence — name AND
+    # email, which Shared with shows once somebody is on the computer. Printed by
+    # both halves of `_device_ask`; executed in test_allow_all_clients_0926.
+    assert cli._OWNER_SEES_T == "The owner sees your name and email."
+    ask_src = code_only(inspect.getsource(cli._device_ask))
+    assert ask_src.count("_OWNER_SEES_T") == 2
+    assert "or your email" not in ask_src
 
 
 def test_the_watcher_says_what_asking_gets_you_like_the_chat_invite():

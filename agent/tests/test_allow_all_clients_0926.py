@@ -645,6 +645,36 @@ def test_terminal_ask_never_sent_says_so(term):
     out = term.out()
     assert "nothing was sent" in out
     assert "may have gone through" not in out and "ask_not_sent" not in out
+    # ⛔ WAVE 12 REPAIR 3 (cross-verify H18): the bridge sends this code for a
+    # connection that never opened too, so the sentence names both causes rather
+    # than blaming a sign-in that may have been fine.
+    assert "could not reach the app or refresh its sign-in" in out
+
+
+# ── wave 12 repair 3 (cross-verify H22): one sentence for what the owner sees ─
+# ⛔⛔ THE ASK SAID "your name — or your email, if you have not set one" AND THE
+# JOIN SAID "name and email" — the same exchange, two claims. The owner's Shared
+# with shows both once somebody is on the computer, and the web's Join and the
+# chat's ask confirm say so word for word.
+OWNER_SEES = "The owner sees your name and email."
+
+
+def test_terminal_ask_says_the_owner_sees_name_and_email(term):
+    term.box["post"]["/device/ask"] = (200, {"ok": True, "status": "pending"})
+    ns = _run(["device", "ask", "dev-j9"])
+    assert ns.func(ns) == 0
+    out = term.out()
+    assert f"     {OWNER_SEES}\n" in out
+    assert "or your email" not in out
+
+
+def test_terminal_join_says_the_same_sentence(term):
+    term.box["post"]["/device/ask"] = _joined()
+    ns = _run(["device", "ask", "dev-j9"])
+    assert ns.func(ns) == 0
+    out = term.out()
+    assert f"     {OWNER_SEES} Your research runs on their AI accounts.\n" in out
+    assert "or your email" not in out
 
 
 def test_terminal_going_private_on_an_open_computer_says_who_keeps_access(term):

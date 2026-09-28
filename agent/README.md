@@ -153,8 +153,8 @@ approve each person by hand, and `device-visibility private` takes it off the
 list again (an access code still lets someone in without asking you, and anyone
 who already joined keeps access — remove people in the web app (Shared with)). From the
 other side, `devices-public` browses what's on offer and `device-ask` puts you in
-that owner's queue — they see your name, or your email if you haven't set one,
-and nothing happens on their machine until they say yes.
+that owner's queue, and nothing happens on their machine until they say yes.
+The owner sees your name and email.
 
 **Allow all** is the one exception, and it is about access. `device-allow-all
 yes` (confirmed first) lets anyone signed in join a public computer you own at
@@ -172,6 +172,9 @@ computers would have taken your research, and starts a held research topic —
 nothing arrives later. When one of yours would have, and you had not chosen
 one, the join saves THAT one as your choice, so your research never moves off a
 computer of your own and you are not asked "which computer?" afterwards.
+A computer of yours part-way through a Reset counts too: it is saved as your
+choice, so your research comes back to it once the re-pair is done.
+The owner sees your name and email.
 
 **Where that setting starts is not here.** The machine's own `--pair` asks it
 during setup, in a step of its own, and the answer defaults to *no*; a computer

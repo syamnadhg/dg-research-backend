@@ -45,3 +45,25 @@ def test_the_join_paragraph_says_your_own_computer_is_kept():
     para = _the_paragraph("a public row marked *joins at once* lets `device-ask`")
     assert "saves that one as your choice" in para
     assert "never moves off a computer of your own" in para
+
+
+# ── wave 12 repair 3 ─────────────────────────────────────────────────────────
+
+def test_the_join_paragraph_says_a_computer_mid_reset_is_kept_too():
+    """Cross-verify H9: a join inside the person's own Reset saves THEIR computer,
+    so their research comes back to it after the re-pair."""
+    para = _the_paragraph("a public row marked *joins at once* lets `device-ask`")
+    assert "a computer of yours part-way through a reset counts too" in para
+    assert "comes back to it once the re-pair is done" in para
+
+
+@pytest.mark.parametrize("marker", [
+    "`devices-public` browses what's on offer",
+    "a public row marked *joins at once* lets `device-ask`",
+], ids=["ask", "join"])
+def test_every_ask_and_join_says_the_owner_sees_name_and_email(marker):
+    """Cross-verify H22: "your name, or your email if you haven't set one" here,
+    "name and email" on the join — one sentence now, the web's and the chat's."""
+    para = _the_paragraph(marker)
+    assert "the owner sees your name and email." in para
+    assert "or your email" not in para

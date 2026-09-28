@@ -910,7 +910,9 @@ MUTANTS = [
     ("V23", CLI, "under",
      "⛔ THE ASK STOPS SAYING WHAT IT DISCLOSES, on the one path that reaches the "
      "route without ever seeing the browse screen",
-     [('    print("     They see your name — or your email, if you have not set one.")\n',
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H22): the line says
+     # the join surfaces' one sentence now, from `_OWNER_SEES_T`. Same defect.
+     [('    print(f"     {_OWNER_SEES_T}")\n',
        '')]),
     ("V24", CLI, "over",
      "⛔ THE ONE VERB THAT WRITES goes back to the 30-second wait its two read "

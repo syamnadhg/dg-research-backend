@@ -873,6 +873,45 @@ def _pick_device_from(devs: list[dict[str, Any]],
     return None, ("stale_selection" if stale else "no_selection"), stale
 
 
+# How long past a Reset's deadline the hold still applies — the web app's
+# `RESET_HOLD_CLOCK_GRACE_MS`. The deadline is the server's clock and `now` is this
+# host's, so a clock a little fast would otherwise end the hold inside the window.
+_RESET_HOLD_CLOCK_GRACE_MS = 2 * 60_000
+
+
+def _own_reset_hold(devs: list[dict[str, Any]], uid: str) -> str | None:
+    """The id of a computer this person OWNS that is part-way through a Reset whose
+    re-pair window is still open, else None. A port of the web app's
+    `heldThroughReset` (`device-order.ts`), the branch that applies when nothing
+    usable is selected.
+
+    ⛔⛔ WHY THE INSTANT JOIN NEEDS IT (wave 12 repair 3, cross-verify H9). A person
+    whose only computer is awaiting its re-pair routes to NOTHING, so a join saved
+    the stranger's computer as their choice — and it stayed their choice after the
+    re-pair, so every unnamed research went to the stranger's computer and AI
+    accounts. The web app met the same trap in wave 3 (an approval landing inside
+    the window) and holds the person's own computer through it; this is that rule.
+
+    ⛔ ONLY `awaiting-re-pair`, ONLY WHILE THE WINDOW IS OPEN, and a missing or
+    unreadable deadline counts as open — all three as the web app decides them. A
+    Reset nobody re-pairs stays listed for about a day past its deadline, and
+    holding it that long would refuse every run with a usable computer sitting
+    there. ⛔ OWNED means `ownerUid` is this account, as `owned` is everywhere else
+    in this file; the web's "or picked" half is the saved choice, which the join
+    keeps before this is ever asked.
+    """
+    now = time.time() * 1000
+    for d in devs:
+        if d.get("pairState") != "awaiting-re-pair" or d.get("ownerUid") != uid:
+            continue
+        deadline = timestamp_millis(d.get("pairCodeExpiresAt"))
+        if deadline is None or now < deadline + _RESET_HOLD_CLOCK_GRACE_MS:
+            did = d.get("id")
+            if did:
+                return did
+    return None
+
+
 def _autostart_pick_device(fs: FirestoreRest,
                            sess: AccountSession) -> tuple[str | None, str | None,
                                                           list[dict[str, Any]], str]:
@@ -1832,9 +1871,10 @@ def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict
     FE helpers return status 0 for a mint failure AND for a transport failure,
     and only the second can sit on a request the web app acted on. `/device/ask`
     tells them apart by this flag: without it a refresh that failed before any
-    request left was answered "that may have gone through". Positive and only
-    here — ABSENT means "unknown", the direction that never claims nothing
-    happened. (On the retry after a 401 one request did go out, but a 401 is
+    request left was answered "that may have gone through". Positive, and set
+    only here and by `_fe_api_post` on a connection that never opened
+    (`_left_nothing`, repair 3) — ABSENT means "unknown", the direction that
+    never claims nothing happened. (On the retry after a 401 one request did go out, but a 401 is
     refused before any work, so nothing was done either way.)
     """
     try:
@@ -1845,6 +1885,36 @@ def _mint_bearer(sess: "AccountSession", force: bool) -> "tuple[str | None, dict
     except Exception as e:  # noqa: BLE001 - a mint failure must not escape
         return None, {"error": f"could not refresh this agent's sign-in "
                                f"({type(e).__name__})", "sent": False}
+
+
+def _left_nothing(e: requests.RequestException) -> bool:
+    """Does this transport failure PROVE the request never left this machine?
+
+    ⛔⛔ WAVE 12 REPAIR 3 (cross-verify H18). A web app that refused the connection,
+    a name that did not resolve and a connection that timed out all came back from
+    `_fe_api_post` exactly like a reply that never arrived, and `/device/ask`
+    answered every one "that may have gone through" — while nothing had been sent.
+    Measured with real sockets: a refused port and a DNS failure arrive as
+    `ConnectionError` wrapping urllib3's `NewConnectionError` (a name failure is a
+    subclass of it), a connect timeout as `ConnectTimeout`.
+
+    ⛔ AND NOTHING ELSE COUNTS. A read timeout, or a server that took the request
+    and hung up (`ConnectionError` wrapping a `ProtocolError`), both happen AFTER
+    the request went out, and either may sit on a join the web app committed. So
+    does anything this cannot recognise — a proxy or TLS failure among them — and
+    answering "unknown" there is the direction that never claims nothing happened.
+
+    ⛔ urllib3's class is recognised BY NAME, along its MRO, never imported: the
+    facade's only third-party packages are `requests` and `keyring`
+    (`test_app_plane_unchanged`), and the name has held across urllib3 1.x and 2.x.
+    """
+    if isinstance(e, requests.ConnectTimeout):
+        return True
+    if not isinstance(e, requests.ConnectionError):
+        return False
+    inner = e.args[0] if e.args else None
+    reason = getattr(inner, "reason", None)
+    return any(c.__name__ == "NewConnectionError" for c in type(reason).__mro__)
 
 
 # ⛔⛔ FIFTEEN SECONDS, AND THE NUMBER IS SET BY THE RETRY, NOT BY THE ROUTE. It
@@ -2102,7 +2172,12 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict,
                 timeout=timeout,
             )
         except requests.RequestException as e:
-            return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+            failed = {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+            # ⛔ `sent: False` ONLY WHEN THE FAILURE PROVES IT — see `_left_nothing`.
+            # Absent still means "unknown", as it does beside the mint's own flag.
+            if _left_nothing(e):
+                failed["sent"] = False
+            return 0, failed
         return r.status_code, _fe_json_body(r)
 
     token, why = _mint_bearer(sess, force=False)
@@ -5056,9 +5131,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # through" over it sent somebody looking for an ask that never
                 # existed. An ordinary failure, with its own bare code that says
                 # nothing was sent.
+                # ⛔ AND SO IS A CONNECTION THAT NEVER OPENED (wave 12 repair 3,
+                # cross-verify H18): refused, a name that did not resolve, or a
+                # connect timeout — `_fe_api_post` flags those too (`_left_nothing`).
                 if body.get("sent") is False:
-                    log.warning("device ask: not sent — the sign-in could not be "
-                                "refreshed")
+                    log.warning("device ask: not sent — %s", body.get("error") or "")
                     self._json(502, {"reason": "ask_not_sent",
                                      "error": "ask_not_sent"})
                     return
@@ -5130,7 +5207,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 no computer, or whose code-shared one was taken away, gets it.
                 When one of the person's own WAS routable and nothing usable was
                 saved, THAT one is saved instead (repair 2), or the joined one
-                would take its unnamed research from the rung that picked it.
+                would take its unnamed research from the rung that picked it —
+                and so is their own computer part-way through a Reset (repair 3).
               • START a held topic on it, pinned to this computer, only when the
                 ask came from a chat and the machine can take work.
             """
@@ -5170,10 +5248,19 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # DID pick one of the person's own, that pick is SAVED — the choice
             # they were already getting, now written down so the joined computer
             # cannot take it. Only when nothing routed is the joined one saved.
+            # ⛔⛔ AND A RESET IS NOT "NOTHING ROUTED" (wave 12 repair 3, cross-verify
+            # H9). A person whose own computer is awaiting its re-pair routes to
+            # nothing before the join — and saving the stranger's computer then
+            # kept it after the re-pair, so their research never came home. Their
+            # own computer inside its Reset window is saved instead, as the web
+            # app's `heldThroughReset` holds it (`_own_reset_hold`); until the
+            # re-pair lands, an unnamed research is refused by name, never moved.
             if devs is not None:
                 before = [d for d in devs if d.get("id") != device_id]
                 kept = bool(saved) and any(d.get("id") == saved for d in before)
                 routed, _why, _stale = _pick_device_from(before, saved)
+                if routed is None:
+                    routed = _own_reset_hold(before, sess.uid)
                 if not kept:
                     pick = device_id if routed is None else routed
                     prefs.set_selected_device(pick, sess.uid)

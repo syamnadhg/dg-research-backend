@@ -1207,10 +1207,12 @@ _ASK_FAILURES = {
     "ask_unconfirmed": "the app did not answer in time — that may have gone "
                        "through; check `agent device requests` (still waiting) "
                        "and `agent device` (let straight in) before asking again",
-    # ⛔ THE BRIDGE'S OTHER CODE: the sign-in could not be refreshed, so the ask
-    # never left — an ordinary failure, and saying so is the whole point.
-    "ask_not_sent": "this agent could not refresh its sign-in, so nothing was "
-                    "sent — it is safe to ask again in a moment",
+    # ⛔ THE BRIDGE'S OTHER CODE: the ask never left — an ordinary failure, and
+    # saying so is the whole point. ⛔ TWO CAUSES SINCE WAVE 12 REPAIR 3 (cross-
+    # verify H18): the sign-in could not be refreshed, or the connection to the
+    # app never opened (refused, a name that did not resolve, a connect timeout).
+    "ask_not_sent": "this agent could not reach the app or refresh its sign-in, so "
+                    "nothing was sent — it is safe to ask again in a moment",
 }
 
 # ⛔⛔ ANSWERING A REQUEST HAS ITS OWN TABLE AND IT IS NOT `_ASK_FAILURES`.
@@ -1285,6 +1287,12 @@ _PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that comp
 # with one such row says this instead; the chat client's `_PUBLIC_JOIN_INVITE`.
 _PUBLIC_JOIN_INVITE_T = ("     Ones marked (joins at once) let you straight in; for the "
                          "others its owner decides. They see your name.")
+# ⛔⛔ WHAT ASKING OR JOINING DISCLOSES, SAID ONCE (wave 12 repair 3, cross-verify
+# H22). The ask's reply said "your name — or your email, if you have not set one"
+# while the join's said "name and email" — one exchange, two claims. The owner's
+# Shared with shows both once somebody is on the computer, so both replies print
+# this, word for word the web's Join line and the chat's ask confirm.
+_OWNER_SEES_T = "The owner sees your name and email."
 # ⭐ WAVE 12: what Allow all costs the owner, in the chat client's words
 # (`_ALLOW_ALL_MEANS`) — said under every reply that leaves a computer letting
 # anyone join, so what was done and what it means sit on one screen.
@@ -1937,8 +1945,9 @@ def _device_ask(device_id: str) -> int:
         print(f"{_OK} Joined — {name} lets anyone in"
               f"{' (now selected)' if body.get('selected') else ''}. It's in your "
               f"list:  agent device")
-        print("     Its owner sees your name and email, and your research runs on "
-              "their AI accounts.")
+        # ⛔ THE JOIN SURFACES' ONE SENTENCE (wave 12 repair 3, cross-verify H22),
+        # the same words as the ask below, the chat and the web's Join.
+        print(f"     {_OWNER_SEES_T} Your research runs on their AI accounts.")
         return 0
     print(f"{_OK} Asked. Its owner decides — nothing happens on that computer "
           f"until they say yes.")
@@ -1946,7 +1955,12 @@ def _device_ask(device_id: str) -> int:
     # can run this without ever seeing the browse screen, and the disclosure was
     # printed only there — so the one path that reaches the route directly was
     # the one that never named what it discloses.
-    print("     They see your name — or your email, if you have not set one.")
+    # ⛔⛔ NAME AND EMAIL, NOT "NAME — OR YOUR EMAIL" (wave 12 repair 3, cross-verify
+    # H22, finishing G24). The ask's own notice shows the name alone, but the
+    # moment somebody is on the computer — at once, on one that lets anyone in —
+    # the owner's Shared with lists the name AND the email under it. One true
+    # sentence on every Join surface, word for word the web's and the chat's.
+    print(f"     {_OWNER_SEES_T}")
     # ⛔ NO POLLING ADVICE AND NO WAIT. Nothing tells this side when an owner
     # answers, and an answered request stops appearing in the list below rather
     # than turning into a "no" — so the honest next step names the list and says
