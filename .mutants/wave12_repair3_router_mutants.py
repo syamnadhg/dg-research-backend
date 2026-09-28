@@ -46,10 +46,12 @@ SR = "agent/facade/skill/scripts/sr.py"
 SKILL = "agent/facade/skill/SKILL.md"
 
 SUITES = {
+    # ⛔ + the repair-4 pins (2026-09-27): the re-described E4 is measured there too.
     SR: (AGENT, "tests/test_allow_all_repair3_0927.py tests/test_allow_all_whole_message_0927.py "
                 "tests/test_allow_all_router_repair_0927.py tests/test_allow_all_router_0926.py "
                 "tests/test_chat_public_792.py tests/test_chat_owner_793.py "
-                "tests/test_empty_state_794.py tests/test_router_codes_and_computers_0926.py"),
+                "tests/test_empty_state_794.py tests/test_router_codes_and_computers_0926.py "
+                "tests/test_allow_all_repair4_0927.py"),
     SKILL: (AGENT, "tests/test_allow_all_repair3_0927.py tests/test_allow_all_whole_message_0927.py "
                    "tests/test_chat_public_792.py tests/test_chat_owner_793.py"),
 }
@@ -132,8 +134,11 @@ MUTANTS = [
      "asks nothing",
      [('        or (_join_obj and _SET_QUOTED_SPAN.fullmatch(_join_obj)))',
        '        )')]),
-    ("E4", SR, "⛔⛔ H17: the code test is `join`'s alone again — `borrow K7XQ-9B2M` posts the "
-     "code as a device id and never pairs",
+    # ⛔ E4 RE-DESCRIBED 2026-09-27 (wave 12 repair 4, cross-verify K3): `borrow` is a
+    # whole-message join verb too, so the only ask verb this gate drops is `ask for`
+    # — the rows that kill it are the `ask for <code>` ones. Same anchor.
+    ("E4", SR, "⛔⛔ H17: a code after `ask for` is not read — `ask for K7XQ-9B2M` asks the "
+     "owner of a computer called “K7XQ-9B2M” and never pairs",
      [('    if _ask_code:\n        return ["device-add", _ask_code], None\n',
        '    if _ask_code and _join_obj:\n        return ["device-add", _ask_code], None\n')]),
     ("E5", SR, "⛔ the code is read AFTER the machine word comes off — `request access to "

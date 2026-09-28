@@ -52,9 +52,11 @@ SUITES = {
     # ⛔ + the repair's pins (2026-09-27): R10 and R18 are measured there now.
     # ⛔ + the repair-2 pins (2026-09-27): the re-aimed R mutants are measured there.
     # ⛔ + the repair-3 pins (2026-09-27): the re-aimed R mutants are measured there.
+    # ⛔ + the repair-4 pins (2026-09-27): R11 R12 R15 R19 re-aimed onto repair 4's lines.
     SR: (AGENT, "tests/test_allow_all_clients_0926.py tests/test_allow_all_router_0926.py "
                 "tests/test_chat_owner_793.py tests/test_allow_all_router_repair_0927.py "
-                "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_repair3_0927.py"),
+                "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_repair3_0927.py "
+                "tests/test_allow_all_repair4_0927.py"),
     CLI: (AGENT, "tests/test_allow_all_clients_0926.py"),
     SKILL: (AGENT, "tests/test_chat_owner_793.py tests/test_chat_public_792.py"),
 }
@@ -400,14 +402,18 @@ MUTANTS = [
     # phrase but not governing it (`I don't mind: let anyone join my mac`, cross-verify
     # G23 noted the why no longer described it). Same removed reader; a leading clause
     # is simply not a command now (pinned: test_allow_all_router_repair_0927).
+    # ⛔ R11 RE-AIMED 2026-09-27 (wave 12 repair 4, K7): a `my` subject's filler words
+    # are never and/or now, and the machine word moved to the next line. Same defect.
     ("R11", SR, "⛔ 'require my approval on my mac' names a computer 'approval on my mac'",
-     [("_AA_ONE_SUBJ = (rf\"(?:qqname|(?:my|our|this)\\s+(?:own\\s+)?(?:[\\w'’-]+\\s+){{0,2}}?{_MACHINE_SINGULAR}\"",
-       "_AA_ONE_SUBJ = (rf\"(?:qqname|(?:my|our|this)\\s+(?:own\\s+)?(?:[\\w'’-]+\\s+){{0,4}}?{_MACHINE_SINGULAR}\"")]),
+     [("_AA_ONE_SUBJ = (rf\"(?:qqname|(?:my|our|this)\\s+(?:own\\s+)?(?:(?!(?:and|or|nor|plus)\\b)[\\w'’-]+\\s+){{0,2}}?\"",
+       "_AA_ONE_SUBJ = (rf\"(?:qqname|(?:my|our|this)\\s+(?:own\\s+)?(?:(?!(?:and|or|nor|plus)\\b)[\\w'’-]+\\s+){{0,4}}?\"")]),
     # ⛔ R12 RE-AIMED 2026-09-27 (repair 3): the `the` subject takes model words.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (wave 12 repair 4, K7): its filler words are never
+    # and/or. Same defect.
     ("R12", SR, "⛔ an audience plus a thing that is not a computer is a subject — 'stop "
      "letting people join the call' switches allow-all off on a computer called “call”",
-     [("rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR}(?:\\s+{_MODEL_WORDS})*\"",
-       "rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?[\\w'’-]+(?:\\s+{_MODEL_WORDS})*\"")]),
+     [("rf\"setting|allow|and|or|nor|plus)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR}(?:\\s+{_MODEL_WORDS})*\"",
+       "rf\"setting|allow|and|or|nor|plus)\\b)[\\w'’-]+\\s+){{0,3}}?[\\w'’-]+(?:\\s+{_MODEL_WORDS})*\"")]),
     ("R13", SR, "⛔⛔ 'stop allowing people to use my mac' — a HIDE since 7.9-3 — switches "
      "allow-all off and leaves it listed",
      [('    ("off", r"stop\\s+allowing\\s+{WO}\\s+to\\s+join(?:\\s+{S})?"),',
@@ -418,9 +424,11 @@ MUTANTS = [
      [('    _join_obj = _join_request(t)\n', '    _join_obj = ""\n')]),
     # ⛔ R15 RE-AIMED 2026-09-27 (repair 3): the person's own computer is refused
     # inside the one-computer test (`_JOIN_NOT_ONE`). Same defect.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (wave 12 repair 4, K13): the list goes on to the
+    # other possessives and the plural demonstratives. Same defect.
     ("R15", SR, "⛔ 'join my mac' files an ask for the asker's OWN computer",
-     [('                           r"my|our|mine|me|us|you|this)\\b")',
-       '                           r"me|us|you|this)\\b")')]),
+     [('                           r"my|our|mine|me|us|you|this|your|yours|his|her|hers|their|"',
+       '                           r"me|us|you|this|your|yours|his|her|hers|their|"')]),
     # ⛔ R16 RE-AIMED 2026-09-27 (repair 2): the capture is gated by `_join_kw` now.
     # ⛔ RE-AIMED AGAIN 2026-09-27 (repair 3): the whole-message join feeds the
     # capture first. Same defect: the join is read but captures nothing.
@@ -443,8 +451,12 @@ MUTANTS = [
     # with Allow-all words (the podcast row FLIPPED to the catch-all,
     # test_allow_all_whole_message_0927, dated). The exemption brought back is
     # wave12_repair3_router_mutants.py C2.
+    # ⛔ R19 RE-AIMED 2026-09-27 (wave 12 repair 4, K8): a quoted span that IS the
+    # setting's name keeps its words first; every other quoted name is blanked. Same
+    # defect.
     ("R19", SR, "⛔ a computer NAMED “Allow All Lab” is read as a request",
-     [('    _aa_src = _outside_quoted_names(low)\n', '    _aa_src = low\n')]),
+     [('    _aa_src = _outside_quoted_names(_unquote_setting(low))\n',
+       '    _aa_src = _unquote_setting(low)\n')]),
     ("R20", SR, "⛔ 'without asking' with no audience ('switch to the office pc without asking "
      "me') counts as Allow all and loses its own route",
      [('    + rf"|\\b{_AA_WHO}\\b[^.?!]{{0,40}}\\bwithout\\s+(?:asking|approv\\w*|"\n',

@@ -154,8 +154,12 @@ _LOST_CODE_REPLY = ("If it's your own computer, open Account in the web app and 
 # machine reads as the identical string "Research computer", so "tell me which one"
 # alone is a question the reader may not be able to answer — and the resolver
 # refuses an ambiguous name rather than guessing.
+# ⛔⛔ AND IT SAYS WHAT THE CONFIRM SAYS (wave 12 repair 4, cross-verify K19): the list
+# said "They see your name." and the ask confirm one message later "The owner sees
+# your name and email." — two claims in one exchange. The owner's Shared with shows
+# both once somebody is on the computer, so the list says the confirm's sentence.
 _PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "
-                      "you can use that computer. They see your name.")
+                      "you can use that computer. The owner sees your name and email.")
 
 # ⭐⭐ ALLOW ALL (wave 12, 2026-09-26). An owner can set a public computer so that
 # anyone who asks joins at once, with no approval step. Four sentences say it, and
@@ -172,8 +176,8 @@ _JOINS_AT_ONCE = " · joins at once"
 # `_PUBLIC_ASK_INVITE` word for word, which is also what every row reads as until
 # the web app ships the bit — the safe direction.
 _PUBLIC_JOIN_INVITE = ("Tell me which one you want. Ones marked “joins at once” let "
-                       "you straight in; for the others its owner decides. They see "
-                       "your name.")
+                       "you straight in; for the others its owner decides. The owner "
+                       "sees your name and email.")
 # ⛔⛔ WHAT ALLOW ALL COSTS THE OWNER, IN THE SPEC'S OWN WORDS. The confirm before
 # switching it on and the reply after it say the same sentence, so what somebody
 # agreed to and what they are told they did are one text. Twenty-five is the
@@ -6372,10 +6376,14 @@ _AA_SET_SUBJ = (rf"(?:(?:all|both|each|every)\s+(?:of\s+)?(?:my|our|the)\s+(?:[\
 # them). ONE list, the Windows sign-in reader's own (9ac9abf), read by both.
 _MODEL_WORDS = (r"(?:mini|pro|air|studio|max|ultra|m\d\w*|\d+|web|chrome|safari|edge|"
                 r"firefox|super|research|sr)")
-_AA_ONE_SUBJ = (rf"(?:qqname|(?:my|our|this)\s+(?:own\s+)?(?:[\w'’-]+\s+){{0,2}}?{_MACHINE_SINGULAR}"
+# ⛔ ONE COMPUTER, NOT TWO JOINED (repair 4, K7): `turn off allow all on the lab pc and
+# mac` read “lab pc and mac” as one subject, then wrote to the Lab PC alone — the Mac
+# stayed open. A filler word is never and/or/nor/plus.
+_AA_ONE_SUBJ = (rf"(?:qqname|(?:my|our|this)\s+(?:own\s+)?(?:(?!(?:and|or|nor|plus)\b)[\w'’-]+\s+){{0,2}}?"
+                rf"{_MACHINE_SINGULAR}"
                 rf"(?:\s+{_MODEL_WORDS})*"
                 rf"|the\s+(?:(?!(?:public|shared|open|other|others|any|some|same|one|ones|whole|"
-                rf"setting|allow)\b)[\w'’-]+\s+){{0,3}}?{_MACHINE_SINGULAR}(?:\s+{_MODEL_WORDS})*"
+                rf"setting|allow|and|or|nor|plus)\b)[\w'’-]+\s+){{0,3}}?{_MACHINE_SINGULAR}(?:\s+{_MODEL_WORDS})*"
                 rf"|it|that)")
 _AA_SUBJ = rf"(?:{_AA_SET_SUBJ}|{_AA_ONE_SUBJ})"
 # `for my mac`, `on the office pc`, `from “Studio Mac”` — optional everywhere.
@@ -6428,10 +6436,14 @@ _AA_GRAMMAR = tuple((d, re.compile(p.format(SET=_AA_SETTING, S=_AA_SUBJ, T=_AA_O
     ("off", r"(?:start\s+)?requir(?:e|ing)\s+(?:my\s+)?approvals?{A}?{T}{A}?"),  # require approval again
     ("off", r"(?:(?:turn|switch)\s+(?:back\s+)?on\s+(?:the\s+)?approvals?(?:\s+step)?|"
             r"(?:turn|switch)\s+(?:the\s+)?approvals?\s+(?:back\s+)?on){T}"),  # approval ON = OFF
-    ("off", r"(?:go\s+back\s+to\s+approving\s+(?:people|each\s+person|every\s+person|everyone|"
-            r"everybody|each\s+request|every\s+request){A}?{T}{A}?"
-            r"|approve\s+(?:people|each\s+person|every\s+person|everyone|everybody|each\s+request|"
-            r"every\s+request)(?:{A}{T}|{T}{A}))"),               # approve people again
+    # ⛔ K2 (repair 4): EVERYONE / EVERY REQUEST ONLY WITH `myself`. `just approve
+    # everyone from now on` and `approve every request going forward` read as the
+    # ON wish, and this row switched Allow all OFF unconfirmed; `approve everyone
+    # myself` is the one spelling of them that says "by hand".
+    ("off", r"(?:go\s+back\s+to\s+approving\s+(?:people|each\s+person){A}?{T}{A}?"
+            r"|approve\s+(?:people|each\s+person)(?:{A}{T}|{T}{A})"
+            r"|(?:go\s+back\s+to\s+approving|approve)\s+(?:everyone|everybody|every\s+person|"
+            r"each\s+request|every\s+request)(?:\s+myself{A}?{T}|{T}\s+myself))"),  # approve people again
     ("off", r"(?:make|have)\s+(?:everyone|everybody|people|anyone|them)\s+ask(?:\s+first|\s+again)?"
             r"(?:\s+before\s+(?:joining|using)(?:\s+{S})?|{T})"),  # make everyone ask
 ))
@@ -6450,11 +6462,32 @@ _AA_TAIL = re.compile(r"(?:[\s,]+(?:please|pls|thanks|thank\s+you|thx|ty|now|rig
 _AA_END = re.compile(r"[\s.!?\u2026\u2600-\u27bf\ufe0f\u200d\U0001f300-\U0001faff]+$")
 
 
+def _is_setting_quote(span: str) -> bool:
+    """True for a quoted span whose words ARE the setting's name (“Allow all”)."""
+    return bool(re.fullmatch(_AA_SETTING, span[1:-1].strip(), re.I))
+
+
+def _unquote_setting(text: str) -> str:
+    """⛔ A QUOTED SETTING NAME IS THE SETTING, NOT A COMPUTER (repair 4, K8). The
+    catch-all names the phrasings in quotes, and `turn off “Allow all”` had its
+    words blanked like a computer's name — the same catch-all came back, and
+    `switch "Allow all" off` hid a computer called “Allow all”."""
+    return _SET_QUOTED_SPAN.sub(
+        lambda q: f" {q.group(0)[1:-1]} " if _is_setting_quote(q.group(0)) else q.group(0),
+        text or "")
+
+
 def _aa_bare(text: str) -> "tuple[str, bool]":
     """The message with its quoted names blanked to `qqname`, lower-cased, the
     politeness in front and the thanks behind taken off — and whether it asked a
-    QUESTION (a trailing `?` that no `can/could/would/will you` made a request)."""
-    s = _SET_QUOTED_SPAN.sub(" qqname ", " ".join((text or "").split())).lower()
+    QUESTION (a trailing `?` that no `can/could/would/will you` made a request).
+    A quoted setting name keeps its words (`_unquote_setting`), and so does a
+    message quoted WHOLE: “turn off Allow all”, pasted back from the catch-all."""
+    s = _unquote_setting(" ".join((text or "").split()))
+    s = _SET_QUOTED_SPAN.sub(
+        lambda q: (f" {q.group(0)[1:-1]} "
+                   if not re.sub(r"[\s.!?]", "", s[:q.start()] + s[q.end():])
+                   else " qqname "), s).lower()
     end = _AA_END.search(s)
     question = bool(end and "?" in end.group(0))
     s = " ".join(_AA_END.sub("", s).split())
@@ -6482,12 +6515,17 @@ def _allow_all_command(text: str) -> "tuple[str, str] | None":
     direction = next((d for d, rx in _AA_GRAMMAR if rx.fullmatch(cmd)), None)
     if direction is None:
         return None
-    subj = re.search(rf"\b{_AA_SUBJ}\b", cmd)
+    # ⛔ THE SETTING'S NAME IS NOT THE COMPUTER'S (repair 4, K6): `turn off the
+    # auto-approve for my mac` read “the auto-approve for my mac” as `the <name>
+    # <machine>` and looked for a computer called “auto-approve for my mac”.
+    subj = re.search(rf"\b{_AA_SUBJ}\b", re.sub(_AA_SETTING, lambda m: " " * len(m.group(0)), cmd))
     if subj and re.fullmatch(_AA_SET_SUBJ, subj.group(0)):
         return "set", ""
     name = ""
     if subj and subj.group(0) == "qqname":
-        name = _cap(_QUOTED_RE.search(t)).strip()
+        # the first quoted span that is a computer's name, not the setting's (K8)
+        name = next((_cap(q).strip() for q in _QUOTED_RE.finditer(t)
+                     if not _is_setting_quote(q.group(0))), "")
     elif subj and not re.fullmatch(r"it|that", subj.group(0)):
         words = re.sub(r"^(?:my|our|this|the)\s+(?:own\s+)?", "", subj.group(0))
         # ⛔ `my Mac mini` is the KIND of computer, not its name: with the model
@@ -6509,15 +6547,17 @@ _AA_WHO = (r"(?:anyone|anybody|everyone|everybody|people|strangers|others|folks|
 # ⛔ THE OTHER NOUNS ARE LISTED, NOT THE SETTING'S NEIGHBOURS: a missed mention falls
 # to the clauses below (where `turn it off` hides and `allow` approves), while an
 # extra one only buys a read-only answer — so a word nobody listed counts.
-_AA_SETTING_NAME = re.compile(
+_AA_ALLOW_ALL_WORD = (
     r"\ballow[- ]?all\b(?!\s+(?:the|my|your|our|their|these|those|of|two|three|four|five|"
     r"\d+|agents?|phases?|notifications?|apps?|applications?|cookies?|requests?|"
     r"permissions?|access|traffic|connections?|files?|downloads?|pop-?ups?|cards?|users?|"
     r"people|changes?|updates?|sites?|websites?|devices?|computers?|machines?|macs?|"
     r"incoming|calls?|messages?|emails?|contacts?|features?|plugins?|extensions?|"
     r"integrations?|tools?|models?|runs?|research|researches|sources?|links?|domains?|"
-    r"videos?|audio|podcasts?|reports?|briefs?|content|types?|formats?)\b)"
-    r"|\bauto(?:matic(?:ally)?)?[- ]?(?:approv|accept|admit|join)\w*", re.I)
+    r"videos?|audio|podcasts?|reports?|briefs?|content|types?|formats?)\b)")
+_AA_SETTING_NAME = re.compile(
+    _AA_ALLOW_ALL_WORD
+    + r"|\bauto(?:matic(?:ally)?)?[- ]?(?:approv|accept|admit|join)\w*", re.I)
 _AA_MENTION = re.compile(
     _AA_SETTING_NAME.pattern
     + rf"|\b(?:let|lets|letting|allow|allows|allowing)\s+{_AA_WHO}\s+(?:straight\s+)?"
@@ -6552,6 +6592,21 @@ _AA_MENTION = re.compile(
     + r"|\bjoins?\s+(?:at\s+once|instantly|straight\s+away|right\s+away|"
       r"automatically|without\s+asking)\b|\bask\s+me\s+first\b"
       r"|\b(?:make|have)\s+(?:people|everyone|everybody|them|anyone)\s+ask\b", re.I)
+# ⛔⛔ THE SETTING'S OWN WORDS — what a research TOPIC must say beside the person's
+# own computer before it is their Allow all and not a subject (repair 4, K4/K5).
+# `_AA_MENTION` above is broad because all it buys is a read-only answer; beside a
+# research verb it vetoed a PAID run's topic, and `research why my laptop keeps
+# auto-joining public wifi` got the Devices list. Only the setting's name, the
+# door it opens (let anyone join, joins at once, without my approval), and people
+# joining the person's own computer — never auto-join/auto-accept/let everyone in.
+_AA_OWN_WORDS = re.compile(
+    _AA_ALLOW_ALL_WORD
+    + r"|\bauto(?:matic(?:ally)?)?[- ]?approv\w*"
+    + rf"|\b(?:let|lets|letting|allow|allows|allowing)\s+{_AA_WHO}\s+(?:to\s+)?join\b"
+    + r"|\bjoins?\s+(?:at\s+once|instantly|straight\s+away|right\s+away|without\s+asking)\b"
+    + r"|\bwithout\s+(?:my\s+)?(?:approval|permission)\b"
+    + rf"|\b{_AA_WHO}\b[^.?!,;]{{0,20}}?\bjoin(?:s|ing|ed)?\s+(?:my|our|this)\s+(?:own\s+)?"
+      rf"(?:[\w'’-]+\s+){{0,2}}?(?:{_MACHINE_NOUNS})\b", re.I)
 # ⛔⛔ SOMEBODY ELSE'S COMPUTERS. `list public computers that let anyone join` is a
 # JOINER looking for a way in — wave 11's fleet door — never the owner's switch.
 # Read with the allow-all phrases blanked, so `let anyone join` is not a joiner's
@@ -6586,9 +6641,21 @@ _JOIN_WHOLE = re.compile(
     r"(?P<obj>[^,;:()—–]+)")
 # What cannot be inside ONE stranger's computer's name: a second clause, a
 # description of it, or the person's own (`join the call from my laptop`).
+# ⛔ …nor somebody's or a set (repair 4, K13): `join your Studio PC`, `join these
+# Studio PCs` asked about one computer called “Studio PC”.
 _JOIN_NOT_ONE = re.compile(r"\b(?:and|or|but|so|because|since|that|which|who|where|when|if|"
                            r"then|it|as|after|before|until|while|though|although|"
-                           r"my|our|mine|me|us|you|this)\b")
+                           r"my|our|mine|me|us|you|this|your|yours|his|her|hers|their|"
+                           r"theirs|its|these|those)\b")
+# ⛔ THE WORDS AFTER A JOIN THAT ARE NOT THE NAME (repair 4, K13): `join the Studio PC
+# again` asked about “Studio PC again”, and the yes found no such computer. The
+# join's own list, on top of the thanks and time words every command drops.
+# (`for today` arrives as a bare `for`: those time words took `today` first.)
+_JOIN_TAIL = re.compile(r"(?:\s+(?:again|tonight|tomorrow|instead|too|later|for(?:\s+today)?|"
+                        r"via\s+the\s+web))+$")
+# ⛔ `the computer called Studio PC` IS “Studio PC” (repair 4, K13).
+_JOIN_CALLED = re.compile(rf"^(?:(?:the|a|an)\s+)?(?:(?:{_MACHINE_NOUNS}|one)\s+)?"
+                          r"(?:called|named)\s+")
 
 
 def _join_request(text: str) -> str:
@@ -6598,16 +6665,50 @@ def _join_request(text: str) -> str:
     a stranger), and never a question (`join the Studio PC?`)."""
     t = " ".join((text or "").split())
     s, question = _aa_bare(t)
-    m = None if question else _JOIN_WHOLE.fullmatch(s)
-    if not m or _JOIN_NOT_ONE.search(m.group("obj")):
+    # ⛔ A SIGN-IN IS A SIGN-IN (repair 4, K11 — e567704): `join the Studio PC to
+    # sign in` asked about “Studio PC to sign in”, and the sign-in never started.
+    if re.search(rf"\b{_SIGN_IN_ASK}\b", s):
         return ""
-    obj = m.group("obj").strip()
+    m = None if question else _JOIN_WHOLE.fullmatch(s)
+    if not m:
+        return ""
+    obj = _AA_TAIL.sub("", _JOIN_TAIL.sub("", m.group("obj").strip())).strip(" ,")
+    obj = _JOIN_CALLED.sub("", obj)
+    if _JOIN_NOT_ONE.search(obj):
+        return ""
     if obj == "qqname":                    # a quoted name, verbatim, quotes kept
         return _SET_QUOTED_SPAN.search(t).group(0)
-    if "qqname" in obj:
+    if "qqname" in obj or _AA_PLURAL.search(obj):
         return ""
     hit = re.search(rf"(?<![\w'’-]){re.escape(obj)}(?![\w'’-])", t, re.I)
     return hit.group(0) if hit else obj
+
+
+# ⛔⛔ A CODE AFTER AN ASK VERB — ONLY AS THE WHOLE MESSAGE (repair 4, K3). Repair 3
+# read it from a capture that searched ANYWHERE, before every guard: `ask to use
+# Studio22` and `request access to “Studio22”` PAIRED a computer's name, `status of
+# support request AB12CD34` paired the support code, and `can I borrow K7XQ-9B2M?`
+# and `my friend wants to borrow K7XQ-9B2M` paired with no confirm. Now: the whole
+# message is the ask, it is no question, and its one object is an UNQUOTED token in
+# the access code's shape (XXXX-XXXX in its alphabet, in capitals as the web app
+# shows it — any case once it carries a digit, which no dashed word does) or the
+# connection code's.
+_ASK_CODE_WHOLE = re.compile(r"(?:let\s+me\s+)?(?:join|ask\s+(?:to\s+(?:join|use)|for)|"
+                             r"request\s+access\s+to|borrow)\s+(?P<code>\S+)")
+_ASK_CODE_SHAPE = re.compile(rf"[2-9{_ACCESS_LETTERS}]{{4}}[{_DASHES}][2-9{_ACCESS_LETTERS}]{{4}}")
+
+
+def _asked_code(text: str) -> str:
+    """The code a whole-message ask names (`borrow K7XQ-9B2M`), as typed, or ""."""
+    t = " ".join((text or "").split())
+    s, question = _aa_bare(t)
+    m = None if question else _ASK_CODE_WHOLE.fullmatch(s)
+    if not m:
+        return ""
+    hit = re.search(rf"(?<![{_DASHES}\w]){re.escape(m.group('code'))}(?![{_DASHES}\w])", t, re.I)
+    tok = hit.group(0) if hit else ""
+    shape = tok.upper() if re.search(r"\d", tok) else tok
+    return tok if (_ASK_CODE_SHAPE.fullmatch(shape) or _NL_CONNECTION_CODE_RE.fullmatch(tok)) else ""
 
 
 def _aa_about_others(src: str) -> bool:
@@ -6827,13 +6928,19 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                   r"browser|(?:web)?site)")
     # ⭐ ONE list with the Allow-all subject's (repair 3) — see `_MODEL_WORDS`.
     _model_words = _MODEL_WORDS
+    # ⛔ The app word that opens the next clause is read across a comma or a `but`
+    # too, with its own subject (repair 4, K14 — the owner's Windows rule 2): "…my
+    # mac mini app, it says it's offline" answered "✓ Signed in as …" alone. Only
+    # what the app SAYS: "…the desktop app, and is it fast?" still asks about the app.
     _to_a_computer = re.match(
         _asker + r"[^.?!]*?" + _to_it +
         rf"(?:(?!(?:on|in|at|from|of|for|with|to|account|email|app)\b)[\w'’-]+\s+){{0,3}}?"
         rf"(?:{_MACHINE_NOUNS})\b"
         rf"(?!\s*['’]s\b|\s+(?:account|email|google|gmail|login|profile)\b"
         rf"|(?:\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\s+{_app_words}\b"
-        rf"(?!\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\b))", low)
+        rf"(?!\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\b"
+        rf"|\s*,?\s+(?:(?:but|and|yet|though|tho)\s+)?(?:(?:it|that|this|which|the\s+{_app_words})\s+)?"
+        rf"(?:says?|said|shows?|showed|showing)\b))", low)
     _to_its_app = re.match(
         _asker + rf"(?:(?!\b(?:{_MACHINE_NOUNS})\b)[^.?!])*?" + _to_it
         + rf"(?:(?!(?:the|a|an|my|your|our|his|her|its|their|this|that|which|where|on|in|at|"
@@ -6906,11 +7013,17 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # join` POSTed /research — a paid run about their own setting, which SKILL.md
         # answers with `devices`. Only with their OWN computer beside the Allow-all
         # words: `research why companies let anyone join their Slack` is a topic.
-        _own_near = rf"\b(?:my|our|this)\s+(?:own\s+)?(?:[\w'’-]+\s+){{0,2}}?(?:{_MACHINE_NOUNS_SAID})\b"
-        _aa_topic = _outside_quoted_names(topic.lower())
+        # ⛔ REPAIR 4 (K4/K5/K17): the setting's OWN words (`_AA_OWN_WORDS`), never a
+        # phone; the computer beside them OR INSIDE them (`people join my mac without
+        # my permission` swallowed “my mac” and started a paid run); and the quoted
+        # names blanked BEFORE the topic's quotes come off (`…on my mac “Allow All
+        # Lab”` lost its closing quote first, and the name read as the setting).
+        _own_near = rf"\b(?:my|our|this)\s+(?:own\s+)?(?:[\w'’-]+\s+){{0,2}}?(?:{_MACHINE_NOUNS})\b"
+        _aa_topic = _outside_quoted_names(rm.group(1).lower())
         if any(re.search(rf"{_own_near}[^.?!,;]{{0,20}}$", _aa_topic[:m.start()])
                or re.match(rf"[^.?!,;]{{0,20}}?{_own_near}", _aa_topic[m.end():])
-               for m in _AA_MENTION.finditer(_aa_topic)):
+               or re.search(_own_near, m.group(0))
+               for m in _AA_OWN_WORDS.finditer(_aa_topic)):
             return ["devices"], None
         if topic and not _not_a_topic:
             flags: list[str] = []
@@ -7377,7 +7490,10 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     #     research verb in front is rule 2b's, above.
     # `allow` and `let anyone in` are the decide clause's yes words, and a yes
     # there lets the one waiting stranger in — which is why nothing falls through.
-    _aa_src = _outside_quoted_names(low)
+    # ⛔ `turn off “Allow all” for my mac but keep it listed` HID the computer: the
+    # quoted setting name was blanked like a computer's, and the hide took the rest
+    # (repair 4, K8). The setting's name keeps its words here too.
+    _aa_src = _outside_quoted_names(_unquote_setting(low))
     _aa_cmd = _allow_all_command(t)
     if _aa_cmd:
         _aa_dir, _aa_obj = _aa_cmd
@@ -7389,7 +7505,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         return None, [_NL_CONFIRMS["device-allow-all"].format(
             name=f"“{_aa_obj}”" if _aa_obj else "that computer")]
     if _AA_MENTION.search(_aa_src):
-        if re.search(rf"\b{_SIGN_IN_ASK}\b", low):
+        # ⛔ …an INSTRUCTION to sign in, never a question that mentions one (repair
+        # 4, K18): `can people join my mac without a login?` started a sign-in.
+        _aa_login_q = (_aa_bare(t)[1] or re.match(
+            _NL_LEAD_IN + r"(?:(?:can|could|would|will)\b(?!\s+you\b)|(?:is|are|does|do|did|who|"
+            r"what|which|how|why|when|has|have|should)\b)", low))
+        if re.search(rf"\b{_SIGN_IN_ASK}\b", low) and not _aa_login_q:
             return ["login"], None                 # e567704: a sign-in stays a sign-in
         # What is left once the allow-all phrases are gone: `let anyone join` is
         # not a joiner's `join`.
@@ -7905,12 +8026,10 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # adjective rode into the name, and no row is called that.
         _ask_obj = re.sub(rf"^(?:public|shared)\s+(?=(?:{_MACHINE_NOUNS})\s+\S)", "",
                           _ask_obj, flags=re.I)
-        # ⛔ A CODE IS READ BEFORE THE MACHINE WORD COMES OFF (repair 3): `request
-        # access to computer LABPC001` names a machine whose id merely LOOKS like a
-        # code (test_chat_public_792 pins it: never a pairing).
-        _ask_code = _ask_obj if (_NL_CODE_RE.fullmatch(_ask_obj)
-                                 or _NL_CONNECTION_CODE_RE.fullmatch(_ask_obj)
-                                 or _NL_CAPS_CODE_RE.fullmatch(_ask_obj)) else ""
+        # ⛔ A CODE IS THE WHOLE MESSAGE'S ONE OBJECT (repair 4, K3) — see
+        # `_asked_code`. `request access to computer LABPC001` names a machine whose
+        # id merely LOOKS like a code (test_chat_public_792 pins it: never a pairing).
+        _ask_code = _asked_code(t)
         _ask_obj = _strip_leading_noun(_ask_obj)
     # ⛔ A PHASE OR AN ARTEFACT IS NOT A COMPUTER. "ask for the podcast" and
     # "ask for an update" belong to the rules below and must survive this one.

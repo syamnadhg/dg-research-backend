@@ -323,8 +323,10 @@ MUTANTS = [
      "⛔⛔ THE DISCLOSURE LEAVES THE SCREEN THAT OFFERS THE ASK. A person decides "
      "HERE whether to ask at all, and the fact that asking names them was the "
      "thing they needed before deciding. RE-ANCHORED 2026-09-24: the list says the "
-     "chat's words now (owner) — 'They see your name.' is the disclosure it keeps",
-     [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "\n                        "They see your name.")',
+     "chat's words now (owner) — 'They see your name.' is the disclosure it keeps. "
+     "RE-ANCHORED 2026-09-27 (wave 12 repair 4, K19): the disclosure is the ask's "
+     "own sentence now — 'The owner sees your name and email.'",
+     [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "\n                        "The owner sees your name and email.")',
        '_PUBLIC_ASK_INVITE_T = "     Once the request is accepted you can use that computer."')]),
     ("P8", CLI, "over",
      "⛔ THE TRUNCATION CAPTION PROMISES A NEXT PAGE. There is no cursor, no "
@@ -350,9 +352,10 @@ MUTANTS = [
        '    return f"  • {label}{dot}{full}"')]),
     ("P12", SR, "under",
      "chat stops saying that asking names the person, so the disclosure exists on "
-     "one client and not the other",
+     "one client and not the other (RE-ANCHORED 2026-09-27, wave 12 repair 4, K19: "
+     "the sentence is the ask's own now)",
      [('_PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "\n'
-       '                      "you can use that computer. They see your name.")',
+       '                      "you can use that computer. The owner sees your name and email.")',
        '_PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "\n'
        '                      "you can use that computer.")')]),
 

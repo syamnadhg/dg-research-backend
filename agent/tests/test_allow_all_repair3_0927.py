@@ -240,7 +240,12 @@ def test_r2_a_sign_in_beside_allow_all_words_stays_a_sign_in(text):
     ("research how open source projects let anyone join", "RESEARCH"),
     # …and one that names the person's computer far from them stays a topic too
     ("research how to let anyone join a Slack workspace from my laptop", "RESEARCH"),
-    ("research the EV market on my mac, allow all agents", "RESEARCH"),
+    # ⛔ REPLACED 2026-09-27 (wave 12 repair 4, cross-verify K5): the row here was
+    # `research the EV market on my mac, allow all agents`, and it passed under D1,
+    # D2 and D3 alike — `allow all agents` is not the setting, so it measured
+    # nothing. This one measures the clause boundary: the person's computer is
+    # within twenty characters, but across a comma.
+    ("research on my mac, how companies let anyone join Slack", "RESEARCH"),
 ])
 def test_r2_a_research_verb_is_research_unless_it_is_about_their_own_allow_all(text, want):
     """⛔⛔ H13: `investigate why my mac won't let anyone join` POSTed /research — a

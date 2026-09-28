@@ -56,9 +56,11 @@ SR = "agent/facade/skill/scripts/sr.py"
 SUITES = {
     # ⛔ + the repair-2 pins (2026-09-27): the re-aimed mutants are measured there.
     # ⛔ + the repair-3 pins (2026-09-27).
+    # ⛔ + the repair-4 pins (2026-09-27): F21 is restored and measured there.
     SR: (AGENT, "tests/test_allow_all_router_repair_0927.py tests/test_allow_all_router_0926.py "
                 "tests/test_chat_public_792.py tests/test_chat_owner_793.py "
-                "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_repair3_0927.py"),
+                "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_repair3_0927.py "
+                "tests/test_allow_all_repair4_0927.py"),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -167,10 +169,13 @@ MUTANTS = [
      "is read as the setting, not its opposite",
      [('    ("on", r"(?:turn|switch)\\s+off\\s+(?:the\\s+)?approvals?(?:\\s+step)?{T}"),',
        '    ("off", r"(?:turn|switch)\\s+off\\s+(?:the\\s+)?approvals?(?:\\s+step)?{T}"),')]),
+    # ⛔ F14 RE-AIMED 2026-09-27 (wave 12 repair 4, K2): the OFF row's `approve people`
+    # alternative no longer carries everyone/every request (they need `myself`).
+    # Same defect.
     ("F14", SR, "⛔⛔ `I want to approve people on my mac again` raises the approve confirm, "
      "whose nameless yes admits the one waiting stranger",
-     [('            r"|approve\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|each\\s+request|"\n',
-       '            r"|NEVER_F14\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|each\\s+request|"\n'),
+     [('            r"|approve\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n',
+       '            r"|NEVER_F14\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n'),
       ('    + r"|\\bapprov(?:e|ing)\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n',
        '    + r"|\\bNEVER_F14B\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n')]),
 
@@ -211,12 +216,14 @@ MUTANTS = [
      [('    return _set_device_visibility(args, payload, "let anyone join “{name}”" if value == "yes"\n'
        '                                  else "stop letting anyone join “{name}”")',
        '    return _set_device_visibility(args, payload, "let anyone join “{name}”")')]),
-    # ⛔ F21 RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H7): it removed
-    # `_join_kw`'s sign-in veto. `_join_kw` is GONE; `sign in to join the Studio PC`
-    # is not a whole-message join, so it cannot ask (pinned:
-    # test_allow_all_router_repair_0927 test_signing_in_to_join_stays_a_sign_in).
-    # The defect returns only if the join stops being whole-message:
-    # wave12_repair2_router J3, re-aimed.
+    # ⛔⛔ F21 RESTORED 2026-09-27 (wave 12 repair 4, cross-verify K11). Repair 3
+    # retired it as "a sign-in cannot reach a whole-message join", and that was FALSE:
+    # `join the Studio PC to sign in` IS a whole-message join, and it asked about
+    # “Studio PC to sign in” — the sign-in never started. `_join_request` vetoes a
+    # sign-in phrase again; this removes that veto.
+    ("F21", SR, "⛔ `join the Studio PC to sign in` raises the ask confirm, overriding "
+     "e567704's sign-in rule",
+     [('    if re.search(rf"\\b{_SIGN_IN_ASK}\\b", s):\n        return ""\n', '')]),
 
     # ═══ S — the narrowing's own pieces ══════════════════════════════════════
     # ⛔ S1 RETIRED 2026-09-27 (wave 12 repair 2): it removed the copula test that

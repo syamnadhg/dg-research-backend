@@ -56,10 +56,11 @@ SKILL = "agent/facade/skill/SKILL.md"
 
 SUITES = {
     # ⛔ + the repair-3 pins (2026-09-27): the re-aimed mutants are measured there too.
+    # ⛔ + the repair-4 pins (2026-09-27): W5 is restored and measured there.
     SR: (AGENT, "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_router_repair_0927.py "
                 "tests/test_allow_all_router_0926.py tests/test_chat_public_792.py "
                 "tests/test_chat_owner_793.py tests/test_empty_state_794.py "
-                "tests/test_allow_all_repair3_0927.py"),
+                "tests/test_allow_all_repair3_0927.py tests/test_allow_all_repair4_0927.py"),
     SKILL: (AGENT, "tests/test_allow_all_whole_message_0927.py tests/test_chat_public_792.py "
                    "tests/test_chat_owner_793.py tests/test_allow_all_repair3_0927.py"),
 }
@@ -175,11 +176,16 @@ MUTANTS = [
     # test_r1_a_reason_makes_it_not_a_command). The opposite mutant — a reason read
     # past — is wave12_repair3_router_mutants.py B4. Proven by execution: the anchor
     # `_AA_PURPOSE = …` no longer exists in sr.py (anchor sweep, 0 matches).
-    # ⛔ W5 RETIRED 2026-09-27 (wave 12 repair 3): it removed the check that a purpose
-    # clause named another computer. With no purpose clause there is no second
-    # clause to name one — a second computer anywhere breaks the fullmatch of the
-    # one-subject grammar (pinned: `turn off allow all on my mac since the lab pc is
-    # set up` → the person's own list, test_allow_all_whole_message_0927).
+    # ⛔⛔ W5 RESTORED 2026-09-27 (wave 12 repair 4, cross-verify K7). Repair 3 retired
+    # it as "a second computer anywhere breaks the fullmatch of the one-subject
+    # grammar", and that was FALSE: `the <name> <machine>` took and/or as filler
+    # words, so `turn off allow all on the lab pc and mac` fullmatched with “lab pc
+    # and mac” as ONE subject, and the name read back was the shortest — the Lab PC
+    # was switched off and the Mac stayed open. The filler words refuse and/or/nor/
+    # plus now; this lets them back in (same defect: two computers, one guess).
+    ("W5", SR, "⛔⛔ two computers joined by and/or are ONE subject — `turn off allow all on "
+     "the lab pc and mac` switches off the Lab PC alone",
+     [('rf"setting|allow|and|or|nor|plus)\\b)', 'rf"setting|allow)\\b)')]),
     ("W6", SR, "⛔ a named computer loses its capitals — `the Lab PC` is looked up as “lab pc”",
      [('            name = hit.group(0) if hit else words\n', '            name = words\n')]),
     # ⛔ W7 RE-AIMED 2026-09-27 (wave 12 repair 3): the bare-noun test now reads the
@@ -188,8 +194,13 @@ MUTANTS = [
      "looks for a computer called “mac” instead of the picker",
      [('        if not _is_bare_machine_noun(re.sub(rf"(?:\\s+{_MODEL_WORDS})+$", "", words)):\n',
        '        if True:\n')]),
+    # ⛔ W8 RE-AIMED 2026-09-27 (wave 12 repair 4, K8): the name is the first quoted
+    # span that is not the setting's own (`turn off “Allow all” on “Studio PC”`).
+    # Same defect.
     ("W8", SR, "⛔ a quoted name is not taken verbatim — the placeholder is sent as the name",
-     [('        name = _cap(_QUOTED_RE.search(t)).strip()\n', '        name = "qqname"\n')]),
+     [('        name = next((_cap(q).strip() for q in _QUOTED_RE.finditer(t)\n'
+       '                     if not _is_setting_quote(q.group(0))), "")\n',
+       '        name = "qqname"\n')]),
     ("W10", SR, "⛔⛔ `the public computer` is the OWNER's subject — `let anyone join the public "
      "computer` raises the confirm that opens the asker's own computer",
      [('(?!(?:public|shared|open|other|others|any|some|same|one|ones|whole|"',
@@ -236,9 +247,12 @@ MUTANTS = [
        '_JOIN_NOT_ONE = re.compile(r"\\b(?:NEVER_M6|"')]),
     # ⛔ M7 RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H15): the sign-in
     # exception covers every message with Allow-all words now, not only a join.
+    # ⛔ M7 RE-AIMED AGAIN 2026-09-27 (wave 12 repair 4, K18): the exception holds for
+    # an instruction only, never a question. Same defect.
     ("M7", SR, "⛔ e567704: a sign-in beside Allow-all words is not a sign-in — `sign in and turn "
      "off allow all` gets the catch-all",
-     [('        if re.search(rf"\\b{_SIGN_IN_ASK}\\b", low):\n            return ["login"], None',
+     [('        if re.search(rf"\\b{_SIGN_IN_ASK}\\b", low) and not _aa_login_q:\n'
+       '            return ["login"], None',
        '        if False:\n            return ["login"], None')]),
     # ⛔ M7b RETIRED 2026-09-27 (wave 12 repair 3): it measured the join route's
     # `my/our` rule — `join my mac, it lets anyone in` asking the owner of “my mac”.

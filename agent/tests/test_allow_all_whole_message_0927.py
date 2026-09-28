@@ -100,7 +100,8 @@ PINNED = [
     ('join BCDF-GHJK', 'ADD:BCDF-GHJK'),  # F5
     ('join BCDF-GHJK please', 'ADD:BCDF-GHJK'),  # t6
     ('i want to join K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
-    ('join "K7XQ-9B2M"', 'ADD:K7XQ-9B2M'),  # t6
+    # ⛔ `join "K7XQ-9B2M"` FLIPPED 2026-09-27 (wave 12 repair 4, K3): a quoted token
+    # is a name — test_allow_all_repair4_0927 FLIPPED_R4.
     ('join computer K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
     ('join K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # F5
     ('join K7XQ-9B2M please', 'ADD:K7XQ-9B2M'),  # t6
@@ -112,7 +113,8 @@ PINNED = [
     ('join using code K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
     ('K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # F5
     ('please let me join K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
-    ('join K7XQ9B2M', 'ADD:K7XQ9B2M'),  # t6
+    # ⛔ `join K7XQ9B2M` FLIPPED 2026-09-27 (wave 12 repair 4, K3): no dash, not the
+    # access code's shape — test_allow_all_repair4_0927 FLIPPED_R4.
     ('join WDJB-MJHT', 'ADD:WDJB-MJHT'),  # t6
     ('sign in with WDJB-MJHT and join the Studio PC', 'ADD:WDJB-MJHT'),  # t6
     ('join bcdf-ghjk', 'ADD:bcdf-ghjk'),  # t6
