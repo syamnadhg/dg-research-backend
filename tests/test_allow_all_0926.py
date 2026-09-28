@@ -854,22 +854,60 @@ def test_a_failed_clear_sends_nothing_after_it_and_claims_nothing(wired, monkeyp
     assert ON not in out and "Public" not in out
 
 
-def test_a_failed_on_after_the_clear_says_allow_all_is_not_on(wired, monkeypatch):
-    """⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT. "Could not confirm that
-    change" would hide that something DID change; "Allow all is on" would be the
-    lie. It says Allow all did not go on, and that the only certain change is a
-    cleared tick that opened nothing while the computer was private."""
+def test_an_unconfirmed_on_after_the_clear_claims_neither_on_nor_off(wired, monkeypatch):
+    """⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT COME BACK CONFIRMED. "Could not
+    confirm that change" would hide that something DID change; "Allow all is on"
+    would be one lie and "Could not turn Allow all on" the other — the writer
+    answers False for a refusal and for a lost reply alike, so it cannot know
+    which (wave 12 repair 5, final verify rules-1: repair 4 pinned the failure
+    claim here). It says it could not confirm, that it may or may not have been
+    saved, and that a tick which opened nothing was cleared before it."""
     wired["meta"] = {"visibility": "private", "allowAll": True}
     seen = _record(monkeypatch, results=[True, False])
     assert research.run_visibility(SHOW, allow_all="yes") == 1
     assert seen == [_CLEAR, _ON]
     out = wired["out"]()
-    assert "Could not turn Allow all on" in out
-    assert "Only an old Allow all tick was cleared for certain" in out
-    assert "nothing while this computer was private" in out
+    assert "Could not confirm Allow all went on — it may or may not have been saved." in out
+    assert "Before it, an old Allow all tick was cleared, which did nothing" in out
+    assert "while this computer was private" in out
+    assert "Could not turn Allow all on" not in out
     assert "Could not confirm that change." not in out
     assert ON not in out and "Public" not in out
     assert "--visibility" in out
+
+
+def test_an_on_patch_that_landed_with_its_reply_lost_is_never_called_a_failure(
+        wired, monkeypatch):
+    """⛔⛔ WAVE 12 REPAIR 5 (final verify rules-1), THE FINDING'S OWN RUN. The clear
+    lands, the ON patch commits on the server, and its reply is lost — a 10-second
+    timeout or a 5xx, which `_pair_patch_device` answers False exactly as it does
+    a refusal. The computer is now public with Allow all on, so anyone who asks
+    joins at once. Repair 4 printed "Could not turn Allow all on" over it. The
+    screen may not claim either state, and the one step it points to finds the
+    truth. Executed against repair 4: the failure line printed."""
+    server = {"visibility": "private", "allowAll": True}
+    wired["meta"] = dict(server)
+    seen = []
+
+    def _patch(device_id, fields, *a, **kw):
+        assert device_id == "dev-1" and not a and not kw
+        seen.append(dict(fields))
+        server.update(fields)
+        # Every patch commits; only the ON patch's reply never arrives.
+        return fields.get("allowAll") is not True
+
+    monkeypatch.setattr(research, "_pair_patch_device", _patch)
+    assert research.run_visibility(SHOW, allow_all="yes") == 1
+    assert seen == [{"allowAll": False}, {"visibility": "public", "allowAll": True}]
+    assert research._allow_all_of(server) is True
+    out = wired["out"]()
+    assert "Could not turn Allow all on" not in out
+    assert "did not go on" not in out
+    assert "Could not confirm Allow all went on — it may or may not have been saved." in out
+    # The step it names reads the computer as it really is.
+    wired["meta"] = dict(server)
+    assert research.run_visibility(SHOW) == 0
+    assert ON in wired["out"]()
 
 
 def test_the_clear_first_goes_through_the_real_parser(tmp_path):

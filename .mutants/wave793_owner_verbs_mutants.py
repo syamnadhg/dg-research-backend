@@ -336,6 +336,8 @@ MUTANTS = [
      "as the sign-in problem it is",
      # ⛔ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K1): the 401 now says, after
      # a cleared tick, that Allow all did not go on. Same mutation — the branch gone.
+     # ⛔ RE-ANCHORED 2026-09-28 (wave 12 repair 5, final verify rules-2): the next
+     # clause also catches a transport error. Same mutation.
      [('            except RevokedError:\n'
        '                # A revoked sign-in sends nothing, so after a landed clear the\n'
        '                # ON patch is known not to have gone out.\n'
@@ -343,9 +345,9 @@ MUTANTS = [
        '                                          + (". Allow all did not go on; "\n'
        '                                             + _TICK_CLEARED if cleared else "")})\n'
        '                return\n'
-       '            except FirestoreError as e:\n'
+       '            except (FirestoreError, requests.RequestException) as e:\n'
        '                # ⛔ THE STATUS DECIDES WHICH SENTENCE IS HONEST',
-       '            except FirestoreError as e:\n'
+       '            except (FirestoreError, requests.RequestException) as e:\n'
        '                # ⛔ THE STATUS DECIDES WHICH SENTENCE IS HONEST')]),
 
     # ═══════════ Q — both halves of the queue ════════════════════════════════

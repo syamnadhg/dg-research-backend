@@ -86638,13 +86638,17 @@ def run_visibility(value: str, allow_all: "str | None" = None,
     if patch and (clear_first and not cleared
                   or not _pair_patch_device(device_id, patch)):
         if cleared:
-            # ⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT (or could not be
-            # confirmed). The tick it cleared opened nothing while the computer
-            # was private, so that is the only change this can vouch for.
-            print(f"  {_c(_WARN, '⚠')}  Could not turn Allow all on — the change was not confirmed.")
-            print(f"  {_c(_DIM, '     Only an old Allow all tick was cleared for certain, and it did')}")
-            print(f"  {_c(_DIM, '     nothing while this computer was private. Run this again with no')}")
-            print(f"  {_c(_DIM, '     value to see where it actually stands:')}  "
+            # ⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT COME BACK CONFIRMED —
+            # which is not the same as failing. `_pair_patch_device` answers False
+            # for a refusal and for a lost reply alike (below), so the computer
+            # may already be public with Allow all on. Repair 4 said "Could not
+            # turn Allow all on" here; wave 12 repair 5 (final verify rules-1)
+            # says what the chat's bridge says. The tick it cleared opened nothing
+            # while the computer was private.
+            print(f"  {_c(_WARN, '⚠')}  Could not confirm Allow all went on — it may or may not have been saved.")
+            print(f"  {_c(_DIM, '     Before it, an old Allow all tick was cleared, which did nothing')}")
+            print(f"  {_c(_DIM, '     while this computer was private. Run this again with no value')}")
+            print(f"  {_c(_DIM, '     to see where it actually stands:')}  "
                   f"{_c(_BOLD, f'{_PROG} --visibility')}")
             print()
             return 1

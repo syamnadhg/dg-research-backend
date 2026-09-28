@@ -5817,10 +5817,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                                           + (". Allow all did not go on; "
                                              + _TICK_CLEARED if cleared else "")})
                 return
-            except FirestoreError as e:
+            except (FirestoreError, requests.RequestException) as e:
                 # ⛔ THE STATUS DECIDES WHICH SENTENCE IS HONEST, and an absent
                 # status is the unknown case — never the refusal, because unknown
                 # is the direction that does not lie about the machine.
+                # ⛔⛔ A TRANSPORT ERROR IS THAT UNKNOWN CASE (wave 12 repair 5,
+                # final verify rules-2). `FirestoreRest` does not wrap them, and a
+                # ReadTimeout may sit on a PATCH Firestore already committed; left
+                # uncaught it closed the socket with no reply, and the chat said
+                # the bridge was not installed. It carries no `status`.
                 log.warning("device visibility write failed: %s", e)
                 refused = getattr(e, "status", None) == 403
                 if cleared:

@@ -507,6 +507,55 @@ def test_a_failed_on_after_the_clear_says_allow_all_did_not_go_on(wire, err, sta
     assert _WireFS.sent == [_W_CLEAR, _W_ON]
 
 
+# ── wave 12 repair 5 (final verify rules-2): a lost reply is the unknown case ──
+# ⛔⛔ `FirestoreRest._request` does not wrap transport errors, so a 15-second
+# `ReadTimeout` — which may sit on a PATCH Firestore already committed — was
+# neither a FirestoreError nor a RevokedError. It escaped the handler, the server
+# closed the socket with no reply, and the chat told the person the bridge was
+# not installed while the computer may have been public with Allow all on.
+# Executed against repair 4: every case below got "Remote end closed connection
+# without response".
+
+_UNSURE = {"reason": "visibility_unconfirmed",
+           "error": "could not confirm that change — it may or may not have been saved",
+           "visibility": None, "allowAll": None}
+
+
+@pytest.mark.parametrize("err", [requests.exceptions.ReadTimeout("read timed out"),
+                                 requests.exceptions.ConnectionError("reset by peer")],
+                         ids=["read-timeout", "connection-reset"])
+def test_a_lost_reply_on_the_on_write_after_the_clear_is_the_unconfirmed_answer(wire, err):
+    """THE FINDING'S OWN CASE: the clear lands, the ON write's reply is lost. The
+    answer is the one repair 4 wrote for exactly this — could not confirm, may or
+    may not have been saved, and a tick that opened nothing was cleared first."""
+    _owned(visibility="private", allowAll=True)
+    _WireFS.fail = {1: err}
+    r = _vis(wire, allowAll=True)
+    assert r.status_code == 502, r.text
+    assert r.json() == {"reason": "visibility_unconfirmed",
+                        "error": "could not confirm Allow all went on — it may or may "
+                                 "not have been saved. Before it, " + _TICK,
+                        "visibility": None, "allowAll": None}
+    assert _WireFS.sent == [_W_CLEAR, _W_ON]
+
+
+@pytest.mark.parametrize("row, body, sent", [
+    # the one ON write from a clean private computer
+    ({"visibility": "private"}, {"allowAll": True}, [_W_ON]),
+    # the clear itself: nothing goes out behind it
+    ({"visibility": "private", "allowAll": True}, {"allowAll": True}, [_W_CLEAR]),
+    # a plain close
+    ({"visibility": "public"}, {"visibility": "private"}, [_W_PRIV]),
+], ids=["one-write-on", "the-clear", "close"])
+def test_a_lost_reply_on_any_other_write_is_todays_unconfirmed_answer(wire, row, body, sent):
+    _owned(**row)
+    _WireFS.fail = {0: requests.exceptions.ReadTimeout("read timed out")}
+    r = _vis(wire, **body)
+    assert r.status_code == 502, r.text
+    assert r.json() == _UNSURE
+    assert _WireFS.sent == sent
+
+
 # ── rows: the effective allow-all rides on every own row ─────────────────────
 
 @pytest.mark.parametrize("fields, want", [

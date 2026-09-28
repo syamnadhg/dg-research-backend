@@ -13,8 +13,10 @@ each must die for the right reason.
        one-step `--visibility public --allow-all`) on a PRIVATE computer that
        carries an old tick first writes `{allowAll: false}` alone, then the ON
        patch — only there. A failed clear sends nothing after it and says
-       today's "could not confirm"; a failed ON after a landed clear says Allow
-       all did not go on and that only the (ineffective) tick was cleared.
+       today's "could not confirm"; a failed ON after a landed clear says it
+       could not confirm Allow all went on and that an (ineffective) tick was
+       cleared before it (wave 12 repair 5 took back "Could not turn Allow all
+       on" — the writer cannot tell a refusal from a lost reply).
   B* — bridge `/device/visibility` (K1, the chat's writer): the same sequence
        through the real `FirestoreRest` writers, with its own replies for a
        refused, unconfirmed or revoked ON after a landed clear.
@@ -60,10 +62,12 @@ M_WRITE = ('    if patch and (clear_first and not cleared\n'
            '                  or not _pair_patch_device(device_id, patch)):')
 M_SECOND = ('        if cleared:\n'
             '            # ⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT')
-M_CERTAIN = ("            print(f\"  {_c(_DIM, '     Only an old Allow all tick was cleared "
-             "for certain, and it did')}\")\n"
-             "            print(f\"  {_c(_DIM, '     nothing while this computer was "
-             "private. Run this again with no')}\")\n")
+# ⛔ RE-AIMED 2026-09-28 (wave 12 repair 5, final verify rules-1): the lines now
+# say the tick was cleared BEFORE an unconfirmed ON. Same mutation — both gone.
+M_CERTAIN = ("            print(f\"  {_c(_DIM, '     Before it, an old Allow all tick was "
+             "cleared, which did nothing')}\")\n"
+             "            print(f\"  {_c(_DIM, '     while this computer was private. "
+             "Run this again with no value')}\")\n")
 M_EXIT = ('            print()\n'
           '            return 1\n'
           '        # ⛔⛔ "NOTHING CHANGED" IS A CLAIM THIS CANNOT MAKE')
