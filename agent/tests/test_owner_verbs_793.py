@@ -491,7 +491,12 @@ def test_the_no_rules_change_evidence_still_names_one_field_and_one_document():
         "the device-document clause must stay quoted — a bare prefix admits "
         "every subcollection under it")
     assert "def test_this_client_can_never_choose_which_device_field_it_writes" in src
-    assert 'body.count("updateMask.fieldPaths=visibility") == 1' in src, (
+    # ⛔ WITH ITS MESSAGE (wave 12 repair 4). Wave 12's allow-all writer guard
+    # carries the same `== 1` count, so the bare assertion text was satisfied by
+    # that copy alone and deleting THIS guard's count left the suite green
+    # (wave793 A2 survived). Only this guard says "the one field".
+    assert ('body.count("updateMask.fieldPaths=visibility") == 1, (\n'
+            '        "the update mask must name the one field as a literal")') in src, (
         "the field-name guard is gone — the path check cannot tell eight "
         "writable keys apart")
     for forbidden in ("name", "priority", "supervised", "restingWorkerIds",
