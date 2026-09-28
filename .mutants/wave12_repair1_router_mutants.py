@@ -18,6 +18,15 @@ breaks exactly one piece of that.
        the pronoun after a comma, `check if`, a named computer, the joiner verb,
        the ON verbs.
 
+⛔⛔ RE-AIMED 2026-09-27 (wave 12 repair 2). The arm these mutants were written on —
+`_allow_all_read`, the governing-word polarity, the "rest" re-resolved through the
+router, the ask-back — was REBUILT on whole-message commands (cross-verify round 2:
+it still misrouted fault reports, joiners and two-computer messages). Each mutant
+below is re-aimed at the new code for the SAME defect where that defect can still
+happen, with a dated note; where the machinery that could produce it is gone, the
+entry is RETIRED as a comment saying why. The new policy's own mutants are in
+wave12_repair2_router_mutants.py, and the suites now include its pins.
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every mutated
 Python file must still COMPILE. Both are harness faults, counted OUT.
 ⛔ BYTES BACK, NOT TEXT — a text restore would flip a CRLF checkout's line endings.
@@ -38,8 +47,10 @@ AGENT = ROOT / "agent"
 SR = "agent/facade/skill/scripts/sr.py"
 
 SUITES = {
+    # ⛔ + the repair-2 pins (2026-09-27): the re-aimed mutants are measured there.
     SR: (AGENT, "tests/test_allow_all_router_repair_0927.py tests/test_allow_all_router_0926.py "
-                "tests/test_chat_public_792.py tests/test_chat_owner_793.py"),
+                "tests/test_chat_public_792.py tests/test_chat_owner_793.py "
+                "tests/test_allow_all_whole_message_0927.py"),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
@@ -51,103 +62,130 @@ MUTANTS = [
        '    if False and _join_kw and _ask_obj and (_NL_CODE_RE.fullmatch(_ask_obj)\n')]),
 
     # ═══ F7 — a hide or a publish beside Allow all ════════════════════════════
-    ("F7a", SR, "⛔⛔ only the first arm's five hide words count — `take my mac off the public "
-     "list and turn off allow all` switches Allow all off and leaves it LISTED",
-     [('        if _aa_rest_argv[:2] == ["device-visibility", "private"]:\n',
-       '        if _aa_rest_argv[:2] == ["device-visibility", "private"] and re.search(\n'
-       '                rf"\\b{_HIDE_POLARITY}\\b|\\b(?:hide|hides|hiding|unlist\\w*|'
-       'unpublish\\w*|delist\\w*)\\b",\n'
-       '                _aa_rest, re.I):\n')]),
-    ("F7b", SR, "⛔ the conjunction stays in what else the message asks — `publish my mac "
-     "but ask me first` names a computer “mac but”",
-     [('            for _i in range(_cj.start() if _cj else _s, _e):\n',
-       '            for _i in range(_s, _e):\n')]),
-    ("F7c", SR, "⛔ `turn allow all off` leaves “turn” behind — `stop offering my mac and turn "
-     "allow all off` hides a computer called “mac and turn”",
-     [('        nb = None if b else re.search(', '        nb = None and re.search(')]),
-    ("F7d", SR, "⛔ `keep my mac public but turn off allow all` reads as a PUBLISH and "
-     "raises the publish confirm instead of switching Allow all off",
-     [('                r"\\bpublic(?:ly)?\\b", _aa_rest, re.I))',
-       '                r"\\bNEVER_F7D\\b", _aa_rest, re.I))')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the arm hands a hide to the
+    # visibility clause when the message says WHAT is hidden. Same defect — only a
+    # few hide words count — on the list that now decides it.
+    ("F7a", SR, "⛔⛔ only a handful of hide words count — `take my mac off the public list and "
+     "turn off allow all` loses the hide and the computer stays LISTED",
+     [('                r"\\b(?:public(?:ly)?|private(?:ly)?|hid(?:e|es|den|ing)|unlist\\w*|delist\\w*|"\n'
+       '                r"unpublish\\w*|list(?:ed|ing)?|directory|shar(?:e|ed|es|ing)|unshar\\w*|"\n'
+       '                r"visib\\w*|invisible|findable|discoverable|find|finding|see|seeing|"\n'
+       '                r"discover\\w*|offer\\w*)\\b"\n',
+       '                r"\\b(?:private(?:ly)?|hid(?:e|es|den|ing)|unlist\\w*|delist\\w*|"\n'
+       '                r"unpublish\\w*)\\b"\n')]),
+    # ⛔ F7b RETIRED 2026-09-27 (wave 12 repair 2): it kept the conjunction in "what
+    # else the message asks" — the blanked rest the arm re-resolved through the
+    # router. Nothing is re-resolved any more (a message with a second clause is not
+    # a command), so there is no rest for a conjunction to stay in.
+    # ⛔ F7c RETIRED 2026-09-27 (wave 12 repair 2): it left "turn" behind when the
+    # phrase was blanked out of the rest — the same removed re-resolution. The name a
+    # hide captures beside Allow all is measured by repair2 M14.
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): "keep it public" used to guard the
+    # publish reading; it guards the hide hand-off now, and without it the same words
+    # are read the other wrong way.
+    ("F7d", SR, "⛔ `keep my mac public but turn off allow all` HIDES the computer the person "
+     "said to keep public (it read as a PUBLISH before repair 2)",
+     [('                and not re.search(r"\\b(?:keep|keeps|keeping|leave|leaves|stay|stays|remain|"\n',
+       '                and not re.search(r"\\bNEVER_F7D\\b(?:keep|keeps|keeping|leave|leaves|stay|stays|remain|"\n')]),
 
     # ═══ F8 / F11 / F15 — other people's computers ════════════════════════════
-    ("F8a", SR, "⛔⛔ `list public computers that let anyone join` reaches the catch-all — "
-     "a joiner's way in, answered with nothing",
-     [('        if not _aa_own and _aa_others:\n            return ["devices-public"], None\n',
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto `_aa_about_others` and the
+    # join route; each keeps its defect.
+    ("F8a", SR, "⛔⛔ `list public computers that let anyone join` reaches the catch-all — a "
+     "joiner's way in, answered with nothing",
+     [('        elif _aa_about_others(_aa_rest):\n            _aa_route = (["devices-public"], None)\n',
        '')]),
-    ("F8b", SR, "⛔ `join a public computer that lets anyone in` loses the browse list",
-     [('        if _aa_joiner:\n            if _aa_others:\n'
-       '                return ["devices-public"], None\n',
-       '        if _aa_joiner:\n')]),
-    ("F8c", SR, "⛔⛔ THE REPORTED DEFECT: any subject is the owner's own — a list of "
-     "strangers' computers raises the confirm that opens the asker's",
-     [('        _aa_own = bool(\n', '        _aa_own = True or bool(\n')]),
-    ("F11", SR, "⛔ `which public computers let anyone join` is not the browse list",
-     [('            if _aa_joiner or (_aa_others and not _mine_kw):\n'
-       '                return ["devices-public"], None\n', '')]),
+    ("F8b", SR, "⛔ `join a public computer that lets anyone in` loses the browse list — it asks "
+     "the owner of “a public computer”",
+     [('    if (not obj or re.match(r"(?:a|an|any|some|another|public|shared|one|ones|all|every)\\b",\n',
+       '    if (not obj or re.match(r"NEVER_F8B\\b",\n')]),
+    ("F8c", SR, "⛔⛔ THE REPORTED DEFECT (round 2's G4 cause): the person's own computer wins "
+     "over other people's — `since my mac is offline, list computers that let anyone join` "
+     "is answered as the owner's",
+     [('        elif _aa_about_others(_aa_rest):\n',
+       '        elif _aa_about_others(_aa_rest) and not _mine_kw:\n')]),
+    ("F11", SR, "⛔ `which public computers let anyone join` — a QUESTION about other people's "
+     "computers — is not the browse list",
+     [('        elif _aa_about_others(_aa_rest):\n',
+       '        elif _aa_about_others(_aa_rest) and not _aa_asking:\n')]),
     ("F15", SR, "⛔ `join one of the public computers` is refused as a set",
      [('        or re.match(r"(?:any\\s+|some\\s+|just\\s+)?one\\s+of\\b", _ask_obj, re.I))',
        '        )')]),
 
-    # ═══ F9 — the stop word of a purpose clause ═══════════════════════════════
-    ("F9", SR, "⛔⛔ THE REPORTED DEFECT: an OFF word ANYWHERE decides — `turn on allow all so "
-     "I stop getting requests` switches Allow all OFF, unconfirmed",
-     [('        said = {g for g in (("on" if b.group("on") else "off") if b else None,\n',
-       '        said = ({"off"} if re.search(rf"\\b(?:{_AA_NEG}|{_AA_OFF_VERB})\\b", src, re.I)'
-       ' else set()) or {g for g in (("on" if b.group("on") else "off") if b else None,\n')]),
+    # ═══ F9 — a stop word anywhere ════════════════════════════════════════════
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the direction is a grammar row read
+    # over the WHOLE message. Same defect class — a command read from words anywhere.
+    ("F9", SR, "⛔⛔ THE REPORTED DEFECT'S CLASS: a command is read from words ANYWHERE in the "
+     "message — `it won't let anyone join my mac` (a fault report) raises the ON confirm",
+     [('    direction = next((d for d, rx in _AA_GRAMMAR if rx.fullmatch(cmd)), None)\n',
+       '    direction = next((d for d, rx in _AA_GRAMMAR if rx.search(cmd)), None)\n')]),
 
     # ═══ F10 — `join` negated or asked about ═════════════════════════════════
-    ("F10a", SR, "⛔⛔ `join` leaves the negation vocabulary — `don't join the Studio PC` "
-     "reaches the ask confirm",
-     [('                   rf"join)")', '                   rf"(?!x)x)")')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): `join` left `_MUTATING_VERBS` (it
+    # vetoed research topics, cross-verify G12); its negation is read in `_join_kw`.
+    ("F10a", SR, "⛔⛔ a negated `join` is a join — `don't join the Studio PC` reaches the ask "
+     "confirm",
+     [('                and not re.search(rf"\\b{_NEG_WORDS}\\b{_NEG_FILLER}\\s+(?:ask\\s+to\\s+)?join\\b",\n'
+       '                                  low)\n', '')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the lines moved above the capture.
     ("F10b", SR, "⛔ `did I join the Studio PC` is read as a request to join",
      [('                and not re.match(_NL_LEAD_IN + r"(?:did|do|does|have|has|had|was|were|is|"\n'
-       '                                 r"are|am|why|when|what|which|who|how|where)\\b", low))\n',
-       '                )\n')]),
+       '                                 r"are|am|why|when|what|which|who|how|where)\\b", low)\n', '')]),
 
     # ═══ F12 — the subjects nothing else supplies ═════════════════════════════
-    ("F12a", SR, "⛔⛔ THE REPORTED DEFECT: `make it public and allow all` misses the arm — "
-     "neither the pronoun nor the publish counts as a subject",
-     [('            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t) or _aa_bare\n',
-       '            _mine_kw or re.search(_QUOTED_SPAN, t) or _aa_bare\n'),
-      ('        if not (_aa_own or _aa_rest_publishes):\n', '        if not _aa_own:\n')]),
-    ("F12b", SR, "⛔ the pronoun alone is not a subject — `keep it public and let anyone "
-     "join` reaches the catch-all",
-     [('            _mine_kw or _pronoun_target or re.search(_QUOTED_SPAN, t) or _aa_bare\n',
-       '            _mine_kw or re.search(_QUOTED_SPAN, t) or _aa_bare\n')]),
-    ("F12c", SR, "⛔ a publish of a named computer is not a subject — `publish LABPC001 and "
-     "allow all` reaches the catch-all",
-     [('        if not (_aa_own or _aa_rest_publishes):\n', '        if not _aa_own:\n')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the pronoun is a grammar subject now.
+    ("F12a", SR, "⛔⛔ THE REPORTED DEFECT: `make it public and allow all` is not a command — the "
+     "pronoun is not a subject",
+     [("rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR}|it|that)\")",
+       "rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR})\")")]),
+    ("F12b", SR, "⛔ the pronoun alone is not a subject — `keep it public and let anyone join` "
+     "reaches the catch-all instead of the person's own list",
+     [('              or _pronoun_target\n', '')]),
+    # ⛔ F12c RETIRED 2026-09-27 (wave 12 repair 2): it measured that `publish LABPC001
+    # and allow all` reached the ON confirm through the publish the arm handed on.
+    # That road is gone with the re-resolution: two requests in one message are not
+    # a command, and the catch-all — the "defect" it named — is now the intended,
+    # pinned route (test_allow_all_router_repair_0927 FLIPPED, same date).
 
     # ═══ F13 / F14 — the approval step, both ways ════════════════════════════
-    ("F13", SR, "⛔⛔ `turn off approval for my mac` switches Allow all OFF — the approval "
-     "step is read as the setting, not its opposite",
-     [('            pol = "on" if said == {"off"} else "off"\n', '            pol = said.pop()\n')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto the grammar rows.
+    ("F13", SR, "⛔⛔ `turn off approval for my mac` switches Allow all OFF — the approval step "
+     "is read as the setting, not its opposite",
+     [('    ("on", r"(?:turn|switch)\\s+off\\s+(?:the\\s+)?approvals?(?:\\s+step)?{T}"),',
+       '    ("off", r"(?:turn|switch)\\s+off\\s+(?:the\\s+)?approvals?(?:\\s+step)?{T}"),')]),
     ("F14", SR, "⛔⛔ `I want to approve people on my mac again` raises the approve confirm, "
      "whose nameless yes admits the one waiting stranger",
-     [('    r"|\\bapprov(?:e|ing)\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n',
-       '    r"|\\bNEVER_F14\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n')]),
+     [('            r"|approve\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|each\\s+request|"\n',
+       '            r"|NEVER_F14\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|each\\s+request|"\n'),
+      ('    + r"|\\bapprov(?:e|ing)\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n',
+       '    + r"|\\bNEVER_F14B\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n')]),
 
     # ═══ F19 — the OFF words ══════════════════════════════════════════════════
-    ("F19a", SR, "⛔⛔ THE REPORTED DEFECT: `uncheck`, `clear`, `remove`, `drop` are not OFF "
-     "words — `uncheck allow all for my mac` raises the ON confirm",
-     [('                r"deactivat\\w*|uncheck\\w*|untick\\w*|clear\\w*|remov\\w*|drop\\w*|stop\\w*|"\n',
-       '                r"deactivat\\w*|stop\\w*|"\n')]),
-    ("F19b", SR, "⛔⛔ the command line's `no` / `to no` / `false` after the phrase is not "
-     "read — `set allow all to no for my mac` raises the ON confirm",
-     [('    r"(?:(?P<off>off|no(?!\\s+(?:need|more|longer|one|approvals?|questions?))|false|"\n',
-       '    r"(?:(?P<off>off|"\n')]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto the grammar. An ON confirm now
+    # needs an ON row, so a lost OFF word changes nothing instead of opening the
+    # door; the defect measured is the OFF request going unmet.
+    ("F19a", SR, "⛔⛔ `uncheck`, `untick`, `remove`, `clear`, `drop` are not OFF words — "
+     "`uncheck allow all for my mac` changes nothing",
+     [('_AA_OFF_VERB = (r"(?:disable|deactivate|untick|uncheck|remove|clear|drop|kill|end|pause|stop|"',
+       '_AA_OFF_VERB = (r"(?:disable|deactivate|kill|end|pause|stop|"')]),
+    ("F19b", SR, "⛔⛔ the command line's `no` / `to no` / `false` after the setting is not read — "
+     "`set allow all to no for my mac` changes nothing",
+     [('    ("off", r"{SET}\\s*[:=]?\\s+(?:off|no|false)(?:\\s+(?:for|on)\\s+{S})?"),',
+       '    ("off", r"{SET}\\s*[:=]?\\s+(?:off)(?:\\s+(?:for|on)\\s+{S})?"),'),
+      ('    ("off", r"set\\s+{SET}\\s+(?:back\\s+)?to\\s+(?:off|no|false){T}"),',
+       '    ("off", r"set\\s+{SET}\\s+(?:back\\s+)?to\\s+(?:off){T}"),')]),
     ("F19c", SR, "⛔ the direction after a short object is not read — `turn allow all on my "
-     "mac off` raises the ON confirm",
-     [("    r\"^\\s*(?:(?:on|for|of)\\s+(?:my|the|this|our|that)\\s+(?:[\\w'’-]+\\s+){0,2}?\"\n",
-       "    r\"^\\s*(?:(?:NEVER_F19C)\\s+(?:my|the|this|our|that)\\s+(?:[\\w'’-]+\\s+){0,2}?\"\n")]),
-    ("F19d", SR, "⛔ a negated governing verb is a direction — `never enable allow all` "
+     "mac off` changes nothing",
+     [('    ("off", r"(?:{TURN}|shut)\\s+{SET}\\s+(?:for|on)\\s+{S}\\s+(?:back\\s+)?off"),',
+       '    ("off", r"NEVER_F19C"),')]),
+    ("F19d", SR, "⛔ a negation in front is not read — `never enable allow all for my mac` "
      "raises the ON confirm",
-     [('        doubled = bool(b and _AA_BEFORE.search(before[:b.start()]))\n',
-       '        doubled = False\n')]),
-    ("F19e", SR, "⛔ ON and OFF in one message ACT on one of them instead of asking",
-     [('        _aa_pol = next(iter(_aa_pols)) if len(_aa_pols) == 1 else "?"\n',
-       '        _aa_pol = next(iter(_aa_pols))\n')]),
+     [('_AA_HEAD = re.compile(r"(?:(?:please|pls|hey|hi|ok|okay|so|now|just)\\b[\\s,]*"',
+       '_AA_HEAD = re.compile(r"(?:(?:please|pls|hey|hi|ok|okay|so|now|just|never)\\b[\\s,]*"')]),
+    ("F19e", SR, "⛔ ON and OFF in one message ACT on one of them — `turn on allow all for my "
+     "mac and turn off auto approve` raises the ON confirm",
+     [('_AA_PURPOSE = re.compile(r"\\s*,?\\s+(?:so|because|since)\\b")',
+       '_AA_PURPOSE = re.compile(r"\\s*,?\\s+(?:so|because|since|and)\\b")')]),
 
     # ═══ F20 / F21 ═══════════════════════════════════════════════════════════
     ("F20", SR, "⛔⛔ the OFF picker suggests `let anyone join “X”` — said back, the ON "
@@ -160,39 +198,38 @@ MUTANTS = [
      [('                and not re.search(rf"\\b{_SIGN_IN_ASK}\\b", low)\n', '')]),
 
     # ═══ S — the narrowing's own pieces ══════════════════════════════════════
-    ("S1", SR, "⛔ a statement of state acts — `✓ Allow all is off (“Studio PC” is "
-     "private)` raises the ON confirm",
-     [('        if _aa_question or any(re.match(', '        if _aa_question or False and any(re.match(')]),
-    ("S2", SR, "⛔ `joins at once` alone — a row of the list — raises the ON confirm",
-     [('                 if p[0] not in ("off_machine", "joins")\n',
-       '                 if p[0] not in ("off_machine",)\n')]),
-    ("S3", SR, "⛔ a joiner naming a computer (`join the Studio PC, it lets anyone in`) "
-     "reaches the catch-all instead of the ask",
-     [('            if _aa_rest_argv[:1] == ["device-add"] or _aa_rest_line.startswith(\n'
-       '                    _NL_CONFIRMS["device-ask"].split("{name}")[0]):\n'
-       '                return _aa_rest_said\n', '')]),
+    # ⛔ S1 RETIRED 2026-09-27 (wave 12 repair 2): it removed the copula test that
+    # stopped `✓ Allow all is off (“Studio PC” is private)` raising the ON confirm.
+    # There is no copula test: a statement is not a whole-message command, so no row
+    # reads it — the class is measured by F9 (a command read from words anywhere).
+    # ⛔ S2 RETIRED 2026-09-27 (wave 12 repair 2): it measured the filter that
+    # dropped `joins at once` unless a machine was in view. `joins at once` is in no
+    # grammar row, so it can never raise the ON confirm; the filter only chose
+    # between two read-only answers, and repair 2 measured removing it: six corpus
+    # messages moved, every one to the browse list a joiner wanted.
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto the whole-message join route.
+    ("S3", SR, "⛔ a joiner naming a computer (`join the Studio PC, it lets anyone in`) gets the "
+     "browse list instead of the ask",
+     [('        _aa_join = _aa_join_route(t)\n', '        _aa_join = None\n')]),
     ("S3b", SR, "⛔ a joiner naming a CODE (`join K7XQ-9B2M, it lets anyone in`) is not paired",
-     [('            if _aa_rest_argv[:1] == ["device-add"] or _aa_rest_line.startswith(\n',
-       '            if _aa_rest_line.startswith(\n')]),
-    ("S4", SR, "⛔ the pronoun after the comma stays in the name — the ask quotes “Studio "
-     "PC, it”",
-     [('                            r"(?:\\s*\\b(?:it|this|that|which)\\b)?\\s*$", t[:_s], re.I)\n',
-       '                            r"\\s*$", t[:_s], re.I)\n')]),
-    ("S5", SR, "⛔ `check allow all` — the checkbox's own verb — is read as a question",
-     [('                             r"check\\s+(?:if|whether))\\b", low)\n',
-       '                             r"check)\\b", low)\n')]),
+     [('    if (_NL_CODE_RE.fullmatch(obj) or _NL_CONNECTION_CODE_RE.fullmatch(obj)\n',
+       '    if False and (_NL_CODE_RE.fullmatch(obj) or _NL_CONNECTION_CODE_RE.fullmatch(obj)\n')]),
+    ("S4", SR, "⛔ the comma stays in the name — the ask quotes “Studio PC,”",
+     [('    obj = re.split(r"\\s*[,;:(—–]\\s*|', '    obj = re.split(r"\\s*[;:(—–]\\s*|')]),
+    ("S5", SR, "⛔ `check allow all` — the checkbox's own verb — is not a command",
+     [('    ("on", r"(?:enable|tick|check|activate)\\s+{SET}{T}"),',
+       '    ("on", r"(?:enable|tick|activate)\\s+{SET}{T}"),')]),
     ("S6", SR, "⛔ `the office pc` is not a subject — `switch off allow all on the office pc` "
-     "reaches the catch-all",
-     [('            or re.search(rf"\\b(?:the|that)\\s+(?:(?!(?:public|shared|open|other|others|any|"\n',
-       '            or re.search(rf"\\bNEVER_S6\\s+(?:(?!(?:public|shared|open|other|others|any|"\n')]),
-    ("S7", SR, "⛔⛔ the joiner's verb is not read — `join the Studio PC, it lets anyone in` "
-     "raises the confirm that opens the asker's OWN computer",
-     [('        _aa_joiner = re.search(r"\\bjoin\\b|\\bask\\s+(?:to\\s+use|for|the\\s+owner)\\b"\n'
-       '                               r"|\\bborrow\\b|\\brequest\\s+access\\b", _aa_rest_low)\n',
-       '        _aa_joiner = None\n')]),
-    ("S8", SR, "⛔ the ON verbs govern nothing — `turn on approval for my mac` is not read",
-     [('_AA_ON_VERB = (r"(?:(?:turn|switch|flip|set|put)(?:s|ed|ing)?\\s+(?:back\\s+)?on|enabl\\w*|"\n',
-       '_AA_ON_VERB = (r"(?:NEVER_S8|"\n')]),
+     "is not a command",
+     [('                rf"|the\\s+(?:(?!(?:public|shared|open|other|others|any|some|same|one|ones|whole|"',
+       '                rf"|NEVER_S6\\s+(?:(?!(?:public|shared|open|other|others|any|some|same|one|ones|whole|"')]),
+    ("S7", SR, "⛔⛔ the joiner's verb is not read — `can I borrow the studio pc, it lets anyone "
+     "in` is answered with the asker's OWN computers",
+     [('_AA_JOINER = re.compile(r"\\b(?:join|borrow|ask\\s+(?:to\\s+(?:use|join)|for)|request\\s+access)\\b"\n',
+       '_AA_JOINER = re.compile(r"\\bNEVER_S7\\b"\n')]),
+    ("S8", SR, "⛔ approval ON is not read — `turn on approval for my mac` changes nothing",
+     [('    ("off", r"(?:(?:turn|switch)\\s+(?:back\\s+)?on\\s+(?:the\\s+)?approvals?(?:\\s+step)?|"',
+       '    ("off", r"(?:(?:turn|switch)\\s+(?:back\\s+)?NEVER_S8\\s+(?:the\\s+)?approvals?(?:\\s+step)?|"')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

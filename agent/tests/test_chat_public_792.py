@@ -157,11 +157,17 @@ def test_the_consent_question_carries_all_three_disclosures():
     # most, which the web app puts FIRST: the research runs on somebody else's
     # computer using their paid AI accounts, and that computer can read the
     # research in this account.
+    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 2, cross-verify G24): "or your email,
+    # if you haven't set one" described the ask NOTICE alone. On a computer that
+    # lets anyone in the ask is the join, and the owner's Shared with row shows
+    # the name AND the email under it (sharers route: `email: u.email`). One
+    # sentence on every Join surface, the web lane's too.
     _argv, lines = sr._nl_resolve("ask for the Studio PC")
     said = lines[0]
     assert "their computer" in said and "their ChatGPT" in said
     assert "read the research in your account" in said
-    assert "or your email, if you haven’t set one" in said
+    assert "The owner sees your name and email." in said
+    assert "or your email" not in said
     assert "name and email address" not in said
 
 
@@ -236,12 +242,19 @@ def test_a_pronoun_is_never_read_as_a_machine_name(said):
     # this test used "ask them to share it again" — which is stopped one check
     # earlier by not being about a machine at all, so the pronoun guard could be
     # deleted with the test still green. A mutant proved it.
+    # ⛔ AND NO ASK AT ALL, NOT ONLY NONE NAMING THE PRONOUN (wave 12 repair 2,
+    # cross-verify G22). This checked only that “it” and “them” were not quoted,
+    # so `Ask the owner of “one of them”` — the defect the 'one of' row exists
+    # for — passed at the commit that shipped it. A pronoun is never a name, so
+    # no row here may reach the ask confirm under ANY name, and `one of them`
+    # names the list.
     argv, lines = sr._nl_resolve(said)
     if argv is not None:
         assert argv[0] == "devices-public", (said, argv)
     else:
-        assert "Ask the owner of “it”" not in lines[0]
-        assert "Ask the owner of “them”" not in lines[0]
+        assert not any("Ask the owner of" in ln for ln in lines), (said, lines)
+    if "one of" in said:
+        assert argv == ["devices-public"], (said, argv)
 
 
 def test_our_own_advice_line_is_not_read_back_as_a_request():
@@ -482,9 +495,11 @@ def test_the_skill_says_an_answered_request_leaves_the_list():
 
 def test_the_skill_says_asking_discloses_the_person():
     low = " ".join(_skill().lower().split())
-    # ⛔ THE SAME CORRECTION AS THE CLIENT'S. "name + email" was wrong: the owner
-    # sees the name, or the email only when there is no name.
-    assert "email, if no name is set" in low or "email if no name is set" in low
+    # ⛔ THE SAME CORRECTION AS THE CLIENT'S — FLIPPED 2026-09-27 (wave 12 repair
+    # 2, cross-verify G24): the owner's Shared with row shows name AND email once
+    # somebody is on the computer, which an allow-all ask makes immediate.
+    assert "the owner sees the user's name and email" in low
+    assert "if no name is set" not in low
     assert "their ai accounts" in low or "their computer using their ai accounts" in low
 
 
@@ -909,16 +924,20 @@ def test_chat_reports_a_truncated_scan_on_the_empty_branch_too(chat):
     assert "not be the whole story" in chat.out()
 
 
-def test_the_skills_safety_bullet_says_name_or_email_not_both():
+def test_the_skills_safety_bullet_says_name_and_email():
     # ⛔⛔ THE ROW AND THE BULLET BOTH SAY IT, and the guard that read the whole
-    # file was satisfied by the row alone — so the BULLET could revert to "name
-    # and email address" with nothing red. A mutant proved it. The bullet is the
-    # normative one: it is what the model reads about what it may reach.
+    # file was satisfied by the row alone — so the BULLET could drift with nothing
+    # red. A mutant proved it. The bullet is the normative one: it is what the
+    # model reads about what it may reach.
+    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 2, cross-verify G24): it pinned "name —
+    # or their email, if no name is set", which understates what the owner sees
+    # once somebody is on the computer: the name AND the email.
     text = _skill()
     bullet = text[text.index("- You drive the user's own account only"):]
     bullet = bullet[:bullet.index("\n- ") if "\n- " in bullet else 600]
-    assert "name and email address" not in bullet, bullet
-    assert "or their email, if no name is set" in bullet, bullet
+    flat = " ".join(bullet.split())
+    assert "tells that owner the user's name and email" in flat, bullet
+    assert "if no name is set" not in flat, bullet
 
 
 def test_the_suite_wide_post_stub_tolerates_the_retry_argument():

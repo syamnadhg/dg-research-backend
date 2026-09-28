@@ -18,6 +18,13 @@ reading the WHOLE message. Driven through `sr._nl_resolve` at the wave-12 commit
 person's OWN computer, and the words governing the phrase give one direction.
 Everything else goes to the clause that owns it — and nothing here reads source:
 every test drives the router, or the command with the bridge stubbed.
+
+⛔ REPAIR 2 (2026-09-27) REBUILT THE ARM ON WHOLE-MESSAGE COMMANDS, and the pins
+in this file that depended on the round-1 reading are FLIPPED in place, each with
+a dated note: a second clause, a leading clause, a statement or the bare label is
+not a command, so it is the person's own list or the catch-all — never a write,
+never a switch confirm, never the removed "on or off?" ask-back. The new policy's
+own pins are in test_allow_all_whole_message_0927.py.
 """
 from __future__ import annotations
 
@@ -63,9 +70,16 @@ _ON_WITH_A_STOP_WORD = [
     "turn on allow all so I don't have to approve people on my mac",
     "turn on allow all for my mac so I never have to approve anyone",
     "auto-approve requests for my mac so I stop getting pinged",
+    "enable auto-approve for my mac so I don't have to keep approving",
+]
+# ⛔ FLIPPED 2026-09-27 (wave 12 repair 2 — the whole-message policy). These three
+# were in the list above, pinned to the ON confirm. `, stop asking me` and `, no
+# more approvals` are a SECOND clause, not a purpose clause, and `keep allow all
+# on` is not a command to change anything — so none is a whole-message command,
+# and none may raise a switch confirm. They get the person's own list.
+_ON_WITH_A_SECOND_CLAUSE = [
     "turn on allow all for my mac, stop asking me",
     "let anyone join my mac, no more approvals",
-    "enable auto-approve for my mac so I don't have to keep approving",
     "keep allow all on for my mac so I stop getting requests",
 ]
 
@@ -73,14 +87,19 @@ _ON_WITH_A_STOP_WORD = [
 @pytest.mark.parametrize("text", _ON_WITH_A_STOP_WORD)
 def test_an_on_request_with_a_stop_word_elsewhere_asks_to_switch_on(text):
     """⛔⛔ Every one of these POSTed allowAll:false with no confirm — the `stop`,
-    `don't`, `never` or `no more` of a PURPOSE clause read as the direction. The
-    direction is the verb governing the phrase: `turn on`, `enable`, `keep … on`."""
+    `don't`, `never` or `no more` of a PURPOSE clause read as the direction. A
+    whole command plus one `so …` purpose clause is still the command."""
     argv, lines = _said(text)
     assert argv is None, f"{text!r} ran {argv} without a confirm"
     assert " ".join(lines).startswith(_ON), lines
 
 
-@pytest.mark.parametrize("text", _ON_WITH_A_STOP_WORD + [
+@pytest.mark.parametrize("text", _ON_WITH_A_SECOND_CLAUSE)
+def test_an_on_request_with_a_second_clause_is_the_list_never_a_switch(text):
+    assert _said(text) == (["devices"], None)
+
+
+@pytest.mark.parametrize("text", _ON_WITH_A_STOP_WORD + _ON_WITH_A_SECOND_CLAUSE + [
     "turn off approval for my mac", "make it public and allow all",
     "let anyone join my mac and don't ask me"])
 def test_no_on_phrasing_ever_switches_allow_all_off(text):
@@ -119,20 +138,23 @@ def test_no_off_phrasing_ever_raises_the_on_confirm(text):
 
 def test_a_negated_governing_verb_is_not_a_direction():
     """`never enable allow all` / `don't stop letting anyone join` name no single
-    direction; guessing either one acts on a guess. Nothing changes."""
-    for text in ("never enable allow all for my mac",
-                 "don't stop letting anyone join my mac"):
-        argv, lines = _said(text)
-        assert argv is None, (text, argv)
-        assert not " ".join(lines).startswith(_ON), text
+    direction; guessing either one acts on a guess. Nothing changes.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): the assertion was `argv is None` (the
+    ask-back line). Not a whole command, so the read-only list — still never a
+    write and never the ON confirm. `don't stop …` never reaches the arm: the
+    negation veto above every act branch answers it with the catch-all."""
+    assert _said("never enable allow all for my mac") == (["devices"], None)
+    assert _said("don't stop letting anyone join my mac") == (None, [sr._NL_CATCH_ALL])
 
 
-def test_on_and_off_together_is_asked_back_never_acted_on():
-    argv, lines = _said("turn on allow all for my mac and turn off auto approve")
-    assert argv is None
-    said = " ".join(lines)
-    assert said.startswith("Should Allow all be on or off?"), said
-    # and both examples it offers route back to one direction each
+def test_on_and_off_together_is_never_acted_on():
+    """⛔ FLIPPED 2026-09-27 (wave 12 repair 2): this answered "Should Allow all be
+    on or off?" — the round-1 ask-back, which round 2 measured trapping plain
+    requests (cross-verify G11). It is removed; two commands in one message are
+    not a whole command, so the person's own list. The two phrasings the
+    catch-all now teaches each route to one direction."""
+    assert _said("turn on allow all for my mac and turn off auto approve") == (
+        ["devices"], None)
     assert _line("turn on Allow all").startswith(_ON)
     assert _said("turn off Allow all") == (_OFF, None)
 
@@ -203,12 +225,15 @@ def test_hiding_and_switching_allow_all_off_hides(text):
 ])
 def test_public_but_approve_each_person_is_a_plain_publish(text):
     """The mirror: a request to be FOUND in approval mode ran `device-allow-all
-    no`, which publishes nothing. It is the plain publish confirm — and `publish
-    my mac but ask me first` no longer names a computer “mac but ask me first”."""
-    argv, lines = _said(text)
-    assert argv is None, (text, argv)
-    said = " ".join(lines)
-    assert said.startswith(f"{_PUBLISH} that computer "), said
+    no`, which publishes nothing.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): pinned to the plain PUBLISH confirm,
+    which needed the arm to read which way the allow-all words pointed and hand
+    the rest to the publish — the reading that misrouted in two review rounds.
+    Not a whole command, so no confirm of either switch and never a write: the
+    person's own list. `make my mac public` said alone is still the publish, and
+    that confirm no longer promises approval on a computer that lets anyone join."""
+    assert _said(text) == (["devices"], None)
+    assert _line("make my mac public").startswith(f"{_PUBLISH} that computer ")
 
 
 # ── F12 / F13 / F14 ──────────────────────────────────────────────────────────
@@ -219,21 +244,27 @@ def test_a_pronoun_subject_publishes_and_allows_all_in_one_confirm():
     assert _line("make it public and allow all").startswith(_ON)
 
 
-@pytest.mark.parametrize("text", [
-    "keep it public and let anyone join",      # the pronoun is the only subject
-    "publish LABPC001 and allow all",          # the publish names the only subject
+@pytest.mark.parametrize("text, route", [
+    ("keep it public and let anyone join", (["devices"], None)),
+    ("publish LABPC001 and allow all", (None, [sr._NL_CATCH_ALL])),
 ])
-def test_each_road_to_a_subject_is_its_own(text):
-    """Two roads to the person's own computer that nothing else in the message
-    supplies: a pronoun the visibility clause resolves, and a publish of a named
-    computer. Each is pinned alone, so neither can go dead unnoticed."""
-    assert _line(text).startswith(_ON), text
+def test_each_road_to_a_subject_is_its_own(text, route):
+    """⛔ FLIPPED 2026-09-27 (wave 12 repair 2). Both were pinned to the ON confirm
+    through two roads repair 1 built — a pronoun the visibility clause resolves,
+    and a publish of a named computer handed on by the arm. Both roads are gone
+    with the free-text reading: an `and …` is not a whole command. The pronoun
+    is still the person's own computer (their list); a bare id beside two
+    requests names nothing this arm reads (the catch-all, which teaches the
+    phrasings). Neither is ever a write or a switch confirm."""
+    assert _said(text) == route
 
 
 def test_a_negation_before_a_phrase_but_not_governing_it_is_not_a_direction():
     """⛔ `I don't mind: let anyone join my mac` switched Allow all OFF — a
-    negation earlier in the message is not the verb governing the phrase."""
-    assert _line("I don't mind: let anyone join my mac").startswith(_ON)
+    negation earlier in the message is not the verb governing the phrase.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): pinned to the ON confirm. A leading
+    clause makes it not a whole command — the person's own list, never OFF."""
+    assert _said("I don't mind: let anyone join my mac") == (["devices"], None)
 
 
 def test_joins_at_once_alone_is_a_row_of_the_list_not_a_request():
@@ -262,10 +293,12 @@ def test_approval_on_is_allow_all_off(text):
     assert _said(text) == (_OFF, None)
 
 
-def test_a_negation_on_the_checkbox_verb_is_asked_back():
+def test_a_negation_on_the_checkbox_verb_is_never_a_switch():
     """`don't tick allow all` switched it OFF on the first arm's whole-message read;
-    a negated governing verb names no single direction."""
-    assert _line("don't tick allow all for my mac").startswith("Should Allow all be on or off?")
+    a negated governing verb names no single direction.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): pinned to the round-1 ask-back line,
+    which is removed (cross-verify G11). The person's own list."""
+    assert _said("don't tick allow all for my mac") == (["devices"], None)
 
 
 def test_approving_people_again_is_allow_all_off_never_the_approve_confirm():
@@ -336,10 +369,14 @@ def test_off_passes_a_quoted_name_through():
 
 @pytest.mark.parametrize("text", ["keep my mac public but turn off allow all",
                                   "turn off allow all but keep my mac public"])
-def test_keeping_it_public_while_switching_off_is_off_not_a_publish(text):
-    """OFF leaves the computer public — which is what "keep it public" asks. Read
-    as a publish, it would raise the plain publish confirm instead of acting."""
-    assert _said(text) == (_OFF, None)
+def test_keeping_it_public_while_switching_off_is_never_a_hide_or_publish(text):
+    """Read as a publish, it would raise the plain publish confirm; read as the
+    visibility clause's `turn … off`, it would HIDE the computer the person said
+    to keep public.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): pinned to OFF. Two clauses are not a
+    whole command, so nothing is written — the person's own list, never a hide
+    (the hand-off to the hide refuses `keep … public`)."""
+    assert _said(text) == (["devices"], None)
 
 
 def test_a_joiner_naming_a_computer_gets_the_ask_with_its_name_alone():

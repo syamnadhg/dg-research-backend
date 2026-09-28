@@ -673,7 +673,12 @@ MUTANTS = [
      # replacement now closes the paren and sits at the same 17-space indent as
      # its neighbours. The MUTATION is unchanged: the capability line stops
      # naming the owner verbs.
-     [('                 "ask to use it, and — for a computer you own — answer the people "\n                 "asking for it and set whether strangers can find it at all — "\n                 "what would you like?")',
+     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G25): the line now also
+     # names Allow all and its two phrasings. Same mutation: the owner verbs go.
+     [('                 "ask to use it, and — for a computer you own — answer the people "\n'
+       '                 "asking for it, set whether strangers can find it at all, and let "\n'
+       '                 "anyone who asks join at once (say “turn on Allow all” or “turn "\n'
+       '                 "off Allow all”) — what would you like?")',
        '                 "ask to use it — what would you like?")')]),
     ("N16", SR, "over",
      "⛔ an artefact question reaches the decide confirm, so \"approve the "

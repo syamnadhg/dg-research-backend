@@ -65,9 +65,7 @@ def _confirm(text) -> str:
     "make my mac public and allow all",         # was the PUBLISH confirm
     "let anyone join my mac",                   # was the device list
     "can you let anyone join my mac",           # a polite imperative, not a question
-    "allow all",                                # the setting's own name, bare
     "turn on allow all",
-    "anyone can use my computer without asking me",
     "let everyone in",
 ])
 def test_switching_allow_all_on_asks_first_with_what_it_costs(text):
@@ -80,6 +78,19 @@ def test_switching_allow_all_on_asks_first_with_what_it_costs(text):
     assert "up to 25 people" in said and "People you removed stay out." in said
     assert "makes it public too" in said
     assert "Say yes to" not in said and "still approve every person" not in said
+
+
+def test_the_setting_named_alone_or_a_statement_is_not_a_command():
+    """⛔ FLIPPED 2026-09-27 (wave 12 repair 2 — the whole-message policy). These
+    two were ON-confirm rows above. `allow all` alone is the checkbox's LABEL, not
+    an order, and `anyone can use my computer without asking me` is a statement
+    (with its question mark stripped it reads the same as the question). Neither
+    is a whole-message command, so neither may raise the switch confirm: the
+    label gets the catch-all, which now names the two phrasings that DO work, and
+    the statement about the person's own computer gets their list, whose row says
+    "anyone can join"."""
+    assert _said("allow all") == (None, [sr._NL_CATCH_ALL])
+    assert _said("anyone can use my computer without asking me") == (["devices"], None)
 
 
 def test_the_confirm_names_a_quoted_computer_verbatim():
@@ -95,8 +106,11 @@ def test_an_unnamed_computer_is_left_to_the_picker():
 
 def test_dont_ask_me_is_not_an_off_word():
     """⛔ "don't" is an OFF word, and `…and don't ask me` asks for exactly the
-    opposite: it was read as "switch allow all off"."""
-    assert _confirm("let anyone join my mac and don't ask me").startswith(_ON)
+    opposite: it was read as "switch allow all off".
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): it was pinned to the ON confirm. An
+    `and …` second clause makes the message not a whole command, so it is never
+    a switch confirm either — it is the person's own list. Still never OFF."""
+    assert _said("let anyone join my mac and don't ask me") == (["devices"], None)
 
 
 # ── OFF: acts at once, and names nothing it was not told ─────────────────────
@@ -176,10 +190,14 @@ def test_a_hide_stays_a_hide(text):
 def test_public_without_allow_all_is_a_plain_publish(text):
     """⛔ Taken by the arm, `…without allow all` raised the ON confirm and `…but not
     allow all` answered a request to be FOUND with `device-allow-all no`, which
-    publishes nothing. A plain publish starts in approval mode."""
-    said = _confirm(text)
-    assert said.startswith("Let other people find"), said
-    assert _ON not in said
+    publishes nothing.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): pinned to the plain PUBLISH confirm,
+    which needed the arm to read the allow-all words' direction and hand the rest
+    on — the machinery that misrouted twice. Not a whole command, so no switch
+    confirm of either kind: the person's own list, and "make my mac public" said
+    alone is the publish."""
+    assert _said(text) == (["devices"], None)
+    assert _confirm("make my mac public").startswith("Let other people find")
 
 
 @pytest.mark.parametrize("text", ["let people join the call",

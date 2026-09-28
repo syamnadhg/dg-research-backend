@@ -476,8 +476,9 @@ def test_the_invitation_says_what_the_consent_question_says(chat):
     The LIST invite is a prompt to pick one of several rows, and a full privacy
     disclosure there made a five-line message out of a one-line question. The
     CONFIRM is the consent gate — the last thing shown before anything is sent —
-    and it keeps the whole sentence, including the email fallback, because that is
-    the moment the claim has to be exactly true.
+    and it keeps the whole sentence, because that is the moment the claim has to
+    be exactly true. (Wave 12 repair 2: that sentence is now "The owner sees your
+    name and email." — true of a join, whose owner sees both in Shared with.)
 
     ⛔ What must NOT diverge is the CLAIM. Neither may say "name and email
     address", which is wrong in both directions."""
@@ -486,9 +487,13 @@ def test_the_invitation_says_what_the_consent_question_says(chat):
     # the short invite: says the owner sees a name, and stops there
     assert "They see your name." in out, out
     assert "name and email address" not in out
-    # the consent gate: the precise version, unchanged
+    # the consent gate: the precise version — ⛔ FLIPPED 2026-09-27 (wave 12
+    # repair 2, cross-verify G24). "or your email, if you haven't set one" was the
+    # ask notice's truth; once somebody is on the computer (at once, on one that
+    # lets anyone in) the owner's Shared with row shows the name AND the email.
     confirm = sr._NL_CONFIRMS["device-ask"]
-    assert "or your email, if you haven’t set one" in confirm
+    assert "The owner sees your name and email." in confirm
+    assert "or your email" not in confirm
     assert "name and email address" not in confirm
 
 

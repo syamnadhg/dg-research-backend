@@ -453,11 +453,13 @@ MUTANTS = [
      "chat path stops saying what is disclosed",
      # ⭐ RE-AIMED 2026-09-26 (wave 12): the confirm is true of both kinds of
      # computer now ("If its owner lets anyone in…"). Same defect.
-     [('                  "and they see your name — or your email, if you haven’t set one. "\n'
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G24): the owner-sees
+     # sentence is "The owner sees your name and email." now. Same defect.
+     [('                  "account. The owner sees your name and email. "\n'
        '                  "If its owner lets anyone in, you join straight away; otherwise "\n'
        '                  "they decide, and nothing runs on it unless they say yes. Say yes "\n'
        '                  "and I’ll ask.",',
-       '                  "Say yes and I’ll ask.",')]),
+       '                  "account. Say yes and I’ll ask.",')]),
 
     # ═══════════ Q — what you are waiting on ═════════════════════════════════
     ("Q1", BRIDGE, "under",
@@ -817,19 +819,22 @@ MUTANTS = [
     ("V12", SR, "under",
      "⛔⛔ THE CONSENT QUESTION DROPS THE TWO DISCLOSURES THAT COST THE READER "
      "MOST — that the research runs on somebody else's computer on their paid AI "
-     "accounts, and that the computer can read this account's research — and "
-     "overstates the third",
+     "accounts, and that the computer can read this account's research",
      # ⭐ RE-AIMED 2026-09-26 (wave 12): the confirm is true of both kinds of
      # computer now. Same defect.
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G24): the third
+     # disclosure is "The owner sees your name and email." now — TRUE, since an
+     # allow-all join shows the owner both — so "and overstates the third" left the
+     # why and the mutant keeps it; the defect is the two it drops.
      [('    "device-ask": "Ask the owner of {name} to let you use it? Your research would "\n'
        '                  "run on their computer, using their ChatGPT, Gemini and Claude "\n'
-       '                  "accounts; that computer can read the research in your account; "\n'
-       '                  "and they see your name — or your email, if you haven’t set one. "\n'
+       '                  "accounts, and that computer can read the research in your "\n'
+       '                  "account. The owner sees your name and email. "\n'
        '                  "If its owner lets anyone in, you join straight away; otherwise "\n'
        '                  "they decide, and nothing runs on it unless they say yes. Say yes "\n'
        '                  "and I’ll ask.",',
-       '    "device-ask": "Ask the owner of {name} to let you use it? They’ll see your "\n'
-       '                  "name and email address. Say yes and I’ll ask.",')]),
+       '    "device-ask": "Ask the owner of {name} to let you use it? The owner sees your "\n'
+       '                  "name and email. Say yes and I’ll ask.",')]),
     ("V13", SR, "over",
      "⛔⛔ CHAT GOES BACK TO RESOLVING AN ID THROUGH THE BROWSE LIST, so the "
      "person who was just GRANTED a computer is told no such public computer "
@@ -949,11 +954,15 @@ MUTANTS = [
      "question has no command named for it",
      [('run the REAL command it described — stop/logout/device-remove/device-ask/',
        'run the REAL command it described — stop/logout/device-remove/')]),
-    ("V32", SKILL, "over",
-     "⛔⛔ THE SKILL SAYS THE OWNER SEES THE ASKER'S EMAIL ADDRESS. They see the "
-     "NAME; the email only when no name is set",
-     [("name — or their email, if no name is set — and a refusal blocks asking again for a",
-       "name and email address, and a refusal blocks asking again for a")]),
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G24), AND ITS WHY IS
+    # REWRITTEN: "name — or their email, if no name is set" was the defect's cure and
+    # is now the defect. An allow-all join shows the owner the name AND the email
+    # (Shared with), so the bullet says both; the mutant puts the understatement back.
+    ("V32", SKILL, "under",
+     "⛔⛔ THE SKILL UNDERSTATES WHAT THE OWNER SEES — the name, or the email only when "
+     "no name is set — when a join shows them the name AND the email",
+     [("name and email, and a refusal blocks asking again for a",
+       "name — or their email, if no name is set — and a refusal blocks asking again for a")]),
     ("V33", CONFTEST, "over",
      "⛔ THE SEAM'S STUB GETS A FIXED SIGNATURE AGAIN, so the helper growing one "
      "argument is a TypeError in a dozen unrelated tests rather than a no-op",
