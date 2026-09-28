@@ -1579,8 +1579,23 @@ def cmd_device(args: argparse.Namespace) -> int:
         "allow-all": "Let anyone join a computer from chat:  "
                      "/sr let anyone join my computer",
     }
-    rc = _redirect_if_wsl(_WSL_HINTS.get(getattr(args, "device_command", None) or "",
-                                         "Manage devices from chat:  /sr devices"))
+    # ⛔⛔ AND THE DIRECTION HAS TO MATCH THE VALUE (wave 12 repair 2, 2026-09-27).
+    # Keyed by subcommand alone, `allow-all <id> no` was pointed at "let anyone
+    # join my computer" — the chat's confirm for OPENING the door somebody had
+    # just asked to close — and `visibility <id> private` at "make my computer
+    # public". Each phrase below is one the chat's router reads the same way.
+    _WSL_HINTS_BY_VALUE = {
+        ("allow-all", "no"): "Stop letting anyone join a computer from chat:  "
+                             "/sr turn off allow all",
+        ("visibility", "private"): "Hide a computer from chat:  "
+                                   "/sr make my computer private",
+    }
+    _sub = getattr(args, "device_command", None) or ""
+    _hint = _WSL_HINTS_BY_VALUE.get((_sub, getattr(args, "value", None)))
+    if _hint is None and _sub == "visibility" and getattr(args, "allow_all", False):
+        _hint = _WSL_HINTS["allow-all"]
+    rc = _redirect_if_wsl(_hint or _WSL_HINTS.get(_sub,
+                                                  "Manage devices from chat:  /sr devices"))
     if rc is not None:
         return rc
     if not _bridge_up():

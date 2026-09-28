@@ -14,6 +14,7 @@ nothing here reads the source to decide what a command prints.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -710,3 +711,47 @@ def test_terminal_wsl_hint_for_allow_all(monkeypatch, capsys):
     ns.func(ns)
     assert seen["hint"] == ("Let anyone join a computer from chat:  "
                             "/sr let anyone join my computer")
+
+
+# ── wave 12 repair 2 (cross-verify G27): the WSL hint points the SAME way ────
+# ⛔⛔ THE HINT WAS PICKED BY SUBCOMMAND ALONE. `agent device allow-all <id> no`
+# under WSL told the person to say "/sr let anyone join my computer" — which the
+# chat answers with the confirm that OPENS the door they had asked to close — and
+# `visibility <id> private` pointed at "make my computer public". Each row runs
+# the REAL redirect (no bridge here, the runtime in a WSL distro), takes the
+# phrase it printed, and hands it to the chat's own router: the direction the
+# router reads must be the direction the command was given.
+
+def _printed_chat_phrase(out: str) -> str:
+    plain =re.sub(r"\x1b\[[0-9;]*m", "", out)
+    hits = [ln.split("/sr ", 1)[1].strip() for ln in plain.splitlines()
+            if "from chat:" in ln and "/sr " in ln]
+    assert len(hits) == 1, plain
+    return hits[0]
+
+
+@pytest.mark.parametrize("argv,check", [
+    # OFF — the router must ACT, in the off direction, with no confirm
+    (["device", "allow-all", "dev-a1", "no"],
+     lambda got: got == (["device-allow-all", "no"], None)),
+    (["device", "visibility", "dev-a1", "private"],
+     lambda got: got == (["device-visibility", "private"], None)),
+    # ON — the router must ask the confirm for THAT door, never act unasked
+    (["device", "allow-all", "dev-a1", "yes"],
+     lambda got: got[0] is None and "at once" in " ".join(got[1])),
+    (["device", "visibility", "dev-a1", "public", "--allow-all"],
+     lambda got: got[0] is None and "at once" in " ".join(got[1])),
+    (["device", "visibility", "dev-a1", "public"],
+     lambda got: got[0] is None and "find that computer" in " ".join(got[1])
+     and "at once" not in " ".join(got[1])),
+], ids=["allow-all-no", "visibility-private", "allow-all-yes",
+        "public-allow-all", "public"])
+def test_the_wsl_hint_says_a_phrase_the_chat_reads_the_same_way(
+        monkeypatch, capsys, argv, check):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: "Ubuntu")
+    ns = _run(argv)
+    assert ns.func(ns) == 0
+    phrase = _printed_chat_phrase(capsys.readouterr().out)
+    got = sr._nl_resolve(phrase)
+    assert check(got), (argv, phrase, got)

@@ -58,8 +58,14 @@ SUITES = {
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
-_SELECT = ('                if not kept and routed is None:\n'
-           '                    prefs.set_selected_device(device_id, sess.uid)\n')
+# ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G8) — `_SELECT`, B1 AND
+# B4. Repair 2 made the join SAVE the router's own pick when nothing usable was
+# saved and one of the person's computers routed, so the rule is now
+# `if not kept:` + `pick = device_id if routed is None else routed`. B1 and B4
+# keep their original defects on the new lines; the new rule's own mutants are
+# R1-R3 in wave12_repair2_agent_mutants.
+_SELECT = ('                if not kept:\n'
+           '                    pick = device_id if routed is None else routed\n')
 _UNREAD = ('            if devs is not None:\n'
            '                before = [d for d in devs if d.get("id") != device_id]\n')
 
@@ -68,7 +74,8 @@ MUTANTS = [
     ("B1", BRIDGE, "⛔⛔ THE FINDING, PUT BACK: nothing SAVED reads as nothing ROUTABLE — "
      "a person who owns one computer joins a stranger's and every unnamed research "
      "moves onto it",
-     [(_SELECT, _SELECT.replace("if not kept and routed is None:", "if not kept:"))]),
+     [(_SELECT, _SELECT.replace("pick = device_id if routed is None else routed",
+                                "pick = device_id"))]),
     ("B2", BRIDGE, "⛔⛔ the router is asked about the list AFTER the join — the joined "
      "computer makes a sole own computer one of two, and the join takes over",
      [('                before = [d for d in devs if d.get("id") != device_id]\n',
@@ -81,7 +88,7 @@ MUTANTS = [
        '                saved = device_id\n' + _UNREAD)]),
     ("B4", BRIDGE, "⛔ a saved choice part-way through a Reset is replaced — still the "
      "person's machine and still their choice",
-     [(_SELECT, _SELECT.replace("if not kept and routed is None:", "if routed is None:"))]),
+     [(_SELECT, _SELECT.replace("if not kept:", "if True:"))]),
 
     # ═══ C — sent or not (F23) ════════════════════════════════════════════════
     ("C1", BRIDGE, "⛔⛔ a sign-in refresh that failed before anything left is answered "

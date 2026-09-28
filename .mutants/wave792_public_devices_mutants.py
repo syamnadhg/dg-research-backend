@@ -899,8 +899,11 @@ MUTANTS = [
     ("V22", CLI, "over",
      "⛔ THE WINDOWS HINT GOES BACK TO ONE MESSAGE FOR EVERY SUBCOMMAND, so all "
      "three new verbs point at the OWNED device list",
-     [('    rc = _redirect_if_wsl(_WSL_HINTS.get(getattr(args, "device_command", None) or "",\n'
-       '                                         "Manage devices from chat:  /sr devices"))',
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G27): the hint is
+     # now chosen by subcommand AND value (`_hint or _WSL_HINTS.get(_sub, …)`).
+     # Same defect: one message for every subcommand.
+     [('    rc = _redirect_if_wsl(_hint or _WSL_HINTS.get(_sub,\n'
+       '                                                  "Manage devices from chat:  /sr devices"))',
        '    rc = _redirect_if_wsl("Manage devices from chat:  /sr devices")')]),
     ("V23", CLI, "under",
      "⛔ THE ASK STOPS SAYING WHAT IT DISCLOSES, on the one path that reaches the "

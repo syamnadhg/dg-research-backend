@@ -150,7 +150,8 @@ for someone who isn't signed in. If its ticking stops, the next `status` /
 Being **findable** is discovery, not access. `device-visibility public` lists a
 computer you own for other signed-in people, who can then *ask* for it; you
 approve each person by hand, and `device-visibility private` takes it off the
-list again (an access code still lets someone in without asking you). From the
+list again (an access code still lets someone in without asking you, and anyone
+who already joined keeps access — remove people in the web app (Shared with)). From the
 other side, `devices-public` browses what's on offer and `device-ask` puts you in
 that owner's queue — they see your name, or your email if you haven't set one,
 and nothing happens on their machine until they say yes.
@@ -161,12 +162,16 @@ once — up to 25 people. They run research on your AI accounts and can see your
 email, who else is on it, and what's running on it. People you removed stay out.
 It makes the computer public too if it wasn't; `device-visibility public
 --allow-all` is the same step. `device-allow-all no` goes back to approving each
-person (the computer stays public, and anyone who already joined keeps access);
-going private switches it off as well (and there too, anyone who joined keeps
-access). On the other side, a public row marked *joins at once* lets `device-ask`
-in straight away: the reply says you're in, selects it only when none of your
-computers would have taken your research (it never moves your research off a
-computer of your own), and starts a held research topic — nothing arrives later.
+person (the computer stays public); going private switches it off as well.
+Neither removes anybody: anyone who already joined keeps access — remove people
+in the web app (Shared with).
+
+On the other side, a public row marked *joins at once* lets `device-ask` in
+straight away: the reply says you're in, selects it only when none of your
+computers would have taken your research, and starts a held research topic —
+nothing arrives later. When one of yours would have, and you had not chosen
+one, the join saves THAT one as your choice, so your research never moves off a
+computer of your own and you are not asked "which computer?" afterwards.
 
 **Where that setting starts is not here.** The machine's own `--pair` asks it
 during setup, in a step of its own, and the answer defaults to *no*; a computer

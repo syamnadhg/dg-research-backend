@@ -5128,6 +5128,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 over a live selection, and never over the computer an unnamed
                 research would have gone to anyway (see below). A fleet box with
                 no computer, or whose code-shared one was taken away, gets it.
+                When one of the person's own WAS routable and nothing usable was
+                saved, THAT one is saved instead (repair 2), or the joined one
+                would take its unnamed research from the rung that picked it.
               • START a held topic on it, pinned to this computer, only when the
                 ask came from a chat and the machine can take work.
             """
@@ -5158,13 +5161,23 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # and still their choice (the picker's own rule).
             # ⛔ UNKNOWN IS NOT EMPTY. A list that could not be read proves nothing
             # about what was routable, so nothing is selected on it.
+            # ⛔⛔ AND NOT SELECTING WAS NOT ENOUGH (wave 12 repair 2, 2026-09-27).
+            # With nothing saved, the joined computer is a SECOND runnable device,
+            # so the sole-device rung the person relied on stops: their own asleep
+            # and the joined one awake, the next unnamed research went to the
+            # stranger's computer and AI accounts; both awake, every one asked
+            # "which computer?". So when nothing usable was saved and the router
+            # DID pick one of the person's own, that pick is SAVED — the choice
+            # they were already getting, now written down so the joined computer
+            # cannot take it. Only when nothing routed is the joined one saved.
             if devs is not None:
                 before = [d for d in devs if d.get("id") != device_id]
                 kept = bool(saved) and any(d.get("id") == saved for d in before)
                 routed, _why, _stale = _pick_device_from(before, saved)
-                if not kept and routed is None:
-                    prefs.set_selected_device(device_id, sess.uid)
-                    saved = device_id
+                if not kept:
+                    pick = device_id if routed is None else routed
+                    prefs.set_selected_device(pick, sess.uid)
+                    saved = pick
             # ⛔ READ BEFORE ANYTHING DECORATES THE ROW. `pair_state_usable` needs
             # `pairState`, which the prune removes; and liveness is computed the
             # way every own row computes it, never read off the document.

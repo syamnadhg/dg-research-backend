@@ -201,6 +201,8 @@ them web-app-only:
   yes|no`, `agent device allow-all <id> yes|no`) it also sets **Allow all** —
   anyone who asks joins at once; on, it makes the machine public too. The agent is one of the writers
   `firestore.rules` names by role — see [§ `--visibility`](#step-5a-bis-who-can-find-this-pc---visibility).
+  Going private or turning Allow all off removes nobody: anyone who already
+  joined keeps access — remove people in the web app (Shared with).
 
 What still has **no** chat route and stays in the web app: **revoking an
 existing sharer** (chat `device remove` unlinks *you*, not somebody else) and
@@ -484,7 +486,7 @@ python research.py --allow-all yes         # public, and anyone who asks joins a
 python research.py --allow-all no          # back to approving each person
 ```
 
-…or from the app, in **Account → the Shared-with popup**, which writes the same field.
+…or from the app, in **Account → the Shared-with popup**, which writes the same field. Neither `--visibility private` nor `--allow-all no` removes anybody: anyone who already joined keeps access — remove people in the web app (Shared with).
 
 **`[4/6] API keys` — Anthropic + Gemini detect-prompt-verify** *(reordered to sit ahead of the browser logins on 2026-05-18 so CUA + Vision are available for Stage 5; shifted from 3/5 to 4/6 by the 2026-09-17 split)*
 `--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (FE Account-page Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
@@ -682,7 +684,7 @@ python research.py --allow-all no          # approve each person again (stays pu
 
 Discovery, not access. A **public** machine is one other people can see listed and **ask** to use; you still approve each request by hand — **Review**, on the Account banner — and an approved person becomes an ordinary sharer with the ordinary sharer's powers (submit a topic to the fixed pipeline, nothing else).
 
-**Allow all** is the one exception, and only on a public machine: anyone signed in who asks joins at once, with no approval — up to the 25-person limit, at most 10 new people an hour (past that, asks wait for you as usual). They run research on your AI accounts and can see your email, who else is on it, and what's running on it. People you removed stay out, and a "no" you gave still stands for its week. It is a separate `allowAll` flag on the device record, never a third visibility value, and the web app's server does the join — no client is trusted to. Turning it on also makes the machine public; making the machine private, Reset, and an owner hand-off all clear it. The web's Shared-with popup has the same switch (an **Allow all** tick under Public), and the chat agent has `device-allow-all yes|no`. A **private** machine can only be asked about by someone you gave the pair code to. Machines paired before this setting existed are private, and nothing changes that on its own. Whether the device record itself can be **read** is unchanged either way: owner, sharers, and the machine, exactly as before.
+**Allow all** is the one exception, and only on a public machine: anyone signed in who asks joins at once, with no approval — up to the 25-person limit, at most 10 new people an hour (past that, asks wait for you as usual). They run research on your AI accounts and can see your email, who else is on it, and what's running on it. People you removed stay out, and a "no" you gave still stands for its week. It is a separate `allowAll` flag on the device record, never a third visibility value, and the web app's server does the join — no client is trusted to. Turning it on also makes the machine public; making the machine private, Reset, and an owner hand-off all clear it. **Turning Allow all off, or making the machine private, removes nobody. Anyone who already joined keeps access — remove people in the web app (Shared with).** Reset is the one that does remove everyone. The web's Shared-with popup has the same switch (an **Allow all** tick under Public), and the chat agent has `device-allow-all yes|no`. A **private** machine can only be asked about by someone you gave the pair code to. Machines paired before this setting existed are private, and nothing changes that on its own. Whether the device record itself can be **read** is unchanged either way: owner, sharers, and the machine, exactly as before.
 
 The setting lives on the device record, so every surface agrees. ⛔ **Four writers set it, and `firestore.rules` names them by role rather than counting them — because the count has already been wrong twice:** the **owner**, from Account → the Shared-with popup; the **machine**, at pair time and from `--visibility`; the **chat agent**, which has its own Firestore door (`POST /device/visibility` — see [§ Super Agent](#drive-it-from-chat--super-agent-hermes--openclaw)); and **owner-unlink**, which deletes the field server-side on a hand-off. Only the first three meet the rule — the Admin SDK bypasses rules entirely — and all three are checked, because a constraint one writer can walk around is decoration. This § used to name two.
 

@@ -170,9 +170,17 @@ MUTANTS = [
     # on the list as it was before the join, and a saved choice still on that list
     # is `kept`. Each mutant keeps its original defect on the new lines; the new
     # rule's own mutants are B1-B4 in wave12_repair1_agent_mutants.
+    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2, cross-verify G8): the rule became
+    # `if not kept:` + `pick = device_id if routed is None else routed` (the
+    # router's own pick is saved when one of the person's computers routed). A
+    # bare `if True:` now re-saves a live selection as itself, so the defect —
+    # the joined computer written over it — needs the pick forced too.
     ("J4", BRIDGE, "⛔⛔ a join replaces a LIVE selection — research moves to a stranger's "
      "computer without anyone asking",
-     [('                if not kept and routed is None:\n', '                if True:\n')]),
+     [('                if not kept:\n'
+       '                    pick = device_id if routed is None else routed\n',
+       '                if True:\n'
+       '                    pick = device_id\n')]),
     ("J5", BRIDGE, "⛔ a selection that no longer exists is kept — the next research asks "
      "'which computer?' of somebody who just joined one",
      [('kept = bool(saved) and any(d.get("id") == saved for d in before)',

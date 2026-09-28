@@ -470,31 +470,48 @@ def _online(d):
     return dict(d, lastHeartbeat=int(time.time() * 1000))
 
 
+def _routed_after_join(live):
+    """Where the NEXT unnamed research goes: the router itself, run on the list as
+    it stands after the join (the joined computer on it) and the choice the join
+    left saved. The only pin that measures the outcome — see repair 2 below."""
+    return bridge._pick_device_from([dict(d) for d in FakeFS.devices],
+                                    live.box["sel"])[0]
+
+
 def test_a_join_never_moves_research_off_the_joiners_own_sole_computer(live, monkeypatch):
+    # RE-AIMED 2026-09-27 (repair 2, G8): this asserted `sel is None`, which the
+    # broken routing satisfied — with nothing saved the joined computer is a
+    # second runnable device and the router asked "which computer?". It now asks
+    # the router where the next research goes.
     FakeFS.devices = [dict(OWNED), dict(JOINED)]
     r = _ask(live, monkeypatch)
     assert r.status_code == 200, r.text
     got = r.json()
     assert got["status"] == "joined" and got["selected"] is False
-    assert live.box["sel"] is None
+    assert _routed_after_join(live) == "dev-a1"
 
 
 def test_a_join_never_takes_the_one_online_computer_the_router_would_use(live, monkeypatch):
     """Two computers of the person's own, one switched on: the sole-online rung
     routes every unnamed research to it. That is a working default too."""
+    # RE-AIMED 2026-09-27 (repair 2, G8): `sel is None` left the joined computer
+    # as a second online one, so the router asked "which computer?" every time.
     FakeFS.devices = [_online(OWNED), dict(SHARED), _online(JOINED)]
     got = _ask(live, monkeypatch).json()
-    assert got["selected"] is False and live.box["sel"] is None
+    assert got["selected"] is False and _routed_after_join(live) == "dev-a1"
 
 
 def test_a_gone_selection_beside_a_computer_that_would_run_it_is_not_replaced(live, monkeypatch):
     """A saved choice that no longer exists is dropped by the run path, which then
     routes to the sole computer left — the person's own. The join must not step in
     between with a stranger's."""
-    FakeFS.devices = [dict(OWNED), dict(JOINED)]
+    # RE-AIMED 2026-09-27 (repair 2, G8): `sel != "dev-j9"` held while the gone
+    # choice stayed saved — and the router then dropped it and went to the only
+    # computer ONLINE, the stranger's.
+    FakeFS.devices = [dict(OWNED), _online(JOINED)]
     live.box["sel"] = "dev-gone"
     got = _ask(live, monkeypatch).json()
-    assert got["selected"] is False and live.box["sel"] != "dev-j9"
+    assert got["selected"] is False and _routed_after_join(live) == "dev-a1"
 
 
 def test_an_unread_list_selects_nothing_even_with_nothing_saved(live, monkeypatch):
@@ -526,6 +543,61 @@ def test_a_fleet_box_with_no_computer_gets_the_joined_one_and_its_topic(live, mo
     assert got["selected"] is True and live.box["sel"] == "dev-j9"
     assert got["autoStarted"] is True
     assert live.box["enq"][0]["deviceId"] == "dev-j9"
+
+
+# ── wave 12 repair 2 (cross-verify G8): the router's answer after the join ───
+# ⛔⛔ REPAIR 1 STOPPED THE JOIN SAVING A STRANGER'S COMPUTER, AND ITS TESTS
+# ASSERTED EXACTLY THAT — `sel is None`, which the broken routing satisfied. With
+# nothing saved the joined computer is a SECOND runnable device, so the sole-
+# device rung stops: asleep at home, the next unnamed research ran on the
+# stranger's computer and AI accounts; both awake, every one asked "which
+# computer?". Executed against repair 1: before the join the router picked
+# dev-a1, after it dev-j9 (or nothing). So the join now SAVES the computer the
+# router was already using, and each row below asks the router itself where the
+# next research goes — nothing else can make these pass.
+#
+# Rows: (who is on the list, each marked online or not; what was saved; where
+# the next research must go; whether the reply says the joined one is selected).
+# Built inside the test: a heartbeat stamped at collection could age out of the
+# online window before a long suite reached it.
+
+_G8_ROWS = [
+    # the sole owner — the case the finding names, in every power state
+    ("sole-owner-online", [(OWNED, True), (JOINED, True)], None, "dev-a1", False),
+    ("sole-owner-asleep-joined-online", [(OWNED, False), (JOINED, True)], None,
+     "dev-a1", False),
+    ("sole-owner-both-asleep", [(OWNED, False), (JOINED, False)], None, "dev-a1", False),
+    # two of the person's own, one switched on: the sole-online rung's pick is kept
+    ("two-own-one-online", [(OWNED, True), (SHARED, False), (JOINED, True)], None,
+     "dev-a1", False),
+    # a saved choice that is gone, beside the person's own computer
+    ("gone-choice-beside-own", [(OWNED, False), (JOINED, True)], "dev-gone",
+     "dev-a1", False),
+    # a working saved choice is never touched — not even by the router's own pick
+    ("working-choice-kept", [(OWNED, True), (SHARED, False), (JOINED, True)],
+     "dev-b2", "dev-b2", False),
+    # ⭐ UNCHANGED: nothing routed before, so the joined computer is selected
+    ("fleet-no-own-computer", [(JOINED, True)], None, "dev-j9", True),
+    ("fleet-no-own-computer-asleep", [(JOINED, False)], None, "dev-j9", True),
+    ("two-own-asleep-nothing-saved", [(OWNED, False), (SHARED, False), (JOINED, True)],
+     None, "dev-j9", True),
+    ("two-own-online-nothing-saved", [(OWNED, True), (SHARED, True), (JOINED, True)],
+     None, "dev-j9", True),
+]
+
+
+@pytest.mark.parametrize("devices,saved,want,selected",
+                         [r[1:] for r in _G8_ROWS], ids=[r[0] for r in _G8_ROWS])
+def test_after_a_join_the_router_sends_research_where_it_went_before(
+        live, monkeypatch, devices, saved, want, selected):
+    FakeFS.devices = [_online(d) if on else dict(d) for d, on in devices]
+    live.box["sel"] = saved
+    r = _ask(live, monkeypatch)
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["status"] == "joined"
+    assert _routed_after_join(live) == want
+    assert got["selected"] is selected
 
 
 # ── wave 12 repair (cross-verify F23): unconfirmed only if something was sent ─

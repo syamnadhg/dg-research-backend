@@ -1383,7 +1383,9 @@ private` closes FIRST and then clears a stored tick best-effort; a private→pub
 flip carries `allowAll: false` when an old tick is stored, so it never comes back
 unasked. Bare `--allow-all` only SHOWS — except right after an explicit
 `--visibility public`, the owner's one-step form. Reset and owner-unlink delete
-the field server-side. Pairing never asks.
+the field server-side. Pairing never asks. Neither `--allow-all no` nor
+`--visibility private` touches `sharedWith[]`: anyone who already joined keeps
+access — remove people in the web app (Shared with).
 
 **The state lives on the device document and nowhere else** — deliberately no
 `research_config.json` key, because the owner can change this from the app and a
