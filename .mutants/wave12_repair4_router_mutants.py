@@ -19,7 +19,6 @@ brings ONE of them back, and the test that kills it EXECUTES `sr._nl_resolve` or
   K13* the join's name: its tail, `called X`, one computer
   K14* the owner's Windows rule 2 across a comma or a `but`
   K18* a question that mentions a login is a question
-  K19* the public lists say the ask's own sentence
 
 ⭐ K11 is repair 1's F21, RESTORED there (its retirement was false); K7's `the`
 subject is repair 2's W5, RESTORED there. Older mutants whose anchors moved are
@@ -189,22 +188,6 @@ MUTANTS = [
      "join my mac` never signs in",
      [('(?:(?:can|could|would|will)\\b(?!\\s+you\\b)|', '(?:(?:can|could|would|will)\\b|')]),
 
-    # ═══ K19 — the lists say the ask's own sentence ════════════════════════════
-    ("K19a", SR, "⛔ the chat's ask list says “They see your name.” while the confirm says "
-     "name and email",
-     [('                      "you can use that computer. The owner sees your name and email.")',
-       '                      "you can use that computer. They see your name.")')]),
-    ("K19b", SR, "⛔ the chat's join list says “They see your name.”",
-     [('"you straight in; for the others its owner decides. The owner "\n'
-       '                       "sees your name and email.")',
-       '"you straight in; for the others its owner decides. They see "\n'
-       '                       "your name.")')]),
-    ("K19c", CLI, "⛔ the terminal's ask list says “They see your name.”",
-     [('                        "The owner sees your name and email.")',
-       '                        "They see your name.")')]),
-    ("K19d", CLI, "⛔ the terminal's join list says “They see your name.”",
-     [('"others its owner decides. The owner sees your name and email.")',
-       '"others its owner decides. They see your name.")')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

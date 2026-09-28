@@ -154,12 +154,13 @@ _LOST_CODE_REPLY = ("If it's your own computer, open Account in the web app and 
 # machine reads as the identical string "Research computer", so "tell me which one"
 # alone is a question the reader may not be able to answer — and the resolver
 # refuses an ambiguous name rather than guessing.
-# ⛔⛔ AND IT SAYS WHAT THE CONFIRM SAYS (wave 12 repair 4, cross-verify K19): the list
-# said "They see your name." and the ask confirm one message later "The owner sees
-# your name and email." — two claims in one exchange. The owner's Shared with shows
-# both once somebody is on the computer, so the list says the confirm's sentence.
+# ⛔⛔ "They see your name." ON EVERY LIST IS THE OWNER'S WORDING (2026-09-24), and
+# the fuller "The owner sees your name and email." is said where the person
+# actually asks (the device-ask confirm). Cross-verify K19 (2026-09-27) called the
+# difference a defect and repair 4 rewrote the lists; that reversed an owner
+# decision, so it was put back. Change it only on the owner's word.
 _PUBLIC_ASK_INVITE = ("Tell me which one to ask for. Once the request is accepted "
-                      "you can use that computer. The owner sees your name and email.")
+                      "you can use that computer. They see your name.")
 
 # ⭐⭐ ALLOW ALL (wave 12, 2026-09-26). An owner can set a public computer so that
 # anyone who asks joins at once, with no approval step. Four sentences say it, and
@@ -176,8 +177,8 @@ _JOINS_AT_ONCE = " · joins at once"
 # `_PUBLIC_ASK_INVITE` word for word, which is also what every row reads as until
 # the web app ships the bit — the safe direction.
 _PUBLIC_JOIN_INVITE = ("Tell me which one you want. Ones marked “joins at once” let "
-                       "you straight in; for the others its owner decides. The owner "
-                       "sees your name and email.")
+                       "you straight in; for the others its owner decides. They see "
+                       "your name.")
 # ⛔⛔ WHAT ALLOW ALL COSTS THE OWNER, IN THE SPEC'S OWN WORDS. The confirm before
 # switching it on and the reply after it say the same sentence, so what somebody
 # agreed to and what they are told they did are one text. Twenty-five is the

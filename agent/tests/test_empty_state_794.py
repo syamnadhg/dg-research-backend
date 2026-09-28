@@ -484,12 +484,8 @@ def test_the_invitation_says_what_the_consent_question_says(chat):
     address", which is wrong in both directions."""
     sr.cmd_devices(_ns())
     out = chat.out()
-    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 4, cross-verify K19): the short invite
-    # said "They see your name." and the confirm one message later "The owner sees
-    # your name and email." — two claims in one exchange. The list says the
-    # confirm's own sentence now (the owner's Shared with shows both).
-    assert "The owner sees your name and email." in out, out
-    assert "They see your name." not in out, out
+    # the short invite: says the owner sees a name, and stops there
+    assert "They see your name." in out, out
     assert "name and email address" not in out
     # the consent gate: the precise version — ⛔ FLIPPED 2026-09-27 (wave 12
     # repair 2, cross-verify G24). "or your email, if you haven't set one" was the
@@ -739,10 +735,7 @@ def test_the_terminal_lists_the_public_ones_in_its_own_row_format(term):
     # ⚠ The terminal asks without a confirm step, so a terminal reader meets the
     # email half after the ask rather than before it; the chat's device-ask confirm
     # still says it before. Owner's call, made knowing that.
-    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 4, cross-verify K19): every public list
-    # says the ask's own sentence now, "The owner sees your name and email."
-    assert "The owner sees your name and email." in out
-    assert "They see your name." not in out
+    assert "They see your name." in out
     assert "or your email" not in out
     assert "name and email address" not in out
 

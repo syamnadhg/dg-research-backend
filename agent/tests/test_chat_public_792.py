@@ -320,11 +320,7 @@ def test_chat_browse_names_every_row_and_holds_the_id_back(chat):
     # email only when no name is set — and it is forbidden on every surface. The
     # full sentence lives on the CONSENT CONFIRM, which is the last thing shown
     # before anything is sent; this screen is only choosing a row.
-    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 4, cross-verify K19): the short form said
-    # "They see your name." and the confirm after it "The owner sees your name and
-    # email." — two claims in one exchange. One sentence on both now.
-    assert "The owner sees your name and email." in out
-    assert "They see your name." not in out
+    assert "They see your name." in out
     assert "name and email address" not in out
 
 

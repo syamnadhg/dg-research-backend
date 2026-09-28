@@ -21,8 +21,6 @@ Round 4 of cross-verify, driven through `sr.py do` with the bridge stubbed at re
       “✓ Signed in as …” alone (the owner's Windows rule 2).
   K17 `research EV batteries on my mac “Allow All Lab”` got the Devices list.
   K18 `can people join my mac without a login?` started a sign-in.
-  K19 the public list said "They see your name." and the ask one message later
-      "The owner sees your name and email."
 
 Each is pinned by EXECUTION: the router (`sr._nl_resolve`) AND the `do` path with
 `_get`/`_post` stubbed, asserting the POSTs a message makes — or that it makes none.
@@ -38,7 +36,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from facade import cli
 
 _TESTS = Path(__file__).resolve().parent
 _SCRIPTS = _TESTS.parent / "facade" / "skill" / "scripts"
@@ -444,48 +441,6 @@ def test_k18_an_instruction_to_sign_in_still_signs_in(bridge, text):
     assert _route(text) == "LOGIN", (text, _route(text))
     _do(text)
     assert [p for p, _b in bridge.posts] == [_LOGIN_POST], (text, bridge.posts)
-
-
-# ── K19: the list says what the confirm says ─────────────────────────────────────
-
-_SEES = "The owner sees your name and email."
-_ASK_ROW = {"deviceId": "dev-k1", "label": "Lab Mac", "online": True, "full": False,
-            "allowAll": False}
-_JOIN_ROW = {"deviceId": "dev-j9", "label": "DG shared", "online": True, "full": False,
-             "allowAll": True}
-
-
-@pytest.mark.parametrize("rows", [[_ASK_ROW], [_ASK_ROW, _JOIN_ROW]])
-def test_k19_the_chat_list_and_the_ask_confirm_make_one_claim(bridge, monkeypatch, rows):
-    monkeypatch.setattr(sr, "_get", lambda path, timeout=None: (
-        (200, {"devices": rows, "truncated": False}) if path == "/devices/public" else (200, {})))
-    assert sr.cmd_devices_public(SimpleNamespace(json=False)) == 0
-    listed = bridge.out()
-    confirm = " ".join(sr._nl_resolve("join the Studio PC")[1])
-    for said in (listed, confirm):
-        assert _SEES in said, said
-        assert "They see your name" not in said, said
-
-
-@pytest.fixture()
-def term(monkeypatch, capsys):
-    box: dict = {"get": {}}
-    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
-    monkeypatch.setattr(cli, "_redirect_if_wsl", lambda _m: None)
-    monkeypatch.setattr(cli, "_bridge_get", lambda p, timeout=10.0: box["get"].get(p))
-    monkeypatch.setattr(cli, "_bridge_post", lambda p, body=None, timeout=30.0: (200, {}))
-    return SimpleNamespace(box=box, out=lambda: capsys.readouterr().out)
-
-
-@pytest.mark.parametrize("rows", [[_ASK_ROW], [_ASK_ROW, _JOIN_ROW]])
-def test_k19_the_terminal_list_says_the_ask_s_sentence(term, rows):
-    term.box["get"]["/devices/public"] = (200, {"devices": rows, "truncated": False})
-    ns = cli.build_parser().parse_args(["device", "public"])
-    assert ns.func(ns) == 0
-    out = term.out()
-    assert _SEES in out, out
-    assert "They see your name" not in out, out
-    assert cli._OWNER_SEES_T == _SEES
 
 
 # ── the two rows repair 3 pinned that this repair flips ──────────────────────────

@@ -353,12 +353,7 @@ def test_the_terminal_lists_public_computers_with_their_ids(term):
     # ⚠ The terminal asks without a confirm step, so a terminal reader meets the
     # email half after the ask rather than before it; the chat's device-ask confirm
     # still says it before. Owner's call, made knowing that.
-    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 4, cross-verify K19): the list says the
-    # ask's own sentence — "The owner sees your name and email." — so a list and
-    # the ask after it make one claim.
-    assert ("Once the request is accepted you can use that computer. "
-            "The owner sees your name and email.") in out
-    assert "They see your name." not in out
+    assert "Once the request is accepted you can use that computer. They see your name." in out
     assert "or your email" not in out
     assert "Its owner decides" not in out
     assert "name and email address" not in out

@@ -1377,7 +1377,11 @@ and an old "make it private" would no-op. The JOIN is done by the web app's
 `access-request` route inside its transaction (live owner / already-shared /
 removed / 25-cap checks, a week's "no" still stands, 10 instant joins per machine
 per hour, then an ordinary ask); this program only writes the flag.
-`--allow-all yes` writes `{visibility: public, allowAll: true}` in ONE patch;
+`--allow-all yes` writes `{visibility: public, allowAll: true}` in ONE patch —
+except on a PRIVATE computer that still carries a stored tick, where it first
+writes `{allowAll: false}` alone and then that patch, because the rules refuse a
+private→public write that leaves a stored tick untouched (repair 4: an OLD writer
+writing `visibility` alone must not re-arm a leftover tick);
 `--allow-all no` writes `{allowAll: false}` and stays public; `--visibility
 private` closes FIRST and then clears a stored tick best-effort; a private→public
 flip carries `allowAll: false` when an old tick is stored, so it never comes back

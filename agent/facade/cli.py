@@ -1280,16 +1280,13 @@ _PUBLIC_TRUNCATED_SOME_T = ("  (there are more public computers than one look ca
 # for every public LIST to say the same. The email half is said where an email is
 # actually sent: `_device_ask`'s own confirmation below keeps it, as the chat
 # client's ask confirmation does.
-# ⛔⛔ WAVE 12 REPAIR 4 (cross-verify K19): the list's "They see your name." and the
-# ask's "The owner sees your name and email." were two claims in one exchange; the
-# owner's Shared with shows both, so every list says the ask's one sentence.
 _PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "
-                        "The owner sees your name and email.")
+                        "They see your name.")
 # ⭐ WAVE 12: the invite has to be true of every row above it, and "once the request
 # is accepted" is false of a row that joins at once — there is no request. A list
 # with one such row says this instead; the chat client's `_PUBLIC_JOIN_INVITE`.
 _PUBLIC_JOIN_INVITE_T = ("     Ones marked (joins at once) let you straight in; for the "
-                         "others its owner decides. The owner sees your name and email.")
+                         "others its owner decides. They see your name.")
 # ⛔⛔ WHAT ASKING OR JOINING DISCLOSES, SAID ONCE (wave 12 repair 3, cross-verify
 # H22). The ask's reply said "your name — or your email, if you have not set one"
 # while the join's said "name and email" — one exchange, two claims. The owner's

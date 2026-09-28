@@ -259,9 +259,8 @@ MUTANTS = [
     ("T5", CLI, "over",
      "⛔⛔ THE TERMINAL'S INVITATION SAYS \"your name and email address\" AGAIN — "
      "wrong twice, and the phrasing the chat confirm was corrected away from in "
-     "7.9-2 while this screen kept saying it (RE-ANCHORED 2026-09-27, wave 12 repair "
-     "4, K19: the invite says the ask's own sentence now)",
-     [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "\n                        "The owner sees your name and email.")',
+     "7.9-2 while this screen kept saying it",
+     [('_PUBLIC_ASK_INVITE_T = ("     Once the request is accepted you can use that computer. "\n                        "They see your name.")',
        '_PUBLIC_ASK_INVITE_T = "     Once the request is accepted you can use that computer. Asking tells them your name and email address."')]),
 
     # ═══════════ W — the two surfaces delivered word for word ════════════════
