@@ -560,6 +560,13 @@ def _allow_all_of(d: dict[str, Any]) -> bool:
     return _discovery_of(d) == "public" and d.get("allowAll") is True
 
 
+# What `/device/visibility` can still vouch for when Allow all ON fails after the
+# old tick was cleared on its own (wave 12 repair 4, K1): the clear, which opened
+# nothing while the computer was private.
+_TICK_CLEARED = ("an old Allow all tick was cleared, which did nothing while the "
+                 "computer was private")
+
+
 # ⛔⛔ THE ONLY DEVICE FIELDS THAT MAY LEAVE THIS PROCESS. `list_devices` sends
 # no field mask, so a device row arrives WHOLE — and a never-rotated machine's
 # row still carries a plaintext `pairCode`, which is the credential that claims
@@ -5259,8 +5266,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 before = [d for d in devs if d.get("id") != device_id]
                 kept = bool(saved) and any(d.get("id") == saved for d in before)
                 routed, _why, _stale = _pick_device_from(before, saved)
-                if routed is None:
-                    routed = _own_reset_hold(before, sess.uid)
+                # ⛔⛔ THE HOLD OUTRANKS ANY PICK THAT IS NOT THEIR OWN (wave 12
+                # repair 4, cross-verify K9). With their own computer mid-Reset, the
+                # router's pick was a friend's code-shared computer — and saving it
+                # kept every unnamed research there after the re-pair. Only a
+                # computer they own beats the hold.
+                mine = {d["id"] for d in before
+                        if d.get("id") and d.get("ownerUid") == sess.uid}
+                if routed not in mine:
+                    routed = _own_reset_hold(before, sess.uid) or routed
                 if not kept:
                     pick = device_id if routed is None else routed
                     prefs.set_selected_device(pick, sess.uid)
@@ -5682,7 +5696,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             machine follow too:
               • allow all ON  → `{visibility:'public', allowAll:true}`, ONE patch —
                 it makes the computer public too (owner: "allow all would by
-                default make it public");
+                default make it public"); on a private computer still carrying
+                an old tick, `allowAll:false` alone goes first (repair 4, K1);
               • allow all OFF → `allowAll:false` alone; the computer stays public;
               • public OFF    → `{visibility:'private'}` alone and FIRST, then a
                 best-effort `{allowAll:false}` only if it was set — a narrowing
@@ -5770,7 +5785,20 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                                  "publicLabel": label, "deviceId": device_id,
                                  "deviceName": row.get("name")})
                 return
+            # ⛔⛔ AN OLD TICK IS CLEARED ALONE BEFORE ALLOW ALL GOES ON (wave 12
+            # repair 4, cross-verify K1). The rules refuse a write that makes a
+            # non-public computer public while a stored `allowAll: true` is left
+            # out of it — what stops an old writer (visibility alone) bringing a
+            # leftover tick back. true→true is not a change the rules can see, so
+            # the ON patch would be refused on exactly that computer: `allowAll:
+            # false` goes out first, alone, and only there. Every other request
+            # makes exactly the one write it always made.
+            clear_first = want_all is True and current != "public" and stored
+            cleared = False
             try:
+                if clear_first:
+                    fs.set_device_allow_all(device_id, False)
+                    cleared = True
                 if want == "private" or (want_all is False and not stored
                                          and current == "private"):
                     # Going private, or a plain publish with nothing stored: the
@@ -5783,7 +5811,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     fs.set_device_allow_all(device_id, want_all,
                                             publish=want_all or current == "private")
             except RevokedError:
-                self._json(401, {"error": "session revoked — run /login again"})
+                # A revoked sign-in sends nothing, so after a landed clear the
+                # ON patch is known not to have gone out.
+                self._json(401, {"error": "session revoked — run /login again"
+                                          + (". Allow all did not go on; "
+                                             + _TICK_CLEARED if cleared else "")})
                 return
             except FirestoreError as e:
                 # ⛔ THE STATUS DECIDES WHICH SENTENCE IS HONEST, and an absent
@@ -5791,6 +5823,22 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # is the direction that does not lie about the machine.
                 log.warning("device visibility write failed: %s", e)
                 refused = getattr(e, "status", None) == 403
+                if cleared:
+                    # ⛔ THE CLEAR LANDED AND ALLOW ALL DID NOT (K1). The tick it
+                    # cleared opened nothing while the computer was private, so
+                    # "nothing changed" would be false — and "it is on" more so.
+                    self._json(403 if refused else 502,
+                               {"reason": "visibility_refused" if refused
+                                else "visibility_unconfirmed",
+                                "error": ("could not turn Allow all on — nothing "
+                                          "changed, except that " + _TICK_CLEARED
+                                          if refused else
+                                          "could not confirm Allow all went on — it "
+                                          "may or may not have been saved. Before "
+                                          "it, " + _TICK_CLEARED),
+                                "visibility": current if refused else None,
+                                "allowAll": False if refused else None})
+                    return
                 self._json(403 if refused else 502,
                            {"reason": "visibility_refused" if refused
                             else "visibility_unconfirmed",

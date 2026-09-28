@@ -334,8 +334,14 @@ MUTANTS = [
     ("V14", BRIDGE, "under",
      "a revoked session during the write is reported as an outage rather than "
      "as the sign-in problem it is",
+     # ⛔ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K1): the 401 now says, after
+     # a cleared tick, that Allow all did not go on. Same mutation — the branch gone.
      [('            except RevokedError:\n'
-       '                self._json(401, {"error": "session revoked — run /login again"})\n'
+       '                # A revoked sign-in sends nothing, so after a landed clear the\n'
+       '                # ON patch is known not to have gone out.\n'
+       '                self._json(401, {"error": "session revoked — run /login again"\n'
+       '                                          + (". Allow all did not go on; "\n'
+       '                                             + _TICK_CLEARED if cleared else "")})\n'
        '                return\n'
        '            except FirestoreError as e:\n'
        '                # ⛔ THE STATUS DECIDES WHICH SENTENCE IS HONEST',

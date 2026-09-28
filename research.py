@@ -86427,7 +86427,10 @@ def run_visibility(value: str, allow_all: "str | None" = None,
       · allow all ON  → `{visibility: public, allowAll: true}` in ONE patch. It
         makes the computer public too (the owner: "allow all would by default
         make it public"), and one patch means the computer is never left
-        allow-all-but-hidden while the screen says on.
+        allow-all-but-hidden while the screen says on. On a PRIVATE computer
+        that still carries an old tick, `{allowAll: false}` goes out alone
+        first — the rules refuse re-publishing over a tick the write leaves
+        untouched (wave 12 repair 4).
       · allow all OFF → `{allowAll: false}`. The computer stays public.
       · public OFF    → `{visibility: private}` ALONE, first; then, only if the
         document carried `allowAll: true`, a second best-effort
@@ -86621,7 +86624,30 @@ def run_visibility(value: str, allow_all: "str | None" = None,
     else:
         patch = {"allowAll": False}
 
-    if patch and not _pair_patch_device(device_id, patch):
+    # ⛔⛔ AN OLD TICK IS CLEARED ALONE BEFORE ALLOW ALL GOES ON (wave 12 repair 4,
+    # cross-verify K1). The rules refuse a write that makes a non-public computer
+    # public while a stored `allowAll: true` is left out of it — the only way to
+    # stop an old wheel, agent or web tab (they write `visibility` alone) from
+    # bringing a leftover tick back. A true→true `allowAll` is NOT a change the
+    # rules can see, so the ON patch below would be refused on exactly that
+    # computer; `{allowAll: false}` goes out first, alone, and only there.
+    # Everywhere else the one write is exactly what it was.
+    # ⛔ The ON patch never follows a clear that was not confirmed.
+    clear_first = want and current != "public" and leftover
+    cleared = clear_first and _pair_patch_device(device_id, {"allowAll": False})
+    if patch and (clear_first and not cleared
+                  or not _pair_patch_device(device_id, patch)):
+        if cleared:
+            # ⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT (or could not be
+            # confirmed). The tick it cleared opened nothing while the computer
+            # was private, so that is the only change this can vouch for.
+            print(f"  {_c(_WARN, '⚠')}  Could not turn Allow all on — the change was not confirmed.")
+            print(f"  {_c(_DIM, '     Only an old Allow all tick was cleared for certain, and it did')}")
+            print(f"  {_c(_DIM, '     nothing while this computer was private. Run this again with no')}")
+            print(f"  {_c(_DIM, '     value to see where it actually stands:')}  "
+                  f"{_c(_BOLD, f'{_PROG} --visibility')}")
+            print()
+            return 1
         # ⛔⛔ "NOTHING CHANGED" IS A CLAIM THIS CANNOT MAKE, and the first
         # version of this made it in bold. `_pair_patch_device` returns False for
         # four different situations and only two of them prove the write did not

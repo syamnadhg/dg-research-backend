@@ -740,3 +740,142 @@ def test_pairing_never_asks_about_or_writes_allow_all(monkeypatch, capsys):
     screen = capsys.readouterr().out.lower()
     assert "allow all" not in screen and "allow-all" not in screen
     assert not any("allow" in q.lower() or "join" in q.lower() for q in asked), asked
+
+
+# ── wave 12 repair 4 (cross-verify K1): an old tick is cleared ALONE first ───
+# ⛔⛔ THE RULES NOW REFUSE A WRITE THAT MAKES A NON-PUBLIC COMPUTER PUBLIC WHILE A
+# STORED `allowAll: true` IS LEFT OUT OF IT. That is what stops an old wheel, the
+# published agent or an old web tab — they write `visibility` alone — from
+# bringing a leftover tick back as an instant door. But `allowAll` true→true is
+# not a change the rules can see either, so this machine's own ON patch would be
+# refused on exactly the computer that carries a tick. The machine clears it with
+# `{allowAll: false}` alone first, then writes the ON patch — there and only
+# there. Every other request makes exactly the writes it made before, key order
+# included (the order is the update mask's order on the wire).
+#
+# Executed against the code before this repair: the three K1 rows wrote the ON
+# patch alone (the rules would refuse it); every other row was already this.
+
+_CLEAR = [("allowAll", False)]
+_ON = [("visibility", "public"), ("allowAll", True)]
+_PUB = [("visibility", "public")]
+_PUB_CLEAR = [("visibility", "public"), ("allowAll", False)]
+_PRIV = [("visibility", "private")]
+
+# The stored documents, grouped by what the writer reads off them: discovery (by
+# `_discovery_of`, either name), and whether `allowAll` is EXACTLY True.
+_PRIVATE_CLEAN = [{"visibility": "private"}, {"visibility": "private", "allowAll": False},
+                  {"visibility": "private", "allowAll": "true"}]
+_PRIVATE_TICKED = [{"visibility": "private", "allowAll": True},
+                   {"joinPolicy": "private", "allowAll": True},
+                   {"allowAll": True, "name": "No discovery key"},
+                   {"visibility": "private", "joinPolicy": "public", "allowAll": True}]
+_PUBLIC_CLEAN = [{"visibility": "public"}, {"visibility": "public", "allowAll": False}]
+_PUBLIC_ON = [{"visibility": "public", "allowAll": True},
+              {"joinPolicy": "public", "allowAll": True}]
+
+# Every request `main` can hand over: (--visibility word, --allow-all word).
+_REQUESTS = [("public", None), ("private", None), (SHOW, "yes"), (SHOW, "no"),
+             (SHOW, BARE), ("public", BARE), ("private", BARE), ("public", "yes"),
+             ("public", "no"), ("private", "no"), ("private", "yes"), (SHOW, None)]
+
+# What each group writes for each request, in order. The K1 cells are marked.
+_K1 = [_CLEAR, _ON]
+_WRITES = {
+    "private-clean": [[_PUB], [], [_ON], [], [], [_ON], [], [_ON], [_PUB], [], [], []],
+    "private-ticked": [[_PUB_CLEAR], [_CLEAR], _K1, [_CLEAR], [], _K1, [_CLEAR], _K1,
+                       [_PUB_CLEAR], [_CLEAR], [_CLEAR], []],
+    "public-clean": [[], [_PRIV], [_ON], [], [], [_ON], [_PRIV], [_ON], [], [_PRIV],
+                     [_PRIV], []],
+    "public-on": [[], [_PRIV, _CLEAR], [], [_CLEAR], [], [], [_PRIV, _CLEAR], [], [_CLEAR],
+                  [_PRIV, _CLEAR], [_PRIV, _CLEAR], []],
+}
+_GROUPS = {"private-clean": _PRIVATE_CLEAN, "private-ticked": _PRIVATE_TICKED,
+           "public-clean": _PUBLIC_CLEAN, "public-on": _PUBLIC_ON}
+_MATRIX = [(g, meta, req, want)
+           for g, metas in _GROUPS.items() for meta in metas
+           for req, want in zip(_REQUESTS, _WRITES[g])]
+
+
+def _record(monkeypatch, results=None):
+    """Replace the writer with a recorder of each patch's keys IN ORDER. `results`
+    answers the n-th write (True when it runs out), so a test can fail one."""
+    seen = []
+    results = list(results or [])
+
+    def _patch(device_id, fields, *a, **kw):
+        # Nothing but the fields: no other device, and no delete list.
+        assert device_id == "dev-1" and not a and not kw
+        seen.append(list(fields.items()))
+        return results[len(seen) - 1] if len(seen) <= len(results) else True
+
+    monkeypatch.setattr(research, "_pair_patch_device", _patch)
+    return seen
+
+
+@pytest.mark.parametrize("group, meta, req, want", _MATRIX,
+                         ids=[f"{g}-{i}-{r[0]}-{r[1]}" for i, (g, _m, r, _w)
+                              in enumerate(_MATRIX)])
+def test_every_request_writes_exactly_this_sequence(wired, monkeypatch, group, meta,
+                                                    req, want):
+    wired["meta"] = dict(meta)
+    seen = _record(monkeypatch)
+    assert research.run_visibility(req[0], allow_all=req[1]) == 0
+    assert seen == want
+
+
+@pytest.mark.parametrize("meta", _PRIVATE_TICKED)
+@pytest.mark.parametrize("req", [(SHOW, "yes"), ("public", BARE), ("public", "yes")])
+def test_allow_all_on_over_an_old_tick_clears_it_alone_first(wired, monkeypatch, meta,
+                                                             req):
+    """⛔⛔ THE FINDING'S OWN CASE, from every spelling of ON: a private computer
+    whose old tick the rules will not let a publish ride over. The screen is the
+    ordinary ON screen — the clear is an implementation detail, not news."""
+    wired["meta"] = dict(meta)
+    seen = _record(monkeypatch)
+    assert research.run_visibility(req[0], allow_all=req[1]) == 0
+    assert seen == [_CLEAR, _ON]
+    out = wired["out"]()
+    assert ON in out
+    assert "made it public too" in out
+    assert "Could not" not in out
+
+
+def test_a_failed_clear_sends_nothing_after_it_and_claims_nothing(wired, monkeypatch):
+    """The first write failing is today's failure: the same "could not confirm"
+    words, no state claimed — and the ON patch never goes out behind it."""
+    wired["meta"] = {"visibility": "private", "allowAll": True}
+    seen = _record(monkeypatch, results=[False])
+    assert research.run_visibility(SHOW, allow_all="yes") == 1
+    assert seen == [_CLEAR]
+    out = wired["out"]()
+    assert "Could not confirm that change." in out
+    assert "Could not turn Allow all on" not in out
+    assert ON not in out and "Public" not in out
+
+
+def test_a_failed_on_after_the_clear_says_allow_all_is_not_on(wired, monkeypatch):
+    """⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT. "Could not confirm that
+    change" would hide that something DID change; "Allow all is on" would be the
+    lie. It says Allow all did not go on, and that the only certain change is a
+    cleared tick that opened nothing while the computer was private."""
+    wired["meta"] = {"visibility": "private", "allowAll": True}
+    seen = _record(monkeypatch, results=[True, False])
+    assert research.run_visibility(SHOW, allow_all="yes") == 1
+    assert seen == [_CLEAR, _ON]
+    out = wired["out"]()
+    assert "Could not turn Allow all on" in out
+    assert "Only an old Allow all tick was cleared for certain" in out
+    assert "nothing while this computer was private" in out
+    assert "Could not confirm that change." not in out
+    assert ON not in out and "Public" not in out
+    assert "--visibility" in out
+
+
+def test_the_clear_first_goes_through_the_real_parser(tmp_path):
+    """The same sequence from `superresearch --allow-all yes`, parsed for real."""
+    code, patches, _out, err = _drive("--allow-all", "yes",
+                                      meta={"visibility": "private", "allowAll": True},
+                                      tmp_home=tmp_path)
+    assert code == 0, err[-2000:]
+    assert patches == [{"allowAll": False}, {"visibility": "public", "allowAll": True}]

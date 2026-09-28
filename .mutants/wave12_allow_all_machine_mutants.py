@@ -63,7 +63,11 @@ ON_PATCH = '        patch = {"visibility": "public", "allowAll": True}'
 #: The close.
 CLOSE = '        patch = {"visibility": "private"} if current == "public" else {}'
 #: The one write site.
-WRITE = '    if patch and not _pair_patch_device(device_id, patch):'
+# ⛔ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K1): the write site also refuses
+# to send the ON patch behind an old-tick clear that did not land, so its
+# condition is two lines now. A15/A21 mean what they meant.
+WRITE = ('    if patch and (clear_first and not cleared\n'
+         '                  or not _pair_patch_device(device_id, patch)):')
 #: The leftover clear after the close.
 CLEAR = ('    if target == "private" and leftover:\n'
          '        _pair_patch_device(device_id, {"allowAll": False})\n')
@@ -153,7 +157,8 @@ MUTANTS = [
        '    if target == "private":\n        pass')]),
     ("A21", RESEARCH, "⛔⛔ an EMPTY patch goes out — a Firestore PATCH with no update "
      "mask replaces the whole device document",
-     [(WRITE, '    if not _pair_patch_device(device_id, patch):')]),
+     [(WRITE, '    if (clear_first and not cleared\n'
+              '                  or not _pair_patch_device(device_id, patch)):')]),
     ("A22", RESEARCH, "⛔ `--allow-all no` on a private computer says \"Already set\" "
      "instead of why it is off",
      [('        if target == "private" and allow_all == "no":', '        if False:')]),

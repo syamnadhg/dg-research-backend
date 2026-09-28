@@ -328,6 +328,185 @@ def test_a_sharer_cannot_switch_allow_all(live):
     assert FakeFS.writes == []
 
 
+# ── wave 12 repair 4 (cross-verify K1): an old tick is cleared ALONE first ───
+# ⛔⛔ THE RULES NOW REFUSE A WRITE THAT MAKES A NON-PUBLIC COMPUTER PUBLIC WHILE A
+# STORED `allowAll: true` IS LEFT OUT OF IT — what stops the published agent, an
+# old wheel or an old web tab (they write `visibility` alone) bringing a leftover
+# tick back as an instant door. `allowAll` true→true is not a change the rules can
+# see either, so this bridge's own ON patch would be refused on exactly the
+# computer that carries a tick. It clears it with `allowAll: false` alone first,
+# then writes the ON patch — there and only there.
+#
+# Pinned ON THE WIRE: the real `FirestoreRest` writers run, and only `_request` is
+# replaced, so every PATCH is compared as it would leave — URL, mask order and
+# body. Executed against repair 3: the two K1 cells sent the ON patch alone; every
+# other cell below was already exactly this.
+
+class _WireFS(FirestoreRest):
+    """The real device writers over a recorded wire. `fail` maps the n-th PATCH
+    (0-based) to the exception it raises — after it is recorded as attempted."""
+    sent: list[tuple] = []
+    fail: dict[int, Exception] = {}
+
+    def __init__(self, _token_provider):
+        pass
+
+    def list_devices(self, uid):
+        return [dict(d) for d in FakeFS.devices]
+
+    def _request(self, method, url, json_body=None, **_kw):
+        n = len(_WireFS.sent)
+        _WireFS.sent.append((method, url[len(bridge.config.FIRESTORE_BASE):], json_body))
+        if n in _WireFS.fail:
+            raise _WireFS.fail[n]
+        return {}
+
+
+@pytest.fixture()
+def wire(live, monkeypatch):
+    _WireFS.sent = []
+    _WireFS.fail = {}
+    monkeypatch.setattr(bridge, "FirestoreRest", _WireFS)
+    return live
+
+
+def _b(v):
+    return {"booleanValue": v}
+
+
+def _s(v):
+    return {"stringValue": v}
+
+
+_DOC = "/devices/dev-a1?"
+_W_CLEAR = ("PATCH", _DOC + "updateMask.fieldPaths=allowAll",
+            {"fields": {"allowAll": _b(False)}})
+_W_ON = ("PATCH", _DOC + "updateMask.fieldPaths=visibility&updateMask.fieldPaths=allowAll",
+         {"fields": {"visibility": _s("public"), "allowAll": _b(True)}})
+_W_PUB_CLEAR = ("PATCH", _DOC + "updateMask.fieldPaths=visibility"
+                "&updateMask.fieldPaths=allowAll",
+                {"fields": {"visibility": _s("public"), "allowAll": _b(False)}})
+_W_PUB = ("PATCH", _DOC + "updateMask.fieldPaths=visibility",
+          {"fields": {"visibility": _s("public")}})
+_W_PRIV = ("PATCH", _DOC + "updateMask.fieldPaths=visibility",
+           {"fields": {"visibility": _s("private")}})
+
+# The stored rows, grouped by what the handler reads off them: discovery (by
+# `_discovery_of`, either name) and whether `allowAll` is EXACTLY True.
+_B_GROUPS = {
+    "private-clean": [{"visibility": "private"},
+                      {"visibility": "private", "allowAll": False},
+                      {"visibility": "private", "allowAll": "true"}],
+    "private-ticked": [{"visibility": "private", "allowAll": True},
+                       {"joinPolicy": "private", "allowAll": True},
+                       {"allowAll": True},
+                       {"visibility": "private", "joinPolicy": "public", "allowAll": True}],
+    "public-clean": [{"visibility": "public"}, {"visibility": "public", "allowAll": False}],
+    "public-on": [{"visibility": "public", "allowAll": True},
+                  {"joinPolicy": "public", "allowAll": True}],
+}
+# Every request shape the two clients send.
+_B_REQUESTS = [{"visibility": "public"}, {"visibility": "private"}, {"allowAll": True},
+               {"allowAll": False}, {"visibility": "public", "allowAll": True},
+               {"visibility": "public", "allowAll": False},
+               {"visibility": "private", "allowAll": False}]
+_B_K1 = [_W_CLEAR, _W_ON]
+_B_WRITES = {
+    "private-clean": [[_W_PUB], [], [_W_ON], [], [_W_ON], [_W_PUB], []],
+    "private-ticked": [[_W_PUB_CLEAR], [_W_CLEAR], _B_K1, [_W_CLEAR], _B_K1,
+                       [_W_PUB_CLEAR], [_W_CLEAR]],
+    "public-clean": [[], [_W_PRIV], [_W_ON], [], [_W_ON], [], [_W_PRIV]],
+    "public-on": [[], [_W_PRIV, _W_CLEAR], [], [_W_CLEAR], [], [_W_CLEAR],
+                  [_W_PRIV, _W_CLEAR]],
+}
+_B_MATRIX = [(g, row, body, want)
+             for g, rows in _B_GROUPS.items() for row in rows
+             for body, want in zip(_B_REQUESTS, _B_WRITES[g])]
+
+
+@pytest.mark.parametrize("group, row, body, want", _B_MATRIX,
+                         ids=[f"{g}-{i}" for i, (g, *_r) in enumerate(_B_MATRIX)])
+def test_every_request_sends_exactly_these_patches(wire, group, row, body, want):
+    _owned(**row)
+    r = _vis(wire, **body)
+    assert r.status_code == 200, r.text
+    assert _WireFS.sent == want
+
+
+@pytest.mark.parametrize("row", _B_GROUPS["private-ticked"])
+@pytest.mark.parametrize("body", [{"allowAll": True},
+                                  {"visibility": "public", "allowAll": True}])
+def test_allow_all_on_over_an_old_tick_clears_it_alone_first(wire, row, body):
+    """⛔⛔ THE FINDING'S OWN CASE, from both request shapes: the reply is the
+    ordinary ON reply — the clear is not news to the person."""
+    _owned(**row)
+    r = _vis(wire, **body)
+    assert r.status_code == 200, r.text
+    assert _WireFS.sent == [_W_CLEAR, _W_ON]
+    got = r.json()
+    assert got["changed"] is True
+    assert got["visibility"] == "public" and got["allowAll"] is True
+    assert got["allowAllWas"] is False
+
+
+@pytest.mark.parametrize("err, status, reason, error, vis, aa", [
+    (FirestoreError("denied", status=403), 403, "visibility_refused",
+     "that change was refused — nothing changed", "private", False),
+    (FirestoreError("boom", status=503), 502, "visibility_unconfirmed",
+     "could not confirm that change — it may or may not have been saved", None, None),
+])
+def test_a_failed_clear_sends_nothing_after_it_in_todays_words(wire, err, status, reason,
+                                                               error, vis, aa):
+    """The first write failing is today's failure, word for word — and the ON
+    patch never goes out behind it."""
+    _owned(visibility="private", allowAll=True)
+    _WireFS.fail = {0: err}
+    r = _vis(wire, allowAll=True)
+    assert r.status_code == status
+    assert r.json() == {"reason": reason, "error": error, "visibility": vis,
+                        "allowAll": aa}
+    assert _WireFS.sent == [_W_CLEAR]
+
+
+def test_a_revoked_sign_in_on_the_clear_is_todays_401(wire):
+    _owned(visibility="private", allowAll=True)
+    _WireFS.fail = {0: bridge.RevokedError("gone")}
+    r = _vis(wire, allowAll=True)
+    assert r.status_code == 401
+    assert r.json() == {"error": "session revoked — run /login again"}
+    assert _WireFS.sent == [_W_CLEAR]
+
+
+_TICK = ("an old Allow all tick was cleared, which did nothing while the computer "
+         "was private")
+
+
+@pytest.mark.parametrize("err, status, want", [
+    (FirestoreError("denied", status=403), 403,
+     {"reason": "visibility_refused",
+      "error": "could not turn Allow all on — nothing changed, except that " + _TICK,
+      "visibility": "private", "allowAll": False}),
+    (FirestoreError("boom", status=503), 502,
+     {"reason": "visibility_unconfirmed",
+      "error": "could not confirm Allow all went on — it may or may not have been "
+               "saved. Before it, " + _TICK,
+      "visibility": None, "allowAll": None}),
+    (bridge.RevokedError("gone"), 401,
+     {"error": "session revoked — run /login again. Allow all did not go on; " + _TICK}),
+])
+def test_a_failed_on_after_the_clear_says_allow_all_did_not_go_on(wire, err, status, want):
+    """⛔ THE CLEAR LANDED AND THE ON PATCH DID NOT. Today's "nothing changed"
+    would be false — a tick was cleared — and the person must not read the
+    computer as open. A refusal and a revoked sign-in prove the ON patch did not
+    land; a 5xx proves nothing, and says so."""
+    _owned(visibility="private", allowAll=True)
+    _WireFS.fail = {1: err}
+    r = _vis(wire, allowAll=True)
+    assert r.status_code == status
+    assert r.json() == want
+    assert _WireFS.sent == [_W_CLEAR, _W_ON]
+
+
 # ── rows: the effective allow-all rides on every own row ─────────────────────
 
 @pytest.mark.parametrize("fields, want", [
@@ -569,6 +748,10 @@ OWNED_RESET = dict(OWNED, pairState="awaiting-re-pair")
 # A second computer of the person's own, ready to run.
 OWNED_TWO = {"id": "dev-a3", "name": "Old laptop", "ownerUid": "u1",
              "pairConfirmedAt": True, "lastHeartbeat": 0}
+# A row of the person's own that carries no id — never a target (the router skips
+# it), so it must never count as "their own pick" either (repair 4, K9).
+NO_ID_OWN = {"name": "Half-written", "ownerUid": "u1", "pairConfirmedAt": True,
+             "lastHeartbeat": 0}
 
 _G8_ROWS = [
     # ⛔⛔ wave 12 repair 3 (cross-verify H9): the sole owner mid-Reset routes to
@@ -583,6 +766,20 @@ _G8_ROWS = [
     # run is the router's pick, and is saved, over the one waiting on its re-pair
     ("own-mid-reset-beside-own-ready", [(OWNED_RESET, False), (OWNED_TWO, False),
                                         (JOINED, True)], None, "dev-a3", False),
+    # ⛔⛔ wave 12 repair 4 (cross-verify K9): …but a FRIEND's code-shared computer
+    # that can run does NOT beat the hold. It was the router's pick, the join saved
+    # it, and after the re-pair every unnamed research went to the friend's
+    # computer. Only a computer the person owns outranks their own Reset.
+    ("own-mid-reset-beside-shared", [(OWNED_RESET, True), (SHARED, True),
+                                     (JOINED, True)], None, None, False),
+    ("own-mid-reset-beside-shared-asleep", [(OWNED_RESET, False), (SHARED, False),
+                                            (JOINED, True)], None, None, False),
+    # an id-less row of their own is not a pick, and never hides the hold
+    ("own-mid-reset-beside-an-id-less-own-row", [(OWNED_RESET, True), (NO_ID_OWN, False),
+                                                 (JOINED, True)], None, None, False),
+    # with no Reset of theirs to hold, a friend's computer the router picks is kept
+    # as before — the hold outranks it, nothing else does
+    ("shared-only-no-reset", [(SHARED, True), (JOINED, True)], None, "dev-b2", False),
     # the sole owner — the case the finding names, in every power state
     ("sole-owner-online", [(OWNED, True), (JOINED, True)], None, "dev-a1", False),
     ("sole-owner-asleep-joined-online", [(OWNED, False), (JOINED, True)], None,
@@ -637,6 +834,21 @@ def test_a_join_during_the_owners_reset_leaves_their_research_on_their_computer(
                                     live.box["sel"]) == (None, "selection_not_ready", False)
     # The re-pair lands: the person's computer is active again, and both are awake.
     FakeFS.devices = [_online(OWNED), _online(JOINED)]
+    assert _routed_after_join(live) == "dev-a1"
+
+
+def test_a_join_during_the_owners_reset_never_saves_a_friends_computer(live, monkeypatch):
+    """⛔⛔ WAVE 12 REPAIR 4 (cross-verify K9), THE FINDING'S OWN MEASUREMENT. With
+    their own computer mid-Reset and a friend's code-shared one online, the router
+    picked the friend's — and the join saved it, so after the re-pair every
+    unnamed research went to the friend's computer and AI accounts. Executed
+    against repair 3: the join saved dev-b2 and the router then gave dev-b2."""
+    FakeFS.devices = [dict(OWNED_RESET), _online(SHARED), _online(JOINED)]
+    got = _ask(live, monkeypatch).json()
+    assert got["status"] == "joined" and got["selected"] is False
+    assert live.box["sel"] == "dev-a1"
+    # The re-pair lands: all three awake, and the research comes home.
+    FakeFS.devices = [_online(OWNED), _online(SHARED), _online(JOINED)]
     assert _routed_after_join(live) == "dev-a1"
 
 

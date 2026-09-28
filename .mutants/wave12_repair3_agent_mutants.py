@@ -57,8 +57,13 @@ SUITES = {
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
-_HOLD = ('                if routed is None:\n'
-         '                    routed = _own_reset_hold(before, sess.uid)\n')
+# ⛔ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K9): the hold now also outranks a
+# pick that is not the person's own (a friend's code-shared computer), so the
+# gate is `routed not in mine` rather than `routed is None`. H1 still removes the
+# hold; H7 still lets it beat every pick. K9's own mutants are in
+# wave12_repair4_writers_mutants.
+_HOLD = ('                if routed not in mine:\n'
+         '                    routed = _own_reset_hold(before, sess.uid) or routed\n')
 _WINDOW = '        if deadline is None or now < deadline + _RESET_HOLD_CLOCK_GRACE_MS:\n'
 
 MUTANTS = [
@@ -87,7 +92,8 @@ MUTANTS = [
     ("H7", BRIDGE, "⛔ the hold beats the router's own pick — a computer of theirs that "
      "can run is passed over for the one waiting on its re-pair, and every run is "
      "refused until then",
-     [(_HOLD, '                routed = _own_reset_hold(before, sess.uid) or routed\n')]),
+     [(_HOLD, '                if True:\n'
+              '                    routed = _own_reset_hold(before, sess.uid) or routed\n')]),
 
     # ═══ S — sent or not, on the wire (H18) ═══════════════════════════════════
     ("S1", BRIDGE, "⛔⛔ THE FINDING, PUT BACK: a refused connection, a DNS failure and a "

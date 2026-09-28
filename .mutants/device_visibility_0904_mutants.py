@@ -161,7 +161,11 @@ VALIDATE = ('        if _vis != _VISIBILITY_SHOW and _vis not in _VISIBILITY_VAL
 # measures the new allow-all guards on the same lines. (That claim was false of
 # V4, which then measured the close only — split into V4a/V4b 2026-09-27.)
 #: The single write site.
-WRITE = '    if patch and not _pair_patch_device(device_id, patch):'
+# ⛔ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K1): the write site also refuses
+# to send the ON patch behind an old-tick clear that did not land, so its
+# condition is two lines now. V5/O1/O2 mean what they meant.
+WRITE = ('    if patch and (clear_first and not cleared\n'
+         '                  or not _pair_patch_device(device_id, patch)):')
 #: The private "already set" shortcut — a close only when there is one to make.
 CLOSE_SHORTCUT = '        patch = {"visibility": "private"} if current == "public" else {}'
 #: The public "already set" shortcut.
@@ -306,7 +310,7 @@ MUTANTS = [
     ("V5", "under",
      "⛔ a refused write reports success. `--visibility public` then exits 0 "
      "having changed nothing, which is the answer a script reads",
-     [(WRITE, '    if patch and not _pair_patch_device(device_id, patch) and False:')]),
+     [(WRITE, WRITE[:-1] + ' and False:')]),
     ("V6", "under",
      "⛔⛔ the refusal goes back to ASSERTING a state. `_pair_patch_device` returns "
      "False for four situations and only two of them prove the write did not land "
