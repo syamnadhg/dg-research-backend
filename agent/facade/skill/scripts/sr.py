@@ -6487,8 +6487,12 @@ _AA_GRAMMAR = tuple((d, re.compile(p.format(SET=_AA_SETTING, S=_AA_SUBJ, T=_AA_O
     # myself` is the one spelling of them that says "by hand".
     # ⛔ `each request` is `each person`'s twin, a plain OFF (repair 5, router-6):
     # `go back to approving each request` reached the catch-all.
+    # ⛔ …but only with `again` / `back` after a bare `approve` (last check, 09-28):
+    # `just approve each request from now on` reads as the ON wish, like K2's
+    # `approve every request going forward`, and switched Allow all OFF unasked.
     ("off", r"(?:go\s+back\s+to\s+approving\s+(?:people|each\s+person|each\s+request){A}?{T}{A}?"
-            r"|approve\s+(?:people|each\s+person|each\s+request)(?:{A}{T}|{T}{A})"
+            r"|approve\s+(?:people|each\s+person)(?:{A}{T}|{T}{A})"
+            r"|approve\s+each\s+request(?:\s+(?:again|back){T}|{T}\s+(?:again|back))"
             r"|(?:go\s+back\s+to\s+approving|approve)\s+(?:everyone|everybody|every\s+person|"
             r"each\s+request|every\s+request)(?:\s+myself{A}?{T}|{T}\s+myself))"),  # approve people again
     ("off", r"(?:make|have)\s+(?:everyone|everybody|people|anyone|them)\s+ask(?:\s+first|\s+again)?"
@@ -7609,7 +7613,32 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return ["device-allow-all", "no"] + ([_aa_obj] if _aa_obj else []), None
         return None, [_NL_CONFIRMS["device-allow-all"].format(
             name=f"“{_aa_obj}”" if _aa_obj else "that computer")]
-    if _AA_MENTION.search(_aa_src):
+    # ⛔⛔ A RUN CONTROL NAMING A RUN IS THE RUN'S, NOT THE SETTING'S (last check,
+    # 09-28): `pause the auto-approve research` and `stop the Slack channels that
+    # let anyone join run` reached the catch-all below, so a run whose TITLE holds
+    # Allow-all words could be started but never stopped or paused through `do`.
+    # A message that OPENS with a run verb ON A RUN — `the / my / that / this …` —
+    # and names a run (run / research, never "research computer"; the one about)
+    # goes on to the run-control branches, as it did at a3b4466, when the Allow-all
+    # words are PART OF THAT RUN'S NAME: before the run word (`the auto-approve
+    # run`) or after it as the title (`the paused run people joining without
+    # permission`). ⛔ Never when a clause follows the run word — `stop the Mars run
+    # and turn off allow all`, `pause the Mars run when anyone can join`: two
+    # requests stay read-only, neither half acted on (repair 3, G15/H5). ⛔ A verb
+    # straight on the setting (`pause allow all on my mac so the run can finish`)
+    # stays the setting's: it is not a run's name.
+    _aa_runctl = False
+    if re.match(_NL_LEAD_IN + r"(?:please\s+)?(?:(?:stop|end|abort|cancel|pause|hold\s+(?:on|it)|"
+                r"resume|unpause|retry|try\s+again)\s+(?:the|my|that|this)\b"
+                r"|continue\s+the\s+paused\b)", low):
+        _aa_rws = list(re.finditer(r"\b(?:runs?|research(?!\s+(?:computers?|machines?|pcs?|macs?)\b)|"
+                                   r"the\s+one\s+about)\b", low))
+        if _aa_rws:
+            _aa_post = low[_aa_rws[-1].end():].strip(" .!?")
+            if not re.match(r"(?:,|;|and|then|also|plus|but|when|while|if|so|because|since|"
+                            r"until|once|after|before)\b", _aa_post):
+                _aa_runctl = bool(_aa_post) or bool(_AA_MENTION.search(low[:_aa_rws[-1].start()]))
+    if _AA_MENTION.search(_aa_src) and not _aa_runctl:
         # ⛔ …an INSTRUCTION to sign in, never a question that mentions one (repair
         # 4, K18): `can people join my mac without a login?` started a sign-in.
         # (`can u sign me in …` is a request, like `can you …` — repair 5.)

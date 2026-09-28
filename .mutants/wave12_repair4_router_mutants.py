@@ -64,8 +64,9 @@ MUTANTS = [
     # is back in the plain OFF alternatives beside `each person`. Same defects.
     ("K2a", SR, "⛔⛔ `approve everyone each time` / `approve every request going forward` "
      "switch Allow all OFF, unconfirmed — the ON wish read as its opposite",
-     [('            r"|approve\\s+(?:people|each\\s+person|each\\s+request)(?:{A}{T}|{T}{A})"\n',
-       '            r"|approve\\s+(?:people|each\\s+person|each\\s+request|everyone|everybody|'
+     # ⭐ RE-AIMED 2026-09-28 (last check): `each request` moved to its own line.
+     [('            r"|approve\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n',
+       '            r"|approve\\s+(?:people|each\\s+person|everyone|everybody|'
        'every\\s+request)(?:{A}{T}|{T}{A})"\n')]),
     ("K2b", SR, "⛔ `go back to approving everyone` switches Allow all OFF with no `myself`",
      [('    ("off", r"(?:go\\s+back\\s+to\\s+approving\\s+(?:people|each\\s+person|each\\s+request)'

@@ -413,3 +413,84 @@ FLIPPED_R5 = [
 @pytest.mark.parametrize("text, want, was, why", FLIPPED_R5)
 def test_repair5_flips_five_code_rows(text, want, was, why):
     assert _route(text) == want, (text, _route(text), why)
+
+
+# ── the last check before the push (2026-09-28) ─────────────────────────────────
+# ⛔⛔ paid-runs-1: a run whose TITLE holds Allow-all words could be started through
+# `do` but never stopped, paused, resumed or retried — the Allow-all arm's
+# read-only catch-all took the message first. Each row routes as it did at a3b4466.
+_RUNCTL_ON_ALLOW_ALL_TITLES = [
+    ("pause the auto-approve research", 'ARGV:["pause", "auto-approve"]'),
+    ("stop the auto-approve run", "STOP:auto-approve"),
+    ("resume the auto-approve run", 'ARGV:["resume", "auto-approve"]'),
+    ("retry the auto-approve research", 'ARGV:["retry", "auto-approve"]'),
+    ("stop the Teams auto-join meetings run", "STOP:Teams auto-join meetings"),
+    ("pause the FDA drugs that require approval research",
+     'ARGV:["pause", "FDA drugs that require approval"]'),
+    ("stop the Slack channels that let anyone join run",
+     "STOP:Slack channels that let anyone join"),
+    ("cancel my auto-joining wifi research", "STOP:auto-joining wifi"),
+    ("continue the paused run people joining without permission",
+     'ARGV:["resume", "people joining without permission"]'),
+]
+
+
+@pytest.mark.parametrize("text, want", _RUNCTL_ON_ALLOW_ALL_TITLES)
+def test_last_check_a_run_named_with_allow_all_words_can_be_controlled(text, want):
+    assert _route(text) == want, (text, _route(text))
+
+
+@pytest.mark.parametrize("text", ["stop the auto-approve run",
+                                  "stop the Slack channels that let anyone join run"])
+def test_last_check_stopping_such_a_run_asks_first_and_never_touches_allow_all(bridge, text):
+    _do(text)
+    assert bridge.posts == [], (text, bridge.posts)
+    assert "Stop “" in bridge.out()
+
+
+# The setting itself is still the setting: a whole command, and no run word.
+@pytest.mark.parametrize("text, want", [
+    ("stop letting anyone join my mac", "OFF"),
+    ("stop allow all on my mac", "OFF"),
+    ("stop letting anyone join the research computer", "OFF:research computer"),
+])
+def test_last_check_the_setting_s_own_off_words_are_still_the_setting(text, want):
+    assert _route(text) == want, (text, _route(text))
+
+
+# ⛔ …and a message that is NOT a run control stays read-only, however it mentions
+# a run or research: a verb straight on the setting, or "research computer".
+@pytest.mark.parametrize("text", [
+    "pause allow all on my mac so the run can finish",
+    "stop letting anyone join the research computer and keep it listed",
+    "stop letting people join my mac while the run is going",
+    # "research computer / machine" is a computer, never a run's name
+    "stop the research computer from letting anyone join",
+    "pause the research machine so nobody can auto-join",
+])
+def test_last_check_a_setting_message_that_mentions_a_run_is_not_a_run_control(bridge, text):
+    got = _route(text)
+    assert not got.startswith(("STOP", 'ARGV:["pause"', 'ARGV:["resume"', 'ARGV:["retry"')), (text, got)
+    _do(text)
+    assert bridge.posts == [], (text, bridge.posts)
+
+
+# ⛔ last-repair-1: `approve each request` with a from-now-on tail reads as the ON
+# wish (K2's `approve every request going forward`) — never the unconfirmed OFF.
+@pytest.mark.parametrize("text", ["just approve each request from now on",
+                                  "approve each request going forward",
+                                  "approve each request each time",
+                                  "approve each request from now on for my mac"])
+def test_last_check_approving_each_request_from_now_on_is_never_the_off_switch(bridge, text):
+    assert not _route(text).startswith("OFF"), (text, _route(text))
+    _do(text)
+    assert bridge.posts == [], (text, bridge.posts)
+
+
+@pytest.mark.parametrize("text", ["approve each request again",
+                                  "go back to approving each request",
+                                  "go back to approving each request from now on"])
+def test_last_check_each_request_again_is_still_off(bridge, text):
+    assert _route(text) == "OFF", (text, _route(text))
+    _do(text)
+    assert bridge.posts == [_OFF_POST], (text, bridge.posts)

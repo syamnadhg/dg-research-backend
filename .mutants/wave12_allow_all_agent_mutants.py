@@ -356,8 +356,9 @@ MUTANTS = [
      "the computer unconfirmed, 'let anyone use my computer' raises the APPROVE confirm",
      [('    if _aa_cmd:\n        _aa_dir, _aa_obj = _aa_cmd\n',
        '    if False:\n        _aa_dir, _aa_obj = _aa_cmd\n'),
-      ('    if _AA_MENTION.search(_aa_src):\n',
-       '    if False and _AA_MENTION.search(_aa_src):\n')]),
+      # ⭐ RE-AIMED 2026-09-28 (last check): the gate carries `and not _aa_runctl`.
+      ('    if _AA_MENTION.search(_aa_src) and not _aa_runctl:\n',
+       '    if False and _AA_MENTION.search(_aa_src) and not _aa_runctl:\n')]),
     ("R2", SR, "⛔ OFF asks the ON confirm",
      [('        if _aa_dir == "off":\n            return ["device-allow-all", "no"]',
        '        if False:\n            return ["device-allow-all", "no"]')]),

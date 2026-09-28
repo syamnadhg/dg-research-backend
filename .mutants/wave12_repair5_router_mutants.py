@@ -167,8 +167,10 @@ MUTANTS = [
 
     # ═══ R6 — `each request`; `can u` ══════════════════════════════════════════
     ("R6a", SR, "⛔ `approve each request again` changes nothing",
-     [('            r"|approve\\s+(?:people|each\\s+person|each\\s+request)(?:{A}{T}|{T}{A})"\n',
-       '            r"|approve\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n')]),
+     # ⭐ RE-AIMED 2026-09-28 (last check, last-repair-1): `each request` has its own
+     # again/back-only alternative now. Same defect: that alternative is gone.
+     [('            r"|approve\\s+each\\s+request(?:\\s+(?:again|back){T}|{T}\\s+(?:again|back))"\n',
+       '')]),
     ("R6b", SR, "⛔ `go back to approving each request` changes nothing",
      [('    ("off", r"(?:go\\s+back\\s+to\\s+approving\\s+(?:people|each\\s+person|each\\s+request)'
        '{A}?{T}{A}?"\n',
@@ -191,6 +193,28 @@ MUTANTS = [
     ("R7c", SR, "⛔ a straight quote's partner is not counted — `research \"tesla\" and \"ford\"` "
      "loses its last quote",
      [('            return s[:-1].count(\'"\') % 2 == 1\n', '            return False\n')]),
+    # ═══ the last check before the push (2026-09-28) ══════════════════════════
+    ("L1", SR, "⛔⛔ paid-runs-1: a run whose title holds Allow-all words cannot be stopped "
+     "or paused through `do` — the read-only catch-all takes it",
+     [('    if _AA_MENTION.search(_aa_src) and not _aa_runctl:\n',
+       '    if _AA_MENTION.search(_aa_src):\n')]),
+    ("L2", SR, "⛔ a verb straight on the setting counts as a run control — `pause allow all "
+     "on my mac so the run can finish` pauses a run called “mac so the run can finish”",
+     [('                r"resume|unpause|retry|try\\s+again)\\s+(?:the|my|that|this)\\b"\n',
+       '                r"resume|unpause|retry|try\\s+again)\\b"\n')]),
+    ("L3", SR, "⛔ “research computer” counts as a run — `stop the research computer from "
+     "letting anyone join` asks to stop a run by that name",
+     [('research(?!\\s+(?:computers?|machines?|pcs?|macs?)\\b)|', 'research|')]),
+    ("L6", SR, "⛔⛔ a clause after the run word no longer stops the exception — `pause the run "
+     "and turn off allow all` PAUSES and drops the Allow-all half (repair 3's two-request rule)",
+     [('            if not re.match(r"(?:,|;|and|then|also|plus|but|when|while|if|so|because|since|"\n'
+       '                            r"until|once|after|before)\\b", _aa_post):\n',
+       '            if True:\n')]),
+    ("L4", SR, "⛔ last-repair-1: `just approve each request from now on` switches Allow all "
+     "OFF unconfirmed again",
+     [('            r"|approve\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n'
+       '            r"|approve\\s+each\\s+request(?:\\s+(?:again|back){T}|{T}\\s+(?:again|back))"\n',
+       '            r"|approve\\s+(?:people|each\\s+person|each\\s+request)(?:{A}{T}|{T}{A})"\n')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

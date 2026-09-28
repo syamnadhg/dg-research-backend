@@ -95,13 +95,15 @@ MUTANTS = [
     # ═══ C — the arm owns every message with Allow-all words (H1, H4, H5) ═════
     ("C1", SR, "⛔⛔ H1 BROUGHT BACK: a message with hide words falls to the visibility clause — "
      "`turn off allow all on my mac but keep it listed` HIDES the computer, unconfirmed",
-     [('    if _AA_MENTION.search(_aa_src):\n',
-       '    if _AA_MENTION.search(_aa_src) and not _hiding_kw:\n')]),
+     # ⭐ RE-AIMED 2026-09-28 (last check): the gate carries `and not _aa_runctl`.
+     [('    if _AA_MENTION.search(_aa_src) and not _aa_runctl:\n',
+       '    if _AA_MENTION.search(_aa_src) and not _aa_runctl and not _hiding_kw:\n')]),
     ("C2", SR, "⛔⛔ H4/H5 BROUGHT BACK: a run control, an artefact or an unlink beside the words "
      "keeps its own route — `forget it, go back to approving people` raises the nameless "
      "approve, `pause the Mars run when anyone can join` PAUSES",
-     [('    if _AA_MENTION.search(_aa_src):\n',
-       '    if _AA_MENTION.search(_aa_src) and not (_unlink_kw or _control_kw or _artefact_kw):\n')]),
+     # ⭐ RE-AIMED 2026-09-28 (last check): the gate carries `and not _aa_runctl`.
+     [('    if _AA_MENTION.search(_aa_src) and not _aa_runctl:\n',
+       '    if _AA_MENTION.search(_aa_src) and not _aa_runctl and not (_unlink_kw or _control_kw or _artefact_kw):\n')]),
     ("C3", SR, "⛔ H7: `ask for` is a joiner's verb again — the owner's `ask for approval before "
      "anyone can join my mac` gets the list of strangers' computers",
      [('_AA_JOINER = re.compile(r"\\b(?:join|borrow|ask\\s+to\\s+(?:use|join)|request\\s+access)\\b"',
