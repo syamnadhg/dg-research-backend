@@ -386,8 +386,9 @@ MUTANTS = [
     ("R6", SR, "⛔ a question ACTS instead of listing — 'turn off allow all on my mac?' "
      "switches it off",
      [('    if not cmd or question:\n', '    if not cmd:\n')]),
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-6): `can u` is `can you`.
     ("R7", SR, "⛔ 'can you let anyone join my mac' is read as a question",
-     [('                      r"|(?P<you>(?:can|could|would|will)\\s+you\\b)[\\s,]*(?:please\\b[\\s,]*)?"\n',
+     [('                      r"|(?P<you>(?:can|could|would|will)\\s+(?:you|u)\\b)[\\s,]*(?:please\\b[\\s,]*)?"\n',
        '                      r"|(?P<you>NEVER_R7)"\n')]),
     ("R8", SR, "⛔ 'let anyone join all my computers' switches one of them",
      [('    if subj and re.fullmatch(_AA_SET_SUBJ, subj.group(0)):\n        return "set", ""\n',
@@ -426,9 +427,11 @@ MUTANTS = [
     # inside the one-computer test (`_JOIN_NOT_ONE`). Same defect.
     # ⛔ RE-AIMED AGAIN 2026-09-27 (wave 12 repair 4, K13): the list goes on to the
     # other possessives and the plural demonstratives. Same defect.
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-3): somebody else's
+    # possessives moved to `_JOIN_SOMEBODYS`; the person's own stay in this list.
     ("R15", SR, "⛔ 'join my mac' files an ask for the asker's OWN computer",
-     [('                           r"my|our|mine|me|us|you|this|your|yours|his|her|hers|their|"',
-       '                           r"me|us|you|this|your|yours|his|her|hers|their|"')]),
+     [('                           r"my|our|mine|me|us|you|this)\\b")',
+       '                           r"me|us|you|this)\\b")')]),
     # ⛔ R16 RE-AIMED 2026-09-27 (repair 2): the capture is gated by `_join_kw` now.
     # ⛔ RE-AIMED AGAIN 2026-09-27 (repair 3): the whole-message join feeds the
     # capture first. Same defect: the join is read but captures nothing.

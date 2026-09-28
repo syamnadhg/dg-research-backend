@@ -164,20 +164,25 @@ MUTANTS = [
      # ⚠ RE-ANCHORED 2026-09-26: the lookahead now also excludes the app words;
      # and 2026-09-27, when they became `_app_words`, reached past model words;
      # and 2026-09-27 (wave 12 repair 4, K14), when the app word's next clause was
-     # read across a comma or a `but` — one more line in the same lookahead.
+     # read across a comma or a `but` — one more line in the same lookahead;
+     # and 2026-09-28 (wave 12 repair 5, router-4), when what the app says had to
+     # be about reaching the computer — one more line again.
      [("        rf\"(?!\\s*['’]s\\b|\\s+(?:account|email|google|gmail|login|profile)\\b\"\n"
        "        rf\"|(?:\\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\\s+{_app_words}\\b\"\n"
        "        rf\"(?!\\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\\b\"\n"
        "        rf\"|\\s*,?\\s+(?:(?:but|and|yet|though|tho)\\s+)?(?:(?:it|that|this|which|the\\s+{_app_words})\\s+)?\"\n"
-       "        rf\"(?:says?|said|shows?|showed|showing)\\b))\", low)",
+       "        rf\"(?:says?|said|shows?|showed|showing)\\s+(?:that\\s+)?(?:(?:it['’]s|it\\s+is|it)\\s+)?(?:as\\s+)?\"\n"
+       "        rf\"(?:offline|online|disconnected|not\\s+connected|unreachable|asleep)\\b))\", low)",
        "        rf\"\", low)")]),
-    # ⚠ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K14): the same extra line.
+    # ⚠ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K14): the same extra line; and
+    # 2026-09-28 (wave 12 repair 5, router-4) the reachability line after it.
     ("R9", SR, "⛔ 'am I signed in to the desktop APP?' lists the computers again — a "
      "sign-in question about this chat (Windows review, 2026-09-26)",
      [("|login|profile)\\b\"\n        rf\"|(?:\\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\\s+{_app_words}\\b\"\n"
        "        rf\"(?!\\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\\b\"\n"
        "        rf\"|\\s*,?\\s+(?:(?:but|and|yet|though|tho)\\s+)?(?:(?:it|that|this|which|the\\s+{_app_words})\\s+)?\"\n"
-       "        rf\"(?:says?|said|shows?|showed|showing)\\b))\", low)",
+       "        rf\"(?:says?|said|shows?|showed|showing)\\s+(?:that\\s+)?(?:(?:it['’]s|it\\s+is|it)\\s+)?(?:as\\s+)?\"\n"
+       "        rf\"(?:offline|online|disconnected|not\\s+connected|unreachable|asleep)\\b))\", low)",
        "|login|profile)\\b)\", low)")]),
     ("R15", SR, "⛔⛔ the lookahead reads one word past the machine noun again — 'am I "
      "signed in to the Mac desktop app?' lists the computers (Windows review r2)",
@@ -185,11 +190,14 @@ MUTANTS = [
        "|\\s+{_app_words}\\b\"")]),
     # ⚠ RE-ANCHORED 2026-09-27 (wave 12 repair 4, K14): the next-clause test gained
     # a second alternative (across a comma or a `but`); the mutant removes both.
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-4): that alternative now
+    # ends on a reachability word, one more line.
     ("R17", SR, "⛔⛔ an app word that opens the next clause declines the computer — 'are "
      "you connected to my mac mini app says its offline?' answers the account line alone",
      [("\"\n        rf\"(?!\\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\\b\"\n"
        "        rf\"|\\s*,?\\s+(?:(?:but|and|yet|though|tho)\\s+)?(?:(?:it|that|this|which|the\\s+{_app_words})\\s+)?\"\n"
-       "        rf\"(?:says?|said|shows?|showed|showing)\\b))\", low)",
+       "        rf\"(?:says?|said|shows?|showed|showing)\\s+(?:that\\s+)?(?:(?:it['’]s|it\\s+is|it)\\s+)?(?:as\\s+)?\"\n"
+       "        rf\"(?:offline|online|disconnected|not\\s+connected|unreachable|asleep)\\b))\", low)",
        ")\", low)")]),
     ("R10", SR, "⛔⛔ the app question in another spelling misses again — 'am I logged "
      "into the mac app?' reaches the catch-all, '…into the Mac version?' prints the "

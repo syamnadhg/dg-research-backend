@@ -113,8 +113,9 @@ PINNED = [
     ('join using code K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
     ('K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # F5
     ('please let me join K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
-    # ⛔ `join K7XQ9B2M` FLIPPED 2026-09-27 (wave 12 repair 4, K3): no dash, not the
-    # access code's shape — test_allow_all_repair4_0927 FLIPPED_R4.
+    # ⛔ `join K7XQ9B2M` FLIPPED 2026-09-27 (wave 12 repair 4, K3) to the catch-all,
+    # and BACK to ADD 2026-09-28 (wave 12 repair 5, router-2): a digit code pairs
+    # without its dash — test_allow_all_repair5_0928 FLIPPED_R5.
     ('join WDJB-MJHT', 'ADD:WDJB-MJHT'),  # t6
     ('sign in with WDJB-MJHT and join the Studio PC', 'ADD:WDJB-MJHT'),  # t6
     ('join bcdf-ghjk', 'ADD:bcdf-ghjk'),  # t6
@@ -187,7 +188,8 @@ PINNED = [
     ('join a computer', 'CATCH'),  # t10
     ('join K7XQ 9B2M', 'CATCH'),  # t6
     ('join K7XQ-9B2M — my friend gave it to me', 'CATCH'),  # t6
-    ('join K7XQ–9B2M', 'CATCH'),  # t6
+    # ⛔ `join K7XQ–9B2M` (a phone's en dash) FLIPPED 2026-09-28 (wave 12 repair 5,
+    # router-2) from the catch-all to ADD — test_allow_all_repair5_0928 FLIPPED_R5.
     ('join me on the Studio PC', 'CATCH'),  # t10
     ('join the research on the Studio PC', 'CATCH'),  # t10
     ('join using K7XQ-9B2M', 'CATCH'),  # t6

@@ -172,10 +172,12 @@ MUTANTS = [
     # ⛔ F14 RE-AIMED 2026-09-27 (wave 12 repair 4, K2): the OFF row's `approve people`
     # alternative no longer carries everyone/every request (they need `myself`).
     # Same defect.
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-6): `each request` is back
+    # beside `each person` in that alternative.
     ("F14", SR, "⛔⛔ `I want to approve people on my mac again` raises the approve confirm, "
      "whose nameless yes admits the one waiting stranger",
-     [('            r"|approve\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n',
-       '            r"|NEVER_F14\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n'),
+     [('            r"|approve\\s+(?:people|each\\s+person|each\\s+request)(?:{A}{T}|{T}{A})"\n',
+       '            r"|NEVER_F14\\s+(?:people|each\\s+person|each\\s+request)(?:{A}{T}|{T}{A})"\n'),
       ('    + r"|\\bapprov(?:e|ing)\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n',
        '    + r"|\\bNEVER_F14B\\s+(?:people|each\\s+person|every\\s+person|everyone|everybody|"\n')]),
 

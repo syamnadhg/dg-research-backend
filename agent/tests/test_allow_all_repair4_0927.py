@@ -183,9 +183,12 @@ _K3_NOT_A_PAIRING = [
     ("borrow “K7XQ-9B2M”", "ASK:K7XQ-9B2M"),
     ("borrow tech-debt", "ASK:tech-debt"),
     ("status of support request AB12CD34", 'ARGV:["status", "support request AB12CD34"]'),
-    ("can I borrow K7XQ-9B2M?", "ASK:K7XQ-9B2M"),
-    ("borrow K7XQ-9B2M?", "ASK:K7XQ-9B2M"),
-    ("my friend wants to borrow K7XQ-9B2M", "ASK:K7XQ-9B2M"),
+    # ⛔ FLIPPED 2026-09-28 (wave 12 repair 5, router-2): a question or a statement
+    # naming an unquoted code is no ask either — the ask's yes posts the code as a
+    # device id (H17). Each was "ASK:K7XQ-9B2M"; test_allow_all_repair5_0928 FLIPPED_R5.
+    ("can I borrow K7XQ-9B2M?", "NOT_ASK_OR_ADD"),
+    ("borrow K7XQ-9B2M?", "NOT_ASK_OR_ADD"),
+    ("my friend wants to borrow K7XQ-9B2M", "NOT_ASK_OR_ADD"),
 ]
 _K3_PAIRS = [("borrow K7XQ-9B2M", "K7XQ-9B2M"), ("request access to K7XQ-9B2M", "K7XQ-9B2M"),
              ("ask for K7XQ-9B2M", "K7XQ-9B2M"), ("ask to use K7XQ-9B2M", "K7XQ-9B2M"),
@@ -201,7 +204,11 @@ def test_k3_a_name_a_question_or_a_statement_is_never_paired(bridge, text, want)
     of the claim route's tries, and with nothing saved the pairing could pick the
     stranger's computer. None of them pairs; `do` posts nothing (an ask confirm
     only asks)."""
-    assert _route(text) == want, (text, _route(text))
+    got = _route(text)
+    if want == "NOT_ASK_OR_ADD":
+        assert not got.startswith(("ASK", "ADD")), (text, got)
+    else:
+        assert got == want, (text, got)
     _do(text)
     assert bridge.posts == [], (text, bridge.posts)
 
@@ -232,6 +239,13 @@ _K4_RESEARCH = [
     "research “Allow All Lab” EV batteries on my mac",
     "research why companies let anyone join their Slack",
     "research how to let anyone join a Slack workspace from my laptop",
+    # ⚠ ADDED 2026-09-28 (wave 12 repair 5): repair 5 made the machine word END the
+    # people-join phrase, so the domain row above no longer measures K4c (nobody
+    # joining); this one ends on `without`. And a topic's quote now comes off only
+    # with its partner, so the EV row no longer measures K17; a topic quoted WHOLE
+    # does — its quotes come off, and only the blanking before that keeps it a topic.
+    "research how to join my laptop without admin rights",
+    "research “how Allow All Lab uses my laptop”",
 ]
 _K5_OWN = [
     "look into why people join my mac without my permission",
@@ -450,14 +464,17 @@ def test_k18_an_instruction_to_sign_in_still_signs_in(bridge, text):
 # dashed shape (or the connection code's): a quoted token is a name (it asks), and
 # an access code retyped without its dash is not guessed at — the same rule
 # `_NL_CAPS_CODE_RE` states for a code said alone (base a3b4466: the catch-all).
+# ⛔ `join K7XQ9B2M` (→ CATCH here) FLIPPED BACK 2026-09-28 (wave 12 repair 5,
+# router-2): a code WITH a digit pairs without its dash — rule 1 pairs it said
+# alone, SKILL.md allows it, and 413e986 paired it after `join`. The dash rule above
+# holds for a code with no digit. test_allow_all_repair5_0928 FLIPPED_R5.
 FLIPPED_R4 = [
     ('join "K7XQ-9B2M"', "ASK:K7XQ-9B2M", "ADD:K7XQ-9B2M", "K3: a quoted token is a name"),
-    ("join K7XQ9B2M", "CATCH", "ADD:K7XQ9B2M", "K3: no dash, not the shape"),
 ]
 
 
 @pytest.mark.parametrize("text, want, was, why", FLIPPED_R4)
-def test_repair4_flips_two_code_rows_and_neither_pairs(bridge, text, want, was, why):
+def test_repair4_flips_a_code_row_and_it_does_not_pair(bridge, text, want, was, why):
     assert _route(text) == want, (text, _route(text), why)
     _do(text)
     assert bridge.posts == [], (text, bridge.posts)

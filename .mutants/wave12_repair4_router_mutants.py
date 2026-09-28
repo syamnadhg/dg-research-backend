@@ -60,15 +60,18 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 MUTANTS = [
     # ═══ K2 — everyone / every request is OFF only with `myself` ═══════════════
+    # ⚠ K2a/K2b RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-6): `each request`
+    # is back in the plain OFF alternatives beside `each person`. Same defects.
     ("K2a", SR, "⛔⛔ `approve everyone each time` / `approve every request going forward` "
      "switch Allow all OFF, unconfirmed — the ON wish read as its opposite",
-     [('            r"|approve\\s+(?:people|each\\s+person)(?:{A}{T}|{T}{A})"\n',
-       '            r"|approve\\s+(?:people|each\\s+person|everyone|everybody|every\\s+request)'
-       '(?:{A}{T}|{T}{A})"\n')]),
+     [('            r"|approve\\s+(?:people|each\\s+person|each\\s+request)(?:{A}{T}|{T}{A})"\n',
+       '            r"|approve\\s+(?:people|each\\s+person|each\\s+request|everyone|everybody|'
+       'every\\s+request)(?:{A}{T}|{T}{A})"\n')]),
     ("K2b", SR, "⛔ `go back to approving everyone` switches Allow all OFF with no `myself`",
-     [('    ("off", r"(?:go\\s+back\\s+to\\s+approving\\s+(?:people|each\\s+person){A}?{T}{A}?"\n',
-       '    ("off", r"(?:go\\s+back\\s+to\\s+approving\\s+(?:people|each\\s+person|everyone|'
-       'every\\s+request){A}?{T}{A}?"\n')]),
+     [('    ("off", r"(?:go\\s+back\\s+to\\s+approving\\s+(?:people|each\\s+person|each\\s+request)'
+       '{A}?{T}{A}?"\n',
+       '    ("off", r"(?:go\\s+back\\s+to\\s+approving\\s+(?:people|each\\s+person|each\\s+request|'
+       'everyone|every\\s+request){A}?{T}{A}?"\n')]),
     ("K2c", SR, "⛔ `approve everyone myself` — the one spelling that says by hand — is not "
      "the OFF command",
      [('            r"each\\s+request|every\\s+request)(?:\\s+myself{A}?{T}|{T}\\s+myself))"),',
@@ -81,9 +84,11 @@ MUTANTS = [
     ("K3b", SR, "⛔⛔ the code is read from anywhere — `my friend wants to borrow K7XQ-9B2M` pairs",
      [('    m = None if question else _ASK_CODE_WHOLE.fullmatch(s)\n',
        '    m = None if question else _ASK_CODE_WHOLE.search(s)\n')]),
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-2): the shape test moved
+    # into `_is_ask_code`, which the ask's code veto reads too. Same defect.
     ("K3c", SR, "⛔⛔ any 8 characters are a code — `ask to use Studio22` pairs a computer's name",
-     [('    return tok if (_ASK_CODE_SHAPE.fullmatch(shape) or _NL_CONNECTION_CODE_RE.fullmatch(tok)) else ""\n',
-       '    return tok if (_NL_CODE_RE.fullmatch(tok) or _NL_CONNECTION_CODE_RE.fullmatch(tok)) else ""\n')]),
+     [('    return bool(_ASK_CODE_SHAPE.fullmatch(shape) or _NL_CONNECTION_CODE_RE.fullmatch(tok))\n',
+       '    return bool(_NL_CODE_RE.fullmatch(tok) or _NL_CONNECTION_CODE_RE.fullmatch(tok))\n')]),
     ("K3d", SR, "⛔ a quoted name is a code — `borrow “K7XQ-9B2M”` pairs",
      [('    s, question = _aa_bare(t)\n    m = None if question else _ASK_CODE_WHOLE',
        '    s, question = _aa_bare(re.sub(r\'[“”"]\', "", t))\n    m = None if question else _ASK_CODE_WHOLE')]),
@@ -131,9 +136,13 @@ MUTANTS = [
        "(?:own\\s+)?(?:[\\w'’-]+\\s+){{0,2}}?\"")]),
 
     # ═══ K8 — a quoted setting name is the setting ═════════════════════════════
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-5): the unquote also asks
+    # `_is_run_title`, over three lines. Same defect.
     ("K8a", SR, "⛔⛔ `turn off “Allow all”` — the catch-all's own suggestion, quoted — gets "
      "the catch-all again",
-     [('        lambda q: f" {q.group(0)[1:-1]} " if _is_setting_quote(q.group(0)) else q.group(0),\n',
+     [('        lambda q: (f" {q.group(0)[1:-1]} "\n'
+       '                   if _is_setting_quote(q.group(0)) and not _is_run_title(q.string, q)\n'
+       '                   else q.group(0)),\n',
        '        lambda q: q.group(0),\n')]),
     ("K8b", SR, "⛔ a message quoted whole — `“turn on Allow all”`, pasted back — gets the "
      "catch-all again",
@@ -155,25 +164,33 @@ MUTANTS = [
        '    obj = m.group("obj").strip()\n')]),
     ("K13b", SR, "⛔ `join the computer called Studio PC` asks about “called Studio PC”",
      [('    obj = _JOIN_CALLED.sub("", obj)\n', '')]),
-    ("K13c", SR, "⛔ `join your Studio PC` / `join these Studio PCs` ask about one computer",
-     [('r"my|our|mine|me|us|you|this|your|yours|his|her|hers|their|"\n'
-       '                           r"theirs|its|these|those)\\b")',
-       'r"my|our|mine|me|us|you|this)\\b")')]),
+    # ⚠ K13c/K13d RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-3): somebody's
+    # possessives are `_JOIN_SOMEBODYS` now (answered None, so the older capture
+    # stands down too), and the plural is read first. Same defects.
+    ("K13c", SR, "⛔ `join your Studio PC` asks about one computer",
+     [('_JOIN_SOMEBODYS = re.compile(r"\\b(?:your|yours|his|her|hers|their|theirs|its|these|those)\\b")',
+       '_JOIN_SOMEBODYS = re.compile(r"\\b(?:NEVER_K13C)\\b")')]),
     ("K13d", SR, "⛔ `join the Studio PCs` — a plural — asks about one computer",
-     [('    if "qqname" in obj or _AA_PLURAL.search(obj):\n', '    if "qqname" in obj:\n')]),
+     [('    if _AA_PLURAL.search(obj):             # a set: the older capture refuses it by name\n',
+       '    if False:\n')]),
     ("K13e", SR, "⛔ `join the Studio PC for today` asks about “Studio PC for”",
      [('r"(?:\\s+(?:again|tonight|tomorrow|instead|too|later|for(?:\\s+today)?|"',
        'r"(?:\\s+(?:again|tonight|tomorrow|instead|too|later|for\\s+today|"')]),
 
     # ═══ K14 — the owner's Windows rule 2 ══════════════════════════════════════
+    # ⚠ K14a/K14b RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-4): what the app
+    # says must be about reaching the computer — one more line. K14b is its old
+    # defect on the new text: any verb, and any words after it.
     ("K14a", SR, "⛔ `are you connected to my mac mini app, it says it's offline` answers "
      "“✓ Signed in as …” alone",
      [('        rf"|\\s*,?\\s+(?:(?:but|and|yet|though|tho)\\s+)?(?:(?:it|that|this|which|the\\s+{_app_words})\\s+)?"\n'
-       '        rf"(?:says?|said|shows?|showed|showing)\\b))", low)',
+       '        rf"(?:says?|said|shows?|showed|showing)\\s+(?:that\\s+)?(?:(?:it[\'’]s|it\\s+is|it)\\s+)?(?:as\\s+)?"\n'
+       '        rf"(?:offline|online|disconnected|not\\s+connected|unreachable|asleep)\\b))", low)',
        '        rf"))", low)')]),
     ("K14b", SR, "⛔ any second clause makes it the computer — `am I signed in to the desktop "
      "app, and is it fast?` lists the computers",
-     [('        rf"(?:says?|said|shows?|showed|showing)\\b))", low)',
+     [('        rf"(?:says?|said|shows?|showed|showing)\\s+(?:that\\s+)?(?:(?:it[\'’]s|it\\s+is|it)\\s+)?(?:as\\s+)?"\n'
+       '        rf"(?:offline|online|disconnected|not\\s+connected|unreachable|asleep)\\b))", low)',
        '        rf"(?:says?|said|shows?|showed|showing|is|are|it)\\b))", low)')]),
 
     # ═══ K18 — a question that mentions a login ════════════════════════════════
@@ -184,9 +201,10 @@ MUTANTS = [
      "login?` starts a sign-in",
      [('        _aa_login_q = (_aa_bare(t)[1] or re.match(\n',
        '        _aa_login_q = (False or re.match(\n')]),
+    # ⚠ RE-ANCHORED 2026-09-28 (wave 12 repair 5, router-6): `u` is `you` too.
     ("K18c", SR, "⛔ a polite request is a question — `will you sign me in and let anyone "
      "join my mac` never signs in",
-     [('(?:(?:can|could|would|will)\\b(?!\\s+you\\b)|', '(?:(?:can|could|would|will)\\b|')]),
+     [('(?:(?:can|could|would|will)\\b(?!\\s+(?:you|u)\\b)|', '(?:(?:can|could|would|will)\\b|')]),
 
 ]
 

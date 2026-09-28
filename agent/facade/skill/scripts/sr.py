@@ -5843,6 +5843,50 @@ def _outside_quoted_names(text: str) -> str:
     return _SET_QUOTED_SPAN.sub(" ", text or "")
 
 
+def _trim_topic_quotes(topic: str) -> str:
+    """A research topic with its surrounding quotes off — a quote comes off only
+    WITH its partner (repair 5, router-7). Stripped one character at a time,
+    `research EV batteries on my mac “Allow All Lab”` started a paid run titled
+    “EV batteries on my mac “Allow All Lab”: the closing quote went, the opening
+    one stayed. A balanced quoted name at either end is kept whole; a pair around
+    the WHOLE topic comes off together (nested quotes counted); a double quote with
+    no partner, and any single quote (it is also an apostrophe), still come off at
+    the ends as they always did."""
+    def partner(s: str, i: int) -> int:      # the quote closing s[i], or -1
+        if s[i] == '"':
+            return s.find('"', i + 1)
+        depth = 0
+        for j in range(i, len(s)):
+            depth += {"“": 1, "”": -1}.get(s[j], 0)
+            if depth == 0:
+                return j
+        return -1
+
+    def opened(s: str) -> bool:              # an unclosed opening quote in s
+        if s.endswith('"'):
+            return s[:-1].count('"') % 2 == 1
+        depth = 0
+        for c in s[:-1]:
+            depth = max(depth + {"“": 1, "”": -1}.get(c, 0), 0)
+        return depth > 0
+
+    for _ in range(4):
+        was = topic
+        topic = topic.strip().strip("'‘’")
+        if topic[:1] in ("“", '"'):
+            p = partner(topic, 0)
+            if p == len(topic) - 1:
+                topic = topic[1:-1]
+                continue
+            if p < 0:
+                topic = topic[1:]
+        if topic[-1:] in ("”", '"') and not opened(topic):
+            topic = topic[:-1]
+        if topic == was:
+            break
+    return topic.strip()
+
+
 # ⛔ THE EXCLUSION SHAPES ARE CLAUSE-BOUNDED, NOT WILDCARDS. Each runs to the next
 # comma, semicolon or full stop — an unbounded span is how 7.9-5's filler ate real
 # names, and nothing in this wave gets to reintroduce one.
@@ -6441,8 +6485,10 @@ _AA_GRAMMAR = tuple((d, re.compile(p.format(SET=_AA_SETTING, S=_AA_SUBJ, T=_AA_O
     # everyone from now on` and `approve every request going forward` read as the
     # ON wish, and this row switched Allow all OFF unconfirmed; `approve everyone
     # myself` is the one spelling of them that says "by hand".
-    ("off", r"(?:go\s+back\s+to\s+approving\s+(?:people|each\s+person){A}?{T}{A}?"
-            r"|approve\s+(?:people|each\s+person)(?:{A}{T}|{T}{A})"
+    # ⛔ `each request` is `each person`'s twin, a plain OFF (repair 5, router-6):
+    # `go back to approving each request` reached the catch-all.
+    ("off", r"(?:go\s+back\s+to\s+approving\s+(?:people|each\s+person|each\s+request){A}?{T}{A}?"
+            r"|approve\s+(?:people|each\s+person|each\s+request)(?:{A}{T}|{T}{A})"
             r"|(?:go\s+back\s+to\s+approving|approve)\s+(?:everyone|everybody|every\s+person|"
             r"each\s+request|every\s+request)(?:\s+myself{A}?{T}|{T}\s+myself))"),  # approve people again
     ("off", r"(?:make|have)\s+(?:everyone|everybody|people|anyone|them)\s+ask(?:\s+first|\s+again)?"
@@ -6453,8 +6499,9 @@ _AA_GRAMMAR = tuple((d, re.compile(p.format(SET=_AA_SETTING, S=_AA_SUBJ, T=_AA_O
 # word behind. That is ALL (repair 3): the `so/because/since …` reason tail repair
 # 2 accepted is gone — `turn on allow all so I can join the Studio PC` is a JOINER,
 # and its reason named a computer the grammar never saw (cross-verify H3).
+# (`can u …` is `can you …` — repair 5, router-6.)
 _AA_HEAD = re.compile(r"(?:(?:please|pls|hey|hi|ok|okay|so|now|just)\b[\s,]*"
-                      r"|(?P<you>(?:can|could|would|will)\s+you\b)[\s,]*(?:please\b[\s,]*)?"
+                      r"|(?P<you>(?:can|could|would|will)\s+(?:you|u)\b)[\s,]*(?:please\b[\s,]*)?"
                       r"|i\s+(?:want|need|would\s+like)\s+to\b\s*|i['’]d\s+like\s+to\b\s*)+",
                       re.I)
 _AA_TAIL = re.compile(r"(?:[\s,]+(?:please|pls|thanks|thank\s+you|thx|ty|now|right\s+now|"
@@ -6468,13 +6515,34 @@ def _is_setting_quote(span: str) -> bool:
     return bool(re.fullmatch(_AA_SETTING, span[1:-1].strip(), re.I))
 
 
+# ⛔ WHAT MAKES A QUOTED SPAN A RUN'S TITLE: it ENDS the message, right after a run
+# verb (`stop “…”`) or a run's artefact and its preposition (`status of “…”`, `skip
+# the podcast on “…”`). `stop “Allow all” on my mac` is still the setting.
+_RUN_TITLE_BEFORE = re.compile(
+    r"\b(?:(?:stop|end|abort|cancel|pause|resume|unpause|retry)"
+    r"|(?:status|progress|podcasts?|audio|videos?|reports?|briefs?|links?|"
+    r"skip\s+(?:the\s+)?[\w'’-]+)\s+(?:of|for|on|from|in))(?:\s+the)?\s*$", re.I)
+
+
+def _is_run_title(text: str, q: "re.Match[str]") -> bool:
+    """True when the quoted span `q` in `text` is a run's title (`_RUN_TITLE_BEFORE`)."""
+    return bool(_RUN_TITLE_BEFORE.search(text[:q.start()])
+                and not _AA_TAIL.sub("", text[q.end():].rstrip(" .!?")).strip(" ,.!?"))
+
+
 def _unquote_setting(text: str) -> str:
     """⛔ A QUOTED SETTING NAME IS THE SETTING, NOT A COMPUTER (repair 4, K8). The
     catch-all names the phrasings in quotes, and `turn off “Allow all”` had its
     words blanked like a computer's name — the same catch-all came back, and
-    `switch "Allow all" off` hid a computer called “Allow all”."""
+    `switch "Allow all" off` hid a computer called “Allow all”.
+    ⛔ …EXCEPT AS A RUN'S TITLE (repair 5, router-5): `stop “auto-approve”` switched
+    Allow all off instead of stopping the run of that name, and `status of “allow
+    all”` listed the computers. Ending the message after a run verb, the quote
+    stays a title (`_is_run_title`), as it was at 413e986."""
     return _SET_QUOTED_SPAN.sub(
-        lambda q: f" {q.group(0)[1:-1]} " if _is_setting_quote(q.group(0)) else q.group(0),
+        lambda q: (f" {q.group(0)[1:-1]} "
+                   if _is_setting_quote(q.group(0)) and not _is_run_title(q.string, q)
+                   else q.group(0)),
         text or "")
 
 
@@ -6600,14 +6668,22 @@ _AA_MENTION = re.compile(
 # auto-joining public wifi` got the Devices list. Only the setting's name, the
 # door it opens (let anyone join, joins at once, without my approval), and people
 # joining the person's own computer — never auto-join/auto-accept/let everyone in.
+# ⛔ REPAIR 5 (router-1): `permission` counts only after somebody who would join
+# (413e986's rule) — `research why my mac installs updates without my permission`
+# is a topic. And people joining `my|our|this <machine>` counts only when the
+# machine word ENDS there (a clause end, `without …`, `at once`): `why people join
+# this computer science program` and `…join my mac's wifi network` are topics.
 _AA_OWN_WORDS = re.compile(
     _AA_ALLOW_ALL_WORD
     + r"|\bauto(?:matic(?:ally)?)?[- ]?approv\w*"
     + rf"|\b(?:let|lets|letting|allow|allows|allowing)\s+{_AA_WHO}\s+(?:to\s+)?join\b"
     + r"|\bjoins?\s+(?:at\s+once|instantly|straight\s+away|right\s+away|without\s+asking)\b"
-    + r"|\bwithout\s+(?:my\s+)?(?:approval|permission)\b"
+    + r"|\bwithout\s+(?:my\s+)?approval\b"
+    + rf"|\b{_AA_WHO}\b[^.?!]{{0,40}}\bwithout\s+(?:my\s+)?permission\b"
     + rf"|\b{_AA_WHO}\b[^.?!,;]{{0,20}}?\bjoin(?:s|ing|ed)?\s+(?:my|our|this)\s+(?:own\s+)?"
-      rf"(?:[\w'’-]+\s+){{0,2}}?(?:{_MACHINE_NOUNS})\b", re.I)
+      rf"(?:[\w'’-]+\s+){{0,2}}?(?:{_MACHINE_NOUNS})\b(?:\s+{_MODEL_WORDS})*"
+      r"(?=\s*(?:$|[.?!,;:]|without\b|at\s+once\b|instantly\b|straight\s+away\b|right\s+away\b))",
+    re.I)
 # ⛔⛔ SOMEBODY ELSE'S COMPUTERS. `list public computers that let anyone join` is a
 # JOINER looking for a way in — wave 11's fleet door — never the owner's switch.
 # Read with the allow-all phrases blanked, so `let anyone join` is not a joiner's
@@ -6646,8 +6722,13 @@ _JOIN_WHOLE = re.compile(
 # Studio PCs` asked about one computer called “Studio PC”.
 _JOIN_NOT_ONE = re.compile(r"\b(?:and|or|but|so|because|since|that|which|who|where|when|if|"
                            r"then|it|as|after|before|until|while|though|although|"
-                           r"my|our|mine|me|us|you|this|your|yours|his|her|hers|their|"
-                           r"theirs|its|these|those)\b")
+                           r"my|our|mine|me|us|you|this)\b")
+# ⛔⛔ SOMEBODY'S COMPUTER IS NO ASK AT ALL (repair 5, router-3): refused here,
+# `borrow her laptop now` fell to the older capture in `_nl_resolve`, which asked
+# about a computer called “laptop now”. `_join_request` answers None for it, and
+# that capture stands down. (A SET still reaches it: its `one owner at a time`
+# refusal is the answer — test_bulk_gate_0910.)
+_JOIN_SOMEBODYS = re.compile(r"\b(?:your|yours|his|her|hers|their|theirs|its|these|those)\b")
 # ⛔ THE WORDS AFTER A JOIN THAT ARE NOT THE NAME (repair 4, K13): `join the Studio PC
 # again` asked about “Studio PC again”, and the yes found no such computer. The
 # join's own list, on top of the thanks and time words every command drops.
@@ -6659,11 +6740,12 @@ _JOIN_CALLED = re.compile(rf"^(?:(?:the|a|an)\s+)?(?:(?:{_MACHINE_NOUNS}|one)\s+
                           r"(?:called|named)\s+")
 
 
-def _join_request(text: str) -> str:
+def _join_request(text: str) -> "str | None":
     """The ONE computer a whole-message ask names — `join the Studio PC`, `please
     borrow “DG shared” now` — as the person wrote it, or "" for every other
     message. ⛔ Never the person's OWN computer (`join my mac` is not a request to
-    a stranger), and never a question (`join the Studio PC?`)."""
+    a stranger), and never a question (`join the Studio PC?`). None when the ask
+    names somebody's computer (`borrow her laptop`): no ask at all (repair 5)."""
     t = " ".join((text or "").split())
     s, question = _aa_bare(t)
     # ⛔ A SIGN-IN IS A SIGN-IN (repair 4, K11 — e567704): `join the Studio PC to
@@ -6675,11 +6757,15 @@ def _join_request(text: str) -> str:
         return ""
     obj = _AA_TAIL.sub("", _JOIN_TAIL.sub("", m.group("obj").strip())).strip(" ,")
     obj = _JOIN_CALLED.sub("", obj)
+    if _AA_PLURAL.search(obj):             # a set: the older capture refuses it by name
+        return ""
+    if _JOIN_SOMEBODYS.search(obj):
+        return None
     if _JOIN_NOT_ONE.search(obj):
         return ""
     if obj == "qqname":                    # a quoted name, verbatim, quotes kept
         return _SET_QUOTED_SPAN.search(t).group(0)
-    if "qqname" in obj or _AA_PLURAL.search(obj):
+    if "qqname" in obj:
         return ""
     hit = re.search(rf"(?<![\w'’-]){re.escape(obj)}(?![\w'’-])", t, re.I)
     return hit.group(0) if hit else obj
@@ -6694,22 +6780,36 @@ def _join_request(text: str) -> str:
 # the access code's shape (XXXX-XXXX in its alphabet, in capitals as the web app
 # shows it — any case once it carries a digit, which no dashed word does) or the
 # connection code's.
-_ASK_CODE_WHOLE = re.compile(r"(?:let\s+me\s+)?(?:join|ask\s+(?:to\s+(?:join|use)|for)|"
-                             r"request\s+access\s+to|borrow)\s+(?P<code>\S+)")
-_ASK_CODE_SHAPE = re.compile(rf"[2-9{_ACCESS_LETTERS}]{{4}}[{_DASHES}][2-9{_ACCESS_LETTERS}]{{4}}")
+# ⛔ REPAIR 5 (router-2): every ask verb 413e986 paired a code after — `ask for
+# access to`, `request`, `ask to borrow`, `apply for` — and a greeting in front
+# (`Hi! borrow …`, `go ahead and borrow …`); the dash may be missing when the code
+# carries a digit (SKILL.md: `YGXU-7WH2 / YGXU7WH2`), as rule 1 reads it alone.
+_ASK_CODE_WHOLE = re.compile(r"(?:let\s+me\s+)?(?:join|ask\s+(?:to\s+(?:join|use|borrow)|"
+                             r"for(?:\s+access\s+to)?)|request(?:\s+access\s+to)?|apply\s+for|"
+                             r"borrow)\s+(?P<code>\S+)")
+_ASK_CODE_HEAD = re.compile(r"^(?:(?:hi|hello|hey|thanks|thank\s+you|thx|ok|okay)\b[\s,.!]*"
+                            r"|go\s+(?:ahead\s+(?:and\s+)?)?)+", re.I)
+_ASK_CODE_SHAPE = re.compile(rf"[2-9{_ACCESS_LETTERS}]{{4}}[{_DASHES}][2-9{_ACCESS_LETTERS}]{{4}}"
+                             rf"|(?=\D*\d)[2-9{_ACCESS_LETTERS}]{{8}}")
+
+
+def _is_ask_code(tok: str) -> bool:
+    """True for ONE token in the access code's shape (in capitals, or any case once
+    it carries a digit, which no dashed word does) or the connection code's."""
+    shape = tok.upper() if re.search(r"\d", tok) else tok
+    return bool(_ASK_CODE_SHAPE.fullmatch(shape) or _NL_CONNECTION_CODE_RE.fullmatch(tok))
 
 
 def _asked_code(text: str) -> str:
     """The code a whole-message ask names (`borrow K7XQ-9B2M`), as typed, or ""."""
-    t = " ".join((text or "").split())
+    t = _ASK_CODE_HEAD.sub("", " ".join((text or "").split()))
     s, question = _aa_bare(t)
     m = None if question else _ASK_CODE_WHOLE.fullmatch(s)
     if not m:
         return ""
     hit = re.search(rf"(?<![{_DASHES}\w]){re.escape(m.group('code'))}(?![{_DASHES}\w])", t, re.I)
     tok = hit.group(0) if hit else ""
-    shape = tok.upper() if re.search(r"\d", tok) else tok
-    return tok if (_ASK_CODE_SHAPE.fullmatch(shape) or _NL_CONNECTION_CODE_RE.fullmatch(tok)) else ""
+    return tok if _is_ask_code(tok) else ""
 
 
 def _aa_about_others(src: str) -> bool:
@@ -6933,6 +7033,9 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # too, with its own subject (repair 4, K14 — the owner's Windows rule 2): "…my
     # mac mini app, it says it's offline" answered "✓ Signed in as …" alone. Only
     # what the app SAYS: "…the desktop app, and is it fast?" still asks about the app.
+    # ⛔ …and only what it says about REACHING the computer (repair 5, router-4):
+    # "am I logged into the mac app, it says I need to log in" is a sign-in
+    # question, and it got the computer list.
     _to_a_computer = re.match(
         _asker + r"[^.?!]*?" + _to_it +
         rf"(?:(?!(?:on|in|at|from|of|for|with|to|account|email|app)\b)[\w'’-]+\s+){{0,3}}?"
@@ -6941,7 +7044,8 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         rf"|(?:\s+(?:{_MACHINE_NOUNS}|{_model_words}))*\s+{_app_words}\b"
         rf"(?!\s+(?:says?|said|shows?|showed|showing|is|are|was|keeps?|it|its|it['’]s)\b"
         rf"|\s*,?\s+(?:(?:but|and|yet|though|tho)\s+)?(?:(?:it|that|this|which|the\s+{_app_words})\s+)?"
-        rf"(?:says?|said|shows?|showed|showing)\b))", low)
+        rf"(?:says?|said|shows?|showed|showing)\s+(?:that\s+)?(?:(?:it['’]s|it\s+is|it)\s+)?(?:as\s+)?"
+        rf"(?:offline|online|disconnected|not\s+connected|unreachable|asleep)\b))", low)
     _to_its_app = re.match(
         _asker + rf"(?:(?!\b(?:{_MACHINE_NOUNS})\b)[^.?!])*?" + _to_it
         + rf"(?:(?!(?:the|a|an|my|your|our|his|her|its|their|this|that|which|where|on|in|at|"
@@ -6969,7 +7073,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     #     falls through (that's a progress ask, not a topic).
     rm = _NL_RESEARCH_RE.match(t)
     if rm:
-        topic = re.sub(r"[?.!]+$", "", rm.group(1)).strip().strip("\"“”'‘’")
+        topic = _trim_topic_quotes(re.sub(r"[?.!]+$", "", rm.group(1)).strip())
         # ⛔⛔ THE RESEARCH BRANCH TOOK 100% OF RESEARCH-VERB OPENINGS — 392 of 392
         # driven — and `research my devices` STARTED A PAID RUN titled “my
         # devices”. The veto was a fullmatch on three bare words, so anything
@@ -7508,8 +7612,9 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     if _AA_MENTION.search(_aa_src):
         # ⛔ …an INSTRUCTION to sign in, never a question that mentions one (repair
         # 4, K18): `can people join my mac without a login?` started a sign-in.
+        # (`can u sign me in …` is a request, like `can you …` — repair 5.)
         _aa_login_q = (_aa_bare(t)[1] or re.match(
-            _NL_LEAD_IN + r"(?:(?:can|could|would|will)\b(?!\s+you\b)|(?:is|are|does|do|did|who|"
+            _NL_LEAD_IN + r"(?:(?:can|could|would|will)\b(?!\s+(?:you|u)\b)|(?:is|are|does|do|did|who|"
             r"what|which|how|why|when|has|have|should)\b)", low))
         if re.search(rf"\b{_SIGN_IN_ASK}\b", low) and not _aa_login_q:
             return ["login"], None                 # e567704: a sign-in stays a sign-in
@@ -7995,16 +8100,31 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # read FIRST, so its trimmed name (`join the Studio PC now` → “Studio PC”)
     # wins over the older shapes' untrimmed one.
     _join_obj = _join_request(t)
-    _ask_obj = _ask_code = ""
-    _om = (re.search(r"\bask\s+(?:the\s+)?owner\s+of\s+(.+?)\s+"
-                     r"(?:for|about|to)\b", t, flags=re.I)
-           or re.search(r"\b(?:ask|apply)\s+(?:the\s+owner\s+of\s+)?"
-                        r"(?:for|to\s+use|about)\s+(.+)$", t, flags=re.I)
-           or re.search(r"\brequest\s+(?:access\s+to\s+)?(.+)$", t, flags=re.I)
-           or re.search(r"\bborrow\s+(.+)$", t, flags=re.I))
+    # ⛔ None: somebody's computer — no ask, and the older capture below stands
+    # down too (repair 5, router-3: `borrow her laptop now` asked about a computer
+    # called “laptop now”).
+    _join_not_one = _join_obj is None
+    _join_obj = _join_obj or ""
+    _ask_obj = ""
+    # ⛔ A CODE IS READ WHATEVER THE JOIN CAPTURE MADE OF IT (repair 5, router-2):
+    # `join K7XQ–9B2M`, typed with a phone's en dash, is no join object, and the
+    # code was only read inside the gate below.
+    _ask_code = _asked_code(t)
+    _om = None if _join_not_one else (
+        re.search(r"\bask\s+(?:the\s+)?owner\s+of\s+(.+?)\s+"
+                  r"(?:for|about|to)\b", t, flags=re.I)
+        or re.search(r"\b(?:ask|apply)\s+(?:the\s+owner\s+of\s+)?"
+                     r"(?:for|to\s+use|about)\s+(.+)$", t, flags=re.I)
+        or re.search(r"\brequest\s+(?:access\s+to\s+)?(.+)$", t, flags=re.I)
+        or re.search(r"\bborrow\s+(.+)$", t, flags=re.I))
     if _join_obj or _om:
-        _ask_obj = re.sub(r"[?.!,]+$", "", _join_obj or _om.group(1)).strip().strip(
-            _NL_QUOTE_CHARS)
+        _ask_obj = re.sub(r"[?.!,]+$", "", _join_obj or _om.group(1)).strip()
+        if not _join_obj:
+            # ⛔ …and it drops the join's own tail words (repair 5, router-3):
+            # `ask for the Studio PC now` asked about “Studio PC now”.
+            _ask_obj = _AA_TAIL.sub("", re.sub(_JOIN_TAIL.pattern, "", _ask_obj,
+                                                flags=re.I)).strip(" ,")
+        _ask_obj = _ask_obj.strip(_NL_QUOTE_CHARS)
         # ⛔⛔ "access to" IS NOT PART OF THE NAME. "ask for access to the studio
         # pc" made the machine "access to the studio pc" and the confirm asked
         # somebody to disclose themselves to the owner of a computer that cannot
@@ -8028,9 +8148,9 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         _ask_obj = re.sub(rf"^(?:public|shared)\s+(?=(?:{_MACHINE_NOUNS})\s+\S)", "",
                           _ask_obj, flags=re.I)
         # ⛔ A CODE IS THE WHOLE MESSAGE'S ONE OBJECT (repair 4, K3) — see
-        # `_asked_code`. `request access to computer LABPC001` names a machine whose
-        # id merely LOOKS like a code (test_chat_public_792 pins it: never a pairing).
-        _ask_code = _asked_code(t)
+        # `_asked_code`, read above. `request access to computer LABPC001` names a
+        # machine whose id merely LOOKS like a code (test_chat_public_792 pins it:
+        # never a pairing).
         _ask_obj = _strip_leading_noun(_ask_obj)
     # ⛔ A PHASE OR AN ARTEFACT IS NOT A COMPUTER. "ask for the podcast" and
     # "ask for an update" belong to the rules below and must survive this one.
@@ -8119,6 +8239,16 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             and not _ask_obj_is_thing \
             and not _ask_obj_is_pronoun and not _ask_obj_is_category \
             and not _control_kw and not _unlink_kw:
+        # ⛔⛔ AN UNQUOTED CODE IS NEVER A COMPUTER TO ASK FOR (repair 5, router-2 —
+        # H17's own class): `can I borrow K7XQ-9B2M?` and `my friend wants to
+        # borrow K7XQ-9B2M` raised the ask confirm, whose yes posts the code as a
+        # device id — one of the five asks an hour spent, nothing ever paired. Only
+        # a whole-message ask pairs it (above); anything else changes nothing. A
+        # QUOTED token stays a name.
+        if _is_ask_code(_ask_obj) and re.search(
+                rf"(?<![{_DASHES}\w]){re.escape(_ask_obj)}(?![{_DASHES}\w])",
+                _outside_quoted_names(t)):
+            return None, [_NL_CATCH_ALL]
         # ⛔ ONE ASK NAMES ONE OWNER. A request for a SET would file a disclosure
         # against every owner in it, and the confirm can only name one.
         if _request_names_a_set(t, _ask_obj):
