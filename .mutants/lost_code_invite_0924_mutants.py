@@ -92,8 +92,11 @@ MUTANTS = [
      "actually sent, and now the only place the terminal says it",
      [('    print("     They see your name — or your email, if you have not set one.")',
        '    print("     They see your name.")')]),
+    # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H22): the chat's pending
+    # reply now says the confirm's own sentence, "The owner sees your name and
+    # email." Same defect — the email half dropped where it is sent.
     ("I4", SR, "⛔ the chat's ask confirmation drops the email half, where it is sent",
-     [('        "They see your name — or your email, if you haven’t set one.",',
+     [('        "The owner sees your name and email.",',
        '        "They see your name.",')]),
     # ═══ K — SKILL.md ══════════════════════════════════════════════════════════
     ("K1", SKILL, "the table loses the lost-code row, so the model guesses where a code "

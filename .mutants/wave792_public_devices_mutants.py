@@ -594,9 +594,11 @@ MUTANTS = [
      "object is read as a request for somebody's computer",
      # ⭐ RE-AIMED 2026-09-26 (wave 12): `join` joined the ask verbs and the
      # condition re-wrapped. Same defect: the machine test goes.
-     [('    if (_ask_kw or _join_kw) and _ask_obj and _ask_is_about_a_machine \\\n'
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3): `_join_kw` became `_join_obj` (a
+     # join is read only as the whole message). Same defect.
+     [('    if (_ask_kw or _join_obj) and _ask_obj and _ask_is_about_a_machine \\\n'
        '            and not _ask_obj_is_thing \\\n',
-       '    if (_ask_kw or _join_kw) and _ask_obj \\\n'
+       '    if (_ask_kw or _join_obj) and _ask_obj \\\n'
        '            and not _ask_obj_is_thing \\\n')]),
     ("N8", SR, "under",
      "⛔⛔ THE CODE-HIJACK COMES BACK: \"switch to the machine LABPC001\" is a "

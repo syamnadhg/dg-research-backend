@@ -655,9 +655,15 @@ def test_the_watcher_says_the_chat_invites_words_and_the_ask_keeps_the_email_hal
                                  "topic": "Golden Retrievers", "pendingTopic": ""})
     assert line.rstrip().endswith("They see your name."), line
     assert "or your email" not in line, line
-    # …and the ask still says it, on both clients, where the email is sent
-    assert ("or your email, if you haven’t set one"
+    # …and the ask still says it, where the email is sent.
+    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 3, cross-verify H22), the chat half:
+    # the chat's ask confirm says "The owner sees your name and email." (repair 2,
+    # G24 — the owner's Shared with row shows both) and its pending reply, one
+    # message later, said "your name — or your email". It says the confirm's own
+    # sentence now; the terminal's half is cli.py's lane.
+    assert ("The owner sees your name and email."
             in code_only(inspect.getsource(sr.cmd_device_ask)))
+    assert "or your email" not in code_only(inspect.getsource(sr.cmd_device_ask))
     assert ("or your email, if you have not set one"
             in code_only(inspect.getsource(cli._device_ask)))
 

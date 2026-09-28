@@ -24,6 +24,14 @@ BY SHAPE. Round 2, driven through `sr._nl_resolve` at repair 1 (850334c):
      a whole-message `join X` names.
   4. Anything else that talks about Allow all is NEVER a write and NEVER a switch
      confirm: the person's own list, or the catch-all, which names the phrasings.
+
+⛔⛔ REPAIR 3 (2026-09-27) STRUCK THE PURPOSE CLAUSE FROM 1, AND 2 AND THE JOIN
+HALF OF 3 ENTIRELY — the machinery round 3's highs came from (H3: a joiner's `so I
+can join the Studio PC` opened their own computer; H1: the hand-off HID a computer
+the person said to keep listed). A command is the whole message; any other message
+with Allow-all words is read-only (browse list / own list / catch-all). The pins
+here that stood on the struck rules are FLIPPED in place with dated notes (see
+FLIPPED_R3); the repair-3 pins are in test_allow_all_repair3_0927.py.
 """
 from __future__ import annotations
 
@@ -97,7 +105,6 @@ PINNED = [
     ('join K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # F5
     ('join K7XQ-9B2M please', 'ADD:K7XQ-9B2M'),  # t6
     ('join K7XQ-9B2M thanks', 'ADD:K7XQ-9B2M'),  # t6
-    ('join K7XQ-9B2M, it lets anyone in', 'ADD:K7XQ-9B2M'),  # F5
     ("join my friend's computer K7XQ-9B2M", 'ADD:K7XQ-9B2M'),  # t6
     ("join my friend's mac with K7XQ-9B2M", 'ADD:K7XQ-9B2M'),  # t6
     ('join the computer K7XQ-9B2M', 'ADD:K7XQ-9B2M'),  # t6
@@ -144,15 +151,10 @@ PINNED = [
     ("status of the why people don't join unions run", 'ARGV:["status", "why people don\'t join unions"]'),  # t10
     ("join Sam's computer", "ASK:Sam's computer"),  # t10
     ("join Sam's mac", "ASK:Sam's mac"),  # t10
-    ('can I join the Studio PC?', 'ASK:Studio PC'),  # t6
     ('join public computer Studio PC', 'ASK:Studio PC'),  # G20
-    ('join the Studio PC, it lets anyone in', 'ASK:Studio PC'),  # G4
-    ('should I join the Studio PC', 'ASK:Studio PC'),  # t6
-    ('sign up and join the Studio PC', 'ASK:Studio PC'),  # t6
     ('ask for the studio pc', 'ASK:studio pc'),  # in1
     ('join studio pc', 'ASK:studio pc'),  # in1
     ('join the studio pc', 'ASK:studio pc'),  # in1
-    ('join the studio pc that lets anyone in', 'ASK:studio pc'),  # G29
     ('allow all', 'CATCH'),  # in1
     ('allow all on the Mars run', 'CATCH'),  # t10
     ('allow all three agents on the Mars run', 'CATCH'),  # t10
@@ -182,7 +184,6 @@ PINNED = [
     ('I want the one that lets me straight in', 'CATCH'),  # t14
     ('join a computer', 'CATCH'),  # t10
     ('join K7XQ 9B2M', 'CATCH'),  # t6
-    ('join K7XQ-9B2M now', 'CATCH'),  # t6
     ('join K7XQ-9B2M — my friend gave it to me', 'CATCH'),  # t6
     ('join K7XQ–9B2M', 'CATCH'),  # t6
     ('join me on the Studio PC', 'CATCH'),  # t10
@@ -436,56 +437,14 @@ PINNED = [
     ('“Studio PC” joins at once, I want that one', 'DEVICES'),  # t14
     ('“Studio PC” · joins at once', 'DEVICES'),  # t14
     ('✓ “Studio PC” no longer lets anyone join — you approve each person again.', 'DEVICES'),  # t8
-    ('disable allow all and public listing on my mac', 'HIDE'),  # G3
-    ('disable allow all and sharing for my mac', 'HIDE'),  # G3
     ('hide my computer', 'HIDE'),  # in1
-    ('hide my mac and stop auto approving', 'HIDE'),  # t4
-    ('hide my mac and stop letting anyone join', 'HIDE'),  # in2
-    ('hide my mac, no more letting anyone join', 'HIDE'),  # t4
-    ('make it private and stop letting anyone join', 'HIDE'),  # t4
-    ('make it private and turn off allow all', 'HIDE'),  # F7
     ('make my computer private', 'HIDE'),  # in1
     ('make my mac private', 'HIDE'),  # in2
-    ('make my mac private and no allow all', 'HIDE'),  # t4
-    ('make my mac private — and allow all off', 'HIDE'),  # t4
-    ('make my mac private, no allow all', 'HIDE'),  # t4
-    ('my mac should not be public, and turn off allow all', 'HIDE'),  # F7
-    ('no longer share my mac and stop allowing anyone to join', 'HIDE'),  # F7
-    ('remove my mac from the public list and turn off allow all', 'HIDE'),  # F7
-    ('stop letting anyone join or see my mac', 'HIDE'),  # G3
-    ('stop letting anyone join or use my mac', 'HIDE'),  # g3
-    ('stop offering my mac and turn allow all off', 'HIDE'),  # F7
-    ('stop sharing and letting anyone join my mac', 'HIDE'),  # t4
-    ('stop sharing my mac and turn off allow all', 'HIDE'),  # F7
-    ('switch off allow all and sharing for my mac', 'HIDE'),  # G3
-    ('switch off allow all and unlist my mac', 'HIDE'),  # t4
-    ('take my mac off the public list and disable allow all', 'HIDE'),  # F7
-    ('take my mac off the public list and turn off allow all', 'HIDE'),  # F7
-    ('take my mac off the public list, stop letting anyone join', 'HIDE'),  # t4
-    ('take my mac private and stop letting anyone join', 'HIDE'),  # t4
-    ('turn off allow all and hide my mac', 'HIDE'),  # G3
-    ('turn off allow all and make my mac private', 'HIDE'),  # g3
-    ('turn off allow all and public for my mac', 'HIDE'),  # g3
-    ('turn off allow all and public sharing for my mac', 'HIDE'),  # t5
-    ('turn off allow all and sharing on my mac', 'HIDE'),  # G3
-    ('turn off allow all and the public listing for my mac', 'HIDE'),  # g3
-    ('turn off allow all and turn off public for my mac', 'HIDE'),  # t4
-    ('turn off allow all, and hide my mac', 'HIDE'),  # t4
-    ('turn off allow all, then hide my mac', 'HIDE'),  # t4
-    ('turn off auto-accept and public sharing on my mac', 'HIDE'),  # G3
-    ('turn off both allow all and sharing on my mac', 'HIDE'),  # t5
-    ('turn off public and allow all for my mac', 'HIDE'),  # t4
-    ('turn off sharing and allow all for my mac', 'HIDE'),  # t4
-    ('turn off sharing and allow all on my mac', 'HIDE'),  # G3
     ('turn off sharing on my mac', 'HIDE'),  # g3
-    ('turn off sharing on my mac and turn off allow all', 'HIDE'),  # F7
-    ('undo making my mac public and turn off allow all', 'HIDE'),  # F7
-    ('unshare my mac and turn off auto join', 'HIDE'),  # t4
     ('join any computer', 'LINE:I ask one owner at a time. Show me the public computers and '),  # t10
     ('help', 'LINE:I can research a topic, check a run’s status, fetch its podc'),  # G25
     ('what can you do', 'LINE:I can research a topic, check a run’s status, fetch its podc'),  # G25
     ('what can you do?', 'LINE:I can research a topic, check a run’s status, fetch its podc'),  # G25
-    ('turn off everything public on my mac including allow all', 'LINE:I hide one computer at a time. Ask me to list them and name '),  # G6
     ('approve everyone waiting', 'LINE:I say yes to one person at a time. Ask me who is waiting and'),  # t10
     ('let them all in', 'LINE:I say yes to one person at a time. Ask me who is waiting and'),  # t10
     ('people keep asking to join my mac, let them all in', 'LINE:I say yes to one person at a time. Ask me who is waiting and'),  # t9
@@ -567,11 +526,9 @@ PINNED = [
     ('approve everyone automatically on my mac', 'ON'),  # in2
     ('auto approve requests for my mac', 'ON'),  # in1
     ('auto-accept people on my computer', 'ON'),  # in1
-    ('auto-approve requests for my mac so I stop getting pinged', 'ON'),  # F9
     ('check allow all', 'ON'),  # G26
     ("don't require approval on my mac", 'ON'),  # G11
     ('enable allow all', 'ON'),  # in1
-    ("enable auto-approve for my mac so I don't have to keep approving", 'ON'),  # F9
     ('let anyone join', 'ON'),  # G2
     ('let anyone join my computer', 'ON'),  # in1
     ('let anyone join my mac', 'ON'),  # in1
@@ -596,14 +553,10 @@ PINNED = [
     ('switch on allow all for my laptop', 'ON'),  # in1
     ('tick allow all', 'ON'),  # in1
     ('turn allow all on', 'ON'),  # in1
-    ('turn allow all on for my mac so i stop getting requests', 'ON'),  # in2
     ('turn off approval for my mac', 'ON'),  # F13
     ('turn off approvals on my mac', 'ON'),  # t2
     ('turn on allow all', 'ON'),  # in1
     ('turn on allow all for my mac', 'ON'),  # t0
-    ('turn on allow all for my mac so I never have to approve anyone', 'ON'),  # F9
-    ("turn on allow all so I don't have to approve people on my mac", 'ON'),  # F9
-    ('turn on allow all so I stop getting requests for my mac', 'ON'),  # F9
     ('let anyone join “Studio Mac”', 'ON:Studio Mac'),  # F20
     ('are there any computers that let anyone join?', 'PUBLIC'),  # in2
     ('are there any public computers?', 'PUBLIC'),  # F8
@@ -663,6 +616,86 @@ PINNED = [
     ('stop the join the dots run', 'STOP:join the dots'),  # t10
     ("stop the why people won't join the gym run", "STOP:why people won't join the gym"),  # t10
 ]
+
+
+# ⛔ FLIPPED 2026-09-27 (wave 12 repair 3) — each row was in PINNED at the route
+# in its third column. Why, by tag (cross-verify round 3):
+#   H1  the hand-off to the visibility clause's hide is gone: it could not tell
+#       `…and turn off allow all` from `…but keep it listed` and HID the second,
+#       unconfirmed. Two requests in one message are read-only now.
+#   H3  the `so/because/since …` reason tail is gone: `turn on allow all so I can
+#       join the Studio PC` (a joiner) raised the confirm that opens their OWN
+#       computer. A command with a reason is read-only now.
+#   H7  a join is read only as the WHOLE message: a question, a statement or a
+#       second verb in front is never an ask (`my friend wants to join…`).
+#   H14 a time word after a whole-message join comes off (“K7XQ-9B2M now”).
+#   R2  a message with Allow-all words that is not a whole command is READ-ONLY
+#       and the arm owns it: no ask, no pairing through the join route.
+FLIPPED_R3 = [
+    ('join K7XQ-9B2M, it lets anyone in', 'PUBLIC', 'ADD:K7XQ-9B2M', 'R2'),
+    ('can I join the Studio PC?', 'CATCH', 'ASK:Studio PC', 'H7'),
+    ('join the Studio PC, it lets anyone in', 'PUBLIC', 'ASK:Studio PC', 'R2'),
+    ('should I join the Studio PC', 'CATCH', 'ASK:Studio PC', 'H7'),
+    ('sign up and join the Studio PC', 'CATCH', 'ASK:Studio PC', 'H7'),
+    ('join the studio pc that lets anyone in', 'PUBLIC', 'ASK:studio pc', 'R2'),
+    ('join K7XQ-9B2M now', 'ADD:K7XQ-9B2M', 'CATCH', 'H14'),
+    ('disable allow all and public listing on my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('disable allow all and sharing for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('hide my mac and stop auto approving', 'DEVICES', 'HIDE', 'H1'),
+    ('hide my mac and stop letting anyone join', 'DEVICES', 'HIDE', 'H1'),
+    ('hide my mac, no more letting anyone join', 'DEVICES', 'HIDE', 'H1'),
+    ('make it private and stop letting anyone join', 'DEVICES', 'HIDE', 'H1'),
+    ('make it private and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('make my mac private and no allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('make my mac private — and allow all off', 'DEVICES', 'HIDE', 'H1'),
+    ('make my mac private, no allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('my mac should not be public, and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('no longer share my mac and stop allowing anyone to join', 'DEVICES', 'HIDE', 'H1'),
+    ('remove my mac from the public list and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('stop letting anyone join or see my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('stop letting anyone join or use my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('stop offering my mac and turn allow all off', 'DEVICES', 'HIDE', 'H1'),
+    ('stop sharing and letting anyone join my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('stop sharing my mac and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('switch off allow all and sharing for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('switch off allow all and unlist my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('take my mac off the public list and disable allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('take my mac off the public list and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('take my mac off the public list, stop letting anyone join', 'DEVICES', 'HIDE', 'H1'),
+    ('take my mac private and stop letting anyone join', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and hide my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and make my mac private', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and public for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and public sharing for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and sharing on my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and the public listing for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all and turn off public for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all, and hide my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off allow all, then hide my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off auto-accept and public sharing on my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off both allow all and sharing on my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off public and allow all for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off sharing and allow all for my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off sharing and allow all on my mac', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off sharing on my mac and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('undo making my mac public and turn off allow all', 'DEVICES', 'HIDE', 'H1'),
+    ('unshare my mac and turn off auto join', 'DEVICES', 'HIDE', 'H1'),
+    ('turn off everything public on my mac including allow all', 'DEVICES', 'LINE:I hide one computer at a time. Ask me to list them and name ', 'H1'),
+    ('auto-approve requests for my mac so I stop getting pinged', 'DEVICES', 'ON', 'H3'),
+    ("enable auto-approve for my mac so I don't have to keep approving", 'DEVICES', 'ON', 'H3'),
+    ('turn allow all on for my mac so i stop getting requests', 'DEVICES', 'ON', 'H3'),
+    ('turn on allow all for my mac so I never have to approve anyone', 'DEVICES', 'ON', 'H3'),
+    ("turn on allow all so I don't have to approve people on my mac", 'DEVICES', 'ON', 'H3'),
+    ('turn on allow all so I stop getting requests for my mac', 'DEVICES', 'ON', 'H3'),
+]
+
+
+@pytest.mark.parametrize("text, want, was, why", FLIPPED_R3)
+def test_repair3_flips_each_row_to_a_read_only_route_or_the_whole_command(text, want, was, why):
+    """Each flipped row, at its repair-3 route — and none of them is a write or
+    a confirm of anything but a whole command (`join K7XQ-9B2M now` pairs)."""
+    assert _route(text) == want
+    assert want in ("DEVICES", "PUBLIC", "CATCH") or text == "join K7XQ-9B2M now"
 
 
 @pytest.mark.parametrize("text, want", PINNED)
@@ -812,12 +845,17 @@ def test_a_question_mark_is_a_question_unless_the_person_asked_us_to_act():
 
 
 @pytest.mark.parametrize("text, want", [
-    ("turn off allow all for my mac so strangers stop joining", "OFF"),
-    ("turn off allow all for my mac, because too many people joined", "OFF"),
-    ("turn on allow all since I'm away all week", "ON"),
-    ("turn on allow all so I stop getting requests for my mac", "ON"),
+    ("turn off allow all for my mac so strangers stop joining", "DEVICES"),
+    ("turn off allow all for my mac, because too many people joined", "DEVICES"),
+    ("turn on allow all since I'm away all week", "CATCH"),
+    ("turn on allow all so I stop getting requests for my mac", "DEVICES"),
 ])
-def test_one_purpose_clause_never_changes_the_command_or_its_direction(text, want):
+def test_a_reason_makes_a_command_read_only(text, want):
+    """⛔ FLIPPED 2026-09-27 (wave 12 repair 3): pinned to OFF / ON through repair
+    2's one-purpose-clause rule. The rule is gone (cross-verify H3: the reason of
+    `turn on allow all so I can join the Studio PC` named a computer the grammar
+    never saw, and a joiner was asked to open their own). A reason makes it not
+    a command: read-only, never a write, never a switch confirm."""
     assert _route(text) == want
 
 
@@ -855,12 +893,17 @@ def test_the_name_after_the_needs_a_machine_word_and_keeps_its_capitals():
     "stop letting anyone join or see my mac", "stop letting anyone join or use my mac",
     "can you make my mac private and turn off allow all",      # a polite imperative
 ])
-def test_a_hide_in_the_visibility_clauses_words_is_that_hide_by_the_picker(text):
+def test_a_hide_beside_allow_all_words_is_read_only(text):
     """⭐ G3: the base revision hid these, and repair 1 raised the PUBLISH confirm
-    or dropped the hide. The allow-all words welded onto the name (“allow all and
-    make my mac”, “anyone join or see my mac”) made the hide REFUSE — so the name
-    goes to the picker, which takes the one computer this account owns."""
-    assert _route(text) == "HIDE"
+    or dropped the hide.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): pinned to HIDE through repair 2's
+    hand-off to the visibility clause. The hand-off is gone — it HID `turn off
+    allow all on my mac but keep it listed` and five more keep/find/share phrasings,
+    unconfirmed (cross-verify H1), and two of its guards measured nothing (H11).
+    Neither request is half-done now: the person's own list, and each works said
+    alone."""
+    assert _route(text) == "DEVICES"
+    assert _route("make my mac private") == "HIDE"
 
 
 @pytest.mark.parametrize("text", [
@@ -895,21 +938,27 @@ def test_the_persons_own_computers_are_never_the_browse_list(text):
 
 
 @pytest.mark.parametrize("text, want", [
-    ("join the studio pc that lets anyone in", "ASK:studio pc"),
-    ("join the Studio PC, it lets anyone in", "ASK:Studio PC"),
-    ("join the Studio PC which lets anyone in", "ASK:Studio PC"),
-    ("join the mac mini that lets anyone in", "ASK:mac mini"),
-    ("join “DG shared”, it lets anyone in", "ASK:DG shared"),
-    ("join K7XQ-9B2M, it lets anyone in", "ADD:K7XQ-9B2M"),
+    ("join the studio pc that lets anyone in", "PUBLIC"),
+    ("join the Studio PC, it lets anyone in", "PUBLIC"),
+    ("join the Studio PC which lets anyone in", "PUBLIC"),
+    ("join the mac mini that lets anyone in", "PUBLIC"),
+    ("join “DG shared”, it lets anyone in", "PUBLIC"),
+    ("join K7XQ-9B2M, it lets anyone in", "PUBLIC"),
     ("join a public computer that lets anyone in", "PUBLIC"),
     ("join the computer that lets anyone in", "PUBLIC"),
     ("join my mac, it lets anyone in", "DEVICES"),
     ("sign in and join the studio pc that lets anyone in", "LOGIN"),
 ])
-def test_a_whole_message_join_names_one_computer_and_nothing_else(text, want):
+def test_a_join_with_allow_all_words_is_the_browse_list(text, want):
     """⛔ G29: `join the studio pc that lets anyone in` asked the owner of “studio pc
-    that”, a name no row carries — the yes then failed."""
+    that”, a name no row carries — the yes then failed.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): the first six rows were pinned to the
+    ask (or the pairing) through repair 2's join route inside the allow-all arm.
+    A message with Allow-all words that is not a whole command is READ-ONLY and
+    the arm owns it, so a joiner gets the browse list — where that computer's row
+    says "joins at once" — and `join the Studio PC` said alone is the ask."""
     assert _route(text) == want
+    assert _route("join the Studio PC") == "ASK:Studio PC"
 
 
 @pytest.mark.parametrize("text, want", [
@@ -944,10 +993,16 @@ def test_an_allow_all_wish_never_reaches_the_nameless_approve(text):
 @pytest.mark.parametrize("text, want", [
     ("allow all cookies", "CATCH"), ("allow all agents on my mac", "DEVICES"),
     ("podcast: allow all requests", 'ARGV:["podcast"]'),
-    # an audience phrase beside an artefact, or `without asking` with no audience,
-    # keeps the route it had before the arm existed
-    ("send me the podcast when anyone can join", 'ARGV:["podcast"]'),
+    # `without asking` with no audience keeps the route it had before the arm
     ("switch to the office pc without asking me", 'ARGV:["device-use"'),
+    # ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): an audience phrase beside an
+    # artefact kept the artefact's route (`podcast`) through repair 2's artefact /
+    # unlink exemption. The same exemption let `pause the Mars run when anyone can
+    # join` PAUSE a run called “Mars run when anyone can join”, unconfirmed, and
+    # `forget it, go back to approving people` reach the nameless approve confirm
+    # (cross-verify H4). It is gone: the arm owns every message with Allow-all
+    # words, and this one names none of its answers — the catch-all.
+    ("send me the podcast when anyone can join", "CATCH"),
 ])
 def test_allow_all_with_another_noun_is_not_the_setting(text, want):
     """G20: `allow all agents on my mac` raised the Allow-all ON confirm. With a

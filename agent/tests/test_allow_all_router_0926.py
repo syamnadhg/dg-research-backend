@@ -173,16 +173,26 @@ def test_a_question_about_the_world_is_not_answered_with_the_computers(text):
     assert _said(text)[0] != ["devices"]
 
 
-@pytest.mark.parametrize("text", ["make it private and turn off allow all",
-                                  "make my mac private and turn off allow all",
-                                  "stop allowing people to use my mac",
+@pytest.mark.parametrize("text", ["stop allowing people to use my mac",
                                   "hide my mac"])
 def test_a_hide_stays_a_hide(text):
-    """Going private clears allow-all anyway; "…and turn off allow all" must not
-    leave the computer public — taken by the allow-all arm, `make my mac private
-    and turn off allow all` ran `device-allow-all no` and the computer stayed
-    LISTED. `stop allowing people to use my mac` has been a hide since 7.9-3."""
+    """`stop allowing people to use my mac` has been a hide since 7.9-3."""
     assert _said(text)[0] == ["device-visibility", "private"]
+
+
+@pytest.mark.parametrize("text", ["make it private and turn off allow all",
+                                  "make my mac private and turn off allow all"])
+def test_a_hide_beside_allow_all_writes_nothing(text):
+    """Taken by the first allow-all arm, `make my mac private and turn off allow
+    all` ran `device-allow-all no` and the computer stayed LISTED under a ✓.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): these were in the hide list above.
+    The hand-off to the visibility clause's hide is gone (cross-verify H1: it hid
+    `turn off allow all on my mac but keep it listed`, unconfirmed), and a message
+    with Allow-all words that is not one whole command is READ-ONLY — the
+    person's own list. Neither switch is ever half-done: `make my mac private`
+    said alone still hides."""
+    assert _said(text) == (["devices"], None)
+    assert _said("make my mac private")[0] == ["device-visibility", "private"]
 
 
 @pytest.mark.parametrize("text", ["make my mac public without allow all",

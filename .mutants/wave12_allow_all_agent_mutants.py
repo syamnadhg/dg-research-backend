@@ -51,9 +51,10 @@ SUITES = {
     FSR: (AGENT, "tests/test_allow_all_bridge_0926.py tests/test_app_plane_unchanged.py"),
     # ⛔ + the repair's pins (2026-09-27): R10 and R18 are measured there now.
     # ⛔ + the repair-2 pins (2026-09-27): the re-aimed R mutants are measured there.
+    # ⛔ + the repair-3 pins (2026-09-27): the re-aimed R mutants are measured there.
     SR: (AGENT, "tests/test_allow_all_clients_0926.py tests/test_allow_all_router_0926.py "
                 "tests/test_chat_owner_793.py tests/test_allow_all_router_repair_0927.py "
-                "tests/test_allow_all_whole_message_0927.py"),
+                "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_repair3_0927.py"),
     CLI: (AGENT, "tests/test_allow_all_clients_0926.py"),
     SKILL: (AGENT, "tests/test_chat_owner_793.py tests/test_chat_public_792.py"),
 }
@@ -344,12 +345,17 @@ MUTANTS = [
     # anchor was in the removed reader is re-aimed at the rule that now stops the
     # same defect; R9, R10 and R24 are RETIRED with a note, because the machinery
     # that could produce their defect no longer exists. R14 and R15 match as written.
+    # ⛔⛔ RE-AIMED / RETIRED AGAIN 2026-09-27 (wave 12 repair 3). Repair 3 removed
+    # the hand-off to the hide, the artefact/unlink exemption and `_join_kw`; R1, R6,
+    # R12, R14-R17 are re-aimed at the rule that now stops the same defect, R4 and
+    # R18 are RETIRED with a note. Repair 3's own mutants are in
+    # wave12_repair3_router_mutants.py.
     ("R1", SR, "⛔⛔ THE MEASURED MISROUTES: no arm — 'turn off allow all for my mac' HIDES "
      "the computer unconfirmed, 'let anyone use my computer' raises the APPROVE confirm",
      [('    if _aa_cmd:\n        _aa_dir, _aa_obj = _aa_cmd\n',
        '    if False:\n        _aa_dir, _aa_obj = _aa_cmd\n'),
-      ('    if _aa_said and not ((_unlink_kw or (_artefact_kw and not _machine_kw))\n',
-       '    if False and _aa_said and not ((_unlink_kw or (_artefact_kw and not _machine_kw))\n')]),
+      ('    if _AA_MENTION.search(_aa_src):\n',
+       '    if False and _AA_MENTION.search(_aa_src):\n')]),
     ("R2", SR, "⛔ OFF asks the ON confirm",
      [('        if _aa_dir == "off":\n            return ["device-allow-all", "no"]',
        '        if False:\n            return ["device-allow-all", "no"]')]),
@@ -359,8 +365,14 @@ MUTANTS = [
        '        if True:\n'
        '            return ["device-allow-all", "no" if _aa_dir == "off" else "yes"] + '
        '([_aa_obj] if _aa_obj else []), None\n')]),
-    ("R4", SR, "⛔⛔ 'make it private and turn off allow all' leaves the computer public",
-     [('        if not (_hiding_kw and re.search(\n', '        if True or not (_hiding_kw and re.search(\n')]),
+    # ⛔ R4 RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H1): it removed the
+    # hand-off from the arm to the visibility clause's hide, so `make it private
+    # and turn off allow all` ran `device-allow-all no` and stayed listed. The
+    # hand-off itself is GONE (it hid `…but keep it listed`, unconfirmed), and the
+    # defect it guarded cannot recur: a two-request message matches no whole-message
+    # grammar row, so it can never run OFF — it is read-only, and `do` posts
+    # nothing (pinned: test_allow_all_repair3_0927
+    # test_do_writes_nothing_for_a_read_only_route). Its anchor is gone from sr.py.
     ("R5", SR, "⛔ 'make my mac public without allow all' raises the ON confirm, or "
      "answers a publish with allow-all off",
      [('    ("on", r"(?:make|set)\\s+{S}\\s+public\\s+(?:and|with)\\s+(?:{SET}|let\\s+{W}\\s+join)"),',
@@ -368,9 +380,10 @@ MUTANTS = [
        '(?:{SET}|let\\s+{W}\\s+join)"),')]),
     # ⛔ R6 RE-AIMED 2026-09-27 (repair 2): the question test is the whole-message
     # command's own `?` rule. Same defect: a question acts.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (repair 3): the `?` is read in `_aa_bare`.
     ("R6", SR, "⛔ a question ACTS instead of listing — 'turn off allow all on my mac?' "
      "switches it off",
-     [('    if not s or (question and not polite):\n', '    if not s:\n')]),
+     [('    if not cmd or question:\n', '    if not cmd:\n')]),
     ("R7", SR, "⛔ 'can you let anyone join my mac' is read as a question",
      [('                      r"|(?P<you>(?:can|could|would|will)\\s+you\\b)[\\s,]*(?:please\\b[\\s,]*)?"\n',
        '                      r"|(?P<you>NEVER_R7)"\n')]),
@@ -390,36 +403,46 @@ MUTANTS = [
     ("R11", SR, "⛔ 'require my approval on my mac' names a computer 'approval on my mac'",
      [("_AA_ONE_SUBJ = (rf\"(?:qqname|(?:my|our|this)\\s+(?:own\\s+)?(?:[\\w'’-]+\\s+){{0,2}}?{_MACHINE_SINGULAR}\"",
        "_AA_ONE_SUBJ = (rf\"(?:qqname|(?:my|our|this)\\s+(?:own\\s+)?(?:[\\w'’-]+\\s+){{0,4}}?{_MACHINE_SINGULAR}\"")]),
+    # ⛔ R12 RE-AIMED 2026-09-27 (repair 3): the `the` subject takes model words.
     ("R12", SR, "⛔ an audience plus a thing that is not a computer is a subject — 'stop "
      "letting people join the call' switches allow-all off on a computer called “call”",
-     [("rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR}|it|that)\")",
-       "rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?[\\w'’-]+|it|that)\")")]),
+     [("rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR}(?:\\s+{_MODEL_WORDS})*\"",
+       "rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?[\\w'’-]+(?:\\s+{_MODEL_WORDS})*\"")]),
     ("R13", SR, "⛔⛔ 'stop allowing people to use my mac' — a HIDE since 7.9-3 — switches "
      "allow-all off and leaves it listed",
      [('    ("off", r"stop\\s+allowing\\s+{WO}\\s+to\\s+join(?:\\s+{S})?"),',
        '    ("off", r"stop\\s+allowing\\s+{WO}\\s+to\\s+(?:join|use)(?:\\s+{S})?"),')]),
+    # ⛔ R14 RE-AIMED 2026-09-27 (repair 3): `_join_kw` became the whole-message
+    # `_join_request`. Same defect: no join is read at all.
     ("R14", SR, "⛔ 'join the Studio PC' reaches the catch-all (join is not an ask verb)",
-     [('    _join_kw = (re.search(r"\\bjoin\\b", low) and not _mine_kw\n',
-       '    _join_kw = (None and not _mine_kw\n')]),
+     [('    _join_obj = _join_request(t)\n', '    _join_obj = ""\n')]),
+    # ⛔ R15 RE-AIMED 2026-09-27 (repair 3): the person's own computer is refused
+    # inside the one-computer test (`_JOIN_NOT_ONE`). Same defect.
     ("R15", SR, "⛔ 'join my mac' files an ask for the asker's OWN computer",
-     [('    _join_kw = (re.search(r"\\bjoin\\b", low) and not _mine_kw\n',
-       '    _join_kw = (re.search(r"\\bjoin\\b", low)\n')]),
+     [('                           r"my|our|mine|me|us|you|this)\\b")',
+       '                           r"me|us|you|this)\\b")')]),
     # ⛔ R16 RE-AIMED 2026-09-27 (repair 2): the capture is gated by `_join_kw` now.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (repair 3): the whole-message join feeds the
+    # capture first. Same defect: the join is read but captures nothing.
     ("R16", SR, "⛔ `join <machine>` has no capture — nothing to ask for",
-     [('           or (_join_kw and re.search(r"\\bjoin\\s+(.+)$", t, flags=re.I)))', '           )')]),
+     [('    if _join_obj or _om:\n        _ask_obj = re.sub(r"[?.!,]+$", "", _join_obj or _om.group(1))',
+       '    if _om:\n        _ask_obj = re.sub(r"[?.!,]+$", "", _om.group(1))')]),
     # ⛔ R17 RE-AIMED 2026-09-27 (repair 2): `allow all cookies` can no longer be a
     # switch (no grammar row reads it); the rule that keeps a subject-less message off
     # the person's computers is the fallback's catch-all.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (repair 3): the arm returns directly.
     ("R17", SR, "⛔ no computer in view is needed — 'let people join the call' is answered "
      "with this account's computers",
-     [('        else:\n            _aa_route = (None, [_NL_CATCH_ALL])\n',
-       '        else:\n            _aa_route = (["devices"], None)\n')]),
-    # ⛔ R18 RE-AIMED 2026-09-27 (repair 2): measured by a podcast request carrying an
-    # audience phrase keeping its own route.
-    ("R18", SR, "⛔ an artefact request with an audience in it ('send me the podcast when "
-     "anyone can join') loses its own route",
-     [('    if _aa_said and not ((_unlink_kw or (_artefact_kw and not _machine_kw))\n',
-       '    if _aa_said and not ((_unlink_kw)\n')]),
+     [('            return ["devices"], None\n        return None, [_NL_CATCH_ALL]\n',
+       '            return ["devices"], None\n        return ["devices"], None\n')]),
+    # ⛔ R18 RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H4/H5): it narrowed
+    # repair 2's artefact / unlink exemption, and the podcast route it kept is the
+    # defect's other face — the same exemption let `pause the Mars run when anyone
+    # can join` PAUSE, unconfirmed, and `forget it, go back to approving people`
+    # reach the nameless approve. The exemption is GONE: the arm owns every message
+    # with Allow-all words (the podcast row FLIPPED to the catch-all,
+    # test_allow_all_whole_message_0927, dated). The exemption brought back is
+    # wave12_repair3_router_mutants.py C2.
     ("R19", SR, "⛔ a computer NAMED “Allow All Lab” is read as a request",
      [('    _aa_src = _outside_quoted_names(low)\n', '    _aa_src = low\n')]),
     ("R20", SR, "⛔ 'without asking' with no audience ('switch to the office pc without asking "

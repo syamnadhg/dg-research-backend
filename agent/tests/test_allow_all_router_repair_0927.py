@@ -25,6 +25,11 @@ a dated note: a second clause, a leading clause, a statement or the bare label i
 not a command, so it is the person's own list or the catch-all — never a write,
 never a switch confirm, never the removed "on or off?" ask-back. The new policy's
 own pins are in test_allow_all_whole_message_0927.py.
+
+⛔ REPAIR 3 (2026-09-27) TOOK OUT WHAT REPAIR 2 ADDED — the `so …` reason tail, the
+hand-off to the hide, the join route inside the arm — and the pins here that
+stood on them are FLIPPED in place, each with a dated note. The repair-3 pins are
+in test_allow_all_repair3_0927.py.
 """
 from __future__ import annotations
 
@@ -85,13 +90,15 @@ _ON_WITH_A_SECOND_CLAUSE = [
 
 
 @pytest.mark.parametrize("text", _ON_WITH_A_STOP_WORD)
-def test_an_on_request_with_a_stop_word_elsewhere_asks_to_switch_on(text):
+def test_an_on_request_with_a_reason_is_the_list_never_a_switch(text):
     """⛔⛔ Every one of these POSTed allowAll:false with no confirm — the `stop`,
-    `don't`, `never` or `no more` of a PURPOSE clause read as the direction. A
-    whole command plus one `so …` purpose clause is still the command."""
-    argv, lines = _said(text)
-    assert argv is None, f"{text!r} ran {argv} without a confirm"
-    assert " ".join(lines).startswith(_ON), lines
+    `don't`, `never` or `no more` of a PURPOSE clause read as the direction.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): pinned to the ON confirm, through
+    repair 2's `so/because/since …` reason tail. That tail is gone (cross-verify
+    H3: `turn on allow all so I can join the Studio PC` — a JOINER — raised the
+    confirm that opens their OWN computer). A command is the whole message; with
+    a reason it is read-only — the person's own list — and still never OFF."""
+    assert _said(text) == (["devices"], None)
 
 
 @pytest.mark.parametrize("text", _ON_WITH_A_SECOND_CLAUSE)
@@ -207,13 +214,18 @@ def test_no_joiner_request_ever_opens_the_askers_computer(text):
     "my mac should not be public, and turn off allow all",
     "undo making my mac public and turn off allow all",
 ])
-def test_hiding_and_switching_allow_all_off_hides(text):
+def test_hiding_and_switching_allow_all_off_writes_nothing(text):
     """⛔⛔ These ran `device-allow-all no` with no confirm: the bridge wrote only
-    allowAll:false and the computer stayed LISTED, under a reply with a ✓. The
-    hide is resolved from what the message asks once the allow-all words are
-    gone — so the name is not welded to "and turn off allow all" either (the
-    base revision hid a machine called “mac and turn off allow all”)."""
-    assert _said(text) == (["device-visibility", "private"], None)
+    allowAll:false and the computer stayed LISTED, under a reply with a ✓.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): pinned to the HIDE, through repair
+    2's hand-off from the allow-all arm to the visibility clause. That hand-off is
+    gone: it could not tell `…and turn off allow all` from `…but keep it listed`
+    and HID the second, unconfirmed (cross-verify H1, H11). Two requests in one
+    message are read-only now — the person's own list, never half of either — and
+    each still works said alone."""
+    assert _said(text) == (["devices"], None)
+    assert _said("take my mac off the public list")[0] == ["device-visibility", "private"]
+    assert _said("turn off allow all on my mac") == (_OFF, None)
 
 
 @pytest.mark.parametrize("text", [
@@ -231,7 +243,8 @@ def test_public_but_approve_each_person_is_a_plain_publish(text):
     the rest to the publish — the reading that misrouted in two review rounds.
     Not a whole command, so no confirm of either switch and never a write: the
     person's own list. `make my mac public` said alone is still the publish, and
-    that confirm no longer promises approval on a computer that lets anyone join."""
+    that confirm no longer promises approval on a computer that lets anyone join.
+    (Repair 3 left these where they were: read-only.)"""
     assert _said(text) == (["devices"], None)
     assert _line("make my mac public").startswith(f"{_PUBLISH} that computer ")
 
@@ -251,12 +264,18 @@ def test_a_pronoun_subject_publishes_and_allows_all_in_one_confirm():
 def test_each_road_to_a_subject_is_its_own(text, route):
     """⛔ FLIPPED 2026-09-27 (wave 12 repair 2). Both were pinned to the ON confirm
     through two roads repair 1 built — a pronoun the visibility clause resolves,
-    and a publish of a named computer handed on by the arm. Both roads are gone
-    with the free-text reading: an `and …` is not a whole command. The pronoun
-    is still the person's own computer (their list); a bare id beside two
-    requests names nothing this arm reads (the catch-all, which teaches the
-    phrasings). Neither is ever a write or a switch confirm."""
+    and a publish of a named computer handed on by the arm. Neither is ever a
+    write or a switch confirm.
+    ⛔⛔ CORRECTED 2026-09-27 (wave 12 repair 3, cross-verify H19). The note here
+    said "an `and …` is not a whole command" — FALSE for the publish row: the
+    grammar DOES read `publish <one computer> and allow all` as one command
+    (`publish my mac and allow all` is the ON confirm, executed below). `publish
+    LABPC001 and allow all` is the catch-all ONLY because a bare, unquoted id is
+    never a subject — an unquoted name must be `the <name> <machine>`. That is a
+    GAP, recorded as one: the quoted form is the command."""
     assert _said(text) == route
+    assert _line("publish my mac and allow all").startswith(_ON)
+    assert _line("publish “LABPC001” and allow all").startswith(f"{_ON} “LABPC001”")
 
 
 def test_a_negation_before_a_phrase_but_not_governing_it_is_not_a_direction():
@@ -313,14 +332,18 @@ def test_approving_people_again_is_allow_all_off_never_the_approve_confirm():
 
 @pytest.mark.parametrize("text, code", [
     ("join K7XQ-9B2M", "K7XQ-9B2M"), ("please join K7XQ-9B2M", "K7XQ-9B2M"),
-    ("can I join K7XQ-9B2M", "K7XQ-9B2M"), ("join BCDF-GHJK", "BCDF-GHJK"),
-    ("join KAXE-WRTQ", "KAXE-WRTQ"),
+    ("join BCDF-GHJK", "BCDF-GHJK"), ("join KAXE-WRTQ", "KAXE-WRTQ"),
 ])
 def test_join_an_access_code_pairs_it(text, code):
     """⛔⛔ The code was POSTed to /device/ask as a device id — one of five asks an
-    hour spent on "isn't offered publicly any more" — and never paired."""
+    hour spent on "isn't offered publicly any more" — and never paired.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): `can I join K7XQ-9B2M` was a row
+    here. A join is read only as the WHOLE message now (cross-verify H7), and a
+    question is not one — it neither pairs nor asks (the catch-all); the
+    whole-message forms above still pair."""
     assert _said(text) == (["device-add", code], None)
     assert _ASK not in _line(text)
+    assert _said("can I join K7XQ-9B2M") == (None, [sr._NL_CATCH_ALL])
 
 
 @pytest.mark.parametrize("text", ["don't join the Studio PC", "did I join the Studio PC",
@@ -374,22 +397,31 @@ def test_keeping_it_public_while_switching_off_is_never_a_hide_or_publish(text):
     visibility clause's `turn … off`, it would HIDE the computer the person said
     to keep public.
     ⛔ FLIPPED 2026-09-27 (wave 12 repair 2): pinned to OFF. Two clauses are not a
-    whole command, so nothing is written — the person's own list, never a hide
-    (the hand-off to the hide refuses `keep … public`)."""
+    whole command, so nothing is written — the person's own list, never a hide.
+    (Repair 3 removed the hand-off to the hide altogether, cross-verify H1.)"""
     assert _said(text) == (["devices"], None)
 
 
-def test_a_joiner_naming_a_computer_gets_the_ask_with_its_name_alone():
+def test_a_joiner_naming_a_computer_gets_the_browse_list():
     """`join the Studio PC, it lets anyone in` raised the OWNER's ON confirm naming
-    “Studio PC” — a yes opens the asker's own computer. It is the ask, and the
-    allow-all words are not welded onto the name."""
-    assert _line("join the Studio PC, it lets anyone in").startswith(f"{_ASK} “Studio PC” ")
+    “Studio PC” — a yes opens the asker's own computer.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): pinned to the ASK, through repair
+    2's join route inside the allow-all arm. A message with Allow-all words that is
+    not a whole command is READ-ONLY and the arm owns it — no ask confirm — so a
+    joiner gets the browse list, whose row for that computer says "joins at once".
+    `join the Studio PC` said alone is still the ask."""
+    assert _said("join the Studio PC, it lets anyone in") == (["devices-public"], None)
+    assert _line("join the Studio PC").startswith(f"{_ASK} “Studio PC” ")
 
 
-def test_a_joiner_naming_a_code_pairs_it():
+def test_a_joiner_naming_a_code_with_allow_all_words_gets_the_browse_list():
     """`join K7XQ-9B2M, it lets anyone in` raised the ON confirm for the asker's own
-    computer; the code is the thing to pair."""
-    assert _said("join K7XQ-9B2M, it lets anyone in") == (["device-add", "K7XQ-9B2M"], None)
+    computer.
+    ⛔ FLIPPED 2026-09-27 (wave 12 repair 3): pinned to the pairing, through the
+    same removed join route. Read-only like every non-command message with
+    Allow-all words; the code said alone, or after any ask verb, still pairs."""
+    assert _said("join K7XQ-9B2M, it lets anyone in") == (["devices-public"], None)
+    assert _said("join K7XQ-9B2M") == (["device-add", "K7XQ-9B2M"], None)
 
 
 def test_check_if_is_a_question_and_check_alone_is_the_checkbox():

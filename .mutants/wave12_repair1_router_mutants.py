@@ -27,6 +27,13 @@ happen, with a dated note; where the machinery that could produce it is gone, th
 entry is RETIRED as a comment saying why. The new policy's own mutants are in
 wave12_repair2_router_mutants.py, and the suites now include its pins.
 
+⛔⛔ RE-AIMED / RETIRED AGAIN 2026-09-27 (wave 12 repair 3). Repair 3 removed what
+repair 2 had added — the purpose clause, the hand-off to the hide, the join route
+and `_join_kw`'s five vetoes (a join is read only as the WHOLE message). Each entry
+below whose anchor moved is re-aimed with a dated note; each whose defect can no
+longer be expressed is retired with a note saying why. The suites include the
+repair-3 pins; repair 3's own mutants are in wave12_repair3_router_mutants.py.
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every mutated
 Python file must still COMPILE. Both are harness faults, counted OUT.
 ⛔ BYTES BACK, NOT TEXT — a text restore would flip a CRLF checkout's line endings.
@@ -48,31 +55,30 @@ SR = "agent/facade/skill/scripts/sr.py"
 
 SUITES = {
     # ⛔ + the repair-2 pins (2026-09-27): the re-aimed mutants are measured there.
+    # ⛔ + the repair-3 pins (2026-09-27).
     SR: (AGENT, "tests/test_allow_all_router_repair_0927.py tests/test_allow_all_router_0926.py "
                 "tests/test_chat_public_792.py tests/test_chat_owner_793.py "
-                "tests/test_allow_all_whole_message_0927.py"),
+                "tests/test_allow_all_whole_message_0927.py tests/test_allow_all_repair3_0927.py"),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 MUTANTS = [
     # ═══ F5 — a code after `join` ═════════════════════════════════════════════
+    # ⛔ F5 RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H17): the code test
+    # covers every ask verb and reads the object before its machine word comes off.
     ("F5", SR, "⛔⛔ `join K7XQ-9B2M` asks the owner of a computer called “K7XQ-9B2M” — the "
      "code posted as a device id, an ask spent, nothing paired",
-     [('    if _join_kw and _ask_obj and (_NL_CODE_RE.fullmatch(_ask_obj)\n',
-       '    if False and _join_kw and _ask_obj and (_NL_CODE_RE.fullmatch(_ask_obj)\n')]),
+     [('    if _ask_code:\n        return ["device-add", _ask_code], None\n',
+       '    if False:\n        return ["device-add", _ask_code], None\n')]),
 
     # ═══ F7 — a hide or a publish beside Allow all ════════════════════════════
-    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the arm hands a hide to the
-    # visibility clause when the message says WHAT is hidden. Same defect — only a
-    # few hide words count — on the list that now decides it.
-    ("F7a", SR, "⛔⛔ only a handful of hide words count — `take my mac off the public list and "
-     "turn off allow all` loses the hide and the computer stays LISTED",
-     [('                r"\\b(?:public(?:ly)?|private(?:ly)?|hid(?:e|es|den|ing)|unlist\\w*|delist\\w*|"\n'
-       '                r"unpublish\\w*|list(?:ed|ing)?|directory|shar(?:e|ed|es|ing)|unshar\\w*|"\n'
-       '                r"visib\\w*|invisible|findable|discoverable|find|finding|see|seeing|"\n'
-       '                r"discover\\w*|offer\\w*)\\b"\n',
-       '                r"\\b(?:private(?:ly)?|hid(?:e|es|den|ing)|unlist\\w*|delist\\w*|"\n'
-       '                r"unpublish\\w*)\\b"\n')]),
+    # ⛔ F7a RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H1/H11): it measured
+    # which hide words let the arm hand a message to the visibility clause. The
+    # hand-off is GONE (it hid `…but keep it listed`, unconfirmed), so no message
+    # with Allow-all words reaches the hide and no list of hide words decides
+    # anything; its anchor no longer exists in sr.py (anchor sweep, 0 matches).
+    # Pinned instead: those messages write nothing (test_allow_all_repair3_0927);
+    # the hand-off brought back is wave12_repair3_router_mutants.py C1.
     # ⛔ F7b RETIRED 2026-09-27 (wave 12 repair 2): it kept the conjunction in "what
     # else the message asks" — the blanked rest the arm re-resolved through the
     # router. Nothing is re-resolved any more (a message with a second clause is not
@@ -80,34 +86,36 @@ MUTANTS = [
     # ⛔ F7c RETIRED 2026-09-27 (wave 12 repair 2): it left "turn" behind when the
     # phrase was blanked out of the rest — the same removed re-resolution. The name a
     # hide captures beside Allow all is measured by repair2 M14.
-    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): "keep it public" used to guard the
-    # publish reading; it guards the hide hand-off now, and without it the same words
-    # are read the other wrong way.
-    ("F7d", SR, "⛔ `keep my mac public but turn off allow all` HIDES the computer the person "
-     "said to keep public (it read as a PUBLISH before repair 2)",
-     [('                and not re.search(r"\\b(?:keep|keeps|keeping|leave|leaves|stay|stays|remain|"\n',
-       '                and not re.search(r"\\bNEVER_F7D\\b(?:keep|keeps|keeping|leave|leaves|stay|stays|remain|"\n')]),
+    # ⛔ F7d RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H1): it measured the
+    # `keep … public` guard on the hide hand-off. The hand-off is GONE, and with it
+    # the guard — round 3 showed it knew only `public` and hid `…keep it listed /
+    # shared / findable`. A keep beside Allow-all words is read-only now whatever
+    # word it keeps (pinned: test_allow_all_repair3_0927 _R2_ROWS).
 
     # ═══ F8 / F11 / F15 — other people's computers ════════════════════════════
     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto `_aa_about_others` and the
     # join route; each keeps its defect.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (wave 12 repair 3): the arm returns directly.
     ("F8a", SR, "⛔⛔ `list public computers that let anyone join` reaches the catch-all — a "
      "joiner's way in, answered with nothing",
-     [('        elif _aa_about_others(_aa_rest):\n            _aa_route = (["devices-public"], None)\n',
+     [('        if _aa_about_others(_aa_rest):\n            return ["devices-public"], None\n',
        '')]),
-    ("F8b", SR, "⛔ `join a public computer that lets anyone in` loses the browse list — it asks "
-     "the owner of “a public computer”",
-     [('    if (not obj or re.match(r"(?:a|an|any|some|another|public|shared|one|ones|all|every)\\b",\n',
-       '    if (not obj or re.match(r"NEVER_F8B\\b",\n')]),
+    # ⛔ F8b RETIRED 2026-09-27 (wave 12 repair 3): it measured the join route's
+    # category rule (`join a public computer that lets anyone in` asking about “a
+    # public computer”). The join route is GONE: a message with Allow-all words never
+    # reaches an ask, and this one is the browse list through `_AA_OTHERS` (pinned;
+    # measured by wave12_repair2_router M3*).
     ("F8c", SR, "⛔⛔ THE REPORTED DEFECT (round 2's G4 cause): the person's own computer wins "
      "over other people's — `since my mac is offline, list computers that let anyone join` "
      "is answered as the owner's",
-     [('        elif _aa_about_others(_aa_rest):\n',
-       '        elif _aa_about_others(_aa_rest) and not _mine_kw:\n')]),
-    ("F11", SR, "⛔ `which public computers let anyone join` — a QUESTION about other people's "
+     [('        if _aa_about_others(_aa_rest):\n',
+       '        if _aa_about_others(_aa_rest) and not _mine_kw:\n')]),
+    # ⛔ F11 RE-AIMED 2026-09-27 (wave 12 repair 3): the question test now sits AFTER
+    # the browse test, so the mutant reads the `?` itself.
+    ("F11", SR, "⛔ `which public computers let anyone join?` — a QUESTION about other people's "
      "computers — is not the browse list",
-     [('        elif _aa_about_others(_aa_rest):\n',
-       '        elif _aa_about_others(_aa_rest) and not _aa_asking:\n')]),
+     [('        if _aa_about_others(_aa_rest):\n',
+       '        if _aa_about_others(_aa_rest) and not t.rstrip().endswith("?"):\n')]),
     ("F15", SR, "⛔ `join one of the public computers` is refused as a set",
      [('        or re.match(r"(?:any\\s+|some\\s+|just\\s+)?one\\s+of\\b", _ask_obj, re.I))',
        '        )')]),
@@ -121,31 +129,37 @@ MUTANTS = [
        '    direction = next((d for d, rx in _AA_GRAMMAR if rx.search(cmd)), None)\n')]),
 
     # ═══ F10 — `join` negated or asked about ═════════════════════════════════
-    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): `join` left `_MUTATING_VERBS` (it
-    # vetoed research topics, cross-verify G12); its negation is read in `_join_kw`.
-    ("F10a", SR, "⛔⛔ a negated `join` is a join — `don't join the Studio PC` reaches the ask "
-     "confirm",
-     [('                and not re.search(rf"\\b{_NEG_WORDS}\\b{_NEG_FILLER}\\s+(?:ask\\s+to\\s+)?join\\b",\n'
-       '                                  low)\n', '')]),
-    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the lines moved above the capture.
-    ("F10b", SR, "⛔ `did I join the Studio PC` is read as a request to join",
-     [('                and not re.match(_NL_LEAD_IN + r"(?:did|do|does|have|has|had|was|were|is|"\n'
-       '                                 r"are|am|why|when|what|which|who|how|where)\\b", low)\n', '')]),
+    # ⛔ F10a, F10b RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H7): they
+    # removed `_join_kw`'s negation and question vetoes. `_join_kw` is GONE — a join
+    # is read only as the WHOLE message, which `don't join…` and `did I join…`
+    # cannot be (pinned: test_allow_all_router_repair_0927
+    # test_a_negated_or_past_join_is_not_an_ask). The defect returns only if the
+    # join stops being whole-message: wave12_repair2_router J3, re-aimed.
 
     # ═══ F12 — the subjects nothing else supplies ═════════════════════════════
     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2): the pronoun is a grammar subject now.
+    # ⛔ RE-AIMED AGAIN 2026-09-27 (wave 12 repair 3): the subject's `the` branch took
+    # model words, so `|it|that` moved to a line of its own.
     ("F12a", SR, "⛔⛔ THE REPORTED DEFECT: `make it public and allow all` is not a command — the "
      "pronoun is not a subject",
-     [("rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR}|it|that)\")",
-       "rf\"setting|allow)\\b)[\\w'’-]+\\s+){{0,3}}?{_MACHINE_SINGULAR})\")")]),
+     [('                rf"|it|that)")', '                rf")")')]),
     ("F12b", SR, "⛔ the pronoun alone is not a subject — `keep it public and let anyone join` "
      "reaches the catch-all instead of the person's own list",
      [('              or _pronoun_target\n', '')]),
     # ⛔ F12c RETIRED 2026-09-27 (wave 12 repair 2): it measured that `publish LABPC001
     # and allow all` reached the ON confirm through the publish the arm handed on.
-    # That road is gone with the re-resolution: two requests in one message are not
-    # a command, and the catch-all — the "defect" it named — is now the intended,
-    # pinned route (test_allow_all_router_repair_0927 FLIPPED, same date).
+    # That road is gone with the re-resolution.
+    # ⛔⛔ CORRECTED 2026-09-27 (wave 12 repair 3, cross-verify H19). The note above
+    # used to add "two requests in one message are not a command" — FALSE: the
+    # grammar DOES read `publish <one computer> and allow all` as ONE command
+    # (`publish my mac and allow all` is the ON confirm; so is `publish “LABPC001”
+    # and allow all`, naming it — both executed in test_allow_all_router_repair_0927
+    # test_each_road_to_a_subject_is_its_own). `publish LABPC001 and allow all` is
+    # the catch-all ONLY because a bare, unquoted id is never a subject (an unquoted
+    # name must be `the <name> <machine>`). That is a GAP, recorded as one, not a
+    # decision: the catch-all names the phrasings, and the quoted form works. The
+    # retirement stands for the honest reason: no rule reads a bare id as a subject,
+    # so there is nothing for a mutant to break.
 
     # ═══ F13 / F14 — the approval step, both ways ════════════════════════════
     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto the grammar rows.
@@ -182,10 +196,14 @@ MUTANTS = [
      "raises the ON confirm",
      [('_AA_HEAD = re.compile(r"(?:(?:please|pls|hey|hi|ok|okay|so|now|just)\\b[\\s,]*"',
        '_AA_HEAD = re.compile(r"(?:(?:please|pls|hey|hi|ok|okay|so|now|just|never)\\b[\\s,]*"')]),
+    # ⛔ F19e RE-AIMED 2026-09-27 (wave 12 repair 3): the purpose clause it widened
+    # to `and` is gone; the mutant now reads the first `and`-clause as the command
+    # in `_aa_bare`, the one reader of what surrounds a command. Same defect.
     ("F19e", SR, "⛔ ON and OFF in one message ACT on one of them — `turn on allow all for my "
      "mac and turn off auto approve` raises the ON confirm",
-     [('_AA_PURPOSE = re.compile(r"\\s*,?\\s+(?:so|because|since)\\b")',
-       '_AA_PURPOSE = re.compile(r"\\s*,?\\s+(?:so|because|since|and)\\b")')]),
+     [('    return _AA_TAIL.sub("", s).strip(" ,"), question and not polite\n',
+       '    return re.split(r"\\s+and\\s+", _AA_TAIL.sub("", s).strip(" ,"))[0], '
+       'question and not polite\n')]),
 
     # ═══ F20 / F21 ═══════════════════════════════════════════════════════════
     ("F20", SR, "⛔⛔ the OFF picker suggests `let anyone join “X”` — said back, the ON "
@@ -193,9 +211,12 @@ MUTANTS = [
      [('    return _set_device_visibility(args, payload, "let anyone join “{name}”" if value == "yes"\n'
        '                                  else "stop letting anyone join “{name}”")',
        '    return _set_device_visibility(args, payload, "let anyone join “{name}”")')]),
-    ("F21", SR, "⛔ `sign in to join the Studio PC` raises the ask confirm, overriding "
-     "e567704's sign-in rule",
-     [('                and not re.search(rf"\\b{_SIGN_IN_ASK}\\b", low)\n', '')]),
+    # ⛔ F21 RETIRED 2026-09-27 (wave 12 repair 3, cross-verify H7): it removed
+    # `_join_kw`'s sign-in veto. `_join_kw` is GONE; `sign in to join the Studio PC`
+    # is not a whole-message join, so it cannot ask (pinned:
+    # test_allow_all_router_repair_0927 test_signing_in_to_join_stays_a_sign_in).
+    # The defect returns only if the join stops being whole-message:
+    # wave12_repair2_router J3, re-aimed.
 
     # ═══ S — the narrowing's own pieces ══════════════════════════════════════
     # ⛔ S1 RETIRED 2026-09-27 (wave 12 repair 2): it removed the copula test that
@@ -207,15 +228,18 @@ MUTANTS = [
     # grammar row, so it can never raise the ON confirm; the filter only chose
     # between two read-only answers, and repair 2 measured removing it: six corpus
     # messages moved, every one to the browse list a joiner wanted.
-    # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 2) onto the whole-message join route.
-    ("S3", SR, "⛔ a joiner naming a computer (`join the Studio PC, it lets anyone in`) gets the "
-     "browse list instead of the ask",
-     [('        _aa_join = _aa_join_route(t)\n', '        _aa_join = None\n')]),
-    ("S3b", SR, "⛔ a joiner naming a CODE (`join K7XQ-9B2M, it lets anyone in`) is not paired",
-     [('    if (_NL_CODE_RE.fullmatch(obj) or _NL_CONNECTION_CODE_RE.fullmatch(obj)\n',
-       '    if False and (_NL_CODE_RE.fullmatch(obj) or _NL_CONNECTION_CODE_RE.fullmatch(obj)\n')]),
-    ("S4", SR, "⛔ the comma stays in the name — the ask quotes “Studio PC,”",
-     [('    obj = re.split(r"\\s*[,;:(—–]\\s*|', '    obj = re.split(r"\\s*[;:(—–]\\s*|')]),
+    # ⛔ S3, S3b RETIRED 2026-09-27 (wave 12 repair 3): they measured the join route
+    # inside the arm answering `join the Studio PC, it lets anyone in` with the ask
+    # and `join K7XQ-9B2M, it lets anyone in` with the pairing. Repair 3 made every
+    # message with Allow-all words READ-ONLY (the owner's policy: no clause writes or
+    # confirms for it), so the browse list those mutants called a defect is now the
+    # pinned route (test_allow_all_router_repair_0927, FLIPPED with a dated note).
+    # The route and its code test are GONE; there is nothing left to break.
+    # ⛔ S4 RE-AIMED 2026-09-27 (wave 12 repair 3): a whole-message join's name
+    # cannot take a comma (`_JOIN_WHOLE`). Same defect.
+    ("S4", SR, "⛔ the comma stays in the name — `join the Studio PC, Lab edition` asks about "
+     "“Studio PC, Lab edition”",
+     [('    r"(?P<obj>[^,;:()—–]+)")', '    r"(?P<obj>[^;:()—–]+)")')]),
     ("S5", SR, "⛔ `check allow all` — the checkbox's own verb — is not a command",
      [('    ("on", r"(?:enable|tick|check|activate)\\s+{SET}{T}"),',
        '    ("on", r"(?:enable|tick|activate)\\s+{SET}{T}"),')]),
@@ -223,9 +247,11 @@ MUTANTS = [
      "is not a command",
      [('                rf"|the\\s+(?:(?!(?:public|shared|open|other|others|any|some|same|one|ones|whole|"',
        '                rf"|NEVER_S6\\s+(?:(?!(?:public|shared|open|other|others|any|some|same|one|ones|whole|"')]),
+    # ⛔ S7 RE-AIMED 2026-09-27 (wave 12 repair 3): `ask for` left the joiner verbs
+    # (cross-verify H7). Same defect.
     ("S7", SR, "⛔⛔ the joiner's verb is not read — `can I borrow the studio pc, it lets anyone "
      "in` is answered with the asker's OWN computers",
-     [('_AA_JOINER = re.compile(r"\\b(?:join|borrow|ask\\s+(?:to\\s+(?:use|join)|for)|request\\s+access)\\b"\n',
+     [('_AA_JOINER = re.compile(r"\\b(?:join|borrow|ask\\s+to\\s+(?:use|join)|request\\s+access)\\b"\n',
        '_AA_JOINER = re.compile(r"\\bNEVER_S7\\b"\n')]),
     ("S8", SR, "⛔ approval ON is not read — `turn on approval for my mac` changes nothing",
      [('    ("off", r"(?:(?:turn|switch)\\s+(?:back\\s+)?on\\s+(?:the\\s+)?approvals?(?:\\s+step)?|"',
