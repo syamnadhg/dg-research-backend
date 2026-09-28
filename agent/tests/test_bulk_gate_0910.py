@@ -546,6 +546,15 @@ def test_a_lead_in_word_does_not_turn_a_question_into_an_offer(lead):
     assert argv == ["devices"], f"{lead!r} -> {argv} / {lines[:90]}"
 
 
+@pytest.mark.parametrize("lead", [x for x in _LEAD_INS if x])
+def test_a_lead_in_question_without_its_question_mark_is_still_a_question(lead):
+    """⛔ Since the Windows review of wave 12 (2026-09-28) a trailing “?” alone makes
+    a question, so the form above no longer depends on the lead-in. Typed without
+    one, it still does: `so are all my computers public` must read the list."""
+    argv, lines = _said(lead + "are all my computers public")
+    assert argv == ["devices"], f"{lead!r} -> {argv} / {lines[:90]}"
+
+
 def test_the_lead_in_list_is_shared_with_the_research_pattern():
     """⛔ TWO COPIES OF A COURTESY LIST IS HOW THIS FILE'S NOUN LISTS DRIFTED."""
     assert sr._NL_LEAD_IN in sr._NL_RESEARCH_RE.pattern

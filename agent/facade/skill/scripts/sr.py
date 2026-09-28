@@ -490,10 +490,17 @@ def _request(method: str, path: str, body: dict | None = None,
         # clause absorbs read timeouts (socket.timeout is TimeoutError) and other
         # low-level socket/OS errors into the same friendly line instead of a
         # raw traceback.
-        return 0, {"error": f"bridge unreachable ({e}) — the Super Research bridge "
-                            "isn't running on this machine yet. Set it up with `pipx run "
-                            "--no-cache superresearch-agent connect` (it starts the bridge + keeps it "
-                            "on login), then sign in."}
+        # ⛔ A READ TIMEOUT IS MARKED (Windows review of wave 12): the bridge
+        # answered the connect and then went quiet, so a WRITE may have landed.
+        # The line stays the same for every reader; a writer that must not say
+        # "failed" about a change that may be saved reads `reason`.
+        out = {"error": f"bridge unreachable ({e}) — the Super Research bridge "
+                        "isn't running on this machine yet. Set it up with `pipx run "
+                        "--no-cache superresearch-agent connect` (it starts the bridge + keeps it "
+                        "on login), then sign in."}
+        if isinstance(e, TimeoutError):
+            out["reason"] = "timeout"
+        return 0, out
 
 
 def _get(path: str, timeout: float | None = None) -> tuple[int, dict]:
@@ -767,7 +774,8 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
     (device, chat-lines-to-print-on-failure) — exactly one is set."""
     code, body = _get("/devices")
     if code != 200 or not isinstance(body, dict):
-        return None, [f"✗ {body.get('error', code)}"]
+        # ⛔ Signed out, "run /login" is the terminal's word (`_signed_out_or`).
+        return None, [f"✗ {_signed_out_or(body.get('error', code))}"]
     devices = body.get("devices", [])
     if not devices:
         # ⛔ WRAPPED HERE, AT THE SOURCE, because every caller emits these lines
@@ -2691,11 +2699,20 @@ def _set_device_visibility(args, payload: dict, example: str) -> int:
             return _emit({}, args.json, fail, 1)
     code, body = _post("/device/visibility",
                        {"deviceId": dev.get("id"), **payload}, timeout=40)
+    if code == 0 and body.get("reason") == "timeout":
+        # ⛔⛔ A LOST REPLY IS NOT A MISSING BRIDGE (Windows review of wave 12). The
+        # GET a moment ago reached it; "isn't running on this machine yet" sent the
+        # owner off to reinstall while Allow all may already be on.
+        return _emit(body, args.json,
+                     ["✗ could not confirm that change — it may or may not have been "
+                      "saved. Ask me to list your computers to see where it stands."],
+                     _fail_code(code))
     if code != 200:
         # ⛔⛔ NOT `_list_refusal_line` — see the terminal's note. Its "Couldn’t
         # …" prefix contradicts the very payload the bridge built to say the
-        # write may have landed.
-        said = body.get("error") or "the app gave no reason"
+        # write may have landed. ⛔ Signed out, the bridge's "run /login" is the
+        # terminal's word — `_signed_out_or` says it the chat's way.
+        said = _signed_out_or(body.get("error") or "the app gave no reason")
         return _emit(body, args.json, [f"✗ {said}"], _fail_code(code))
     return _emit(body, args.json,
                  _visibility_lines(body, dev, payload.get("allowAll")))
@@ -2772,7 +2789,7 @@ def _pick_owned_device(example: str = "make “{name}” public") -> "tuple[dict
     """
     code, body = _get("/devices")
     if code != 200:
-        return None, [f"✗ {body.get('error', code)}"]
+        return None, [f"✗ {_signed_out_or(body.get('error', code))}"]
     owned = [d for d in (body.get("devices") or []) if d.get("owned")]
     if not owned:
         return None, ["None of the computers on this account are yours to change "
@@ -2846,7 +2863,11 @@ def _names_a_machine(span: str) -> bool:
     where a name stops or where a clause does.
     """
     w = (span or "").strip().strip(_NL_QUOTE_CHARS).strip()
-    if not w:
+    # ⛔⛔ A LONE PARTICLE IS NOT A NAME (Windows review of wave 12, 2026-09-28).
+    # `turn off public for my mac` captured “off”, which the resolver matched as
+    # a substring of “Office PC” — and hid THAT computer, unconfirmed. Only the
+    # whole span: a quoted “Kick Off” is still somebody's name.
+    if not w or re.fullmatch(r"(?:off|on|up|down|out)", w, re.I):
         return False
     return not re.search(rf"(?:^|\s){_NOT_A_NAME_TAIL}$", w, re.I)
 
@@ -6522,10 +6543,13 @@ def _is_setting_quote(span: str) -> bool:
 # ⛔ WHAT MAKES A QUOTED SPAN A RUN'S TITLE: it ENDS the message, right after a run
 # verb (`stop “…”`) or a run's artefact and its preposition (`status of “…”`, `skip
 # the podcast on “…”`). `stop “Allow all” on my mac` is still the setting.
+# ⛔ …and after the run word itself (Windows review of wave 12): `stop research on
+# “allow all”` gave the device list.
 _RUN_TITLE_BEFORE = re.compile(
     r"\b(?:(?:stop|end|abort|cancel|pause|resume|unpause|retry)"
     r"|(?:status|progress|podcasts?|audio|videos?|reports?|briefs?|links?|"
-    r"skip\s+(?:the\s+)?[\w'’-]+)\s+(?:of|for|on|from|in))(?:\s+the)?\s*$", re.I)
+    r"skip\s+(?:the\s+)?[\w'’-]+)\s+(?:of|for|on|from|in))(?:\s+the)?"
+    r"(?:\s+(?:research|run)(?:\s+(?:on|about|called|named))?)?\s*$", re.I)
 
 
 def _is_run_title(text: str, q: "re.Match[str]") -> bool:
@@ -6570,6 +6594,14 @@ def _aa_bare(text: str) -> "tuple[str, bool]":
     return _AA_TAIL.sub("", s).strip(" ,"), question and not polite
 
 
+# ⛔ THE PRODUCT'S OWN NOUN IS A KIND, NOT A NAME (Windows review of wave 12,
+# 2026-09-28). `make my research computer private` and `turn off allow all for my
+# research computer` looked for a computer CALLED “research computer” and found
+# none — though this client's own replies say "research computer". Off the front
+# of a captured object, it leaves the bare machine word the picker already takes.
+_PRODUCT_KIND = re.compile(r"^(?:super\s*research|research|sr)\s+", re.I)
+
+
 def _allow_all_command(text: str) -> "tuple[str, str] | None":
     """("on" | "off" | "set", name) when the WHOLE message is one Allow-all command.
 
@@ -6604,7 +6636,8 @@ def _allow_all_command(text: str) -> "tuple[str, str] | None":
         # ⛔ `my Mac mini` is the KIND of computer, not its name: with the model
         # words off it is a bare machine word, so the picker takes the one this
         # account owns — exactly as `my mac` does. `the office Mac mini` keeps them.
-        if not _is_bare_machine_noun(re.sub(rf"(?:\s+{_MODEL_WORDS})+$", "", words)):
+        if not _is_bare_machine_noun(re.sub(rf"(?:\s+{_MODEL_WORDS})+$", "",
+                                            _PRODUCT_KIND.sub("", words))):
             hit = re.search(rf"(?<![\w'’-]){re.escape(words)}(?![\w'’-])", t, re.I)
             name = hit.group(0) if hit else words
     return direction, name
@@ -6660,6 +6693,10 @@ _AA_MENTION = re.compile(
       r"(?:all\s+)?(?:in|join)\s+automatically\b"
     + r"|\b(?:turn|switch)\w*\s+(?:off|on)\s+(?:the\s+)?approvals?\b"
     + r"|\bapprovals?\s+(?:back\s+)?(?:off|on)\b|\bno\s+(?:more\s+)?approvals?\b"
+    # ⛔ `turn off approving for my mac` (meaning Allow all ON) reached the HIDE,
+    # and `remove approval for my mac` an Unlink confirm (Windows review, 09-28).
+    + r"|\b(?:turn|switch)\w*\s+off\s+(?:the\s+)?approv\w*"
+    + r"|\b(?:disable|remove|drop|get\s+rid\s+of)\s+(?:the\s+)?approv\w*"
     + r"|\bwithout\s+(?:my\s+)?approval\b"
     # descriptive — `the one that joins at once` is a joiner reading the list
     + r"|\bjoins?\s+(?:at\s+once|instantly|straight\s+away|right\s+away|"
@@ -7469,8 +7506,15 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                                   low)
     # ⛔⛔ THE LEAD-IN IS WHY THIS WAS ANCHORED WRONG. `^` alone meant one
     # conversational word turned a read-only question into an offer to publish.
-    _asking_state = (re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"
-                              r"which|how|tell me (?:if|whether)|check)\b", low)
+    # ⛔⛔ AND IT KNEW TOO FEW QUESTIONS (Windows review of wave 12, 2026-09-28).
+    # `why is my mac private?`, `did you hide my mac?` and `should I hide my mac?`
+    # HID the computer, unconfirmed — and since wave 12 a hide also switches Allow
+    # all off. The same words `_aa_asking` knows, plus a trailing "?"; the polite
+    # imperative (`can you hide my mac?`) still acts.
+    _asking_state = ((t.rstrip().endswith("?")
+                      or re.match(_NL_LEAD_IN + r"(is|are|does|do|did|can|could|who|what|"
+                                  r"which|how|why|when|will|has|have|should|if|"
+                                  r"tell me (?:if|whether)|check)\b", low))
                      and not _polite_imperative)
     # ⛔⛔ THE SUBJECT MUST BE ONE OF THIS ACCOUNT'S OWN MACHINES, AND A BARE
     # SETTER IS NOT THAT. Widening the gate to any setter verb let "switch to a
@@ -7627,9 +7671,12 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     # requests stay read-only, neither half acted on (repair 3, G15/H5). ⛔ A verb
     # straight on the setting (`pause allow all on my mac so the run can finish`)
     # stays the setting's: it is not a run's name.
+    # ⛔ …and `stop research on allow all` — the run word straight after the verb
+    # — is the same request (Windows review, 09-28; it reached the catch-all).
     _aa_runctl = False
     if re.match(_NL_LEAD_IN + r"(?:please\s+)?(?:(?:stop|end|abort|cancel|pause|hold\s+(?:on|it)|"
-                r"resume|unpause|retry|try\s+again)\s+(?:the|my|that|this)\b"
+                r"resume|unpause|retry|try\s+again)\s+(?:(?:the|my|that|this)\b"
+                r"|(?:research|run)\s+(?:on|about|into|for|called|named)\b)"
                 r"|continue\s+the\s+paused\b)", low):
         _aa_rws = list(re.finditer(r"\b(?:runs?|research(?!\s+(?:computers?|machines?|pcs?|macs?)\b)|"
                                    r"the\s+one\s+about)\b", low))
@@ -7860,7 +7907,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             # called “my mac” is theirs to call that.
             if not _vis_quoted and (re.fullmatch(
                     rf"(?:{_MACHINE_NOUNS_SAID}|it|them|one|ones|everything|"
-                             rf"me|us|myself)", _vis_obj, flags=re.I)
+                             rf"me|us|myself)", _PRODUCT_KIND.sub("", _vis_obj), flags=re.I)
                     or re.search(r"\bpublic|\bsomebody else|\bsomeone else|"
                                  r"\bother (?:people|persons?|users?)\b",
                                  _vis_obj, flags=re.I)):
@@ -7881,6 +7928,30 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             return None, [f"I {_verb} one computer at a time. Ask me to list them "
                           f"and name the one to {_verb} — nothing changes until "
                           f"you do."]
+        # ⛔⛔ A REQUEST TO KEEP IT PUBLIC IS NOT A HIDE (Windows review of wave
+        # 12, 2026-09-28). `stop hiding my mac`, `don't take my mac off the
+        # public list` and `my mac shouldn't be private` all HID it, unconfirmed
+        # — and since wave 12 a hide also switches Allow all off. Like `don't
+        # hide my mac`, they land on the catch-all: guessing which opposite was
+        # meant is worse than asking (rule 0).
+        _stop_hiding = (
+            re.search(r"\b(?:stop|quit)\s+(?:hiding|keeping\b[^.?!]{0,30}\b"
+                      r"(?:private|hidden|unlisted)\b|[^.?!]{0,30}\bfrom\s+being\s+"
+                      r"(?:private|hidden|unlisted)\b)", low)
+            or re.search(r"\b(?:turn|switch)\w*\s+off\s+(?:the\s+)?(?:hiding|private|privacy)\b",
+                         low)
+            or re.search(rf"\b{_NEG_WORDS}\b[^.?!]{{0,30}}\b(?:off|out\s+of|from)\b"
+                         rf"[^.?!]{{0,24}}\b(?:list|public|directory)\b", low)
+            or re.search(rf"\b{_NEG_WORDS}\s+(?:stop|quit|cease)\b", low)
+            or (re.search(rf"\b{_HIDE_POLARITY}\b", low)
+                and re.search(r"\b(?:should|want\w*|needs?)\b[^.?!]{0,20}\bpublic\b", low))
+            # `my mac shouldn't be private`, `I don't want it hidden` — a closed
+            # list of wishes, on the words outside quotes (“Never Mind PC” is a name)
+            or re.search(r"\b(?:shouldn['’]?t|should\s+not|don['’]?t\s+want|do\s+not\s+want)"
+                         rf"\b[^.?!]{{0,20}}\b{_HIDE_POLARITY}\b",
+                         _NL_QUOTED_RE.sub(" ", t).lower()))
+        if _hiding_kw and _stop_hiding:
+            return None, [_NL_CATCH_ALL]
         if _hiding_kw:
             # ⛔ NO CONFIRM ON HIDING. It takes a computer OFF a list; the only
             # thing it can cost is somebody not finding a machine they were
@@ -9245,8 +9316,26 @@ def cmd_do(args) -> int:
     return ns.func(ns)
 
 
+class _SrParser(argparse.ArgumentParser):
+    """⛔⛔ `device-visibility public --allow-all "Studio PC"` IS REFUSED BY PYTHON
+    3.12's argparse (Windows review of wave 12, 2026-09-28) — "unrecognized
+    arguments: Studio PC" — because it binds the optional name to `public` before
+    it reaches the flag; 3.13+ accept it. The chat runtime in WSL is 3.12. The
+    flag moves after the words, where every version reads it the same."""
+
+    def parse_known_args(self, args=None, namespace=None):
+        args = list(sys.argv[1:] if args is None else args)
+        # the command is the first word that is not an option (`--json` may lead)
+        i = next((k for k, a in enumerate(args) if not a.startswith("-")), None)
+        if (i is not None and args[i] == "device-visibility"
+                and "--allow-all" in args[i + 1:] and "--" not in args):
+            args = (args[:i + 1] + [a for a in args[i + 1:] if a != "--allow-all"]
+                    + ["--allow-all"])
+        return super().parse_known_args(args, namespace)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="sr", description="Super Research skill client")
+    p = _SrParser(prog="sr", description="Super Research skill client")
     p.add_argument("--json", action="store_true", help="print the raw bridge JSON")
     sub = p.add_subparsers(dest="command", required=True)
 

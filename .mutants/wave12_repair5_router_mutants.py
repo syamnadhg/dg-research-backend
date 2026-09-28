@@ -161,9 +161,11 @@ MUTANTS = [
        '                and not text[q.end():].rstrip(" .!?").strip(" ,.!?"))\n')]),
     ("R5d", SR, "⛔ a run's artefact is no run verb — `status of “allow all”` lists the "
      "computers",
+     # ⚠ RE-ANCHORED 2026-09-28 (Windows review): the run word after the verb
+     # (`stop research on “…”`) is its own line now; the artefact half still goes.
      [('    r"|(?:status|progress|podcasts?|audio|videos?|reports?|briefs?|links?|"\n'
-       '    r"skip\\s+(?:the\\s+)?[\\w\'’-]+)\\s+(?:of|for|on|from|in))(?:\\s+the)?\\s*$", re.I)\n',
-       '    r")(?:\\s+the)?\\s*$", re.I)\n')]),
+       '    r"skip\\s+(?:the\\s+)?[\\w\'’-]+)\\s+(?:of|for|on|from|in))(?:\\s+the)?"\n',
+       '    r")(?:\\s+the)?"\n')]),
 
     # ═══ R6 — `each request`; `can u` ══════════════════════════════════════════
     ("R6a", SR, "⛔ `approve each request again` changes nothing",
@@ -200,7 +202,9 @@ MUTANTS = [
        '    if _AA_MENTION.search(_aa_src):\n')]),
     ("L2", SR, "⛔ a verb straight on the setting counts as a run control — `pause allow all "
      "on my mac so the run can finish` pauses a run called “mac so the run can finish”",
-     [('                r"resume|unpause|retry|try\\s+again)\\s+(?:the|my|that|this)\\b"\n',
+     # ⚠ RE-ANCHORED 2026-09-28 (Windows review): `research on …` joined `the …`.
+     [('                r"resume|unpause|retry|try\\s+again)\\s+(?:(?:the|my|that|this)\\b"\n'
+       '                r"|(?:research|run)\\s+(?:on|about|into|for|called|named)\\b)"\n',
        '                r"resume|unpause|retry|try\\s+again)\\b"\n')]),
     ("L3", SR, "⛔ “research computer” counts as a run — `stop the research computer from "
      "letting anyone join` asks to stop a run by that name",

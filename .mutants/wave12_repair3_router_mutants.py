@@ -70,8 +70,11 @@ MUTANTS = [
     ("A3", SR, "⛔⛔ H6: the model words are read as a NAME — `turn off allow all for my Mac mini` "
      "looks for a computer called “Mac mini” instead of the picker, and on an account whose "
      "one computer is “My Mac” nothing is written",
-     [('        if not _is_bare_machine_noun(re.sub(rf"(?:\\s+{_MODEL_WORDS})+$", "", words)):\n',
-       '        if not _is_bare_machine_noun(words):\n')]),
+     # ⚠ RE-ANCHORED 2026-09-28 (Windows review): `_PRODUCT_KIND` joined the test;
+     # the mutant still drops only the model-word strip.
+     [('        if not _is_bare_machine_noun(re.sub(rf"(?:\\s+{_MODEL_WORDS})+$", "",\n'
+       '                                            _PRODUCT_KIND.sub("", words))):\n',
+       '        if not _is_bare_machine_noun(_PRODUCT_KIND.sub("", words)):\n')]),
     ("A4", SR, "⛔ the two model-word lists drift apart — the sign-in reader (9ac9abf) loses "
      "“the MacBook Pro app”",
      [('    _model_words = _MODEL_WORDS\n', '    _model_words = r"(?:NEVER_A4)"\n')]),

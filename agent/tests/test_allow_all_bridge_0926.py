@@ -328,6 +328,20 @@ def test_a_sharer_cannot_switch_allow_all(live):
     assert FakeFS.writes == []
 
 
+@pytest.mark.parametrize("body, said", [
+    ({"allowAll": False}, "change who can join it"),
+    ({"allowAll": True}, "change who can join it"),
+    ({"visibility": "private"}, "change who can find it"),
+])
+def test_a_sharers_refusal_names_the_switch_they_asked_about(live, body, said):
+    """⛔ Windows review of wave 12 (2026-09-28): `turn off allow all` on a shared
+    computer was refused about who could FIND it — the other switch."""
+    r = _vis(live, deviceId="dev-b2", **body)
+    assert r.status_code == 403 and r.json()["reason"] == "not_owner"
+    assert said in r.json()["error"], r.json()
+    assert FakeFS.writes == []
+
+
 # ── wave 12 repair 4 (cross-verify K1): an old tick is cleared ALONE first ───
 # ⛔⛔ THE RULES NOW REFUSE A WRITE THAT MAKES A NON-PUBLIC COMPUTER PUBLIC WHILE A
 # STORED `allowAll: true` IS LEFT OUT OF IT — what stops the published agent, an

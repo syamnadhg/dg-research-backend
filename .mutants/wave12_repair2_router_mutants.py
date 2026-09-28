@@ -192,7 +192,9 @@ MUTANTS = [
     # subject with its model words off (`my Mac mini`). Same defect.
     ("W7", SR, "⛔⛔ a bare machine word is sent as a NAME — `turn off allow all for my mac` "
      "looks for a computer called “mac” instead of the picker",
-     [('        if not _is_bare_machine_noun(re.sub(rf"(?:\\s+{_MODEL_WORDS})+$", "", words)):\n',
+     # ⚠ RE-ANCHORED 2026-09-28 (Windows review): `_PRODUCT_KIND` joined the test.
+     [('        if not _is_bare_machine_noun(re.sub(rf"(?:\\s+{_MODEL_WORDS})+$", "",\n'
+       '                                            _PRODUCT_KIND.sub("", words))):\n',
        '        if True:\n')]),
     # ⛔ W8 RE-AIMED 2026-09-27 (wave 12 repair 4, K8): the name is the first quoted
     # span that is not the setting's own (`turn off “Allow all” on “Studio PC”`).

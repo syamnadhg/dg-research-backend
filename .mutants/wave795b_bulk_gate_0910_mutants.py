@@ -203,8 +203,10 @@ MUTANTS = [
        '                 ) \\')]),
     ('R1', SR, 'over',
      "⛔⛝ THE LEAD-IN GOES FROM THE STATE QUESTION. Measured: `so are all my computers public?` reached the PUBLISH confirm and offered to publish 'that computer' with NO name, so a 'yes' published whichever one the picker landed on. One conversational word — `so`, `and`, `hey` — turned a read-only question into an offer",
-     [('    _asking_state = (re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"',
-       '    _asking_state = (re.match(r"^(is|are|does|do|can|could|who|what|"')]),
+     # ⚠ RE-ANCHORED 2026-09-28 (Windows review of wave 12): the question list
+     # grew and a trailing "?" counts too — the mutant still drops only the lead-in.
+     [('                      or re.match(_NL_LEAD_IN + r"(is|are|does|do|did|can|could|who|what|"',
+       '                      or re.match(r"^(is|are|does|do|did|can|could|who|what|"')]),
     ('R2', SR, 'over',
      '⛔ THE LEAD-IN LIST IS COPIED RATHER THAN SHARED, so the research pattern and the state question can drift — which is exactly how `_machine_kw` and `_mine_kw` ended up differing by two words and silently broke four guards',
      [('_NL_LEAD_IN = r"(?:please |can you |could you |would you |hey |ok |okay |go |now |so |and |also |then |just )*"',

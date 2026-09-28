@@ -452,7 +452,9 @@ def test_last_check_stopping_such_a_run_asks_first_and_never_touches_allow_all(b
 @pytest.mark.parametrize("text, want", [
     ("stop letting anyone join my mac", "OFF"),
     ("stop allow all on my mac", "OFF"),
-    ("stop letting anyone join the research computer", "OFF:research computer"),
+    # ⛔ Windows review (09-28, owner-approved): "research computer" is the KIND —
+    # it goes to the owned-computer picker, never looked up as a name.
+    ("stop letting anyone join the research computer", "OFF"),
 ])
 def test_last_check_the_setting_s_own_off_words_are_still_the_setting(text, want):
     assert _route(text) == want, (text, _route(text))

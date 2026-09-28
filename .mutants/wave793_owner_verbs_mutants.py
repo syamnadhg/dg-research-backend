@@ -787,11 +787,12 @@ MUTANTS = [
      # into an offer to publish an unnamed machine. The mutant is unchanged in
      # what it asserts — that dropping `_polite_imperative` reads "can you make
      # my mac public" as a question.
-     [('    _asking_state = (re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"\n'
-       '                              r"which|how|tell me (?:if|whether)|check)\\b", low)\n'
+     # ⚠ RE-ANCHORED 2026-09-28 (Windows review of wave 12): the question also
+     # knows a trailing "?" and more question words; the mutant still drops the
+     # `_polite_imperative` exception, nothing else.
+     [('                                  r"tell me (?:if|whether)|check)\\b", low))\n'
        '                     and not _polite_imperative)',
-       '    _asking_state = re.match(_NL_LEAD_IN + r"(is|are|does|do|can|could|who|what|"\n'
-       '                             r"which|how|tell me (?:if|whether)|check)\\b", low)')]),
+       '                                  r"tell me (?:if|whether)|check)\\b", low)))')]),
     ("W4", SR, "over",
      "⛔⛔ A BROWSE WISH ABOUT OTHER PEOPLE\'S MACHINES SILENTLY MAKES YOUR OWN "
      "PRIVATE — \"hide other people\'s computers from me\" acted, with no confirm",

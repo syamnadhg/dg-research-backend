@@ -5743,8 +5743,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if acct is None:
                 return
             sess, fs = acct
+            # ⛔ The refusal names the setting asked about (Windows review of wave
+            # 12): "turn off allow all" on a shared computer was told who could
+            # FIND it.
             row = self._owned_device(fs, sess, device_id,
-                                     "change who can find it")
+                                     "change who can join it" if has_all
+                                     else "change who can find it")
             if row is None:
                 return
             # ⛔⛔ THE NO-OP BRANCH IS THE WORST PLACE TO GET THIS WRONG. Read off
