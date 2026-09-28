@@ -2058,9 +2058,12 @@ _ASK_ERRORS = {
                        "Ask me for your requests before asking again: it’s either "
                        "waiting there, or it let you in and it’s one of your "
                        "computers.",
-    # ⛔ THE BRIDGE'S OTHER CODE: the sign-in could not be refreshed, so the ask
-    # never left — an ordinary failure, and saying so is the whole point.
-    "ask_not_sent": "This agent couldn’t refresh its sign-in, so nothing was sent. "
+    # ⛔ THE BRIDGE'S OTHER CODE: the sign-in could not be refreshed, or the
+    # connection never opened (refused, DNS, connect timeout — repair 3, H18), so
+    # the ask never left — an ordinary failure, and saying so is the whole point.
+    # It names both causes, as the terminal's does, rather than blaming a sign-in
+    # that may have been fine.
+    "ask_not_sent": "This agent couldn’t reach the app or refresh its sign-in, so nothing was sent. "
                     "It’s safe to ask again in a moment.",
 }
 

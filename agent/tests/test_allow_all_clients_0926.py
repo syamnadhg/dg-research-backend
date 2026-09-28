@@ -438,6 +438,10 @@ def test_an_ask_that_was_never_sent_says_so(chat):
     out = chat.out()
     assert "nothing was sent" in out
     assert "may have gone through" not in out and "ask_not_sent" not in out
+    # ⛔ WAVE 12 REPAIR 3 (cross-verify H18): the bridge sends this code for a
+    # connection that never opened too — the chat names both causes, like the
+    # terminal, rather than blaming a sign-in that may have been fine.
+    assert "couldn’t reach the app or refresh its sign-in" in out
 
 
 # ── sr.py device-requests, owner half ─────────────────────────────────────────

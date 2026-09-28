@@ -103,8 +103,15 @@ MUTANTS = [
      [('                if body.get("sent") is False:\n',
        '                if not body.get("sent"):\n')]),
     ("C4", SR, "⛔ ask_not_sent has no chat sentence — the machine token reaches the person",
-     [('    "ask_not_sent": "This agent couldn’t refresh its sign-in, so nothing was sent. "\n'
+     # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, H18 follow-up): the chat's
+     # sentence names both causes now, like the terminal's. Same defect: the row
+     # is gone.
+     [('    "ask_not_sent": "This agent couldn’t reach the app or refresh its sign-in, so nothing was sent. "\n'
        '                    "It’s safe to ask again in a moment.",\n', '')]),
+    ("C4b", SR, "⛔ the chat's not-sent sentence blames the sign-in alone, though the bridge "
+     "also sends it for a connection that never opened (refused, DNS, connect timeout)",
+     [('"This agent couldn’t reach the app or refresh its sign-in, so nothing was sent. "',
+       '"This agent couldn’t refresh its sign-in, so nothing was sent. "')]),
     ("C5", CLI, "⛔ ask_not_sent has no terminal sentence",
      # ⭐ RE-AIMED 2026-09-27 (wave 12 repair 3, cross-verify H18): the sentence
      # names both causes now. Same defect: the row is gone.
