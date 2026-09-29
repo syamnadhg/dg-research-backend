@@ -612,6 +612,26 @@ def test_a_device_id_mismatch_still_says_re_pair_whoever_the_research_belongs_to
     assert "re-pair required" in line and "another account" not in line, line
 
 
+@pytest.mark.parametrize("uid", [SHARER, FORMER], ids=["current-sharer", "former-sharer"])
+def test_a_token_with_no_device_claim_still_says_re_pair_whoever_the_research_belongs_to(
+        monkeypatch, uid):
+    """⭐ THE OTHER WAY THIS COMPUTER'S OWN PAIRING IS AT FAULT (09-29 verify).
+    A token with no deviceId claim has every user-tree write refused, whoever's
+    research it is — boot says "re-pair required" for exactly this. The three
+    refusals in a row can land on a sharer's run, and the line said the job
+    belonged to another account and re-pairing would not fix it."""
+    db, lines = _heal_machine(monkeypatch, token_device=None)
+
+    def _write():
+        with pytest.raises(PermissionDenied):
+            research._grpc_write_with_heal(lambda: db.add({}), what="emit_event", uid=uid)
+    _deny_three_times(_write)
+
+    [line] = _structural(lines)
+    assert "MISSING deviceId" in line, f"precondition: the token really had no claim: {line}"
+    assert "re-pair required" in line and "another account" not in line, line
+
+
 RUN_RID = "agent-82bb870dba1140ed"
 
 #: The research writers a run makes, each driven through its real code. The

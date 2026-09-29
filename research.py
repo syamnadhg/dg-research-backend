@@ -8515,7 +8515,7 @@ def _config_device_id_uncached() -> "str | None":
         return None
 
 
-def _structural_heal_advice(uid, claims: dict, *, mismatch: bool) -> str:
+def _structural_heal_advice(uid, claims: dict, *, own_pairing: bool) -> str:
     """What the structural latch tells the reader to do.
 
     ⛔⛔ RE-PAIRING IS ADVICE ONLY FOR THIS COMPUTER'S OWN TREE. A denied write
@@ -8523,11 +8523,16 @@ def _structural_heal_advice(uid, claims: dict, *, mismatch: bool) -> str:
     the rules saying that account is not among this computer's (not paired to
     it, or no longer shared with it). Re-pairing changes nothing there, and on
     09-28 the line sent the owner to re-pair over a job of an account the
-    computer had stopped being shared with. The one exception is a deviceId
-    mismatch between the token and the config: that is this computer's own
-    pairing, whoever's research the write was for."""
+    computer had stopped being shared with.
+
+    ⭐ THE EXCEPTION IS THIS COMPUTER'S OWN PAIRING BEING AT FAULT —
+    `own_pairing`, whoever's research the write was for: the token's deviceId
+    disagrees with the config, or the token carries none at all. A token with
+    no claim has every user-tree write refused, and boot says "re-pair
+    required" for it; the three refusals in a row can land on a sharer's run,
+    and the line then blamed the sharer's account (09-29 verify)."""
     owner = str((claims or {}).get("ownerUid") or load_paired_uid() or "")
-    if uid and owner and uid != owner and not mismatch:
+    if uid and owner and uid != owner and not own_pairing:
         return (f"This write was to research owned by another account "
                 f"({str(uid)[:8]}…), not the one this computer is paired to "
                 f"({owner[:8]}…) — the job belongs to another account, and "
@@ -8627,7 +8632,7 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
         except Exception as ref_e:
             log(f"[grpc-heal] {what}: force-refresh failed: {ref_e}", "WARN")
         tok_did = before.get("deviceId")
-        mismatch = bool(tok_did and cfg_did and tok_did != cfg_did)
+        own_pairing = not tok_did or bool(cfg_did and tok_did != cfg_did)
         if not tok_did:
             cause = "token MISSING deviceId claim — read-side deviceMemberOf (a refresh CLEARS this)"
         elif cfg_did and tok_did != cfg_did:
@@ -8689,7 +8694,7 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
                     log(
                         f"[grpc-heal] STRUCTURAL: {_consec} consecutive "
                         f"heals failed to clear the synth-user 403 ({cause}). "
-                        f"{_structural_heal_advice(uid, before, mismatch=mismatch)} "
+                        f"{_structural_heal_advice(uid, before, own_pairing=own_pairing)} "
                         f"Suppressing further force-refreshes until a write succeeds.",
                         "ERROR",
                     )
