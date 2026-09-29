@@ -16105,6 +16105,9 @@ def start_firestore_start_listener(job_queue, loop):
                         job_queue.put_nowait({
                             "topic": t, "email": e, "config": c, "run_id": r,
                             "uid": u, "research_id": ri, "resume_dir": rd_path,
+                            # ⛔ ITS OWN CLOCK: the run id and the folder are
+                            # as old as the run — see `_job_age_s`.
+                            "queued_at_ms": int(time.time() * 1000),
                         })
                     except Exception as ex:
                         log(f"Resume: put_nowait failed: {ex}", "WARN")
@@ -17651,13 +17654,22 @@ def _job_age_s(job, now: "float | None" = None) -> "float | None":
     """Seconds since a queued job last showed any sign of life, or None when
     nothing about it can tell.
 
-    ⭐ THE NEWER OF TWO CLOCKS. The run id's `YYYYMMDD_HHMMSS` stamp is minted
-    when the job is queued, so a job that never started is exactly as old as
-    it says. A run that started, or that somebody resumed, has a folder, and
-    working in it moves that folder's time — so a run resumed today from a
-    folder minted a fortnight ago is judged by today."""
+    ⭐ THE NEWEST OF ITS CLOCKS. The run id's `YYYYMMDD_HHMMSS` stamp is minted
+    when a NEW run is queued, so a job that never started is exactly as old as
+    it says. A folder that has been worked in since shows it too.
+
+    ⛔⛔ A JOB QUEUED FOR AN OLD RUN CARRIES ITS OWN — `queued_at_ms` (09-29
+    verify). A Resume, and the supervised auto-resume at boot, queue a run whose
+    id and folder are as old as the run, and a Resume rewrites the folder's
+    files in place, which moves neither. Judged by those two, a Resume pressed
+    minutes ago on a run parked ten days back was dropped at the next boot as
+    "waited 10 days", its record left "ongoing" with nothing running it. Those
+    two paths stamp the moment they queue it, and the snapshot carries it."""
     now = time.time() if now is None else now
     seen = []
+    clock = (job or {}).get("queued_at_ms")
+    if isinstance(clock, (int, float)):
+        seen.append(clock / 1000)
     for key in ("run_id", "resume_dir"):
         m = _RUN_ID_STAMP_RE.search(str((job or {}).get(key) or ""))
         if m:
@@ -76673,6 +76685,9 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                     # the app — the fail-closed direction.
                                     "submitted_by": str(
                                         data.get("submittedBy") or "").strip(),
+                                    # ⛔ ITS OWN CLOCK: the run id and the folder
+                                    # are as old as the run — see `_job_age_s`.
+                                    "queued_at_ms": int(time.time() * 1000),
                                 }, source="rehydrate-supervised-auto-resume"):
                                     rehydrated += 1
                                     auto_resumed = True

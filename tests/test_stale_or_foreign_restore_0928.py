@@ -98,6 +98,27 @@ class _Node:
             raise answer
         return _Snap(answer)
 
+    def where(self, **_filter):
+        """`users/{uid}/researches` asked for its "ongoing" records — boot
+        rehydration's one query."""
+        return _Ongoing(self._fs, self._parts[1])
+
+
+class _DocSnap(_Snap):
+    def __init__(self, doc_id, data):
+        super().__init__(data)
+        self.id = doc_id
+
+
+class _Ongoing:
+    def __init__(self, fs, uid):
+        self._fs, self._uid = fs, uid
+
+    def get(self):
+        return [_DocSnap(rid, answers[0]) for (uid, rid), answers in self._fs.records.items()
+                if uid == self._uid and isinstance(answers[0], dict)
+                and answers[0].get("status") == "ongoing"]
+
 
 class _Fs:
     """`users/{uid}/researches/{rid}` answering one read at a time, in order
@@ -363,8 +384,10 @@ def test_an_owner_file_about_another_research_says_nothing_about_this_job(
 def test_a_job_older_than_the_sweep_horizon_is_not_restored(monkeypatch, tmp_path):
     """⛔⛔ EIGHT DAYS. The owner's own job, whose record still reads "queued" —
     only its age can stop it. Beside it: an hour old and six days old, both
-    restored; and a run resumed today from a folder minted ten days ago, judged
-    by its folder, not its name."""
+    restored; and an entry an OLDER build wrote — no clock of its own — for a
+    run in a folder minted ten days ago that has been worked in today, judged by
+    its folder, not its name. (A Resume does not move its folder's time; the job
+    it queues carries its own clock — see section 4.)"""
     old, fresh, six, resumed = ("chat_old_0000000001", "chat_fresh_00000001",
                                 "chat_six_0000000001", "chat_resumed_000001")
     fs = _Fs(records={(OWNER, old): QUEUED, (OWNER, fresh): QUEUED,
@@ -404,7 +427,93 @@ def test_the_horizon_is_the_startup_sweeps_one_number(monkeypatch, tmp_path):
     assert _boot(path, _Q()) == [one]
 
 
-# ══ 4. the heal's structural line ═══════════════════════════════════════════
+# ══ 4. a job queued for an OLD run carries its own clock ══════════════════════
+
+def _old_run_folder(tmp_path, rid, *, days, uid=OWNER, topic="Old_Topic"):
+    """A run parked `days` ago, as the startup sweep keeps it for a Resume: its
+    owner file, its config, its paused meta — and the folder's time that old."""
+    run_id = _job(uid, rid, days=days, topic=topic)["run_id"]
+    folder = tmp_path / "queues" / run_id
+    folder.mkdir(parents=True)
+    (folder / "owner.json").write_text(json.dumps({"uid": uid, "researchId": rid}),
+                                       encoding="utf-8")
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    (folder / "meta.json").write_text(json.dumps({"status": "paused"}), encoding="utf-8")
+    then = time.time() - days * 86400
+    os.utime(folder, (then, then))
+    return run_id, folder
+
+
+def _days_old(folder):
+    return (time.time() - folder.stat().st_mtime) / 86400
+
+
+def _crash_with(tmp_path, jobs):
+    """The worker boundary's own write of what waits in the queue — then the PC
+    dies, so this file is all the next boot has."""
+    path = tmp_path / "queues" / "_pending_queue.json"
+    research._write_pending_queue_snapshot(path, None, jobs)
+    return path
+
+
+def test_a_resume_pressed_today_on_a_ten_day_old_run_is_restored(monkeypatch, tmp_path):
+    """⛔⛔ THE REAL RESUME, THEN THE CRASH, THEN THE BOOT (09-29 verify). The
+    person presses Resume on a run parked ten days ago. The start listener's
+    Resume branch rewrites the folder's files in place, so the folder is still
+    ten days old, and so is the run id it names. The job waits behind another
+    run and the PC dies; at boot the rehydration query failed, so the disk
+    restore is what brings it back — and it dropped it as "waited 10 days",
+    leaving the record "ongoing" with nothing running it. Beside it, an entry
+    that really was queued eight days ago, by its own clock, still goes."""
+    from _queue_listener import Listener
+    rid, stale = "chat_1759000000000_r", "chat_1759000000000_s"
+    run_id, folder = _old_run_folder(tmp_path, rid, days=10)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs={
+        (OWNER, rid): {"status": "paused_backend_restart", "topic": "t"}})
+    lis.feed(action="resume", uid=OWNER, submittedBy=OWNER, researchId=rid,
+             backendRunId=run_id, email="", config={"x": 1})
+    [resumed] = lis.enqueued
+    assert _days_old(folder) > 9.9, "precondition: the Resume left the folder's time alone"
+
+    fs = _Fs(records={(OWNER, rid): {"status": "ongoing"}, (OWNER, stale): QUEUED},
+             device=SHARED)
+    lines = _machine(monkeypatch, tmp_path, fs)
+    eight_days_ago_ms = int((time.time() - 8 * 86400) * 1000)
+    path = _crash_with(tmp_path, [resumed, _job(OWNER, stale, days=8, topic="Stale",
+                                                queued_at_ms=eight_days_ago_ms)])
+
+    assert _boot(path, _Q()) == [rid], (
+        f"a Resume pressed minutes ago was dropped as stale: {lines}")
+    assert len(_said(lines, stale, "not run: it has waited 8 days")) == 1, lines
+
+
+def test_a_supervised_auto_resume_of_an_old_run_keeps_its_own_clock(monkeypatch, tmp_path):
+    """⛔ THE OTHER PATH THAT QUEUES AN OLD RUN. Boot rehydration auto-resumes a
+    supervised run whose run id and folder are ten days old — the REAL scan and
+    the real funnel. The job waits, the PC dies again, and at the next boot the
+    rehydration query fails: the disk restore brings it back instead of dropping
+    it as stale."""
+    rid = "chat_1759000000000_u"
+    run_id, folder = _old_run_folder(tmp_path, rid, days=10)
+    fs = _Fs(records={(OWNER, rid): {"status": "ongoing", "backendRunId": run_id,
+                                     "deviceId": DEVICE}},
+             device={**SHARED, "supervised": True})
+    lines = _machine(monkeypatch, tmp_path, fs)
+    monkeypatch.setattr(research, "_scan_sibling_locks_for_research", lambda *_a: [])
+    monkeypatch.setattr(research, "load_checkpoint", lambda _qd: {"topic": "t"})
+    q = _Q()
+    monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", q)
+
+    assert asyncio.run(research._rehydrate_ongoing_for_tree(OWNER, OWNER, set())) == (1, 0), (
+        f"precondition: the scan auto-resumed the run: {lines}")
+    assert _days_old(folder) > 9.9, "precondition: the auto-resume left the folder's time alone"
+    path = _crash_with(tmp_path, list(q._queue))
+
+    assert _boot(path, _Q()) == [rid], (
+        f"an auto-resume queued at the last boot was dropped as stale: {lines}")
+
+
+# ══ 5. the heal's structural line ═══════════════════════════════════════════
 
 def _token(claims):
     def _b64(obj):
