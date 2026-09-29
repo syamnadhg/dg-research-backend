@@ -850,7 +850,10 @@ def test_the_dequeue_does_not_run_a_job_whose_account_left(
         return
     assert started == [], f"a job of an account that left was run: {lines}"
     assert len(_said(lines, LEFTOVER, NOT_OPENABLE)) == 1, lines
-    assert not _said(lines, LEFTOVER, "Proceeding"), lines
+    # ⛔ EVERY LINE, NOT THE JOB'S: neither "proceeding" line names the research.
+    # Stood down before the flip, a gone job's record is not asked about at all.
+    assert not [m for _lvl, m in lines if "roceeding" in m], (
+        f"the flip was tried for a job that does not run: {lines}")
 
 
 # ══ 7. the other pickups, against a record this computer wrote ═══════════════

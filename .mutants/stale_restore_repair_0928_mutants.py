@@ -6,12 +6,16 @@
        they queue it, and the boot restore's age check takes it as one of the
        job's clocks. Without it a Resume pressed minutes ago on a run parked ten
        days back was dropped at the next boot as "waited 10 days".
-  M* — on EVERY pickup, a 403 on the job's record is the answer when the device
-       document positively does not list the job's account: a removed sharer's
-       leftover start doc, or Resume, is not run at serve start, and the dequeue
-       does not run a job whose account was removed while it waited. A member's
-       403 (the fresh-document race) and a membership nobody could read are
-       still taken.
+  M* — on EVERY pickup, and at the dequeue before the flip, a job whose account
+       the device document positively does not list is not run — asked BEFORE
+       the record is read, whatever the read would say (09-29 re-verify). The
+       rules refuse a removed account's record only when this computer never
+       wrote it; one it wrote carries its deviceId and still reads "queued", so
+       a removed sharer's waiting job, their Resume, a start doc the idle rescan
+       claims, and a boot-restore entry behind a device read that blipped once
+       all ran when only a 403 was asked about. A member's 403 (the
+       fresh-document race) and a membership nobody could read are still taken,
+       and the paired account costs no read of the device document.
   P* — a token with no deviceId claim is this computer's own pairing at fault,
        like a deviceId mismatch: the heal's structural line says re-pair,
        whoever's research the refused write was for.
@@ -62,14 +66,23 @@ AUTO_RESUME_CLOCK = ("                                    # ⛔ ITS OWN CLOCK: t
                      "                                    # are as old as the run — see `_job_age_s`.\n"
                      '                                    "queued_at_ms": int(time.time() * 1000),\n')
 
-# ── anchors: a refusal for an account that left, on every pickup ───────────
-RULE = "        if _is_denied_read(err) and (denied_is_answer or _known_not_a_member(uid)):"
-NOT_A_MEMBER = '    return members is not None and str(uid or "").strip() not in members'
-DEQUEUE_ASKS = ('                    if _is_denied_read(_fe) and '
-                '_known_not_a_member(job.get("uid")):')
-DEQUEUE_ANSWER = ("                        should_run = False\n"
-                  '                        _log_pickup_not_run("dequeue", job.get("research_id"),\n'
-                  "                                            _RESTORE_NOT_OPENABLE)\n")
+# ── anchors: an account that left, on every pickup ─────────────────────────
+PICKUP_ASKS = "    if _known_not_a_member(uid):"
+RULE = "        if _is_denied_read(err) and denied_is_answer:"
+NOT_A_MEMBER = "    return members is not None and uid not in members"
+PAIRED_IS_A_MEMBER = ('    if uid == str(load_paired_uid() or "").strip():\n'
+                      "        return False\n")
+DEQUEUE_ASKS = '            _account_gone = _known_not_a_member(job.get("uid"))'
+DEQUEUE_LINE = ("            if _account_gone:\n"
+                '                _log_pickup_not_run("dequeue", job.get("research_id"),\n'
+                "                                    _RESTORE_NOT_OPENABLE)\n")
+DEQUEUE_ANSWER = "            should_run = not _account_gone"
+DEQUEUE_NO_FLIP = ("            flip_outcome = (None if _account_gone else\n"
+                   '                            _flip_queued_to_ongoing(job.get("uid"), '
+                   'job.get("research_id")))')
+DEQUEUE_FALLBACK = ('                    log(f"[flip] the transaction was refused and the fallback "\n'
+                    '                        f"read also failed ({type(_fe).__name__}) — "\n'
+                    '                        f"proceeding, as before", "WARN")')
 
 # ── anchors: a token with no claim is this computer's own pairing ──────────
 OWN_PAIRING = "        own_pairing = not tok_did or bool(cfg_did and tok_did != cfg_did)"
@@ -89,27 +102,43 @@ MUTANTS = [
      "the run it queued is dropped as stale at the boot after",
      [(AUTO_RESUME_CLOCK, "")]),
 
-    # ═══ M — a refusal for an account that left, on every pickup ═══════════
-    ("M1", RESEARCH, "⛔⛔ THE 09-29 DEFECT: only the boot restore hears a refusal "
-     "— a removed sharer's leftover start doc runs at serve start",
-     [(RULE, "        if _is_denied_read(err) and denied_is_answer:")]),
+    # ═══ M — an account that left, on every pickup ═════════════════════════
+    ("M1", RESEARCH, "⛔⛔ THE 09-29 DEFECT: no pickup asks who shares this computer "
+     "— a removed sharer's leftover start doc, or Resume, runs at serve start",
+     [(PICKUP_ASKS, "    if False:")]),
     ("M2", RESEARCH, "⛔⛔ OVER-REACH: every 403 on a pickup is an answer — a "
      "current sharer's fresh research, or the owner's, is thrown away",
      [(RULE, "        if _is_denied_read(err):")]),
     ("M3", RESEARCH, "⛔ OVER-REACH: 'can't tell who shares this computer' reads as "
      "'not a member' — a device read that blips drops a sharer's job",
-     [(NOT_A_MEMBER, '    return members is None or str(uid or "").strip() not in members')]),
-    ("M4", RESEARCH, "⛔⛔ the dequeue runs a job whose account left while it "
-     "waited, 'proceeding, as before'",
-     [(DEQUEUE_ASKS, "                    if False:")]),
-    ("M5", RESEARCH, "⛔ OVER-REACH: the dequeue refuses on every 403 — a member's "
-     "run is not started when the flip and the read are both refused",
-     [(DEQUEUE_ASKS, "                    if _is_denied_read(_fe):")]),
+     [(NOT_A_MEMBER, "    return members is None or uid not in members")]),
+    ("M4", RESEARCH, "⛔⛔ the dequeue never asks — a job whose account left while "
+     "it waited, its record still reading 'queued', runs",
+     [(DEQUEUE_ASKS, "            _account_gone = False")]),
+    ("M5", RESEARCH, "⛔ OVER-REACH: the dequeue refuses on every refused read — a "
+     "member's run is not started when the flip and the read are both refused",
+     [(DEQUEUE_FALLBACK, "                    should_run = False")]),
     ("M6", RESEARCH, "⛔ the dequeue says the job is not run, and runs it",
-     [(DEQUEUE_ANSWER, '                        _log_pickup_not_run("dequeue", job.get("research_id"),\n'
-                       "                                            _RESTORE_NOT_OPENABLE)\n")]),
+     [(DEQUEUE_ANSWER, "            should_run = True")]),
     ("M7", RESEARCH, "the dequeue drops the job and never says why",
-     [(DEQUEUE_ANSWER, "                        should_run = False\n")]),
+     [(DEQUEUE_LINE, "")]),
+    ("M8", RESEARCH, "⛔⛔ THE 09-29 RE-VERIFY DEFECT, EXACTLY: the pickup rule asks "
+     "who shares this computer on a 403 only — a removed account's record this "
+     "computer wrote reads 'queued', and its Resume, start doc or boot entry runs",
+     [(PICKUP_ASKS, "    if False:"),
+      (RULE, "        if _is_denied_read(err) and (denied_is_answer or "
+             "_known_not_a_member(uid)):")]),
+    ("M9", RESEARCH, "the paired account is asked about like a sharer — every job "
+     "of the owner's reads the device document at every pickup",
+     [(PAIRED_IS_A_MEMBER, "")]),
+    ("M10", RESEARCH, "⛔ OVER-REACH: the paired account reads as not a member — "
+     "the owner's own jobs are never run",
+     [(PAIRED_IS_A_MEMBER, '    if uid == str(load_paired_uid() or "").strip():\n'
+                           "        return True\n")]),
+    ("M11", RESEARCH, "the dequeue flips a job it will not run — the refused "
+     "transaction and a 'proceeding' line for a job that never starts",
+     [(DEQUEUE_NO_FLIP, '            flip_outcome = _flip_queued_to_ongoing(job.get("uid"), '
+                        'job.get("research_id"))')]),
 
     # ═══ P — a token with no claim is this computer's own pairing ══════════
     ("P1", RESEARCH, "⛔ a token with no deviceId claim blames the sharer's account "

@@ -54,7 +54,7 @@ SUITES = {
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # ── anchors: a 403 is an answer at boot ─────────────────────────────────────
-RULE_DENIED = "        if _is_denied_read(err) and (denied_is_answer or _known_not_a_member(uid)):"
+RULE_DENIED = "        if _is_denied_read(err) and denied_is_answer:"
 RULE_DENIED_LINE = ("            _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)\n"
                     '            return "denied", None')
 DENIED_TEST = ('    return (type(err).__name__ == "PermissionDenied" or "403" in s\n'
@@ -109,8 +109,7 @@ MUTANTS = [
      [(RULE_DENIED, "        if False:")]),
     ("D2", RESEARCH, "⛔⛔ OVER-REACH: every failed read counts as a refusal — a "
      "boot that came up before the network drops the owner's real jobs",
-     [(RULE_DENIED, "        if denied_is_answer or (_is_denied_read(err) and "
-                    "_known_not_a_member(uid)):")]),
+     [(RULE_DENIED, "        if denied_is_answer:")]),
     ("D3", RESEARCH, "the refusal is dropped but never said — no line tells the "
      "owner why a queued job did not run",
      [(RULE_DENIED_LINE, '            return "denied", None')]),
