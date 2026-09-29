@@ -40811,6 +40811,90 @@ async def verify_claude_generating(page) -> bool:
         return False
 
 
+# ⛔⛔ 2026-09-16 — CLAUDE SAID IT WAS OUT OF MESSAGES, AND THE CARD SAID "DIDN'T
+# START". The account had hit its weekly usage limit. Claude's page said so
+# ("Usage limit reached · Resets Sep 20 at 1:00 AM", and a "Need more usage?"
+# dialog), the vision step read it out loud three times in each of that day's
+# two runs, and all of it was thrown away: the person got "Claude didn't start —
+# Retry or Skip", Retry could not have worked, nobody answered, and Claude was
+# skipped ten minutes later with nothing saying why.
+#
+# So the Claude launch now reads the page itself while it waits for Claude to
+# start, and a limit it sees is what the card says, with the reset time in the
+# page's own words.
+#
+# ⚠ The words are the ones the vision step quoted from the page on 09-16; no
+# capture of the page's markup exists. "limit reached" also covers a "Weekly" or
+# "Session" limit — assumed to be worded the same way, not measured.
+#: Claude's words for a limit that has been REACHED (never "approaching").
+_CLAUDE_LIMIT_RE = re.compile(r"\blimit reached\b|\bhit your limit\b|\bneed more usage\?", re.I)
+#: When it ends: "Resets Sep 20 at 1:00 AM", "Limits will reset Sep 20 at 1:00 AM."
+_CLAUDE_LIMIT_RESET_RE = re.compile(r"\bresets?[^\S\n]+(?:on[^\S\n]+)?([^\n·•]{1,60})", re.I)
+
+#: Claude's page text, minus what the program typed (the message box) and the
+#: sidebar's chat titles — a brief or a chat ABOUT usage limits is not a limit.
+_CLAUDE_PAGE_TEXT_JS = """() => {
+    let text = (document.body && document.body.innerText) || '';
+    for (const c of document.querySelectorAll(
+            'div[contenteditable="true"], .ProseMirror, textarea, nav, aside')) {
+        const t = ((c.innerText || c.value) || '').trim();
+        if (t.length > 3) text = text.split(t).join('\\n');
+    }
+    return text.slice(0, 50000);
+}"""
+
+
+def _claude_usage_limit(text) -> "dict | None":
+    """Claude's own "you are out of messages", read off its page text.
+
+    Returns ``{"line": <the page's line>, "resets": <when, in its words, or "">}``
+    or None. The reset time is looked for on the limit's line and the two after
+    it, and only kept when it names a date or a time (it holds a digit).
+    """
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if not _CLAUDE_LIMIT_RE.search(ln):
+            continue
+        resets = ""
+        for near in lines[i:i + 3]:
+            m = _CLAUDE_LIMIT_RESET_RE.search(near)
+            if not m:
+                continue
+            when = re.split(r"\.(?:\s|$)", m.group(1))[0].strip(" .,;:")
+            if re.search(r"\d", when):
+                resets = when[:40]
+                break
+        return {"line": ln[:160], "resets": resets}
+    return None
+
+
+async def _note_claude_usage_limit(page, note: dict, label: str = "2B") -> None:
+    """Record Claude's usage limit in `note` the first time the page shows it.
+    Never raises."""
+    if note or page is None:
+        return
+    try:
+        seen = _claude_usage_limit(await page.evaluate(_CLAUDE_PAGE_TEXT_JS))
+    except Exception:
+        return
+    if seen:
+        note.update(seen)
+        log(f"[{label}] Claude's page shows its usage limit: \"{seen['line']}\" — "
+            "nothing can be sent to Claude until it resets", "WARN")
+
+
+def _claude_limit_card(resets: str) -> "tuple[str, str]":
+    """The card's title and body for Claude's usage limit."""
+    if resets:
+        return (f"Claude's usage limit is reached — it resets {resets}",
+                f"Claude's page says its usage limit resets {resets}. Retry won't work "
+                "before then, so Skip Claude for this run. The other agents carry on.")
+    return ("Claude's usage limit is reached",
+            "Claude's page says this account has used up its messages for now. Retry "
+            "won't work until the limit resets, so Skip Claude for this run. The other "
+            "agents carry on.")
+
+
 async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=None,
                               max_retries=20, interval=3, verbose=False, phase=None,
                               chatgpt_prompt=None):
@@ -65177,6 +65261,18 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
         _p2_mark_agent_done(_p2_run_dir(), "claude", False)  # wave 10.9 — see 2A
+        # What Claude's own page said about its usage limit during THIS launch —
+        # read on every check while we wait for Claude to start (09-16: by the
+        # time the launch gave up, the page had gone blank). See
+        # `_claude_usage_limit`.
+        _cl_limit: dict = {}
+
+        async def _verify_claude_2b(p):
+            if await verify_claude_generating(p):
+                return True
+            await _note_claude_usage_limit(p, _cl_limit)
+            return False
+
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -65193,9 +65289,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             if not _claude_setup_ok:
                 verified_c = False
                 break
-            verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2B",
+            verified_c = await wait_until_verified(_verify_claude_2b, claude_page, "2B",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
-            if verified_c:
+            # A fresh tab cannot get past a usage limit either.
+            if verified_c or _cl_limit:
                 break
         # #905: research start = submit time (see the ChatGPT note above).
         agents["Claude"] = {"page": claude_page, "verified": verified_c,
@@ -65254,12 +65351,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 else:
                     # #893: stale-cookie login wall → honest signed-out card.
                     _cl_wall = await _page_shows_login_wall(claude_page)
+                    await _note_claude_usage_limit(claude_page, _cl_limit)
                     if _cl_wall:
                         _controls.cookie_trust_broken.add("claude")
                         log(f"[2B] Claude shows {_cl_wall} — session expired (stale cookie)", "WARN")
                         fail_agent("claude", "Claude looks signed out",
                                    "Claude is showing its sign-in page — the saved session expired. "
                                    "Sign in using the open browser (or run the login command on the device), then Retry.")
+                    elif _cl_limit:
+                        _cl_title, _cl_body = _claude_limit_card(_cl_limit.get("resets", ""))
+                        log("[2B] Claude could not start because its usage limit is "
+                            "reached — the card says so and when it resets", "WARN")
+                        fail_agent("claude", _cl_title, _cl_body,
+                                   raw_err=_cl_limit.get("line", ""))
                     elif _cl_specific_already:
                         # See the 2A twin — don't clobber the specific card
                         # (snapshot taken before the probes above).

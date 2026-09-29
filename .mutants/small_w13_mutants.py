@@ -7,9 +7,16 @@
        after the first now goes through one helper: an empty one is taken once
        more, then the model is told in words. Five places send a picture; each
        is driven by the real agent_loop.
+  U* — Claude's usage limit is named on the card. The 2B launch reads Claude's
+       page on every check while it waits (09-16: the page had gone blank by
+       the time the launch gave up), again in the failure branch, and a limit
+       it saw becomes "Claude's usage limit is reached — it resets <when>";
+       the fresh-tab second try is not made. Driven through the real
+       run_phase2 launch against a local page in headless Chrome.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
-the real agent_loop, Browser.screenshot and execute_action.
+the real agent_loop, Browser.screenshot and execute_action; the real run_phase2
+Claude launch in headless Chrome.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every
 mutated file must still COMPILE. Both are harness faults, counted OUT.
@@ -29,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 RESEARCH = "research.py"
 
-TESTS = ["tests/test_cua_empty_screenshot_0929.py"]
+TESTS = ["tests/test_cua_empty_screenshot_0929.py", "tests/test_claude_usage_limit_0916.py"]
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 _IMG_OLD = ('{"type": "image", "source": {"type": "base64", "media_type": "image/png", '
@@ -81,6 +88,63 @@ MUTANTS = [
      [("        log(\"[cua] The page did not give a screenshot twice in a row (it is busy) — \"\n"
        "            \"telling the vision model in words instead of sending an empty picture\", "
        "\"WARN\")\n", "")]),
+
+    # ═══ U — Claude's usage limit, named ════════════════════════════════════
+    ("U1", RESEARCH, "⛔⛔ the wait never reads the page — a limit seen while waiting "
+     "is lost once the page goes blank (the second 09-16 run)",
+     [("            await _note_claude_usage_limit(p, _cl_limit)\n            return False\n",
+       "            return False\n")]),
+    ("U2", RESEARCH, "⛔ the launch waits with the plain check, not the one that reads "
+     "the page",
+     [("verified_c = await wait_until_verified(_verify_claude_2b, claude_page, \"2B\",",
+       "verified_c = await wait_until_verified(verify_claude_generating, claude_page, \"2B\",")]),
+    ("U3", RESEARCH, "a fresh tab is tried after the limit was seen — minutes spent on "
+     "a try that cannot work",
+     [("            if verified_c or _cl_limit:\n", "            if verified_c:\n")]),
+    ("U4", RESEARCH, "⛔ the failure branch does not read the page — a launch that gave "
+     "up before the wait gets 'didn't start'",
+     [("                    await _note_claude_usage_limit(claude_page, _cl_limit)\n", "")]),
+    ("U5", RESEARCH, "⛔⛔ the limit is seen and the card still says 'Claude didn't start'",
+     [("                    elif _cl_limit:\n", "                    elif False:\n")]),
+    ("U6", RESEARCH, "⛔ the card drops when the limit resets",
+     [("_claude_limit_card(_cl_limit.get(\"resets\", \"\"))", "_claude_limit_card(\"\")")]),
+    ("U7", RESEARCH, "⛔ the message box is read — a brief ABOUT usage limits reads "
+     "as Claude's limit",
+     [("            'div[contenteditable=\"true\"], .ProseMirror, textarea, nav, aside')) {",
+       "            'textarea, nav, aside')) {")]),
+    ("U8", RESEARCH, "the sidebar is read — a chat titled with the words reads as the limit",
+     [("            'div[contenteditable=\"true\"], .ProseMirror, textarea, nav, aside')) {",
+       "            'div[contenteditable=\"true\"], .ProseMirror, textarea')) {")]),
+    ("U9", RESEARCH, "⛔ 'approaching' reads as reached",
+     [("_CLAUDE_LIMIT_RE = re.compile(r\"\\blimit reached\\b|\\bhit your limit\\b|"
+       "\\bneed more usage\\?\", re.I)",
+       "_CLAUDE_LIMIT_RE = re.compile(r\"\\blimit\\b|\\bhit your limit\\b|"
+       "\\bneed more usage\\?\", re.I)")]),
+    ("U10", RESEARCH, "the 'Need more usage?' dialog is not read",
+     [("_CLAUDE_LIMIT_RE = re.compile(r\"\\blimit reached\\b|\\bhit your limit\\b|"
+       "\\bneed more usage\\?\", re.I)",
+       "_CLAUDE_LIMIT_RE = re.compile(r\"\\blimit reached\\b|\\bhit your limit\\b\", re.I)")]),
+    ("U11", RESEARCH, "the 'You've hit your limit' note is not read",
+     [("_CLAUDE_LIMIT_RE = re.compile(r\"\\blimit reached\\b|\\bhit your limit\\b|"
+       "\\bneed more usage\\?\", re.I)",
+       "_CLAUDE_LIMIT_RE = re.compile(r\"\\blimit reached\\b|"
+       "\\bneed more usage\\?\", re.I)")]),
+    ("U12", RESEARCH, "a reset time on the line after the limit is missed",
+     [("        for near in lines[i:i + 3]:\n", "        for near in lines[i:i + 1]:\n")]),
+    ("U13", RESEARCH, "words with no date or time are kept as the reset time "
+     "('resets soon')",
+     [("            if re.search(r\"\\d\", when):\n                resets = when[:40]\n",
+       "            if when:\n                resets = when[:40]\n")]),
+    ("U14", RESEARCH, "the sentence after the reset time is kept as part of it",
+     [("            when = re.split(r\"\\.(?:\\s|$)\", m.group(1))[0].strip(\" .,;:\")\n",
+       "            when = m.group(1).strip(\" .,;:\")\n")]),
+    ("U15", RESEARCH, "the limit leaves no line in the log",
+     [("        log(f\"[{label}] Claude's page shows its usage limit: \\\"{seen['line']}\\\" — \"\n"
+       "            \"nothing can be sent to Claude until it resets\", \"WARN\")\n",
+       "        pass\n")]),
+    ("U16", RESEARCH, "the page is read again after the limit was noted — the same line "
+     "every three seconds",
+     [("    if note or page is None:\n        return\n", "    if page is None:\n        return\n")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.
