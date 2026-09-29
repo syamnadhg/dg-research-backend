@@ -39607,11 +39607,30 @@ async def _cua_click_lands_on(browser, params, sel) -> bool:
     cannot be taken back."""
     try:
         x, y = (params or {})["coordinate"]
-        return bool(await browser.page.evaluate(
-            "([x, y, s]) => { const e = document.elementFromPoint(x, y);"
-            " return !!(e && e.closest(s)); }", [x, y, sel]))
+        return bool(await browser.page.evaluate(_CUA_CLICK_TARGET_JS, [x, y, sel]))
     except Exception:
         return True
+
+
+#: What a click at (x, y) lands on, matched against `s`. ⛔ Into OPEN shadow
+#: roots (`elementFromPoint` stops at the host, whose `closest` never sees the
+#: button inside), and a frame is "can't tell" — refused (09-29 re-verify).
+_CUA_CLICK_TARGET_JS = """([x, y, s]) => {
+    let e = document.elementFromPoint(x, y);
+    while (e && e.shadowRoot) {
+        const inner = e.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === e) break;
+        e = inner;
+    }
+    if (!e) return false;
+    if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return true;
+    for (let n = e; n; ) {
+        if (n.closest(s)) return true;
+        const root = n.getRootNode();
+        n = root && root.host ? root.host : null;
+    }
+    return false;
+}"""
 
 
 def _cua_refusal(action, params, allow) -> str:
@@ -50783,26 +50802,37 @@ async def _chatgpt_wait_prompt_sent(page, prompt, timeout_s=10.0) -> bool:
         await asyncio.sleep(0.5)
 
 
-async def _chatgpt_user_msg_count(page) -> "int | None":
-    """How many of the person's messages the thread shows; None when unreadable."""
+async def _chatgpt_user_msg_count(page) -> "tuple | None":
+    """The thread as the caret step found it: (how many of the person's
+    messages it shows, the page's address). None when unreadable."""
     try:
-        return int(await page.evaluate("(s) => document.querySelectorAll(s).length",
-                                       CHATGPT_USER_MSG_SEL))
+        n, href = await page.evaluate(
+            "(s) => [document.querySelectorAll(s).length, location.href]",
+            CHATGPT_USER_MSG_SEL)
+        return int(n), str(href)
     except Exception:
         return None
 
 
 def _chatgpt_caret_step_sent(before, after, tag) -> bool:
-    """⛔ THE BELT (09-29 verify). A message that appeared while a CUA was only
-    placing the caret was SENT by it — whatever the refusals missed: a Vision
-    step, a click the Send guard misjudged. The prompt is then not typed; a
-    thread with a stray message ahead of the brief is not the run's thread, and
-    on Pro the stray message's reply holds Send anyway. Unreadable is False."""
-    if before is None or after is None or after <= before:
+    """⛔ THE BELT (09-29 verify). The thread must be EXACTLY as the caret step
+    found it — the same page, the same number of the person's messages. One
+    more was SENT by the CUA, whatever the refusals missed (a Vision step, a
+    click the Send guard misjudged): a stray message ahead of the brief, whose
+    reply on Pro holds Send anyway. Fewer, or another address, is a click on
+    "New chat" or another conversation (09-29 re-verify): the follow-up then
+    went into an empty chat and its reply was read as the brief. Either way the
+    prompt is not typed. Unreadable is False."""
+    if before is None or after is None or after == before:
         return False
-    log(f"{tag} ✗ a message was sent while the CUA was only placing the caret "
-        f"({before} → {after} of your messages on screen) — NOT typing the prompt",
-        "ERROR")
+    (n0, href0), (n1, href1) = before, after
+    if n1 > n0:
+        what = f"a message was sent ({n0} → {n1} of your messages on screen)"
+    else:
+        what = (f"the chat changed ({n0} → {n1} of your messages on screen"
+                f"{', another page' if href1 != href0 else ''})")
+    log(f"{tag} ✗ {what} while the CUA was only placing the caret — NOT typing "
+        f"the prompt", "ERROR")
     return True
 
 
