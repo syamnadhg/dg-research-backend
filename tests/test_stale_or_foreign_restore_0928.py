@@ -1161,3 +1161,12 @@ def test_a_blip_on_who_shares_at_boot_is_asked_again_before_a_record_this_comput
     assert _boot(path, _Q()) == [bobs], f"a job of an account that left was restored: {lines}"
     assert _in_file(path) == [bobs], "the former sharer's entry stays to come back"
     assert len(_said(lines, gone, NOT_OPENABLE)) == 1, lines
+
+
+def test_each_accounts_batch_is_still_cut_under_firestores_500_writes():
+    """One batch per account, and each still cut at 450 writes (Firestore
+    refuses a batch of more than 500): 451 of one account's records are two
+    batches, and another account's one record is a third."""
+    patches = [(OWNER, f"rid-{i}", {}) for i in range(451)] + [(SHARER, "rid-s", {})]
+    got = [(uid, i, len(part)) for uid, i, part in research._queue_pos_batches(patches)]
+    assert got == [(OWNER, 0, 450), (OWNER, 450, 1), (SHARER, 0, 1)]
