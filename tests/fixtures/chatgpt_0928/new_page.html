@@ -20,9 +20,12 @@
   Start Voice for Send, sending appends the user block, shows Stop, then appends
   the reply; the model button opens and Escape closes the menu, leaving focus on
   the button. body[data-sr-fixture="thread"] loads a finished exchange with Stop
-  still showing (a reply "generating"). body[data-mangle="N"] is a TEST HOOK: the
-  next N inserts lose their first character, so the read-back check can be
-  exercised.
+  still showing (a reply "generating"). TEST HOOKS, not page behaviour:
+  body[data-mangle="N"] — the next N inserts lose their first character, so the
+  read-back check can be exercised; body[data-sendmangle] — Send posts the text
+  minus its first character; body[data-menu-closed-by] / [data-sent-via] record
+  how the menu closed (escape / outside) and how the message went (button /
+  enter).
 -->
 <html lang="en">
 <head>
@@ -148,7 +151,8 @@
     const t = text();
     if (!t) return;
     document.body.dataset.sentVia = via;
-    const addReply = addExchange(t, false);
+    // TEST HOOK: the page posts something other than what the box held.
+    const addReply = addExchange(document.body.dataset.sendmangle ? t.slice(1) : t, false);
     box.innerHTML = EMPTY;
     setAction('stop');
     setTimeout(() => { addReply(); setAction('voice'); }, 400);
@@ -187,10 +191,14 @@
   modelBtn.addEventListener('click', () => { if (menuOpen()) closeMenu(); else openMenu(); });
   document.addEventListener('keydown', (e) => {
     // The capture: Escape closes the menu and focus lands on the model button.
-    if (e.key === 'Escape' && menuOpen()) { closeMenu(); modelBtn.focus(); }
+    if (e.key === 'Escape' && menuOpen()) {
+      closeMenu(); modelBtn.focus(); document.body.dataset.menuClosedBy = 'escape';
+    }
   });
   document.addEventListener('pointerdown', (e) => {
-    if (menuOpen() && !layer.contains(e.target) && e.target !== modelBtn) closeMenu();
+    if (menuOpen() && !layer.contains(e.target) && e.target !== modelBtn) {
+      closeMenu(); document.body.dataset.menuClosedBy = 'outside';
+    }
   }, true);
 
   if (document.body.dataset.srFixture === 'thread') {

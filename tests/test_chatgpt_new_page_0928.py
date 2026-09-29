@@ -283,6 +283,22 @@ def test_live_the_prompt_is_typed_read_back_and_sent(chrome, page, fast, logs, l
     # Sent with ChatGPT's own Send button (either page's), not the Enter fallback.
     assert chrome.run(page.evaluate("() => document.body.dataset.sentVia")) == "button"
     assert chrome.run(page.evaluate("() => document.querySelectorAll('[role=\"menu\"]').length")) == 0
+    if layout == "new":
+        # Closed by the submit's own bounded Escape — not left for the box
+        # click to dismiss by accident.
+        assert chrome.run(page.evaluate("() => document.body.dataset.menuClosedBy")) == "escape"
+
+
+def test_live_a_send_that_posts_other_text_is_not_counted_as_sent(chrome, page, fast, logs):
+    """The page shows something else after Send: not "sent" — and the outcome
+    says Send WAS pressed, so no fallback types the prompt a second time."""
+    _load(chrome, page, "new")
+    chrome.run(page.evaluate("() => { document.body.dataset.sendmangle = '1'; }"))
+    out = {}
+    ok = chrome.run(research.submit_chatgpt_direct(_browser(page), PROMPT, outcome=out))
+    assert ok is False and out["state"] == "sent_unconfirmed"
+    assert chrome.run(page.evaluate(USERS_JS)) == [PROMPT[1:]]
+    assert any("not counting it as sent" in m for _lv, m in logs), logs
 
 
 def test_live_after_the_menu_closes_the_box_is_found_and_focused_by_a_click(chrome, page, fast, logs):
@@ -410,10 +426,16 @@ def test_live_the_census_sees_the_user_message(chrome, page, logs, layout):
     _load(chrome, page, layout, thread=True)
     snap = chrome.run(page.evaluate(js_constant(research._log_chatgpt_thread_snapshot, "JS")))
     assert snap["lub"] > 0, snap
+    # The reply's "ChatGPT said:" label sits in the TURN but outside the reply
+    # text, on either page — only the turn marker can place it (a new-page turn
+    # holds the user block and the reply; an old one was an article).
+    rows = [r for r in snap["rows"] if r["t"] == "ChatGPT said:"]
+    assert rows and all(r["inTurn"] for r in rows), snap["rows"]
     inline = chrome.run(page.evaluate(research._CHATGPT_INLINE_ACTIVITY_JS))
     assert inline is not None and inline["dbg"]["lub"] > 0, inline
     res = chrome.run(research._open_chatgpt_activity_panel(page))
     assert res.get("structSkip", "") != "no user message on screen", res
+    assert res.get("structRan") is True, res
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -430,6 +452,38 @@ def test_live_the_scraper_reads_the_reply_its_links_and_headings(chrome, page, l
     assert r["status"] == "generating", r            # the Stop button, read
     if layout == "new":
         assert r["model"] == "Pro"
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_live_the_scrapers_own_host_read_sees_the_reply(chrome, page, logs, monkeypatch, layout):
+    """The same, with the in-turn walker silenced: its pass also measures the
+    reply, and would otherwise cover for a blind host read."""
+    monkeypatch.setattr(research, "_CHATGPT_INLINE_ACTIVITY_JS", "() => null")
+    _load(chrome, page, layout, thread=True)
+    r = chrome.run(research.scrape_progress_chatgpt(page))
+    assert r["partial_text_len"] > 2000, r
+    assert LINK in r["source_urls"], r
+    assert HEADING in r["sections"], r
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_live_the_stream_observer_attaches_to_the_reply(chrome, page, layout):
+    _load(chrome, page, layout, thread=True)
+    assert chrome.run(research.inject_agent_observer(page, "chatgpt")) is True
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_live_a_password_box_beside_the_composer_is_not_a_lost_session(chrome, page, layout):
+    """A visible password field + login words reads as "signed out" UNLESS a
+    composer is on the page. On the new page no old marker named one."""
+    _load(chrome, page, layout)
+    chrome.run(page.evaluate("""() => {
+        const d = document.createElement('div');
+        d.innerHTML = '<p>Enter your password to unlock connectors</p><input type="password">';
+        document.body.appendChild(d);
+    }"""))
+    expired, why = chrome.run(research.detect_session_expiry(page, "chatgpt", "ChatGPT"))
+    assert expired is False, why
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -620,6 +674,9 @@ def test_without_a_chatgpt_prompt_nothing_changes_for_other_platforms(monkeypatc
 
 def test_phase_one_verifies_with_its_prompt_and_the_fallback_only_focuses():
     src = inspect.getsource(research.run_phase1)
+    # The tier step's menu is closed before anything else touches the page.
+    assert src.index("_chatgpt_close_open_menus(browser.page") < src.index(
+        "submit_chatgpt_direct(browser, prompt")
     assert src.count("chatgpt_prompt=prompt") == 1
     assert src.count("chatgpt_prompt=followup") == 1
     assert src.count('.get("state") == "not_sent"') == 2
