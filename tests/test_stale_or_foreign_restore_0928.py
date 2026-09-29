@@ -233,6 +233,23 @@ def test_a_read_that_blips_still_takes_the_job_while_a_refusal_does_not(
     assert _in_file(path) == [mine]
 
 
+def test_a_refusal_on_the_funnels_own_read_is_the_same_answer(monkeypatch, tmp_path):
+    """⛔ TWO READS, A MOMENT APART. The pickup rule's read answers "queued" and
+    the funnel's, a moment later, is refused — the funnel used to "trust the
+    FE-side queue write" and take it. It is dropped and shed like any refusal;
+    the owner's job beside it is restored."""
+    gone, mine = "chat_1759000000000_a", "chat_1759000000000_b"
+    fs = _Fs(records={(FORMER, gone): [QUEUED, DENIED], (OWNER, mine): QUEUED},
+             device=DEVICE_UNREADABLE)
+    lines = _machine(monkeypatch, tmp_path, fs)
+    path = _snapshot(tmp_path, [_job(FORMER, gone, topic="Gone"), _job(OWNER, mine)])
+
+    assert _boot(path, _Q()) == [mine]
+    assert _in_file(path) == [mine], "a job refused on the funnel's read was kept"
+    assert research._UNREAD_RESTORES == [], "a refused job is held for a retry"
+    assert len(_said(lines, gone, NOT_OPENABLE)) == 1, lines
+
+
 def test_a_held_entry_whose_later_read_is_refused_is_let_go_not_run(monkeypatch, tmp_path):
     """⛔ THE RE-OFFER ASKED THE SAME FUNNEL AND TRUSTED THE SAME 403. An entry
     held on a blip at boot, refused when the retry reads it: not queued, no
@@ -277,6 +294,23 @@ def test_a_strangers_job_is_dropped_before_any_read_and_a_sharers_is_restored(
     assert fs.record_reads(STRANGER) == [], "the stranger's record was read before the drop"
     assert theirs not in _in_file(path), "the stranger's job stays to come back"
     assert len(_said(lines, theirs, NOT_OPENABLE)) == 1, lines
+
+
+@pytest.mark.parametrize("device", [DEVICE_UNREADABLE, None],
+                         ids=["device-read-blips", "no-device-document"])
+def test_a_sharers_job_is_not_dropped_when_who_shares_cannot_be_read(
+        monkeypatch, tmp_path, device):
+    """⭐ "DON'T KNOW" IS NEVER "NOBODY". With the device document unreadable or
+    missing, the owner check has no evidence — a sharer's job whose record reads
+    "queued" is restored, and only the record read can drop one: the former
+    sharer's, refused, beside it."""
+    bobs, gone = "chat_1759000000000_c", "chat_1759000000000_d"
+    fs = _Fs(records={(SHARER, bobs): QUEUED, (FORMER, gone): DENIED}, device=device)
+    _machine(monkeypatch, tmp_path, fs)
+    path = _snapshot(tmp_path, [_job(SHARER, bobs), _job(FORMER, gone, topic="Gone")])
+
+    assert _boot(path, _Q()) == [bobs]
+    assert _in_file(path) == [bobs]
 
 
 def test_the_run_folders_owner_file_names_a_job_the_entry_does_not(monkeypatch, tmp_path):
@@ -378,7 +412,7 @@ class _DenyingDb:
         self.writes += 1
         raise PermissionDenied("403 Missing or insufficient permissions.")
 
-    add = update = set = _deny
+    add = update = set = get = _deny
 
 
 def _heal_machine(monkeypatch, *, token_device=DEVICE, config_device=DEVICE):
@@ -445,28 +479,36 @@ def test_a_device_id_mismatch_still_says_re_pair_whoever_the_research_belongs_to
     assert "re-pair required" in line and "another account" not in line, line
 
 
-def test_the_run_event_writer_names_the_run_owners_account(monkeypatch):
-    """⛔⛔ THE CONSUMER THE 09-28 LOG LATCHED ON — `emit_event`'s write. Run
-    with the job's owner armed as the run's uid, its structural line must say
-    whose research it was, which only the uid the writer hands the heal can."""
+RUN_RID = "agent-82bb870dba1140ed"
+
+#: The research writers a run makes, each driven through its real code. The
+#: first is the one the 09-28 log latched on — `emit_event`'s write.
+WRITERS = {
+    "emit_event": lambda: research._emit_to_firestore({"type": "phase_start"}),
+    "update-record": lambda: research._update_research_doc(
+        FORMER, RUN_RID, {"status": "ongoing"}),
+    "set-record": lambda: research._set_research_doc(
+        FORMER, RUN_RID, {"backendRunId": "Topic_20260920_181415"}),
+    "link": lambda: research.update_link_in_firestore("brief", "https://example.com/b"),
+    "document": lambda: research.save_document_to_firestore("brief", "# Brief\n\nbody"),
+    "phase-status": lambda: research._do_phase_terminal_status_write(1, "complete"),
+    "cloud-kick-refusal": lambda: research._record_cloud_kick_refusal(
+        FORMER, RUN_RID, "the cloud said no"),
+}
+
+
+@pytest.mark.parametrize("writer", list(WRITERS))
+def test_every_research_writer_names_the_research_owners_account(monkeypatch, writer):
+    """⛔⛔ THE CONSUMERS. The heal can only say whose research it was if the
+    writer hands it the uid of the tree it writes into. With the job's owner
+    armed as the run's uid (and passed where the writer takes it), the
+    structural line must name another account — never re-pairing."""
     _db, lines = _heal_machine(monkeypatch)
     monkeypatch.setattr(research, "_fb_uid", FORMER)
-    monkeypatch.setattr(research, "_fb_research_id", "agent-82bb870dba1140ed")
+    monkeypatch.setattr(research, "_fb_research_id", RUN_RID)
     monkeypatch.setattr(research, "_fb_seq", 0)
     monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
-    _deny_three_times(lambda: research._emit_to_firestore({"type": "phase_start"}))
-
-    [line] = _structural(lines)
-    assert "the job belongs to another account" in line, line
-    assert "re-pair required" not in line, line
-
-
-def test_the_research_record_writer_names_the_records_account(monkeypatch):
-    """⭐ The seam every status, phase and agent write goes through."""
-    _db, lines = _heal_machine(monkeypatch)
-    monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
-    _deny_three_times(lambda: research._update_research_doc(
-        FORMER, "agent-82bb870dba1140ed", {"status": "ongoing"}))
+    _deny_three_times(WRITERS[writer])
 
     [line] = _structural(lines)
     assert "the job belongs to another account" in line, line

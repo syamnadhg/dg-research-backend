@@ -75,9 +75,11 @@ SEEN = ("            if record_seen is not None:\n"
 FUNNEL_READ = '                .collection("researches").document(rid).get(**(read_options or {}))'
 
 # ── anchors: the boot restore and its retry ─────────────────────────────────
+#: ⛔ RE-AIMED 2026-09-28: the boot restore and its re-offer also hand the funnel
+#: a `denied` list (a 403 at boot is an answer). R1 and Q13 mean what they meant.
 RESTORE_CALL = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
                 '                         allowed_statuses=("queued", "ongoing"),\n'
-                '                         hold_unreadable=_UNREAD_RESTORES):')
+                '                         hold_unreadable=_UNREAD_RESTORES, denied=denied):')
 RESTORE_SPAWN = ("    if _UNREAD_RESTORES:\n"
                  "        _retry_after_restart(_reoffer_unread_restores(job_queue))")
 RETRY_CALL = ('    took = _safe_enqueue(staged, job, source="disk-restore-retry",\n'
@@ -86,7 +88,8 @@ RETRY_CALL = ('    took = _safe_enqueue(staged, job, source="disk-restore-retry"
 RETRY_READ_OPTIONS = ('                         hold_unreadable=unread, record_seen=record,\n'
                       '                         read_options={"retry": None,\n'
                       '                                       "timeout": '
-                      '_RESTART_RETRY_READ_TIMEOUT_S})')
+                      '_RESTART_RETRY_READ_TIMEOUT_S},\n'
+                      '                         denied=[])')
 RETRY_NO_RETRY = '                         read_options={"retry": None,'
 ASK_UNREAD = ('    if unread:\n'
               '        return "unread", {}')
@@ -188,7 +191,8 @@ MUTANTS = [
     ("R1", "under", "⛔⛔ the boot restore stops passing its hold list — back to "
      "a refusal that the next rewrite erases",
      [(RESTORE_CALL, '        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
-                     '                         allowed_statuses=("queued", "ongoing")):')],
+                     '                         allowed_statuses=("queued", "ongoing"),\n'
+                     '                         denied=denied):')],
      RESEARCH, PICKUP),
     ("R2", "under", "⛔ the held entry is never asked about again — it waits for a "
      "restart that may be days away",
@@ -266,7 +270,8 @@ MUTANTS = [
      "each one retries for 300 s, one more blocked thread per held entry per "
      "round in the shared executor",
      [(RETRY_READ_OPTIONS, "                         hold_unreadable=unread, "
-                           "record_seen=record)")],
+                           "record_seen=record,\n"
+                           "                         denied=[])")],
      RESEARCH, PICKUP),
     ("Q14", "under", "the read gets a deadline but keeps the client's retry — "
      "DeadlineExceeded is one of the errors it retries, for 300 s",

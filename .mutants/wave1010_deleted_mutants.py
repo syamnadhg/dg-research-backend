@@ -66,8 +66,9 @@ RULE_TAKE = ('        return "archived", record\n'
              "    return None, record")
 LINE_SCOPE = ("    with _machine_log_scope():\n"
               "        log(f\"[pickup:{where}] {str(research_id or '')[:8]}… was {reason} — \"")
-UNREADABLE_SCOPE = ("    except Exception as err:\n"
-                    "        with _machine_log_scope():\n"
+#: ⛔ RE-AIMED 2026-09-28: the boot restore's refusal branch now sits between the
+#: `except` and this scope, so the anchor starts at the scope itself.
+UNREADABLE_SCOPE = ("        with _machine_log_scope():\n"
                     '            log(f"[pickup:{where}] {rid[:8]}… record unreadable "')
 
 # ── anchors: the consumers ──────────────────────────────────────────────────
@@ -95,7 +96,8 @@ DEQUEUE_FALLBACK = ("                    if not _snap.exists:\n"
                     "                    elif _cur:")
 DEQUEUE_BAIL = ("                _PICKUP_WITHDRAWN_STATUS,\n"
                 "            }")
-RESTORE = ('                             "disk-restore")[0]:')
+#: ⛔ RE-AIMED 2026-09-28: the boot restore passes `denied_is_answer=True`.
+RESTORE = ('                             "disk-restore", denied_is_answer=True)[0]:')
 #: ⛔ Its own `elif`, so wave 10.9's `RESTORE_FORGET` anchor still matches.
 RESTORE_SHED = "    elif withdrew:"
 REHYDRATE = '                        _pickup_withdrawn, tree_uid, research_id, "rehydrate"))[0]:'
@@ -132,8 +134,7 @@ MUTANTS = [
      [(LINE_SCOPE, "    if True:\n"
                    "        log(f\"[pickup:{where}] {str(research_id or '')[:8]}… was {reason} — \"")]),
     ("L2", "under", "the unreadable-record line is written into the armed run too",
-     [(UNREADABLE_SCOPE, "    except Exception as err:\n"
-                         "        if True:\n"
+     [(UNREADABLE_SCOPE, "        if True:\n"
                          '            log(f"[pickup:{where}] {rid[:8]}… record unreadable "')]),
 
     # ══ one pickup path ignores the rule ═══════════════════════════════════
@@ -169,7 +170,8 @@ MUTANTS = [
      [(DEQUEUE_BAIL, "            }")]),
     ("C9", "under", "the boot restore stops asking — a deleted research's "
      "snapshot entry is re-offered at every boot",
-     [(RESTORE, '                             "disk-restore")[0] and False:')]),
+     [(RESTORE, '                             "disk-restore", '
+                'denied_is_answer=True)[0] and False:')]),
     ("C10", "under", "the boot restore asks but never sheds — the withdrawn "
      "entry stays in the file for good",
      [(RESTORE_SHED, "    elif False:")]),

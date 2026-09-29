@@ -95,6 +95,8 @@ MUTANTS = [
        '                                    "pipeline_events", "commands"):\n'
        '                         for sd in research_ref.collection(sub).stream():')],
      f"{T_5D} {T_HEAL}"),
+    # ⛔ RE-AIMED 2026-09-28: every research write hands the heal its owner's
+    # uid now (`uid=uid`), so C3/C4 carry it. They mean what they meant.
     ("C3", RESEARCH, "under",
      "⛔ OVER-CORRECTION — the commands sweep goes too, stranding real queued "
      "work for a run being torn down. The one delete that could ever land.",
@@ -102,13 +104,13 @@ MUTANTS = [
        '                                    try:\n'
        '                                        _grpc_write_with_heal(\n'
        '                                            lambda sd=sd: sd.reference.delete(),\n'
-       '                                            what="cascade-sweep cmd delete")\n'
+       '                                            what="cascade-sweep cmd delete", uid=uid)\n'
        '                                    except Exception: pass',
        '                            for sd in []:\n'
        '                                    try:\n'
        '                                        _grpc_write_with_heal(\n'
        '                                            lambda sd=sd: sd.reference.delete(),\n'
-       '                                            what="cascade-sweep cmd delete")\n'
+       '                                            what="cascade-sweep cmd delete", uid=uid)\n'
        '                                    except Exception: pass')],
      f"{T_5D} {T_HEAL}"),
     ("C4", RESEARCH, "under",
@@ -116,7 +118,7 @@ MUTANTS = [
      "stops being repairable and the denial goes back to being invisible",
      [('                                        _grpc_write_with_heal(\n'
        '                                            lambda sd=sd: sd.reference.delete(),\n'
-       '                                            what="cascade-sweep cmd delete")',
+       '                                            what="cascade-sweep cmd delete", uid=uid)',
        '                                        sd.reference.delete()')],
      f"{T_5D} {T_HEAL}"),
     ("C5", RESEARCH, "over",
