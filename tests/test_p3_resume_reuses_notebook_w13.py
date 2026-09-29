@@ -365,6 +365,12 @@ def resumed(tmp_path, monkeypatch):
         return None
     monkeypatch.setattr(research._controls, "interruptible_sleep", _wait)
 
+    # ── no person answers a card here. A card's wait is bounded by a day, so a
+    # run that reached one would sit for a day: it is answered Skip at once.
+    async def _skip(*_a, **_k):
+        return "skip"
+    monkeypatch.setattr(research._controls, "await_phase_decision", _skip)
+
     real_sleep = asyncio.sleep
 
     async def _fast_sleep(_d=0, *a, **k):
