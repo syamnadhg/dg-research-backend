@@ -748,18 +748,18 @@ def test_live_p1_with_no_copy_button_found_the_cua_clicks_it(chrome, page, p1, l
     assert _lines(logs, "brief taken from ChatGPT's Copy button, clicked by the CUA ("), logs
 
 
-#: The user's own "Edit message", and a "Share prompt", pinned where a stray
-#: click can reach them.
+#: The buttons under the user's own message, "Edit message" and "Share prompt"
+#: (both captured labels), pinned where a stray click can reach them — clear of
+#: the pinned row of icons under the reply.
 PIN_EDIT_SHARE_JS = """() => {
-    const edit = document.querySelector('[aria-label="Edit message"]');
-    document.body.appendChild(edit);
-    edit.style.cssText = 'position: fixed; left: 900px; top: 500px; width: 40px; height: 30px; '
-        + 'z-index: 9; display: block; visibility: visible; opacity: 1;';
-    const share = document.createElement('button');
-    share.type = 'button';           // as ChatGPT's own; a bare <button> is a submit button
-    share.setAttribute('aria-label', 'Share prompt');
-    share.style.cssText = 'position: fixed; left: 1000px; top: 300px; width: 40px; height: 30px; z-index: 9;';
-    document.body.appendChild(share);
+    const pin = (label, left, top) => {
+        const b = document.querySelector(`[aria-label="${label}"]`);
+        document.body.appendChild(b);
+        b.style.cssText = `position: fixed; left: ${left}px; top: ${top}px; width: 40px; `
+            + 'height: 30px; z-index: 9; display: block; visibility: visible; opacity: 1;';
+    };
+    pin('Edit message', 900, 500);
+    pin('Share prompt', 1000, 300);
 }"""
 
 
@@ -793,6 +793,10 @@ def test_live_p1_the_copy_cua_only_clicks_and_never_regenerate_or_send(chrome, p
     clicked = _clicked(chrome, page)
     for never in ("Regenerate response", "Share", "Share prompt", "Edit message"):
         assert never not in clicked, clicked
+    for label, at in (("Share", "share"), ("Share prompt", "share prompt"), ("Edit message", "edit")):
+        assert chrome.run(page.evaluate(      # each click aimed at that button itself
+            "([x, y]) => document.elementFromPoint(x, y).closest('button').getAttribute('aria-label')",
+            p1.at[at])) == label
     refused = _lines(logs, "REFUSED")
     assert len(refused) == 7, refused
     assert len(_lines(logs, "[cua] REFUSED a click on Send, Regenerate, Share or Edit — this "
