@@ -75904,8 +75904,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Chrome died mid-podcast goes back to it — and to its podcast —
             # instead of making a second notebook and a second podcast. Only the
             # FIRST upload gets it: the re-upload below runs because the notebook
-            # we had is not usable.
-            _p3_recorded_nb = (cp.get("notebook_url") or "") if resume_dir else ""
+            # we had is not usable. (A fresh run's checkpoint is empty.)
+            _p3_recorded_nb = cp.get("notebook_url") or ""
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(

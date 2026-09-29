@@ -41,6 +41,9 @@ NB_ID = "9351b159-2d9d-4ffe-bc41-44a1b1129bcb"
 # "notebooklm", so the podcast step navigates to the notebook itself — as live.
 NB_URL = f"https://notebook.google.com/notebook/{NB_ID}"
 NEW_NB_URL = "https://notebook.google.com/notebook/7187233f-16e7-47a1-b316-665ae3d717fb"
+# ANOTHER research's notebook. Every research uploads the same file names.
+OTHER_ID = "c8819561-73f1-4041-9b3e-384df0b34e19"
+OTHER_NB_URL = f"https://notebook.google.com/notebook/{OTHER_ID}"
 HOME_URL = "https://notebook.google.com/"
 SIGN_IN_URL = "https://accounts.google.com/v3/signin/identifier?continue=nlm"
 SOURCES = ("chatgpt.md", "gemini.md")
@@ -69,6 +72,10 @@ class _Notebook:
         self.ready = 0
         self.generating = 0
         self.signed_in = True
+        # Where NotebookLM sends a tab asked for this notebook once it is gone.
+        self.gone_to = HOME_URL
+        # Another research's notebook, when a test needs one on screen.
+        self.other: "_Notebook | None" = None
 
 
 class _FakePage:
@@ -77,6 +84,7 @@ class _FakePage:
         self.url = url
         self.closed = False
         self.download_handlers = []
+        self.asked_for = ""
 
     def is_closed(self):
         return self.closed
@@ -87,6 +95,7 @@ class _FakePage:
     async def goto(self, url, **_k):
         if self._browser.dead or self.closed:
             raise _Closed("Page.goto")
+        self.asked_for = self.asked_for or url
         self.url = self._browser._land(url)
 
     async def evaluate(self, *_a, **_k):
@@ -115,7 +124,9 @@ class _FakeContext:
     async def new_page(self):
         if self._browser.dead:
             raise _Closed("BrowserContext.new_page")
-        return _FakePage(self._browser)
+        page = _FakePage(self._browser)
+        self._browser.pages.append(page)
+        return page
 
 
 class _FakeBrowser:
@@ -137,6 +148,7 @@ class _FakeBrowser:
         self.page = _FakePage(self)
         self._known_pages = set()
         self.opened: list = []
+        self.pages: list = []
         _FakeBrowser.instances.append(self)
 
     def _attach_file_handler(self, _page):
@@ -160,7 +172,7 @@ class _FakeBrowser:
         if not nb.signed_in:
             return SIGN_IN_URL
         if research._nlm_notebook_id(url) == NB_ID and not nb.exists:
-            return HOME_URL
+            return nb.gone_to
         return url
 
     def set_upload_file(self, *_a):
@@ -170,10 +182,21 @@ class _FakeBrowser:
         return None
 
 
+def _shown(page):
+    """The notebook this tab shows, or None."""
+    if getattr(page, "closed", False):
+        return None
+    nb = _FakeBrowser.notebook
+    here = research._nlm_notebook_id(getattr(page, "url", "") or "")
+    if here == NB_ID and nb.exists:
+        return nb
+    if here == OTHER_ID and nb.other is not None:
+        return nb.other
+    return None
+
+
 def _on_the_notebook(page):
-    return (not getattr(page, "closed", False)
-            and research._nlm_notebook_id(getattr(page, "url", "") or "") == NB_ID
-            and _FakeBrowser.notebook.exists)
+    return _shown(page) is _FakeBrowser.notebook
 
 
 class _FailingDownload:
@@ -216,7 +239,8 @@ def resumed(tmp_path, monkeypatch):
     _FakeBrowser.notebook = nb
     _FakeBrowser.instances = []
     seen = {"created": 0, "audio": [], "plan": [], "cards": [], "lines": [],
-            "waits": [], "downloads": [], "published": [], "hotspots": []}
+            "waits": [], "downloads": [], "published": [], "hotspots": [],
+            "shared": 0}
 
     monkeypatch.setattr(research, "resolve_api_key", lambda *_a, **_k: "test-key")
     monkeypatch.setattr(research, "_capture_anthropic_attribution", lambda *a, **k: None)
@@ -254,20 +278,23 @@ def resumed(tmp_path, monkeypatch):
         return True
     monkeypatch.setattr(research, "check_hv_gate", _hv)
 
-    # ── NotebookLM's page, read from the fake notebook ──
+    # ── NotebookLM's page, read from whichever fake notebook the tab shows ──
     async def _census(page, expected):
-        if not _on_the_notebook(page):
+        shown = _shown(page)
+        if shown is None:
             return set(), -1
-        return {n for n in expected if n in nb.sources}, (len(nb.sources) or -1)
+        return {n for n in expected if n in shown.sources}, (len(shown.sources) or -1)
     monkeypatch.setattr(research, "_nlm_visible_source_names", _census)
 
     async def _ready(page):
-        return nb.ready if _on_the_notebook(page) else 0
+        shown = _shown(page)
+        return shown.ready if shown is not None else 0
     monkeypatch.setattr(research, "_count_nlm_audio_cards", _ready)
     monkeypatch.setattr(research, "_count_nlm_deep_dive_cards", _ready)
 
     async def _generating(page):
-        return nb.generating if _on_the_notebook(page) else 0
+        shown = _shown(page)
+        return shown.generating if shown is not None else 0
     monkeypatch.setattr(research, "_count_nlm_audio_generating", _generating)
 
     async def _complete(page):
@@ -300,6 +327,7 @@ def resumed(tmp_path, monkeypatch):
     monkeypatch.setattr(research, "_nlm_dom_rename", _rename)
 
     async def _share(browser, *_a, **_k):
+        seen["shared"] += 1
         return research.LinkResult(url=browser.page.url, verified=True)
     monkeypatch.setattr(research, "extract_notebooklm_url", _share)
 
@@ -407,6 +435,22 @@ def test_a_resume_goes_back_to_the_notebook_it_made(resumed, ready, generating):
     assert step["url"] == NB_URL, "the podcast step was pointed at another notebook"
     assert research._nlm_notebook_id(step["tab"]) == NB_ID, (
         "the podcast step did not start on the notebook's own page")
+    assert seen["shared"] == 0, (
+        "the notebook's share step ran again — it was shared when it was made")
+
+
+@pytest.mark.parametrize("ready, generating", [(1, 0), (0, 1)])
+def test_a_notebook_whose_sources_are_not_showing_but_has_a_podcast_is_kept(
+        resumed, ready, generating):
+    """The podcast is what the resume came back for. A sources panel that has
+    not drawn yet does not throw away a podcast that is there."""
+    run, nb, _qd, _seen = resumed
+    nb.sources = set()
+    nb.ready, nb.generating = ready, generating
+    seen = run(_stop_here)
+
+    assert seen["created"] == 0
+    assert seen["audio"] and seen["audio"][0]["url"] == NB_URL
 
 
 def test_a_podcast_still_being_made_is_waited_on_not_made_again(resumed, monkeypatch):
@@ -457,19 +501,74 @@ def test_a_sign_in_page_is_not_a_gone_notebook(resumed):
 
 # ══ 2. …and makes a new one only when the old one is not there ════════════
 
+def _reopened_tab(browser):
+    """The tab the resume opened for the recorded notebook."""
+    return next((p for p in browser.pages if p.asked_for == NB_URL), None)
+
+
 def test_a_notebook_that_is_gone_is_replaced(resumed):
-    """⭐ ACCEPT POLARITY. NotebookLM no longer opens the recorded notebook."""
+    """⭐ ACCEPT POLARITY. NotebookLM no longer opens the recorded notebook. The
+    tab that went looking for it is closed, so the new notebook's is the only
+    NotebookLM tab left."""
     run, nb, _qd, _seen = resumed
     nb.exists = False
     seen = run(_stop_here)
 
     assert seen["created"] == 1, "no new notebook for a notebook that is gone"
     assert seen["audio"] and seen["audio"][0]["url"] == NEW_NB_URL
+    tab = _reopened_tab(_FakeBrowser.instances[0])
+    assert tab is not None and tab.url == HOME_URL and tab.closed
 
 
 def test_a_notebook_with_nothing_of_this_research_is_replaced(resumed):
     run, nb, _qd, _seen = resumed
     nb.sources = set()
+    seen = run(_stop_here)
+
+    assert seen["created"] == 1
+    assert seen["audio"] and seen["audio"][0]["url"] == NEW_NB_URL
+    tab = _reopened_tab(_FakeBrowser.instances[0])
+    assert tab is not None and tab.url == NB_URL and tab.closed
+
+
+def test_another_researchs_notebook_is_not_carried_on_in(resumed):
+    """⛔ Every research uploads the same file names — chatgpt.md, gemini.md —
+    so a tab that landed on ANOTHER research's notebook shows "our" sources and
+    a podcast. Only the notebook this research made is carried on in."""
+    run, nb, _qd, _seen = resumed
+    nb.exists = False
+    nb.gone_to = OTHER_NB_URL
+    nb.other = _Notebook()
+    nb.other.ready = 1
+    seen = run(_stop_here)
+
+    assert seen["created"] == 1, "the podcast step was sent into another research's notebook"
+    assert seen["audio"] and seen["audio"][0]["url"] == NEW_NB_URL
+
+
+def test_a_recorded_address_that_is_not_a_notebook_is_not_opened(resumed):
+    """The checkpoint is read, not trusted: only a NotebookLM notebook address
+    is ever opened from it."""
+    run, _nb, queue_dir, _seen = resumed
+    research.save_checkpoint(queue_dir, 3, topic="Grid storage", brief_url="",
+                             notebook_url=HOME_URL)
+    seen = run(_stop_here)
+
+    assert HOME_URL not in _FakeBrowser.instances[0].opened
+    assert seen["created"] == 1
+
+
+def test_a_notebook_tab_that_will_not_open_goes_to_the_upload(resumed, monkeypatch):
+    """Chrome is alive but the notebook's tab failed to open (a page-load
+    timeout). The run goes on to the upload rather than stalling on it."""
+    run, _nb, _qd, _seen = resumed
+    real_new_tab = _FakeBrowser.new_tab
+
+    async def _times_out(self, url=None):
+        if research._nlm_notebook_id(url or "") == NB_ID:
+            raise TimeoutError("Page.goto: Timeout 30000ms exceeded")
+        return await real_new_tab(self, url)
+    monkeypatch.setattr(_FakeBrowser, "new_tab", _times_out)
     seen = run(_stop_here)
 
     assert seen["created"] == 1
@@ -593,6 +692,25 @@ def test_a_retry_that_finds_chrome_gone_unwinds_before_the_next_wait(resumed):
         f"{len(seen['audio']) - 2} more retries ran on a dead browser")
     assert seen["waits"] == [300]
     assert "browser_crash" in seen["plan"]
+
+
+def test_chrome_dying_on_the_last_retry_is_a_crash_not_a_give_up(resumed):
+    """Two retries find no file on a live browser; the third meets a dead one.
+    With the budget spent, the loop's next stop was "continue with the notebook
+    link only" — the run ended without a podcast that was sitting finished in
+    the notebook. The browser is asked BEFORE the loop gives up."""
+    run, _nb, _qd, seen = resumed
+
+    async def _audio(browser, _url, _prefer):
+        if len(seen["audio"]) < 4:
+            return {"audio_path": None, "audio_stored_url": ""}
+        browser.die()
+        raise _Closed("BrowserContext.new_page")
+    run(_audio)
+
+    assert len(seen["audio"]) == 4 and seen["waits"] == [300, 300, 300]
+    assert "browser_crash" in seen["plan"], (
+        "the run gave up on the podcast instead of relaunching Chrome")
 
 
 def test_a_live_browser_still_gets_its_download_retries(resumed):
