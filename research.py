@@ -67391,9 +67391,122 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         return missing
 
 
-async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose=False):
+def _p3_browser_gone(where: str) -> RuntimeError:
+    """The error a Phase-3 step raises when Chrome is gone, with its kind set.
+
+    ⛔⛔ WAVE 13 — A DEAD BROWSER AT THE PODCAST DOWNLOAD WAS "RETRIED" ON THE
+    DEAD BROWSER. On 09-16 Chrome died two seconds after the Download click. The
+    download swallowed it, and the no-audio loop then waited five minutes and
+    tried again three times — each try failing at once on the same dead browser
+    — before ending the run without the podcast. The mid-poll check already
+    unwinds a dead browser; these two sites now unwind it the same way, so the
+    run relaunches Chrome and resumes, and the resume goes back to the notebook
+    whose podcast is already finished (`_p3_reopen_recorded_notebook`).
+
+    ⭐ SAME TWO KINDS AS THE MID-POLL SITE. The login command closes Chrome on
+    purpose and must pause the run at its checkpoint, not relaunch Chrome onto
+    the profile being signed into. Everything else is a crash. The crash text
+    ends in the marker `_is_browser_close_error` reads, so the kind survives
+    the unwind even if the flag does not."""
+    if _login_interrupt_active():
+        _runtime.last_failure_kind = "login_interrupt"
+        log(f"[Phase3] the login command closed the browser {where} — pausing the "
+            f"run at its checkpoint", "WARN")
+        return RuntimeError("research browser closed by the login command (login interrupt)")
+    _runtime.last_failure_kind = "browser_crash"
+    log(f"[Phase3] the browser is gone {where} — stopping here so the run can "
+        f"restart the browser and carry on from its checkpoint", "WARN")
+    return RuntimeError(f"research browser died {where} (browser crash)")
+
+
+async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
+    """Open the notebook this research already made. True means carry on in it.
+
+    ⛔⛔ WAVE 13 — A RESUMED PHASE 3 ALWAYS MADE A NEW NOTEBOOK. When Chrome died
+    during the podcast step, the relaunch resumed at Phase 3 and clicked "Create
+    new notebook" again, forgetting the notebook — and the podcast in it, still
+    being made or already finished — that the checkpoint had recorded. On 09-16
+    one research made three notebooks and three podcasts; a finished 29-minute
+    podcast was thrown away and the person still got none.
+
+    ⭐ THE ANSWER IS WHAT THE NOTEBOOK SHOWS, and a new one is made only when the
+    old one is not there to carry on in:
+
+      * the tab would not open           → fall through to the upload. If Chrome
+                                           is gone, its first new tab meets the
+                                           same dead browser and unwinds it as a
+                                           crash (`_p3_upload_failure_kind`)
+      * NotebookLM asks to sign in       → carry on: the podcast step waits for
+                                           the sign-in on this notebook's page
+      * the tab is not on the notebook   → gone: make a new one
+      * a podcast is ready or being made → carry on (the podcast step adopts a
+                                           finished one or waits on it)
+      * any of its sources is there      → carry on (the podcast step starts
+                                           the podcast in this notebook)
+      * none of its sources, no podcast  → nothing of it left: make a new one
+
+    ⛔ A SIGN-IN WALL IS NOT A GONE NOTEBOOK. Signed out, NotebookLM sends the tab
+    to Google's sign-in page, which the id test below would read as "gone" — and
+    a new notebook would be made for a person who only needed to sign in.
+
+    The notebook stays public and renamed: it is recorded only after the upload
+    step has shared and renamed it. Read-only apart from opening the tab."""
+    log("Phase 3: going back to the notebook this research already made, "
+        "instead of making a new one")
+    emit_event("agent_progress", phase=3, agent="notebooklm",
+               status="reopening", stage="notebook",
+               progress="Going back to the notebook this research already made…")
+    try:
+        page = await browser.new_tab(notebook_url)
+        await asyncio.sleep(4)
+    except Exception as e:
+        log(f"Phase 3: could not open the notebook this research made "
+            f"({type(e).__name__}) — going to the upload instead", "WARN")
+        return False
+    if await _page_shows_login_wall(page):
+        log("Phase 3: NotebookLM is asking to sign in — carrying on in the notebook "
+            "this research made; the podcast step waits there for the sign-in", "WARN")
+        return True
+    try:
+        here = page.url or ""
+    except Exception:
+        here = ""
+    if _nlm_notebook_id(here) != _nlm_notebook_id(notebook_url):
+        log("Phase 3: the notebook this research made is gone (NotebookLM did not "
+            "open it) — making a new one", "WARN")
+        try:
+            await page.close()
+        except Exception:
+            pass
+        return False
+    names = [p.name for p in md_files]
+    present, _rows = await _nlm_census_settled(page, names, attempts=5, interval=3.0)
+    ready = await _count_nlm_audio_cards(page)
+    making = await _count_nlm_audio_generating(page)
+    if not present and not ready and not making:
+        log(f"Phase 3: the notebook this research made shows none of its "
+            f"{len(names)} sources and no podcast — making a new one", "WARN")
+        try:
+            await page.close()
+        except Exception:
+            pass
+        return False
+    podcast = ("ready" if ready else "still being made" if making else "not started yet")
+    missing = sorted(n for n in names if n not in present)
+    log(f"Phase 3: carrying on in the notebook this research made — "
+        f"{len(present)} of {len(names)} sources there, podcast {podcast}"
+        + (f" (not showing: {', '.join(missing)})" if missing else ""))
+    return True
+
+
+async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose=False,
+                            recorded_notebook_url: str = ""):
     """Phase 3: upload P2-built MDs to NotebookLM and make notebook public.
-    Share-URL extraction lives entirely in P2 — this phase is pure NotebookLM."""
+    Share-URL extraction lives entirely in P2 — this phase is pure NotebookLM.
+
+    `recorded_notebook_url` (wave 13): the notebook a RESUMED run's checkpoint
+    recorded. When it is still there the run carries on in it and nothing is
+    uploaded — see `_p3_reopen_recorded_notebook`."""
     log("=" * 60)
     log("PHASE 3: NotebookLM Upload")
     log("=" * 60)
@@ -67427,6 +67540,15 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
     links_file = queue_dir / "links.json"
     links_file.write_text(json.dumps(links, indent=2), encoding="utf-8")
     log(f"Links saved: {links}")
+
+    # ⛔⛔ Wave 13: a resumed run goes back to the notebook it already made —
+    # and to the podcast in it — before it thinks about making another. A prior
+    # Skip of NotebookLM is respected here exactly as the upload loop does.
+    if (recorded_notebook_url and validate_link("notebooklm", recorded_notebook_url)
+            and "notebooklm" not in _controls.skipped_agents):
+        if await _p3_reopen_recorded_notebook(browser, recorded_notebook_url, md_files):
+            return {"links": links, "notebook_url": recorded_notebook_url,
+                    "md_files": [str(p) for p in md_files]}
 
     # Upload MDs to NotebookLM (wrapped in retry loop — user can re-attempt
     # after a login-expired or generic upload failure without losing the rest
@@ -68957,6 +69079,12 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # That's a real error — surface it so the user knows Phase 5 will
         # skip and can decide whether to re-run or accept report-only.
         if not audio_path:
+            # ⛔⛔ Wave 13: unless the browser died under the download. That
+            # is no failed download — nothing here can download anything
+            # until Chrome is relaunched, and the card's Retry would meet the
+            # same dead browser. Unwind the way the poll loop above does.
+            if await _browser_context_is_dead(browser):
+                raise _p3_browser_gone("while the podcast was downloading")
             fail_phase(3, "Couldn't save the audio file",
                        "NotebookLM finished the audio but we couldn't download it. Retry to try again, or Skip it.",
                        agent="notebooklm")
@@ -75771,11 +75899,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # domain. Total upload attempts = 1 + MAX_REATTEMPTS.
             _p3_upload_attempt = 0
             _P3_UPLOAD_MAX_REATTEMPTS = 1
+            # ⛔⛔ Wave 13: the notebook this run already made. The checkpoint
+            # records it before the podcast step starts, so a run resumed after
+            # Chrome died mid-podcast goes back to it — and to its podcast —
+            # instead of making a second notebook and a second podcast. Only the
+            # FIRST upload gets it: the re-upload below runs because the notebook
+            # we had is not usable.
+            _p3_recorded_nb = (cp.get("notebook_url") or "") if resume_dir else ""
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(
                         3, PHASE_3_UPLOAD_MAX_MIN,
-                        lambda: run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
+                        lambda: run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose,
+                                                  recorded_notebook_url=_p3_recorded_nb),
                     )
                     break
                 except asyncio.TimeoutError:
@@ -76211,6 +76347,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _p3_audio_user_skipped = True
                     _controls.skipped_phases.add(4)
                     break
+                # ⛔⛔ Wave 13: IS THE BROWSER EVEN THERE? Asked before every
+                # wait and every give-up. Each retry below runs on this same
+                # browser, so on a dead one the loop waited five minutes and
+                # failed at once, three times over, then ended the run without
+                # the podcast — which was finished and waiting in the notebook.
+                # A dead browser unwinds instead: relaunch, resume, and the
+                # resume goes back to that notebook and downloads it.
+                if await _browser_context_is_dead(browser):
+                    raise _p3_browser_gone("before the podcast could be downloaded")
                 if _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:
                     # Exhausted auto-retries → graceful, non-blocking fallback:
                     # continue with notebook-link-only. P5 still delivers the
