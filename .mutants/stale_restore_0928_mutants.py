@@ -70,6 +70,8 @@ RETRY_LIST = "                         denied=[])"
 OWNER_CHECK = "        if foreign:"
 MEMBERS_SHARED = "    members.update(s for s in shared if isinstance(s, str) and s)"
 OWNER_FILE = "                    owners.add(o)"
+OWNER_FILE_ABOUT = ('                    and str(meta.get("researchId") or "") in\n'
+                    '                    ("", str((job or {}).get("research_id") or ""))):')
 NO_DEVICE_DOC = ('        snap = _firebase_db.collection("devices").document(device_id).get()\n'
                  "        if not snap.exists:\n"
                  "            return None")
@@ -137,6 +139,9 @@ MUTANTS = [
     ("F3", RESEARCH, "the run folder's owner.json is never read — an entry with no "
      "uid of its own stays in the snapshot for ever",
      [(OWNER_FILE, "                    pass")]),
+    ("F6", RESEARCH, "⛔ OVER-REACH: an owner.json about ANOTHER research in a shared "
+     "folder name drops a sharer's job it says nothing about",
+     [(OWNER_FILE_ABOUT, "                    ):")]),
     ("F4", RESEARCH, "⛔ OVER-REACH: no device document reads as 'shared with "
      "nobody' — every sharer's job is dropped",
      [(NO_DEVICE_DOC, '        snap = _firebase_db.collection("devices").document(device_id).get()\n'

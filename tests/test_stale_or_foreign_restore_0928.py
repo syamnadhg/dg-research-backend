@@ -334,6 +334,30 @@ def test_the_run_folders_owner_file_names_a_job_the_entry_does_not(monkeypatch, 
     assert len(_said(lines, theirs, NOT_OPENABLE)) == 1, lines
 
 
+def test_an_owner_file_about_another_research_says_nothing_about_this_job(
+        monkeypatch, tmp_path):
+    """⭐ A FOLDER IS NOT ALWAYS THE JOB'S. Run folders are named for a topic and
+    a second, so two members can land on one; an `owner.json` that names a
+    DIFFERENT research is not evidence about this job, and the sharer's job is
+    restored. Beside it, a folder that does name its own job for a stranger —
+    the case the file is read for — still drops that job."""
+    bobs, theirs = "chat_1759000000000_e", "chat_1759000000000_f"
+    fs = _Fs(records={(SHARER, bobs): QUEUED, (SHARER, theirs): QUEUED}, device=SHARED)
+    _machine(monkeypatch, tmp_path, fs)
+    shared_folder, strangers_folder = _job(SHARER, bobs, topic="Same"), _job(
+        SHARER, theirs, topic="Stranger")
+    for job, about in ((shared_folder, "chat_someone_elses_research"),
+                       (strangers_folder, theirs)):
+        d = tmp_path / "queues" / job["run_id"]
+        d.mkdir(parents=True)
+        (d / "owner.json").write_text(
+            json.dumps({"uid": STRANGER, "researchId": about}), encoding="utf-8")
+    path = _snapshot(tmp_path, [shared_folder, strangers_folder])
+
+    assert _boot(path, _Q()) == [bobs]
+    assert _in_file(path) == [bobs]
+
+
 # ══ 3. older than the startup sweep's horizon ═══════════════════════════════
 
 def test_a_job_older_than_the_sweep_horizon_is_not_restored(monkeypatch, tmp_path):
