@@ -242,7 +242,9 @@ def p1(chrome, page, fast, logs, monkeypatch):
                      ("_chatgpt_wait_prompt_sent", _wait_sent)):
         monkeypatch.setattr(research, name, fn)
     # The clipboard is read for up to this long after a click that copied nothing.
-    monkeypatch.setattr(research, "_CG_COPY_READ_S", 1.0)
+    # raising=False: against the pre-fix module a test fails on BEHAVIOUR (no
+    # brief), not on a missing name.
+    monkeypatch.setattr(research, "_CG_COPY_READ_S", 1.0, raising=False)
     rt, ctl = research._runtime, research._controls
     monkeypatch.setattr(rt, "register_page", lambda *a, **k: None)
     monkeypatch.setattr(rt, "unregister_page", lambda *a, **k: None)
@@ -482,7 +484,7 @@ CODE_BLOCK_JS = """() => {
 
 @pytest.fixture
 def quick(monkeypatch, fast, logs):
-    monkeypatch.setattr(research, "_CG_COPY_READ_S", 1.0)
+    monkeypatch.setattr(research, "_CG_COPY_READ_S", 1.0, raising=False)
 
 
 def test_live_a_code_blocks_copy_button_is_never_used(chrome, page, quick, logs):
