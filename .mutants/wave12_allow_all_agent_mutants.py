@@ -326,11 +326,13 @@ MUTANTS = [
      [('"If its owner lets anyone in, you join straight away; otherwise "\n'
        '                  "they decide, and nothing runs on it unless they say yes. Say yes "',
        '"They decide, and nothing runs on it unless they say yes. Say yes "')]),
+    # ⛔ S25 RE-AIMED 2026-09-29 (admit-waiting): the confirm gained the sentence
+    # that anyone already waiting joins too, between the disclosure and this one.
     ("S25", SR, "⛔ the allow-all confirm never says it publishes a private computer too",
-     [('(_ALLOW_ALL_MEANS + " If it isn’t public yet, this makes "\n'
-       '                         "it public too — listed under the name it reports. Say "\n'
-       '                         "yes and I’ll switch it on."),',
-       '(_ALLOW_ALL_MEANS + " Say yes and I’ll switch it on."),')]),
+     [('(_ALLOW_ALL_MEANS + " " + _AA_WAITING_JOIN + " If it isn’t "\n'
+       '                         "public yet, this makes it public too — listed under the "\n'
+       '                         "name it reports. Say yes and I’ll switch it on."),',
+       '(_ALLOW_ALL_MEANS + " " + _AA_WAITING_JOIN + " Say yes and I’ll switch it on."),')]),
 
     # ═══ R — the router ════════════════════════════════════════════════════════
     # ⛔ RE-AIMED 2026-09-27 (wave 12 repair 1). The arm was rebuilt by NARROWING —

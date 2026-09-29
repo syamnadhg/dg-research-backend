@@ -200,6 +200,17 @@ _ALLOW_ALL_MEANS = ("Anyone signed in can join {name} at once — up to 25 peopl
 # 2026-09-27), from this one place so the two replies cannot drift apart.
 _JOINED_KEEP_ACCESS = ("Anyone who already joined keeps access — remove people in "
                        "the web app (Shared with).")
+# ⭐⭐ AND A YES LETS IN EVERYONE ALREADY WAITING (owner, 2026-09-29) — people who
+# asked before the tick join too, oldest first up to 25. The switch-on question
+# says so from the words alone (the router cannot look); `do` swaps in the count
+# when one look at the owner's requests can give it (`_with_waiting_count`).
+_AA_WAITING_JOIN = "Anyone already waiting to use it joins too."
+# ⛔ SAID WHEN THE SWEEP COULD NOT BE CONFIRMED, and it never says Allow all
+# failed: the tick was saved before the web app was asked. Saying yes again is the
+# retry (owner decision 4) — the router reads “allow all yes” as the switch-on.
+_WAITING_UNCONFIRMED = ("Allow all is on, but I couldn’t confirm that anyone "
+                        "already waiting was let in — say “allow all yes” again to "
+                        "retry.")
 
 # ⛔ ONE EXPLANATION OF AN EMPTY PUBLIC LIST. The two screens ask different
 # questions — "are there any?" and "I have none, is there another way?" — so the
@@ -2746,8 +2757,12 @@ def _set_device_visibility(args, payload: dict, example: str) -> int:
         dev, fail = _pick_owned_device(example)
         if dev is None:
             return _emit({}, args.json, fail, 1)
+    # ⛔ SEVENTY-FIVE, NOT FORTY (2026-09-29): a yes now waits for the web app to
+    # let in everyone already waiting as well as for the write — the bridge's
+    # `_FE_ADMIT_TIMEOUT` records the budget. Past forty a slow sweep read as a
+    # lost switch.
     code, body = _post("/device/visibility",
-                       {"deviceId": dev.get("id"), **payload}, timeout=40)
+                       {"deviceId": dev.get("id"), **payload}, timeout=75)
     if code == 0 and body.get("reason") == "timeout":
         # ⛔⛔ A LOST REPLY IS NOT A MISSING BRIDGE (Windows review of wave 12). The
         # GET a moment ago reached it; "isn't running on this machine yet" sent the
@@ -2782,9 +2797,14 @@ def _visibility_lines(body: dict, dev: dict, asked_all) -> "list[str]":
     # the sentence — never what was asked.
     everyone = state == "public" and body.get("allowAll") is True
     if everyone:
+        # ⭐ WHO ELSE GOT IN, straight under the switch (2026-09-29) — and
+        # "Nothing to change" only when there is nothing else to say: over two
+        # people a retry just let in, it would be false.
+        waiting = _waiting_lines(body)
         lines = [f"✓ “{name}” now lets anyone join at once." if changed
-                 else f"✓ “{name}” already lets anyone join at once. Nothing to "
-                      f"change.",
+                 else f"✓ “{name}” already lets anyone join at once."
+                      + ("" if waiting else " Nothing to change."),
+                 *waiting,
                  _ALLOW_ALL_MEANS.format(name=f"“{name}”")]
     elif asked_all is False and state == "public":
         # ⛔ WHAT OFF DOES NOT DO IS THE HALF WORTH SAYING. Nobody who already
@@ -2823,6 +2843,34 @@ def _visibility_lines(body: dict, dev: dict, asked_all) -> "list[str]":
     # own name, and this is where that becomes visible to strangers.
     if state == "public" and body.get("publicLabel"):
         lines.append(f"They see it as “{body.get('publicLabel')}”.")
+    return lines
+
+
+def _waiting_lines(body: dict) -> "list[str]":
+    """Who else a yes to Allow all let in — the bridge's `waiting` (2026-09-29).
+
+    ⛔ NOTHING WHEN NOBODY WAS WAITING, and nothing from an older bridge that sends
+    no `waiting` at all. ⛔ The people left over when it is full stay in the
+    owner's requests and are told nothing (owner decision 6); the line says so, so
+    the owner does not go looking for a notice that was never sent.
+    """
+    waiting = body.get("waiting")
+    if not isinstance(waiting, dict):
+        return []
+    if waiting.get("unconfirmed"):
+        return [_WAITING_UNCONFIRMED]
+    lines = []
+    joined = waiting.get("admitted") or 0
+    if joined:
+        lines.append("1 person who was already waiting joined too." if joined == 1
+                     else f"{joined} people who were already waiting joined too.")
+    left = waiting.get("stillWaiting") or 0
+    if left:
+        who = "1 person is" if left == 1 else f"{left} people are"
+        lines.append(f"{who} still waiting — it’s full (25 people), so they stay in "
+                     f"your requests." if waiting.get("full") is True
+                     else f"{who} still waiting for you to decide — ask me who’s "
+                          f"waiting.")
     return lines
 
 
@@ -6336,9 +6384,11 @@ _NL_CONFIRMS = {
     # research on their AI accounts, their email in view — and on a private
     # computer it publishes the name too, which is its own consent moment. The
     # first sentence is `_ALLOW_ALL_MEANS`, the same one the reply prints after.
-    "device-allow-all": (_ALLOW_ALL_MEANS + " If it isn’t public yet, this makes "
-                         "it public too — listed under the name it reports. Say "
-                         "yes and I’ll switch it on."),
+    # ⭐ …AND IT LETS IN EVERYONE ALREADY WAITING (owner, 2026-09-29), which is
+    # part of what the yes agrees to — `do` puts the count in when it can.
+    "device-allow-all": (_ALLOW_ALL_MEANS + " " + _AA_WAITING_JOIN + " If it isn’t "
+                         "public yet, this makes it public too — listed under the "
+                         "name it reports. Say yes and I’ll switch it on."),
     # ⛔⛔ THE WEB APP DOES NOT CONFIRM THIS AND THIS SURFACE MUST. Over there the
     # warning sits at the top of the list the Yes and No buttons are in, so the
     # cost is on screen at the moment of the tap. Here there is no screen — the
@@ -9342,12 +9392,47 @@ _DO_FLAGS = frozenset({"--no-video", "--no-email", "--machine", "--agent-log",
                        "--run"})
 
 
+# ⛔ A LOOK THAT ONLY BUYS A NUMBER, so it waits less than the requests screen's
+# forty: past this the question goes out with the uncounted sentence, still true.
+_WAITING_LOOK_TIMEOUT = 20
+
+
+def _with_waiting_count(text: str, lines: "list[str]") -> "list[str]":
+    """The switch-on question, with how many people are already waiting on that
+    computer when one look can tell (owner decision 1, 2026-09-29).
+
+    ⛔⛔ HERE AND NOT IN THE ROUTER, which builds its questions from the words
+    alone and makes no network call. Only the question carrying
+    `_AA_WAITING_JOIN` costs a look; the computer is found exactly as the yes
+    will find it — the name said, else the one this account owns — and with
+    several and none named there is no "it" to count for.
+    ⛔ No count is never "nobody": a failed look, or nobody waiting, keeps the
+    uncounted sentence, which is true either way.
+    """
+    if not any(_AA_WAITING_JOIN in line for line in lines):
+        return lines
+    named = (_allow_all_command(text) or ("", ""))[1]
+    dev, _ = _resolve_device_arg(named) if named else _pick_owned_device()
+    if dev is None:
+        return lines
+    # A failed look carries no `incoming`, so it counts nobody.
+    _code, body = _get("/devices/requests", timeout=_WAITING_LOOK_TIMEOUT)
+    count = sum(1 for row in body.get("incoming") or []
+                if isinstance(row, dict) and row.get("deviceId") == dev.get("id"))
+    if not count:
+        return lines
+    said = ("1 person is already waiting to use it — they join too." if count == 1
+            else f"{count} people are already waiting to use it — they join too.")
+    return [line.replace(_AA_WAITING_JOIN, said) for line in lines]
+
+
 def cmd_do(args) -> int:
     """Resolve a verbatim user message to a command and run it (or print the
     one confirm/clarify question). The AI relays whatever this prints."""
-    argv, lines = _nl_resolve(" ".join(args.text))
+    text = " ".join(args.text)
+    argv, lines = _nl_resolve(text)
     if argv is None:
-        return _emit({}, args.json, lines or [])
+        return _emit({}, args.json, _with_waiting_count(text, lines or []))
     # `--` before the free-text positionals: a topic/name that happens to start
     # with a dash ("research --help") must reach the command as a literal value,
     # never dump argparse usage into the chat relay.

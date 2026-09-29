@@ -2055,6 +2055,59 @@ _FE_UNLINK_TIMEOUT = 35
 # for the reason `_FE_UNLINK_TIMEOUT` records above, and both clients wait fifty.
 _FE_ASK_TIMEOUT = 35
 
+# ⛔⛔ LETTING IN EVERYONE ALREADY WAITING IS THE WEB APP'S TO DO, AND IT TAKES
+# LONGER THAN ONE GRANT (2026-09-29). When the owner turns Allow all on, the people
+# who asked BEFORE the tick are let in too — up to 25, oldest first — and only an
+# Admin-SDK route can: `sharedWith` and the request rows are closed to every
+# client. `admit-waiting` grants them in one transaction, syncs the machine's
+# claims once and sends each of them a notice, so it gets its own wait, PER CALL
+# for the reason `_FE_UNLINK_TIMEOUT` records. ⛔ And both clients wait seventy-five
+# on `/device/visibility` to match: the owner read and the write (fifteen each),
+# this, and a re-minted sign-in — a 401 is answered before any work, so a retried
+# call's first leg is short. At their old forty a slow sweep read as a lost switch.
+_FE_ADMIT_TIMEOUT = 30
+_ADMIT_WAITING_PATH = "/api/devices/access-request/admit-waiting"
+
+
+def _admit_waiting(sess: "AccountSession", device_id: str) -> dict:
+    """Ask the web app to let in everyone already waiting on one of this account's
+    machines, now that its Allow all is on — the `waiting` field of the owner
+    switch's reply.
+
+    ⭐⭐ THE OWNER'S DECISIONS (2026-09-29): turning Allow all on lets in everyone
+    who asked before the tick, oldest first up to 25 people; the rest stay in the
+    owner's requests and are told nothing. The route re-reads the live computer
+    and does nothing unless Allow all is in effect there, so the checks live in
+    ONE place — the web checkbox calls the same route. `_device_visibility`
+    decides WHEN to ask (a confirmed yes, or a yes on a computer already on —
+    the retry); this only asks, with the signed-in owner's own session.
+
+    ⛔⛔ AND IT NEVER FAILS THE SWITCH. The tick is saved before this runs, so a
+    slow answer, a 404 (the route not deployed yet, or no longer this account's
+    computer), a 429, a 5xx or a dead session all come back as
+    `{"unconfirmed": True}`: the people waiting could not be confirmed let in,
+    and Allow all is still reported on. ⛔ A 200 whose counts are not counts is
+    that same unknown, never a zero — "nobody was waiting" over people still
+    waiting would leave the owner nothing to retry.
+
+    Returns `{"admitted", "stillWaiting", "full"}` when the route answered.
+    """
+    status, body = _fe_api_post(sess, _ADMIT_WAITING_PATH, {"deviceId": device_id},
+                                timeout=_FE_ADMIT_TIMEOUT)
+    admitted, still = body.get("admitted"), body.get("stillWaiting")
+    counts = all(isinstance(n, int) and not isinstance(n, bool) and n >= 0
+                 for n in (admitted, still))
+    if status != 200 or not counts:
+        # ⛔ The route's `error` is logged, never relayed: the reply's only job
+        # here is to say Allow all is on and the waiting people are unconfirmed.
+        log.warning("admit waiting: not confirmed on %s (HTTP %s, %s)", device_id,
+                    status, body.get("reason") or body.get("error") or "no counts")
+        return {"unconfirmed": True}
+    full = body.get("full") is True
+    log.info("admit waiting: %s admitted=%d still=%d full=%s allowAll=%s", device_id,
+             admitted, still, full, body.get("allowAll"))
+    return {"admitted": admitted, "stillWaiting": still, "full": full}
+
 
 def _fe_json_body(r: "requests.Response") -> dict:
     """The decoded JSON object, or `{}`.
@@ -5705,6 +5758,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
               • public ON with no flag, from private → `allowAll:false` rides the
                 same patch if an old tick is stored, so it never comes back
                 unasked; with nothing stored the write is exactly today's.
+
+            ⭐⭐ AND A YES LETS IN EVERYONE ALREADY WAITING (2026-09-29) — one web
+            route, `_admit_waiting`, asked after the ON write is CONFIRMED, or when
+            the yes finds Allow all already on (owner: saying it again is the
+            retry). Its answer rides the reply as `waiting`. Never on OFF, private,
+            a plain public, or a write that was refused, unconfirmed or revoked.
             """
             body_in = self._read_json()
             device_id = _body_str(body_in, "deviceId")
@@ -5784,10 +5843,19 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         fs.set_device_allow_all(device_id, False)
                     except (RevokedError, FirestoreError) as e:
                         log.warning("could not clear a leftover allow-all: %s", e)
-                self._json(200, {"ok": True, "changed": False,
-                                 "visibility": current, "allowAll": current_all,
-                                 "publicLabel": label, "deviceId": device_id,
-                                 "deviceName": row.get("name")})
+                same = {"ok": True, "changed": False,
+                        "visibility": current, "allowAll": current_all,
+                        "publicLabel": label, "deviceId": device_id,
+                        "deviceName": row.get("name")}
+                # ⛔⛔ "ALLOW ALL YES" ON A COMPUTER ALREADY ON RUNS THE SWEEP AGAIN
+                # (owner, 2026-09-29): it is the retry after an answer that could
+                # not be confirmed, and how a computer ticked before this shipped
+                # lets its waiting people in from chat. `allow is True` here means
+                # it IS on — the no-op holds only when both fields already match —
+                # while a flag-less "public" on the same computer is not a yes.
+                if allow is True:
+                    same["waiting"] = _admit_waiting(sess, device_id)
+                self._json(200, same)
                 return
             # ⛔⛔ AN OLD TICK IS CLEARED ALONE BEFORE ALLOW ALL GOES ON (wave 12
             # repair 4, cross-verify K1). The rules refuse a write that makes a
@@ -5877,10 +5945,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # removing people is the web app's Shared with. The reply can only say
             # so if it knows the door was open: the machine says it from its own
             # read, and the clients have only this.
-            self._json(200, {"ok": True, "changed": True, "visibility": want,
-                             "allowAll": want_all, "allowAllWas": current_all,
-                             "publicLabel": label,
-                             "deviceId": device_id, "deviceName": row.get("name")})
+            done = {"ok": True, "changed": True, "visibility": want,
+                    "allowAll": want_all, "allowAllWas": current_all,
+                    "publicLabel": label,
+                    "deviceId": device_id, "deviceName": row.get("name")}
+            # ⛔⛔ ONLY NOW, AFTER EVERY WRITE THE YES NEEDED HAS LANDED (2026-09-29).
+            # Every path that did not land returned above, so nobody is let in on
+            # the back of a switch that may not be on. `allow is True` is the yes
+            # itself: OFF, private and a plain public never reach the route.
+            if allow is True:
+                done["waiting"] = _admit_waiting(sess, device_id)
+            self._json(200, done)
 
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,
                             fs: FirestoreRest) -> str | None:

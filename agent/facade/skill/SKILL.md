@@ -226,6 +226,7 @@ are on the list anyway, because each tells somebody something about somebody els
 research on the user's computer; `device-deny` stops that person asking again for
 a week; `device-visibility public` publishes the computer's name to everyone
 signed in; and `device-allow-all yes` lets ANY of them on with no step between.
+Its yes also lets in everyone already waiting on that computer (oldest first, up to 25 people in all) — the question says so, the reply says who joined, and when the reply could not confirm them the retry is the same `device-allow-all yes`, confirmed again.
 **`device-visibility private` and `device-allow-all no` need no confirmation** —
 they only narrow. **Always answer "what phase / is
 X skipped / how's it going" from a FRESH `sr.py status`** (or `updates`) — never

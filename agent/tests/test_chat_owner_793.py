@@ -849,9 +849,13 @@ def test_each_new_verb_has_its_own_wsl_hint(monkeypatch, sub, phrase):
     assert phrase in seen["msg"], (sub, seen)
 
 
-@pytest.mark.parametrize("sub,path", [("approve", "/device/decide"),
-                                      ("visibility", "/device/visibility")])
-def test_the_owner_verbs_wait_longer_than_a_firestore_read(term, sub, path):
+# ⛔ RE-PINNED 2026-09-29: `/device/visibility` waits seventy-five now — a yes to
+# Allow all also waits for the web app to let in everyone already waiting (the
+# bridge's `_FE_ADMIT_TIMEOUT`). Still longer than a Firestore read, which is what
+# this pins; test_allow_all_admit_waiting_0929 pins the budget itself.
+@pytest.mark.parametrize("sub,path,wait", [("approve", "/device/decide", 40.0),
+                                           ("visibility", "/device/visibility", 75.0)])
+def test_the_owner_verbs_wait_longer_than_a_firestore_read(term, sub, path, wait):
     """⛔ The default is right for the Firestore-backed routes it was written
     for; these wait on the bridge waiting on the web app waiting on a
     transaction, and that call is allowed fifteen seconds on its own before a
@@ -860,7 +864,7 @@ def test_the_owner_verbs_wait_longer_than_a_firestore_read(term, sub, path):
          value="public")
     sent = [c for c in term.calls if c[0] == "POST" and c[1] == path]
     assert sent, (sub, term.calls)
-    assert sent[0][3] == 40.0, (sub, sent)
+    assert sent[0][3] == wait, (sub, sent)
 
 
 def test_the_chat_denial_states_the_week(chat):

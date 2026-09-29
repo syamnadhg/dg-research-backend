@@ -2079,8 +2079,11 @@ def _device_switch(device_id: str, payload: dict, asked_all) -> int:
         print(f"{_NO} name the computer by its id — `agent device` prints one on "
               f"every row.")
         return 1
+    # ⛔ SEVENTY-FIVE, NOT FORTY (2026-09-29): a yes now waits for the web app to
+    # let in everyone already waiting as well as for the write — the bridge's
+    # `_FE_ADMIT_TIMEOUT` records the budget.
     res = _bridge_post("/device/visibility",
-                       {"deviceId": device_id, **payload}, timeout=40.0)
+                       {"deviceId": device_id, **payload}, timeout=75.0)
     if res is None:
         print(f"{_NO} couldn't change that: {_err(res)}")
         return 1
@@ -2115,8 +2118,13 @@ def _device_switch(device_id: str, payload: dict, asked_all) -> int:
     # join used to print "You still approve every person yourself".
     everyone = state == "public" and body.get("allowAll") is True
     if everyone:
+        # ⭐ WHO ELSE GOT IN, straight under the switch (2026-09-29) — and
+        # "Nothing to change" only when there is nothing else to say.
+        waiting = _waiting_lines_t(body, device_id)
         print(f"{_OK} {name} {'now lets' if changed else 'already lets'} anyone "
-              f"join at once.{'' if changed else ' Nothing to change.'}")
+              f"join at once.{'' if changed or waiting else ' Nothing to change.'}")
+        for line in waiting:
+            print(line)
     elif asked_all is False and state == "public":
         if changed:
             print(f"{_OK} {name} no longer lets anyone join — you approve each "
@@ -2142,6 +2150,36 @@ def _device_switch(device_id: str, payload: dict, asked_all) -> int:
     if state == "private" and changed and body.get("allowAllWas") is True:
         print(_JOINED_KEEP_ACCESS_T)
     return 0
+
+
+def _waiting_lines_t(body: dict, device_id: str) -> "list[str]":
+    """Who else a yes to Allow all let in — the bridge's `waiting` (2026-09-29).
+    The chat client's `_waiting_lines`, in this file's voice.
+
+    ⛔ NOTHING WHEN NOBODY WAS WAITING, and nothing from an older bridge. ⛔ An
+    unconfirmed sweep never says Allow all failed — the tick was saved before the
+    web app was asked — and running the same yes again is the retry.
+    """
+    waiting = body.get("waiting")
+    if not isinstance(waiting, dict):
+        return []
+    if waiting.get("unconfirmed"):
+        return ["     Allow all is on, but it couldn't be confirmed that anyone "
+                "already waiting was let in —",
+                f"     run `agent device allow-all {device_id} yes` again to retry."]
+    lines = []
+    joined = waiting.get("admitted") or 0
+    if joined:
+        lines.append("     1 person who was already waiting joined too." if joined == 1
+                     else f"     {joined} people who were already waiting joined too.")
+    left = waiting.get("stillWaiting") or 0
+    if left:
+        who = "1 person is" if left == 1 else f"{left} people are"
+        lines.append(f"     {who} still waiting — it's full (25 people), so they stay "
+                     f"in your requests." if waiting.get("full") is True
+                     else f"     {who} still waiting for you to decide — see "
+                          f"`agent device requests`.")
+    return lines
 
 
 # ⛔ THE WORDS ARE THE MACHINE'S OWN. `superresearch --visibility` calls these
