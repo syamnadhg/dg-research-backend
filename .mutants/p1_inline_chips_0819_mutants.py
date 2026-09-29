@@ -74,16 +74,20 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ the predicate itself ══
     ("P1", SRC, "over", "⛔ ONE hostname counts as open — ordinary prose and a "
      "single citation would latch the drawer shut for the rest of the phase",
+     # Re-aimed 2026-09-29 (wave 13): the predicate gained the new page's step
+     # list; the mutant still swaps only the chip-row arm.
      [("    return bool(st.get(\"side_panel\") or st.get(\"inline_expanded\")\n"
-       "                or st.get(\"inline_chip_row\"))",
+       "                or st.get(\"inline_chip_row\") or st.get(\"inline_step_list\"))",
        "    return bool(st.get(\"side_panel\") or st.get(\"inline_expanded\")\n"
-       "                or int(st.get(\"inline_chips\", 0) or 0) >= 1)")],
+       "                or int(st.get(\"inline_chips\", 0) or 0) >= 1 "
+       "or st.get(\"inline_step_list\"))")],
      [T_NEW]),
     ("P2", SRC, "under", "the side-panel and inline shapes stop counting, so P1 "
      "only ever recognises chips and every P2-shaped drawer is a miss",
+     # Re-aimed 2026-09-29 (wave 13) — see P1.
      [("    return bool(st.get(\"side_panel\") or st.get(\"inline_expanded\")\n"
-       "                or st.get(\"inline_chip_row\"))",
-       "    return bool(st.get(\"inline_chip_row\"))")],
+       "                or st.get(\"inline_chip_row\") or st.get(\"inline_step_list\"))",
+       "    return bool(st.get(\"inline_chip_row\") or st.get(\"inline_step_list\"))")],
      [T_NEW]),
     ("P3", SRC, "over", "⛔ the chip row leaks into P2's round-robin gate — P2 "
      "latches 'already open' and never clicks the DR strip (2026-08-06)",
@@ -252,8 +256,11 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("V3", SRC, "under", "the P1 CUA brief goes back to promising an 'Activity · "
      "<seconds>' panel — an instruction to keep clicking",
-     [("                                    \"result: a row of small website chips (favicon + \"",
-       "                                    \"result: a NARROW 'Activity · <seconds>' panel on the \"")],
+     # Re-aimed 2026-09-29 (wave 13): the brief was reworded for the new page's
+     # step list; the mutant still makes it promise the old side panel.
+     [("                                    \"click the line once; expected result: that list of \"",
+       "                                    \"click the line once; expected result: a NARROW "
+       "'Activity · <seconds>' panel on the \"")],
      [T_NEW]),
     ("V4", SRC, "over", "⛔ the ELLIPSIS anchor is deleted from the OPENER, taking "
      "P2's working leg with it — the same run opened its strip off 'Researching...'",
