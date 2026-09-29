@@ -27,6 +27,14 @@
   X* — Clear Local Storage keeps every run running or waiting, on ANY worker.
   Z* — Reset Backend ends the waiting runs too.
   Y* — the capability the app reads, in its own write.
+  R* — the repair after review (rv13, 09-29): the move takes the run out of its
+       old worker's snapshot; the boot restore and rehydration leave a run
+       another worker runs or has taken; a run out of automatic attempts is
+       never parked and, if it waited, gets its Resume card; a stop or cancel
+       of a waiting run ends it as a running run's is (and every worker's copy
+       writes the same); a run ended for good stops waiting; a resting
+       worker's queued jobs wait behind, exactly as they were queued; the
+       claim survives a leftover taken marker on Windows.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET's KILLS. Every mutant here dies on
 behaviour: the real device-command listener, the real idle rescan and worker
@@ -83,19 +91,33 @@ FILTERED_PUBLISH = ("        # the local deque is empty too). Best-effort.\n"
                     "        try:\n"
                     '            _firebase_db.collection("devices").document(device_id).update(\n'
                     '                {"queueOwners": _front_owners + _local_owners})\n')
-REHYDRATE_WAITING = ("                if _run_dir_waiting(_run_dir_inside_queues(_corroborated_run_id(\n"
-                     '                        data.get("backendRunId"), research_id, tree_uid))):\n'
+REHYDRATE_WAITING = ("                if _run_dir_waiting(_queue_dir_now):\n"
                      "                    _update_research_doc(tree_uid, research_id, "
                      "_waiting_record_patch())\n")
 REHYDRATE_PARK = ("                                elif (await asyncio.to_thread(_worker_is_resting)\n"
                   "                                      and await asyncio.to_thread(\n")
-RESTORE_WAITING = ("        if _run_dir_waiting(_job_run_dir(j)):\n"
-                   '            log(f"[pending_queue] {rid[:24]}… is waiting in the queue for a worker "\n'
-                   '                f"— left there", "INFO")\n'
+RESTORE_WAITING = ("        if _run_dir_held_by_queue(_job_run_dir(j)):\n"
+                   '            log(f"[pending_queue] {rid[:24]}… is waiting in the queue for a worker, "\n'
+                   '                f"or one has taken it — left there", "INFO")\n'
                    "            skipped += 1\n"
                    "            withdrew = True\n"
                    "            continue\n")
-RESTORE_PARK = "        if j is cur and _worker_is_resting() and _park_instead_of_resuming("
+RESTORE_PARK = ("        if (_worker_is_resting()\n"
+                '                and (record or {}).get("status") in ("queued", "ongoing")\n')
+RESTORE_TAKEN = ('        if why is not None:\n'
+                 '            log(f"[pending_queue] {rid[:24]}… not restored — {why}", "INFO")\n')
+PARK_REFUSAL = ('    if run_dir is not None and ((run_dir / ".stop").exists()\n'
+                '                                or _no_auto_retry_marked(run_dir)):')
+BEHIND_STATUS = ('        if status != "queued":\n'
+                 '            _update_research_doc(str(job.get("uid") or ""), rid, {"status": "queued"})\n')
+MOVED_CANCEL = ('                                        "summary": "Cancelled",\n'
+                '                                        "cancelled": True,\n'
+                '                                        "queuePosition": _DF,\n'
+                '                                        "queuedBehindRunId": _DF,\n'
+                '                                        "queuedBehindTitle": _DF,\n'
+                '                                    }, movedToQueueAt=_DF))\n')
+STOP_TOUCH = ('        try:\n            (d / ".stop").touch()\n        except Exception as e:\n'
+              '            log(f"[moved-run] could not end {d.name}: {e}", "WARN")\n')
 IN_USE_LOCK = ('                alive = bool(data.get("pid")) and _ps.pid_exists(int(data["pid"]))\n')
 
 MUTANTS = [
@@ -156,7 +178,8 @@ MUTANTS = [
     ("W1", RESEARCH, "⛔ the OLDEST move leads — the owner's #1 is somebody else's",
      [(SORT, '    out.sort(key=lambda r: (r["moved_at_ms"], r["_dir"].name))')]),
     ("W2", RESEARCH, "the move's time is not written — every move ties",
-     [('        "moved_at_ms": int(time.time() * 1000),\n        "from_worker": int(from_worker),',
+     [('        "moved_at_ms": (min([w["moved_at_ms"] for w in _waiting_runs()] + [now_ms]) - 1\n'
+       '                        if behind else now_ms),\n        "from_worker": int(from_worker),',
        '        "from_worker": int(from_worker),')]),
     ("W3", RESEARCH, "⛔ a marker with an odd time stops the reader — and every start",
      [('        rec["moved_at_ms"] = moved if isinstance(moved, int) and not isinstance(moved, bool) '
@@ -191,8 +214,7 @@ MUTANTS = [
      "wrong accounts", [('        "status": "ongoing", "assignedWorker": WORKER_ID,\n',
                          '        "status": "ongoing",\n')]),
     ("C10", RESEARCH, "a run the funnel refused is left half-taken, holding its folder",
-     [("        await asyncio.to_thread(_drop_waiting_claim, job.get(\"resume_dir\"), WORKER_ID)\n"
-       "        return False\n", "        return False\n")]),
+     [("        await asyncio.to_thread(_drop_waiting_claim, run_dir, WORKER_ID)\n", "")]),
     ("C11", RESEARCH, "the rest of the queue does not move up after a run is taken",
      [("    _kick_queue_publish()\n    return True\n\n\ndef _publish_queue_positions_now",
        "    return True\n\n\ndef _publish_queue_positions_now")]),
@@ -285,10 +307,11 @@ MUTANTS = [
      [('                        f"a worker — left there", "INFO")\n                    _kick_queue_publish()\n',
        '                        f"a worker — left there", "INFO")\n')]),
     ("F6", RESEARCH, "a parked run's record is left reading \"ongoing\"",
-     [("    _update_research_doc(str(job.get(\"uid\") or \"\"), rid, _waiting_record_patch())\n", "")]),
+     [("        _update_research_doc(str(job.get(\"uid\") or \"\"), rid, _waiting_record_patch())\n",
+       "        pass\n")]),
     ("F7", RESEARCH, "a parked run is not published — no pill until something else moves",
-     [('        f"front of the queue for a worker that is on", "INFO")\n    _kick_queue_publish()\n',
-       '        f"front of the queue for a worker that is on", "INFO")\n')]),
+     [('            f"worker that is on", "INFO")\n    _kick_queue_publish()\n    return True\n',
+       '            f"worker that is on", "INFO")\n    return True\n')]),
 
     # ═══ T — the boot restore ═════════════════════════════════════════════════
     ("T1", RESEARCH, "⛔⛔ the moved run is restored onto the worker that was turned off",
@@ -299,10 +322,13 @@ MUTANTS = [
        "        # ⛔⛔ NOT ONE OF THIS COMPUTER'S ACCOUNTS",
        "            skipped += 1\n            withdrew = True\n            continue\n"
        + RESTORE_WAITING + "        # ⛔⛔ NOT ONE OF THIS COMPUTER'S ACCOUNTS")]),
-    ("T3", RESEARCH, "OVER-REACH: a resting worker parks jobs it had only queued, too",
-     [(RESTORE_PARK, "        if _worker_is_resting() and _park_instead_of_resuming(")]),
+    ("T3", RESEARCH, "⛔⛔ a resting worker's queued jobs go into its own line — the worker "
+     "that is off runs them while the order shows them waiting",
+     [(RESTORE_PARK, RESTORE_PARK.replace("        if (_worker_is_resting()",
+                                          "        if (j is cur and _worker_is_resting()"))]),
     ("T4", RESEARCH, "⛔ a resting worker restores its interrupted run from the snapshot",
-     [(RESTORE_PARK, "        if False and _park_instead_of_resuming(")]),
+     [(RESTORE_PARK, RESTORE_PARK.replace("        if (_worker_is_resting()",
+                                          "        if (False"))]),
 
     # ═══ K — the startup sweep ════════════════════════════════════════════════
     ("K1", RESEARCH, "⛔⛔ a week of resting workers and the sweep deletes the checkpoint",
@@ -329,8 +355,134 @@ MUTANTS = [
     ("Z1", RESEARCH, "⛔ Reset Backend leaves the waiting runs — they run after the reset",
      [("                    _drained_jobs.extend(_drain_waiting_runs())\n", "")]),
     ("Z2", RESEARCH, "a drained waiting run is not ended for good",
-     [('        try:\n            (d / ".stop").touch()\n        except Exception as e:\n'
-       '            log(f"[moved-run] could not end {d.name}: {e}", "WARN")\n', "")]),
+     [(STOP_TOUCH + "        for m in markers:\n", "        for m in markers:\n")]),
+    ("Z3", RESEARCH, "⛔ a run another worker took and has not started survives the reset",
+     [("        markers = [d / WAITING_MARKER] + list(d.glob(f\"{WAITING_MARKER}.w*\"))\n",
+       "        markers = [d / WAITING_MARKER]\n")]),
+
+    # ═══ R — the repair after review ══════════════════════════════════════════
+    # the old worker's snapshot, and the boot that reads it
+    ("R1", RESEARCH, "⛔⛔ the old worker's snapshot still names the moved run — its boot "
+     "puts it back or runs it a second time",
+     [("    _forget_running_job_in_snapshot()\n    _update_research_doc(uid, rid, _waiting_record_patch())\n",
+       "    _update_research_doc(uid, rid, _waiting_record_patch())\n")]),
+    ("R2", RESEARCH, "the move writes back a line Reset Backend is clearing",
+     [('            if not _QUEUE_STATE.get("_hard_reset_in_progress"):\n'
+       '                persist(current_job=None)',
+       '            if True:\n                persist(current_job=None)')]),
+    ("R3", RESEARCH, "⛔ a run another worker has taken (not started) is restored or parked "
+     "from a stale snapshot", [(RESTORE_WAITING, RESTORE_WAITING.replace(
+         "_run_dir_held_by_queue(_job_run_dir(j))", "_run_dir_waiting(_job_run_dir(j))"))]),
+    ("R4", RESEARCH, "⛔⛔ a run another worker is running is put back at #1, or started "
+     "a second time", [(RESTORE_TAKEN, RESTORE_TAKEN.replace(
+         "        if why is not None:\n", "        if False:\n"))]),
+    ("R5", RESEARCH, "a record with no worker named reads as worker 1's — worker 2 lets its "
+     "own run go", [("        why = _run_taken_since_boot((j or {}).get(\"uid\"), rid, record, job_queue,\n"
+                     "                                    unstamped_is_worker_1=False)\n",
+                     "        why = _run_taken_since_boot((j or {}).get(\"uid\"), rid, record, job_queue,\n"
+                     "                                    unstamped_is_worker_1=True)\n")]),
+    ("R6", RESEARCH, "⛔ a Resume card or a stop is written over with \"queued\" by a stale "
+     "snapshot", [(RESTORE_PARK, "        if (_worker_is_resting()\n")]),
+    ("R7", RESEARCH, "⛔ the queued jobs go to the FRONT — ahead of the run that was running",
+     [("behind=j is not cur,", "behind=False,")]),
+    # a run out of automatic attempts
+    ("R8", RESEARCH, "⛔ a run ended for good is parked — its stop is written over",
+     [(PARK_REFUSAL, PARK_REFUSAL.replace('((run_dir / ".stop").exists()', "(False"))]),
+    ("R9", RESEARCH, "⛔⛔ a run out of attempts is parked — its Retry card is taken away and "
+     "it waits for ever", [(PARK_REFUSAL, PARK_REFUSAL.replace(
+         "or _no_auto_retry_marked(run_dir)", "or False"))]),
+    ("R10", RESEARCH, "⛔ a run that keeps nothing is written to disk to wait, brief and all",
+     [("    if _is_incognito_research(rid):\n        return False\n    run_dir = _job_run_dir(job)\n",
+       "    run_dir = _job_run_dir(job)\n")]),
+    ("R11", RESEARCH, "⛔⛔ a waiting run out of attempts is left \"queued\" for ever",
+     [("            await asyncio.to_thread(_update_research_doc, job[\"uid\"], rid,\n"
+       "                                    _restart_recovery_patch(rid))\n", "")]),
+    ("R12", RESEARCH, "a Resume card is written over a run stopped while it was being taken",
+     [('        if (run_dir is not None and not (run_dir / ".stop").exists()\n'
+       '                and _no_auto_retry_marked(run_dir)):',
+       '        if (run_dir is not None\n                and _no_auto_retry_marked(run_dir)):')]),
+    ("R13", RESEARCH, "the Resume card is written and the queue order is not re-published",
+     [('                f"offered to its person to resume instead", "INFO")\n'
+       '            _kick_queue_publish()\n',
+       '                f"offered to its person to resume instead", "INFO")\n')]),
+    # a waiting run ended for good
+    ("R14", RESEARCH, "⛔⛔ a run ended for good stays #1 and holds every new start back",
+     [('            if (d / ".stop").exists():\n                _retire_waiting_marker(marker)\n'
+       '                continue\n', "")]),
+    ("R15", RESEARCH, "a run ended for good keeps its folder for ever",
+     [("                _retire_waiting_marker(marker)\n", "                pass\n")]),
+    # stopping or cancelling a waiting run
+    ("R16", RESEARCH, "⛔⛔ a cancelled waiting run is not ended — the next worker takes it",
+     [(STOP_TOUCH + "        for m in live:\n", "        for m in live:\n")]),
+    ("R17", RESEARCH, "a cancelled run still reads as waiting or taken",
+     [("        for m in live:\n            _retire_waiting_marker(m)\n",
+       "        for m in live:\n            pass\n")]),
+    ("R18", RESEARCH, "⛔ the second worker's copy of the cancel writes the purge over it",
+     [("            names = live + ([ended] if ended.exists() else [])\n",
+       "            names = live\n")]),
+    ("R19", RESEARCH, "⛔⛔ a waiting run's cancel purges a run with finished steps; the "
+     "owner's Stop is dropped", [("                        elif _waiting_rec is not None or removed_taken:\n",
+                                  "                        elif False:\n")]),
+    ("R20", RESEARCH, "a run taken into this worker's line is cancelled as one that never ran",
+     [("                        removed_taken = any(_cancels(j) and j.get(\"moved_run\") for j in dq)\n",
+       "                        removed_taken = False\n")]),
+    ("R21", RESEARCH, "a job that was only queued is ended as a running run — no phase reset",
+     [('                        if _waiting_rec is not None and _waiting_rec.get("queued_job") is not None:\n',
+       "                        if False:\n")]),
+    ("R22", RESEARCH, "a cancel of a later start of the same research ends the old run instead",
+     [("                                        if _start_doc_id is None and (removed_taken or not removed)\n",
+       "                                        if (removed_taken or not removed)\n")]),
+    ("R23", RESEARCH, "a cancelled waiting run stays the amber #1 until something else moves",
+     [("                                    }, movedToQueueAt=_DF))\n                            _kick_queue_publish()\n",
+       "                                    }, movedToQueueAt=_DF))\n")]),
+    ("R24", RESEARCH, "a cancelled queued job is not taken out of the published order",
+     [("                            removed = True\n                            _kick_queue_publish()\n",
+       "                            removed = True\n")]),
+    ("R25", RESEARCH, "a stopped run still reads as moved to the queue",
+     [(MOVED_CANCEL, MOVED_CANCEL.replace("}, movedToQueueAt=_DF))", "}))"))]),
+    ("R26", RESEARCH, "⛔ the owner's cancel resets the steps of a run with work in it",
+     [("                                    _owner_control_patch(oc, running=True) or {\n",
+       "                                    _owner_control_patch(oc, running=False) or {\n")]),
+    ("R27", RESEARCH, "⛔ the person's own cancel resets the steps of a run with work in it",
+     [(MOVED_CANCEL, MOVED_CANCEL.replace('"summary": "Cancelled",\n',
+                                          '"summary": "Cancelled",\n"phase": 0,\n'))]),
+    # the claim and the park
+    ("R28", RESEARCH, "⛔ Windows: a leftover taken marker stalls this worker for good",
+     [("            os.replace(d / WAITING_MARKER, taken)\n",
+       "            os.rename(d / WAITING_MARKER, taken)\n")]),
+    ("R29", RESEARCH, "a leftover taken marker stays beside the new one",
+     [("        for stale in run_dir.glob(f\"{WAITING_MARKER}.w*\"):\n"
+       "            stale.unlink(missing_ok=True)\n", "")]),
+    # a resting worker's own line
+    ("R30", RESEARCH, "⛔ a queued job with no folder yet cannot wait — the worker that is "
+     "off runs it", [("    if behind and not run_dir.exists():\n", "    if False:\n")]),
+    ("R31", RESEARCH, "⛔ the queued jobs jump the run that was running",
+     [('        "moved_at_ms": (min([w["moved_at_ms"] for w in _waiting_runs()] + [now_ms]) - 1\n'
+       '                        if behind else now_ms),\n',
+       '        "moved_at_ms": now_ms,\n')]),
+    ("R32", RESEARCH, "⛔⛔ a queued job loses what it was sent with — it resumes an empty "
+     "folder, with no brief", [('    if behind:\n        rec["queued_job"] = dict(job)\n', "")]),
+    ("R33", RESEARCH, "the taking worker ignores the job as it was queued",
+     [("        if isinstance(queued_job, dict):\n", "        if False:\n")]),
+    ("R34", RESEARCH, "a queued job taken from the queue still reads as taken once started",
+     [("                        queued_at_ms=int(time.time() * 1000), moved_run=True)\n",
+       "                        queued_at_ms=int(time.time() * 1000))\n")]),
+    ("R35", RESEARCH, "a record that already says queued is written again",
+     [(BEHIND_STATUS, BEHIND_STATUS.replace('        if status != "queued":\n', "        if True:\n"))]),
+    ("R36", RESEARCH, "a queued Resume waiting behind still reads as running",
+     [(BEHIND_STATUS, BEHIND_STATUS.replace('        if status != "queued":\n', "        if False:\n"))]),
+    # rehydration
+    ("R37", RESEARCH, "⛔⛔ boot resumes a run another worker has taken — two pipelines",
+     [("                if _run_dir_held_by_queue(_queue_dir_now):\n", "                if False:\n")]),
+    # what the lane claimed and nothing measured
+    ("R38", RESEARCH, "⛔ the move restarts without waiting for uploads in flight",
+     [("        left = _wait_for_uploads_to_settle(max_wait_s=5.0)\n", "        left = 0\n")]),
+    ("R39", RESEARCH, "⛔ Clear Local Storage deletes the runs in this worker's own line",
+     [('    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref"))) + list(_UNREAD_RESTORES)\n',
+       "    jobs = list(_UNREAD_RESTORES)\n")]),
+    ("R40", RESEARCH, "Clear Local Storage deletes the boot entries still to be checked",
+     [('    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref"))) + list(_UNREAD_RESTORES)\n',
+       '    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref")))\n')]),
 
     # ═══ Y — the capability ═══════════════════════════════════════════════════
     ("Y1", RESEARCH, "⛔ the capability is never published — the app never shows the chip",

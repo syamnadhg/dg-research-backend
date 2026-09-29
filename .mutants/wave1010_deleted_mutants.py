@@ -98,8 +98,10 @@ DEQUEUE_BAIL = ("                _PICKUP_WITHDRAWN_STATUS,\n"
                 "            }")
 #: ⛔ RE-AIMED 2026-09-28: the boot restore passes `denied_is_answer=True`.
 # ⚠ RE-ANCHORED 2026-09-29 (Windows review): the restore passes the members it read.
-RESTORE = ('                             "disk-restore", denied_is_answer=True,\n'
-           '                             members=_MEMBERS_UNREAD if members is None else members)[0]:')
+# ⚠ RE-ANCHORED 2026-09-29 (wave 13 repair): the restore keeps the record it read.
+RESTORE = ('            "disk-restore", denied_is_answer=True,\n'
+           '            members=_MEMBERS_UNREAD if members is None else members)\n'
+           '        if withdrawn:\n')
 #: ⛔ Its own `elif`, so wave 10.9's `RESTORE_FORGET` anchor still matches.
 RESTORE_SHED = "    elif withdrew:"
 REHYDRATE = '                        _pickup_withdrawn, tree_uid, research_id, "rehydrate"))[0]:'
@@ -172,9 +174,9 @@ MUTANTS = [
      [(DEQUEUE_BAIL, "            }")]),
     ("C9", "under", "the boot restore stops asking — a deleted research's "
      "snapshot entry is re-offered at every boot",
-     [(RESTORE, '                             "disk-restore", denied_is_answer=True,\n'
-                '                             members=_MEMBERS_UNREAD if members is None else '
-                'members)[0] and False:')]),
+     [(RESTORE, '            "disk-restore", denied_is_answer=True,\n'
+                '            members=_MEMBERS_UNREAD if members is None else members)\n'
+                '        if withdrawn and False:\n')]),
     ("C10", "under", "the boot restore asks but never sheds — the withdrawn "
      "entry stays in the file for good",
      [(RESTORE_SHED, "    elif False:")]),
