@@ -31,7 +31,6 @@ import base64
 import collections
 import json
 import os
-import sys
 import time
 from datetime import datetime
 
@@ -96,6 +95,11 @@ class _Node:
             raise answer
         return _Snap(answer)
 
+    def update(self, payload):
+        """Recorded, never refused: what the machine posts on the device
+        document (its busy slot, the job it says is running)."""
+        self._fs.updates.append((self._parts, dict(payload)))
+
     def where(self, **_filter):
         """`users/{uid}/researches` asked for its "ongoing" records — boot
         rehydration's one query."""
@@ -158,6 +162,7 @@ class _Fs:
         self.queue_docs = dict(queue_docs or {})
         self.queue_deleted: list = []
         self.reads: list = []
+        self.updates: list = []
 
     def collection(self, name):
         return _Node(self, (name,))
@@ -730,13 +735,16 @@ def test_every_research_writer_names_the_research_owners_account(monkeypatch, wr
 
 
 class _RenumberDb(_DenyingDb):
-    """The queue-position renumber's reads answer; its ONE batch is refused,
-    the way Firestore refuses a whole batch for one record it will not take."""
+    """The queue-position renumber's reads answer; a batch holding a record of
+    an account in `refuse` is refused whole, the way Firestore refuses a batch
+    for one record it will not take (`refuse=None`: every batch refused)."""
 
-    def __init__(self, claims, deferred):
+    def __init__(self, claims, refuse=None):
         super().__init__(claims)
-        self._deferred = deferred
-        self.batched: list = []
+        self._deferred: list = []
+        self._refuse = refuse
+        self.committed: list = []
+        self.refused: list = []
 
     def collection(self, name):
         db = self
@@ -775,70 +783,103 @@ class _RenumberDb(_DenyingDb):
 
     def batch(self):
         db = self
+        paths: list = []
 
         class _Batch:
             def update(self, ref, _patch):
-                db.batched.append(ref.path)
+                paths.append(ref.path)
 
             def commit(self):
-                db._deny()
+                if db._refuse is None or any(pth[1] in db._refuse for pth in paths):
+                    db.refused.append(list(paths))
+                    db._deny()
+                db.committed.extend(paths)
         return _Batch()
 
 
-#: Two waiting jobs, the owner's first: the batch holds the owner's record AND
-#: the removed sharer's, and one refused record refuses both.
-WAITING = [(OWNER, "rid-owner"), (FORMER, "rid-former")]
-
-
-def _renumber_deferred(db):
+def _renumber_deferred(db, waiting):
     db._deferred = [{"topic": "t", "researchId": rid, "uid": uid, "submittedBy": uid,
                      "action": "start", "processed": False, "timestamp": 1000 + i}
-                    for i, (uid, rid) in enumerate(WAITING)]
+                    for i, (uid, rid) in enumerate(waiting)]
     research._recompute_deferred_queue_positions()
 
 
-def _renumber_local(monkeypatch):
+def _renumber_local(monkeypatch, waiting):
     from _run_server_closure import lift
     jq = type("JQ", (), {})()
-    jq._queue = [{"uid": uid, "research_id": rid} for uid, rid in WAITING]
+    jq._queue = [{"uid": uid, "research_id": rid} for uid, rid in waiting]
     monkeypatch.setattr(research, "_job_queue", jq, raising=False)
     monkeypatch.setattr(research, "_QUEUE_STATE", {}, raising=False)
     monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
     lift("_recompute_queue_positions")()
 
 
-@pytest.mark.parametrize("renumber", ["deferred", "local"])
-def test_a_refused_renumber_batch_holding_another_accounts_record_does_not_say_re_pair(
-        monkeypatch, renumber):
-    """⛔ THE BATCH WRITERS (09-29 verify). The renumber updates every waiting
-    job's record in ONE batch; a removed sharer's record refuses the owner's
-    with it. The heal was handed no uid, so it charged the refusal to this
-    computer's pairing and said "re-pair required"."""
-    db = _RenumberDb({"deviceId": DEVICE, "ownerUid": OWNER}, [])
+def _renumber_machine(monkeypatch, refuse):
+    db = _RenumberDb({"deviceId": DEVICE, "ownerUid": OWNER}, refuse)
     _db, lines = _heal_machine(monkeypatch)
     monkeypatch.setattr(research, "_firebase_db", db)
     monkeypatch.setattr(research, "load_device_id", lambda: DEVICE)
     monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
-    for _ in range(research._GRPC_HEAL_STRUCTURAL_AFTER):
-        (_renumber_deferred(db) if renumber == "deferred" else _renumber_local(monkeypatch))
+    return db, lines
 
-    assert ("users", FORMER, "researches", "rid-former") in db.batched, db.batched
-    [line] = _structural(lines)
-    assert "the job belongs to another account" in line and FORMER[:8] in line, line
-    assert "re-pair required" not in line, line
+
+def _renumber(renumber, monkeypatch, db, waiting):
+    if renumber == "deferred":
+        _renumber_deferred(db, waiting)
+    else:
+        _renumber_local(monkeypatch, waiting)
+
+
+def _rec(uid, rid):
+    return ("users", uid, "researches", rid)
+
+
+RENUMBERS = ["deferred", "local"]
+
+
+@pytest.mark.parametrize("renumber", RENUMBERS)
+def test_one_refused_account_does_not_hold_back_everyone_elses_queue_positions(
+        monkeypatch, renumber):
+    """⛔⛔ ONE BATCH FOR EVERY ACCOUNT WAS ONE REFUSAL FOR ALL (09-29 verify). A
+    job of an account removed while it waited here sat in the renumber's one
+    batch, and Firestore refuses a batch whole: the owner's and every current
+    sharer's position and ETA froze until that job reached the dequeue."""
+    db, lines = _renumber_machine(monkeypatch, {FORMER})
+    _renumber(renumber, monkeypatch, db, [(OWNER, "rid-owner"), (SHARER, "rid-sharer"),
+                                          (FORMER, "rid-former")])
+    assert _rec(OWNER, "rid-owner") in db.committed, db.committed
+    assert _rec(SHARER, "rid-sharer") in db.committed, db.committed
+    assert _rec(FORMER, "rid-former") not in db.committed
+    assert db.refused and all(pth[1] == FORMER for b in db.refused for pth in b), db.refused
+    assert not [m for _lvl, m in lines if "re-pair required" in m], lines
+
+
+@pytest.mark.parametrize("renumber", RENUMBERS)
+@pytest.mark.parametrize("waiting", [[(FORMER, "rid-former")],
+                                     [(SHARER, "rid-sharer"), (FORMER, "rid-former")]],
+                         ids=["alone", "behind-a-current-sharer"])
+def test_a_refused_renumber_names_the_account_refused_never_a_member(
+        monkeypatch, renumber, waiting):
+    """The heal names whose research a refused write was for. A batch per
+    account is exactly one account's, so the refused one is named by its own
+    uid — never a current sharer waiting ahead of it in the same queue, and
+    never "re-pair required"."""
+    db, lines = _renumber_machine(monkeypatch, {FORMER})
+    for _ in range(research._GRPC_HEAL_STRUCTURAL_AFTER):
+        _renumber(renumber, monkeypatch, db, waiting)
+    structural = _structural(lines)
+    assert all(SHARER[:8] not in m and "re-pair required" not in m for m in structural), structural
+    if len(waiting) == 1:
+        [line] = structural
+        assert "the job belongs to another account" in line and FORMER[:8] in line, line
 
 
 def test_a_refused_renumber_of_only_the_owners_jobs_still_says_re_pair(monkeypatch):
-    """The control: a batch of the owner's own records only is this computer's
-    own tree, and the advice stays re-pairing."""
-    db = _RenumberDb({"deviceId": DEVICE, "ownerUid": OWNER}, [])
-    _db, lines = _heal_machine(monkeypatch)
-    monkeypatch.setattr(research, "_firebase_db", db)
-    monkeypatch.setattr(research, "load_device_id", lambda: DEVICE)
-    monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
-    monkeypatch.setattr(sys.modules[__name__], "WAITING", [(OWNER, "rid-1"), (OWNER, "rid-2")])
+    """The control: the owner's own records refused is this computer's own
+    tree, and the advice stays re-pairing."""
+    db, lines = _renumber_machine(monkeypatch, None)
     for _ in range(research._GRPC_HEAL_STRUCTURAL_AFTER):
-        _renumber_deferred(db)
+        _renumber_deferred(db, [(OWNER, "rid-1"), (OWNER, "rid-2")])
 
     [line] = _structural(lines)
     assert "re-pair required" in line and "another account" not in line, line
@@ -987,6 +1028,72 @@ def test_the_dequeue_does_not_run_a_job_whose_account_left(
     # Stood down before the flip, a gone job's record is not asked about at all.
     assert not [m for _lvl, m in lines if "roceeding" in m], (
         f"the flip was tried for a job that does not run: {lines}")
+
+
+def test_the_serve_apis_own_resume_with_no_account_still_runs(monkeypatch, tmp_path):
+    """⛔⛔ `POST /api/runs/{id}/resume` — the second half of the /feedback redo —
+    queues {topic, email, resume_dir} with NO uid (09-29 re-verify). "" is not
+    the paired account, so the dequeue asked who shares this computer, found
+    "" among nobody, and stood the job down after the route had answered
+    `queued_resume` and flipped the run folder to ongoing."""
+    from _run_server_closure import run_worker_once
+    monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
+    lines = _logged(monkeypatch)
+    db = _Fs(device=SHARED)
+    job = {"topic": "a topic", "email": "someone@example.com",
+           "resume_dir": str(tmp_path / "queues" / "Topic_20260920_181415")}
+    started = run_worker_once(monkeypatch, tmp_path, job, flip=None, db=db,
+                              update_research=lambda *a, **k: True, device_id=DEVICE)
+    assert len(started) == 1, f"the serve API's own Resume did not run: {lines}"
+    assert db.device_reads() == [], "a job with no account asked who shares this computer"
+
+
+@pytest.mark.parametrize("uid, taken", [(FORMER, False), (SHARER, True)],
+                         ids=["former-sharer", "current-sharer"])
+def test_a_job_stood_down_at_the_dequeue_is_never_posted_as_running(
+        monkeypatch, tmp_path, uid, taken):
+    """⛔ Every member reads the device document. The dequeue posted the job as
+    this computer's running one — its research id and its account — and only
+    then asked whether the account was still a member (09-29 re-verify). A
+    current sharer's job is posted as before (the control)."""
+    from _run_server_closure import run_worker_once
+    monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
+    monkeypatch.setattr(research, "WORKER_ID", 1)
+    lines = _logged(monkeypatch)
+    db = _Fs(records={(uid, LEFTOVER): STAMPED}, device=SHARED)
+    started = run_worker_once(monkeypatch, tmp_path, _job(uid, LEFTOVER), flip="flipped",
+                              db=db, update_research=lambda *a, **k: True, device_id=DEVICE)
+    posted = [pl for parts, pl in db.updates if parts[:1] == ("devices",)]
+    assert len(started) == (1 if taken else 0), lines
+    if taken:
+        assert any(pl.get("currentRunId") == LEFTOVER for pl in posted), posted
+        assert any("busyWorkerIds" in pl for pl in posted), posted
+    else:
+        assert posted == [], f"a job stood down was posted as running first: {posted}"
+
+
+def test_the_dequeue_asks_off_the_loop_and_a_read_that_hangs_is_taken(monkeypatch, tmp_path):
+    """⛔ The device read retries for minutes by default. On the loop it froze
+    the local API and every listener with it; now it runs on a thread, and a
+    read that does not answer in time is "can't tell" — the job is taken."""
+    import threading
+    from _run_server_closure import run_worker_once
+    monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
+    lines = _logged(monkeypatch)
+    asked_on: list = []
+
+    def _slow(_uid):
+        asked_on.append(threading.current_thread() is threading.main_thread())
+        time.sleep(1.0)
+        return True               # "gone" — but too late to count
+    monkeypatch.setattr(research, "_known_not_a_member", _slow)
+    monkeypatch.setattr(research, "_RESTART_RETRY_READ_TIMEOUT_S", 0.2)
+    started = run_worker_once(monkeypatch, tmp_path, _job(SHARER, LEFTOVER), flip="flipped",
+                              db=_Fs(device=SHARED), update_research=lambda *a, **k: True,
+                              device_id=DEVICE)
+    assert asked_on == [False], "the membership read ran on the event loop's thread"
+    assert len(started) == 1, lines
+    assert [m for lvl, m in lines if lvl == "WARN" and "did not answer in 0.2s" in m], lines
 
 
 # ══ 7. the other pickups, against a record this computer wrote ═══════════════
