@@ -9,9 +9,12 @@ while the finished brief sat on the screen, under a Copy button that hands out
 its markdown. The page read stays the default. Only when it comes back empty
 does Phase 1 put a marker on the clipboard, press the Copy button under the
 latest reply (or, when no Copy button can be found, have a CUA press it — a CUA
-that may only click, and never on Send or Regenerate), and read the clipboard,
-keeping the text only if it is not the marker, is long enough, is not our own
-prompt and reads like a brief.
+that may only click, and never on Send, Regenerate, Share or Edit message), and
+read the clipboard, keeping the text only if it is not the marker, is as long as
+the page read requires (more than 2000 characters of prose), is not our own
+prompt, reads like a brief, and is text this page shows (fleet workers on one
+computer share ONE clipboard — two tabs of one headless context share one too,
+which is how another worker is played here).
 
 ⚠ ASSUMED, NOT CAPTURED: WHERE the Copy button sits. The capture names it
 (aria-label "Copy"; the user's own message has "Copy message") but not its
@@ -44,6 +47,8 @@ LINK = base.LINK
 TOPIC = "the St Bernard"
 URL = "http://127.0.0.1:9/c/sr-fixture"     # answered by page.route — never fetched
 ORIGIN = "http://127.0.0.1:9"
+#: Another brief — a real one's shape and length (past the page read's floor of
+#: 2000 characters), on another topic.
 OLD_BRIEF = "\n\n".join([
     "## Research brief: the Newfoundland",
     "Scope: the breed's origins on the island, its water rescue work, and the "
@@ -52,23 +57,89 @@ OLD_BRIEF = "\n\n".join([
     "reputation formed, and which of the famous rescues are actually documented.",
     "Method: prefer primary sources and veterinary studies over breeder material, "
     "and give both sides where the sources disagree about a date or a number.",
+    "History: trace the dogs from the fishing villages of the island to the first "
+    "kennel club registrations in England, and say which of the early accounts were "
+    "written by people who actually saw the dogs working in the water.",
+    "Working roles: cover the dogs that hauled nets and carts for fishermen, the "
+    "lifesaving dogs kept on ships and at harbours, and the water rescue trials that "
+    "breed clubs still run today, with the rules those trials follow.",
+    "Health and welfare: list the conditions that are most common in the breed, "
+    "such as heart disease, hip and elbow problems and cystinuria, with how often "
+    "each is found and which screening tests breeders are asked to use.",
+    "Breed standard: explain what the modern standard requires for size, coat and "
+    "colour, how it differs between the main kennel clubs, and why the black and "
+    "white variety is shown as a separate breed in some countries.",
+    "Famous dogs: check the stories told about named Newfoundlands, from the dogs "
+    "said to have saved shipwrecked sailors to the dog that went west with the "
+    "explorers, and say which of those stories rest on letters or logbooks.",
+    "Sources to start from: the breed club archives, the kennel club stud books, "
+    "the veterinary literature on giant breeds, and the island's own museums and "
+    "newspapers from the years when the dogs were still working with fishermen.",
+    "Open questions: list what the evidence could not settle, such as the breed's "
+    "exact ancestry, and say what kind of source would be needed to settle each one.",
+    "Out of scope: training advice, product recommendations and other giant breeds, "
+    "except where a comparison explains a Newfoundland trait that readers ask about.",
     "Deliverable: a structured report with sections, sources and open questions "
     "for the research agent to pursue, every claim traceable to its source.",
 ])
-#: A long user feedback, so our own prompt is long and reads like prose — then
-#: only the "is it our prompt" check can refuse a copy of it.
+#: A long user feedback, so our own prompt is long enough to be a brief and
+#: reads like prose — then only the "is it our prompt" check can refuse a copy
+#: of it.
 FEEDBACK = ("Cover the hospice kennels in the twentieth century in much more detail "
-            "than usual, including who ran them and how the dogs were trained.\n"
-            "Explain how the tunnel changed the work of the dogs at the pass, and "
-            "what the monks did with the dogs once travellers stopped coming.\n"
-            "Say which modern breeders still work with the hospice line, and how "
-            "their dogs differ from the show dogs registered elsewhere today.")
+            "than usual, including who ran them, how the dogs were chosen and trained, "
+            "how many dogs the hospice kept in each decade, where the puppies went when "
+            "the kennel had too many of them, and how the monks decided which dogs to "
+            "breed from when the old working lines began to thin out after the wars. "
+            "Quote the kennel books wherever the hospice has published them.\n"
+            "Explain how the road tunnel changed the work of the dogs at the pass, what "
+            "the monks did with the dogs once travellers stopped coming on foot, why the "
+            "kennel was eventually handed to a foundation in the valley, what that "
+            "foundation does with the dogs today in summer and in winter, and how the "
+            "visitors who come to see the dogs pay for their keep and their vet bills. "
+            "Say which parts of this are documented and which are only told to tourists.\n"
+            "Say which modern breeders still work with the hospice line, how their dogs "
+            "differ from the show dogs registered elsewhere today in size, coat, head "
+            "shape and health, which of those differences the breed clubs accept, which "
+            "ones they argue about, and whether any study has compared the two groups "
+            "for hip scores, heart disease or life expectancy. Give the numbers with "
+            "their sources, and say plainly where no numbers could be found at all.\n"
+            "Add a section on the paintings, stamps and postcards that made the dogs "
+            "famous, with the barrel on the collar that the monks say their dogs never "
+            "wore, and explain when that picture first appeared, who painted it, and "
+            "how it spread through books for children and advertising in the century "
+            "that followed. Keep this section short and clearly apart from the history.\n"
+            "Finally, write the report for a reader who knows dogs well but has never "
+            "read about this breed, avoid the breeders' own marketing words, and put "
+            "every figure in a table with its source, its year and a short note on how "
+            "reliable that source is, so the reader can check each one for themselves.")
 EXTRA = ("Add the hospice's own records of every rescue they wrote down, with the "
-         "year and the name of the dog wherever the records give one.\n"
-         "Say which of those rescues were reported in newspapers at the time, and "
-         "which ones only appear in books written a century or more later.\n"
+         "year, the place on the pass and the name of the dog wherever the records "
+         "give one, and say how many of those rescues were of travellers who were "
+         "still alive when the dogs found them. Keep the records in the order the "
+         "hospice wrote them, and mark any entry that was added or corrected later. "
+         "Where two records describe the same rescue, say so and keep both.\n"
+         "Say which of those rescues were reported in newspapers at the time, which "
+         "ones only appear in books written a century or more later, and which ones "
+         "first appear in the guidebooks sold to visitors. For each rescue that the "
+         "newspapers reported, give the paper, the date and what it said, and note "
+         "where the story grew in the retelling from one book to the next one. "
+         "Treat every number that only appears in a guidebook as unconfirmed.\n"
          "Compare the number of rescues in the records with the famous figure of "
-         "forty that is usually quoted for Barry, and explain where it came from.")
+         "forty that is usually quoted for Barry, explain where that figure came "
+         "from, who first wrote it down, how the story of his death was invented and "
+         "later corrected, and what the museum in Bern says about his body and the "
+         "way it was remodelled. Finish with a short list of what can be said about "
+         "Barry with confidence, and what should be left out of the report entirely.\n"
+         "Add the other dogs whose names the hospice remembers, the years they worked "
+         "and what the records say they did, and say whether any of them were bred "
+         "from Barry's line or brought in from farms in the valley below the pass. "
+         "Where a name appears only in a book for children, leave that dog out.\n"
+         "Say how the rescues were actually carried out: whether the dogs went out "
+         "alone or with the monks, how they found people under the snow, what the "
+         "monks carried with them, and how the work changed once telephones, better "
+         "maps and the road made the crossing safer for the people who made it. "
+         "Where the monks' own accounts and the visitors' accounts disagree about how "
+         "the work was done, give both of them and say which one is better supported.")
 
 logs = base.logs
 fast = base.fast
@@ -325,16 +396,32 @@ def test_live_p1_citation_tokens_in_the_copy_are_dropped(chrome, page, p1, logs)
     assert "turn0search1" not in out["text"]
 
 
+def _first_draft_hook(page):
+    """The poll hook that marks the first reply as the first draft."""
+    async def _mark_first_draft():
+        await page.evaluate(
+            "() => { document.querySelector('[data-selected-text-overlay-target] h2')"
+            ".textContent = 'Research brief: the St Bernard (first draft)'; }")
+    return _mark_first_draft
+
+
 def test_live_p1_a_copy_that_copied_nothing_never_hands_back_the_old_clipboard(
         chrome, page, p1, logs):
-    """⛔ The clipboard holds an EARLIER brief and the Copy click copies nothing.
-    Without the marker that old brief would come back as this run's. Every
-    re-read tries the Copy button again."""
+    """⛔ The clipboard holds an EARLIER draft of this very brief — text this
+    page shows, long enough, prose, not our prompt, so every other check would
+    keep it — and the Copy click copies nothing. Without the marker that first
+    draft would come back as the updated brief. Every re-read tries the Copy
+    button again."""
     _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True,
           copy_gives="nothing")
-    _set_clip(chrome, page, OLD_BRIEF)
-    assert research._chatgpt_copy_verdict(OLD_BRIEF, "m") == ""   # it WOULD pass
+    p1.extra = EXTRA
+    p1.hooks = [_first_draft_hook(page)]
+    first_draft = _fixture_markdown(f"{HEADING} (first draft)")
+    _set_clip(chrome, page, first_draft)
     out = p1.run()
+    assert research._chatgpt_copy_verdict(first_draft, "m") == ""       # it WOULD pass
+    assert chrome.run(research._chatgpt_copy_on_page(page, first_draft))  # and it is here
+    assert p1.polls == ["Phase1", "Phase1-followup"]
     assert out["text"] == "", logs
     assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]       # the read + 2 re-reads
     assert len(_lines(logs, "was not used — nothing was copied")) == 3, logs
@@ -349,7 +436,7 @@ def test_live_p1_a_copy_of_our_own_prompt_is_refused(chrome, page, p1, logs):
           copy_gives="prompt")
     out = p1.run(feedback=FEEDBACK)
     copied = _clip(chrome, page)
-    assert FEEDBACK.split("\n")[0] in copied and len(copied) > 500
+    assert FEEDBACK.split("\n")[0] in copied and len(copied) > 2000
     assert out["text"] == "", logs
     assert _lines(logs, "was not used — it was our own prompt"), logs
 
@@ -359,13 +446,7 @@ def test_live_p1_after_a_follow_up_the_latest_reply_is_copied(chrome, page, p1, 
     under the LATEST reply gives the updated brief, never the first draft."""
     _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
     p1.extra = EXTRA
-
-    async def _mark_first_draft():
-        await page.evaluate(
-            "() => { document.querySelector('[data-selected-text-overlay-target] h2')"
-            ".textContent = 'Research brief: the St Bernard (first draft)'; }")
-
-    p1.hooks = [_mark_first_draft]
+    p1.hooks = [_first_draft_hook(page)]
     out = p1.run()
     assert p1.polls == ["Phase1", "Phase1-followup"]
     assert len(_users(chrome, page)) == 2
@@ -381,9 +462,243 @@ def test_live_p1_a_copy_of_the_follow_up_is_refused(chrome, page, p1, logs):
     p1.extra = EXTRA
     out = p1.run()
     copied = _clip(chrome, page)
-    assert EXTRA.split("\n")[0] in copied and len(copied) > 500
+    assert EXTRA.split("\n")[0] in copied and len(copied) > 2000
     assert out["text"] == "", logs
     assert _lines(logs, "was not used — it was our own prompt"), logs
+
+
+#: ChatGPT's answer to the brief prompt when it asks before it writes: four
+#: paragraphs of prose, about 660 characters — not a brief.
+QUESTION = [
+    "Before I write the brief, could you tell me a little more about what you want "
+    "the research to cover, so that the agent does not spend its time in the wrong place?",
+    "Should the report focus on the history of the breed at the hospice, on the modern "
+    "breed as a family dog, or on its health and the screening that breeders use today?",
+    "Is there a particular country whose kennel club standard you care about most, and do "
+    "you want the report written for a general reader or for someone who already breeds dogs?",
+    "Once you answer these questions I will write the complete research brief for you, with "
+    "sections, sources and open questions for the research agent to pursue.",
+]
+
+
+def test_live_p1_a_short_reply_is_never_taken_as_the_brief(chrome, page, p1, logs):
+    """⛔ ChatGPT answers the brief prompt with a clarifying question. Every
+    marker still matches; the page read refuses it (it keeps only more than 2000
+    characters of prose), and so does the Copy button's copy — Phase 1 has no
+    brief, as it had before the Copy fallback ("No brief was generated", with
+    Retry and Skip), instead of sending three research agents off on a question."""
+    _open(chrome, page, "new", reply_actions=True, streaming=True)
+
+    async def _short_reply():
+        await page.evaluate(
+            "(ps) => { const r = document.querySelector('[data-selected-text-overlay-target]');"
+            " r.innerHTML = ps.map((p) => '<p>' + p + '</p>').join(''); }", QUESTION)
+
+    p1.hooks = [_short_reply]
+    out = p1.run()
+    assert out["text"] == "", logs
+    assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]       # the read + 2 re-reads
+    assert QUESTION[0] in _clip(chrome, page)                        # it WAS copied
+    assert len(_lines(logs, "was not used — it was only")) == 3, logs
+
+
+#: The paragraphs of the fixture's reply, in its Copy's markdown.
+REPLY_PARAS = _fixture_markdown().split("\n\n")[1:]
+#: Worker 2's brief: the SAME topic (another run of it), long enough, prose, not
+#: our prompt — every check but "is it on this page" keeps it. Its second line
+#: is the closing line ChatGPT writes into every brief of this kind, word for
+#: word the one on worker 1's page; one shared line is not enough.
+OTHER = "\n\n".join([
+    "## Research brief: the St Bernard (another run of it)",
+    "Scope: the St Bernard as a family dog today, its temperament with small "
+    "children, its exercise needs and the cost of keeping a giant breed at home.",
+    REPLY_PARAS[-1],
+    "Questions to answer: how much space and exercise a St Bernard needs, which "
+    "health checks a buyer should ask a breeder for, and what insurance costs.",
+    "Method: prefer veterinary sources and breed club surveys over breeder "
+    "advertising, and give both sides where owners and vets disagree on a point.",
+    "Family life: how the dogs behave with small children and with other pets, "
+    "what owners report about drooling, shedding and the space the dogs need, and "
+    "how often St Bernards are given up to rescue centres and for what reasons.",
+    "Costs: the price of a puppy from a breeder who screens for hip and heart "
+    "problems, the yearly cost of food, grooming and insurance, and the cost of "
+    "the operations the breed most often needs, with the sources for each figure.",
+    "Exercise: how much walking a grown dog needs, why puppies of giant breeds "
+    "should not be walked too far, and what vets say about heat and summer walks.",
+    "Health: the conditions a family should know about before buying, such as hip "
+    "and elbow problems, bloat and heart disease, what each one costs to treat, and "
+    "which of them a responsible breeder screens the parents for before a litter.",
+    "Choosing a breeder: which questions to ask, which papers and test results to "
+    "see, how to recognise a puppy farm, and what the breed clubs in each country "
+    "offer to families who want to buy from someone who breeds for health first.",
+    "Old age: how long the dogs usually live, what changes in their last years, "
+    "how families cope with a dog that can no longer climb stairs or get into a car, "
+    "and what vets advise about keeping an old giant dog comfortable at home.",
+    "Out of scope: the hospice's history and the rescue legends, which the other "
+    "report covers, and training advice beyond what a new owner needs to know.",
+    "Deliverable: a structured report for a family deciding whether to take on a "
+    "St Bernard, with sections, sources and a list of questions to ask a breeder.",
+])
+#: What another worker does with the shared clipboard: its Phase 2 paste, or its
+#: own Copy fallback, writes a whole brief there.
+_WRITE_JS = "(t) => navigator.clipboard.writeText(t)"
+_READ_JS = "async () => { try { return await navigator.clipboard.readText(); } catch (e) { return null; } }"
+_CLICKS_JS = ("([l, n]) => (document.body.dataset.clicked || '').split('|')"
+              ".filter((x) => x === l).length >= n")
+
+
+def _worker2(chrome, page):
+    """Worker 2's ChatGPT tab: another Chrome on the same computer, sharing the
+    one clipboard. Worker 1's tab is put back in front, as each worker's Chrome
+    shows its own ChatGPT tab."""
+    other = chrome.run(chrome.ctx.new_page())
+    _open(chrome, other, "new", thread=True)
+    chrome.run(page.bring_to_front())
+    return other
+
+
+async def _worker2_writes(page, other, label, times, delay):
+    """Worker 2 writes its brief `delay` seconds after each of worker 1's first
+    `times` clicks on `label`."""
+    for n in range(1, times + 1):
+        await page.wait_for_function(_CLICKS_JS, arg=[label, n], polling=50, timeout=30000)
+        await asyncio.sleep(delay)
+        await other.evaluate(_WRITE_JS, OTHER)
+
+
+def _finish(chrome, other, tasks):
+    for t in tasks:
+        t.cancel()
+    chrome.run(asyncio.sleep(0.05))
+    chrome.run(other.close())
+
+
+def test_live_p1_another_workers_brief_is_never_taken_as_this_runs(
+        chrome, page, p1, logs, monkeypatch):
+    """⛔ The Copy button copies nothing, and within the read window worker 2
+    writes its brief — same topic — to the clipboard. The marker only proves
+    that SOMETHING changed the clipboard; the brief is not on this page, so it
+    is not used, on the read or on either re-read."""
+    monkeypatch.setattr(research, "_CG_COPY_READ_S", 5.0, raising=False)
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True,
+          copy_gives="nothing")
+    other = _worker2(chrome, page)
+    tasks = []
+
+    async def _start():
+        tasks.append(asyncio.ensure_future(_worker2_writes(page, other, "Copy", 3, 0.3)))
+
+    p1.hooks = [_start]
+    try:
+        out = p1.run()
+        assert out["text"] == "", logs                              # never worker 2's brief
+        assert chrome.run(asyncio.wait_for(tasks[0], 10)) is None   # all three writes landed
+    finally:
+        _finish(chrome, other, tasks)
+    assert research._chatgpt_copy_verdict(OTHER, "m", (PROMPT,)) == ""   # it WOULD pass
+    assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]
+    assert len(_lines(logs, "was not used — it is not text on this ChatGPT page")) == 3, logs
+    assert not _lines(logs, "brief taken from"), logs
+
+
+def test_live_p1_the_cuas_copy_overwritten_by_another_worker_is_not_used(
+        chrome, page, p1, logs, monkeypatch):
+    """⛔ No Copy button by its marker: the CUA presses Copy, which DOES copy
+    this brief, and while the CUA takes its next look worker 2's brief lands on
+    the clipboard. That is refused; the re-read presses Copy again and gets this
+    page's own brief."""
+    _cua_page(chrome, page, p1)
+    other = _worker2(chrome, page)
+    tasks, wrote = [], asyncio.Event()
+
+    class _Look(base._FastAsyncio):
+        """research's sleeps, capped — except the CUA's "wait 7", its next
+        look, which lasts until worker 2 has written."""
+        @staticmethod
+        async def sleep(delay=0, *a, **k):
+            if delay == 7:
+                await asyncio.wait_for(wrote.wait(), 10)
+            else:
+                await asyncio.sleep(min(float(delay or 0), 0.05))
+
+    monkeypatch.setattr(research, "asyncio", _Look())
+
+    async def _write_once():
+        await _worker2_writes(page, other, "Copy response", 1, 0.4)
+        wrote.set()
+
+    hook = p1.hooks[0]
+
+    async def _hook():
+        await hook()
+        tasks.append(asyncio.ensure_future(_write_once()))
+
+    p1.hooks = [_hook]
+    cua = _CopyCua(lambda: [_click(p1, "copy"), ("wait", {"duration": 7})])
+    try:
+        out = p1.run(cua)
+    finally:
+        _finish(chrome, other, tasks)
+    assert wrote.is_set()
+    assert out["text"] == _fixture_markdown(), logs
+    assert cua.missions == ["copy", "copy"]
+    assert len(_lines(logs, "was not used — it is not text on this ChatGPT page")) == 1, logs
+    assert _lines(logs, "brief taken from ChatGPT's Copy button, clicked by the CUA ("), logs
+
+
+#: ChatGPT's source chips inside the reply: on the page, and not in the Copy's
+#: markdown (the copy carries a citation token there, which is dropped). One
+#: early in the first paragraph, one late in the second (past the part of a
+#: line that is looked for on the page).
+SOURCE_CHIPS_JS = """() => {
+    const spans = document.querySelectorAll('[data-selected-text-overlay-target] p > span');
+    const chip = () => { const b = document.createElement('button');
+        b.textContent = 'akc.org +2'; b.dataset.srName = 'source chip'; return b; };
+    spans[0].insertBefore(chip(), spans[0].firstChild.splitText('Scope: '.length));
+    const tail = spans[1].lastChild;
+    spans[1].insertBefore(chip(), tail.splitText(' and the hospice archives,'.length));
+}"""
+
+
+def test_live_p1_source_chips_on_the_page_do_not_cost_the_brief(chrome, page, p1, logs):
+    """A copy is kept when two of its first three lines of prose open with words
+    the page shows. A source chip inside a sentence is on the page and not in
+    the copy; a link shows only its words."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+
+    async def _chips():
+        await page.evaluate(SOURCE_CHIPS_JS)
+
+    p1.hooks = [_chips]
+    out = p1.run()
+    assert chrome.run(page.evaluate(
+        "() => document.querySelectorAll('[data-sr-name=\"source chip\"]').length")) == 2
+    assert out["text"] == _fixture_markdown(), logs
+    assert "akc.org" not in out["text"]
+
+
+def test_live_p1_a_brief_written_as_a_numbered_list_is_taken(chrome, page, p1, logs):
+    """The brief is a numbered list. Its copy writes "1.", "2.", … in front of
+    each line; the page draws those numbers, so they are not in its text."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+
+    async def _as_list():
+        await page.evaluate("""() => {
+            const root = document.querySelector('[data-selected-text-overlay-target]');
+            const ol = document.createElement('ol');
+            for (const p of [...root.querySelectorAll('p')]) {
+                const li = document.createElement('li');
+                li.innerHTML = p.innerHTML;
+                ol.appendChild(li);
+                p.remove();
+            }
+            root.appendChild(ol);
+        }""")
+
+    p1.hooks = [_as_list]
+    out = p1.run()
+    want = f"## {HEADING}\n\n" + "\n".join(f"{i}. {p}" for i, p in enumerate(REPLY_PARAS, 1))
+    assert out["text"] == want, logs
 
 
 # ── the CUA, when no Copy button can be found ────────────────────────────────
@@ -432,26 +747,95 @@ def test_live_p1_with_no_copy_button_found_the_cua_clicks_it(chrome, page, p1, l
     assert _lines(logs, "brief taken from ChatGPT's Copy button, clicked by the CUA ("), logs
 
 
+#: The user's own "Edit message", and a "Share prompt", pinned where a stray
+#: click can reach them.
+PIN_EDIT_SHARE_JS = """() => {
+    const edit = document.querySelector('[aria-label="Edit message"]');
+    document.body.appendChild(edit);
+    edit.style.cssText = 'position: fixed; left: 900px; top: 500px; width: 40px; height: 30px; '
+        + 'z-index: 9; display: block; visibility: visible; opacity: 1;';
+    const share = document.createElement('button');
+    share.setAttribute('aria-label', 'Share prompt');
+    share.style.cssText = 'position: fixed; left: 1000px; top: 300px; width: 40px; height: 30px; z-index: 9;';
+    document.body.appendChild(share);
+}"""
+
+
 def test_live_p1_the_copy_cua_only_clicks_and_never_regenerate_or_send(chrome, page, p1, logs):
     """⛔ The CUA tries what must never happen: Regenerate (it would throw the
-    brief away), a word typed into the box and Enter, Send on a leftover draft.
-    None of it is carried out; its Copy click still gives the brief."""
+    brief away), a word typed into the box and Enter, Send on a leftover draft,
+    Share next to Copy (a public link to the chat), the user's Edit message (its
+    Send re-submits the prompt). None of it is carried out; its Copy click still
+    gives the brief."""
     _cua_page(chrome, page, p1, draft=True)
+    hook = p1.hooks[0]
+
+    async def _hook():
+        await hook()
+        await page.evaluate(PIN_EDIT_SHARE_JS)
+        p1.at.update({k: await page.evaluate(CENTER_JS, s) for k, s in (
+            ("share", '[data-sr-reply-actions] [aria-label="Share"]'),
+            ("share prompt", '[aria-label="Share prompt"]'),
+            ("edit", '[aria-label="Edit message"]'))})
+
+    p1.hooks = [_hook]
     cua = _CopyCua(lambda: [_click(p1, "regen"), _click(p1, "box"),
                             ("type", {"text": "hello"}), ("key", {"text": "Return"}),
-                            _click(p1, "send"), _click(p1, "copy")])
+                            _click(p1, "send"), _click(p1, "share"), _click(p1, "share prompt"),
+                            _click(p1, "edit"), _click(p1, "copy")])
     out = p1.run(cua)
     assert out["text"] == _fixture_markdown(), logs
     users = _users(chrome, page)                         # the prompt, and nothing else
     assert len(users) == 1 and users[0].startswith("Please create a detailed"), users
     assert chrome.run(page.evaluate(base.BOX_JS)) == "draft"   # never sent, never typed on
-    assert "Regenerate response" not in _clicked(chrome, page)
+    clicked = _clicked(chrome, page)
+    for never in ("Regenerate response", "Share", "Share prompt", "Edit message"):
+        assert never not in clicked, clicked
     refused = _lines(logs, "REFUSED")
-    assert len(refused) == 4, refused
-    assert len(_lines(logs, "[cua] REFUSED a click on Send or Regenerate — this task only "
-                            "clicks the Copy button under ChatGPT's latest reply")) == 2, refused
+    assert len(refused) == 7, refused
+    assert len(_lines(logs, "[cua] REFUSED a click on Send, Regenerate, Share or Edit — this "
+                            "task only clicks the Copy button under ChatGPT's latest reply")) == 5, refused
     assert any("Click only the Copy button directly under ChatGPT's latest reply." in t
                for t in cua.told), cua.told
+
+
+#: Something left open over the reply's row of icons (a popover, say), placed
+#: over the whole row; a click closes it.
+COVER_JS = """() => {
+    const r = document.querySelector('[data-sr-reply-actions]').getBoundingClientRect();
+    const c = document.createElement('div');
+    c.dataset.srCover = '';
+    c.style.cssText = `position: fixed; left: ${r.left - 10}px; top: ${r.top - 10}px; `
+        + `width: ${r.width + 20}px; height: ${r.height + 20}px; z-index: 10; `
+        + 'background: rgba(0, 0, 0, 0.3);';
+    c.addEventListener('click', () => c.remove());
+    document.body.appendChild(c);
+}"""
+
+
+def test_live_p1_a_copy_button_that_cannot_be_clicked_is_left_to_the_cua(
+        chrome, page, p1, logs, monkeypatch):
+    """The Copy button is found, but something covers it and its click times
+    out. The CUA takes over: it closes what covers the row and presses Copy."""
+    monkeypatch.setattr(research, "_CG_COPY_CLICK_MS", 500, raising=False)
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+
+    async def _hook():
+        await page.add_style_tag(content=PIN_ROW_CSS)
+        await page.evaluate(COVER_JS)
+        p1.at = {k: await page.evaluate(CENTER_JS, s) for k, s in (
+            ("copy", '[data-sr-act="copy"]'), ("cover", '[data-sr-cover]'))}
+        assert await page.evaluate(
+            "([x, y]) => !!document.elementFromPoint(x, y).closest('[data-sr-cover]')",
+            p1.at["copy"])                               # the Copy button IS covered
+
+    p1.hooks = [_hook]
+    cua = _CopyCua(lambda: [_click(p1, "cover"), _click(p1, "copy")])
+    out = p1.run(cua)
+    assert _lines(logs, "the Copy button under ChatGPT's reply could not be clicked"), logs
+    assert cua.missions == ["copy"]
+    assert out["text"] == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["Copy"]
 
 
 def test_live_p1_without_a_cua_no_copy_button_means_no_brief(chrome, page, p1, logs):
@@ -590,6 +974,27 @@ def test_live_a_clipboard_that_cannot_be_read_is_never_used(chrome, page, quick,
                                                 origin=ORIGIN))
 
 
+def test_live_a_chatgpt_tab_behind_another_tab_still_gets_its_brief(chrome, page, quick, logs):
+    """Another tab of the same Chrome is in front of ChatGPT's: the clipboard
+    answers only the tab in front, and a tab behind reads it back empty. The
+    ChatGPT tab is brought to the front first, so the Copy button still gives
+    the brief. (Measured on a finished chat nobody has typed into: headless
+    Chrome keeps the clipboard with a tab that has had typing in it, whatever
+    tab is in front, so run_phase1's own page cannot show this here.)"""
+    _open(chrome, page, "new", thread=True, reply_renamed=True, reply_actions=True)
+    other = chrome.run(chrome.ctx.new_page())
+    try:
+        _open(chrome, other, "new", thread=True)            # opened after ChatGPT's: in front
+        chrome.run(page.evaluate(_WRITE_JS, "probe"))
+        assert chrome.run(page.evaluate(_READ_JS)) == "", "the ChatGPT tab is not behind"
+        got = _brief(chrome, page)
+    finally:
+        chrome.run(other.close())
+    assert got == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["Copy"]
+    assert not _lines(logs, "can't use the clipboard"), logs
+
+
 def test_live_a_clipboard_that_does_not_keep_the_marker_is_never_used(chrome, page, quick, logs):
     """The marker is written and something else reads back (a clipboard tool
     that rewrites it, a write that did not land): the clipboard cannot tell a
@@ -608,8 +1013,36 @@ CODE = "\n".join(["def rescue(dog, traveller):",
                   "    # find the traveller in the snow and bring them back to the hospice",
                   "    for step in range(dog.max_steps):",
                   "        if dog.smells(traveller): return dog.carry(traveller)",
-                  "    return None"] * 6)
+                  "    return None"] * 12)
 PLAIN = OLD_BRIEF.replace("## ", "")
+#: A brief in Japanese, written as headings and bullet sentences: no spaces
+#: between its words, so its lines are counted by their letters.
+JA_LINES = [
+    "- セントバーナードの歴史について、修道院の記録と当時の新聞記事を比べて調べる。",
+    "- 峠での救助活動がいつ始まり、どのような犬が選ばれていたのかを一次資料で確かめる。",
+    "- 有名な救助の話のうち、記録で裏付けられるものと後から作られた話を分けて書く。",
+    "- 現代の犬種標準が何を求めているのか、各国のケンネルクラブの違いも含めて説明する。",
+    "- よく見られる病気と、繁殖の前に行われている検査の種類と頻度を表にまとめる。",
+    "- 資料どうしの記述が食い違う場合は両方を示し、どちらがより確かなのかを述べる。",
+]
+JA_BRIEF = "\n".join(["## 調査の概要"] + JA_LINES + ["## 調べること"] + JA_LINES * 8
+                     + ["## 成果物"] + JA_LINES)
+#: The same length in Japanese, but only short labels — no line reads like prose.
+JA_LABELS = "\n".join(["## 調査の概要"] + ["- 犬種：セントバーナード", "- 地域：スイスとイタリア",
+                                          "- 期間：十八世紀から現在"] * 60)
+
+
+def _sized(n):
+    """A brief of exactly `n` characters (cut from PLAIN, repeated)."""
+    t = (PLAIN + "\n\n" + PLAIN)[:n]
+    assert len(t) == n and t == t.strip()
+    return t
+
+
+#: A short brief padded past the floor by an image's ADDRESS — which the page
+#: read does not count either (`_doc_img_prose_len`).
+IMAGED = ("\n\n".join(PLAIN.split("\n\n")[:4])
+          + "\n\n![chart](https://example.org/" + "a" * 2000 + ".png)")
 
 
 @pytest.mark.parametrize("text,why", [
@@ -617,6 +1050,10 @@ PLAIN = OLD_BRIEF.replace("## ", "")
     ("", "nothing was copied"),
     ("   \n", "nothing was copied"),
     ("x" * 300, "it was only 300 characters"),
+    # The page read's own floor: more than 2000 characters of prose.
+    (_sized(2000), "it was only 2000 characters"),
+    (_sized(2001), ""),
+    (IMAGED, f"it was only {research._doc_img_prose_len(IMAGED)} characters"),
     (PROMPT + "\n\n" + FEEDBACK, "it was our own prompt, not ChatGPT's reply"),
     ("St_Bernard_notes.pdf PDF " + PROMPT + "\n\n" + FEEDBACK,
      "it was our own prompt, not ChatGPT's reply"),
@@ -624,15 +1061,20 @@ PLAIN = OLD_BRIEF.replace("## ", "")
     (OLD_BRIEF, ""),
     (PLAIN, ""),
     (_fixture_markdown(), ""),
-])
+    # A script written without spaces: its lines are counted by their letters.
+    (JA_BRIEF, ""),
+    (JA_LABELS, "it does not read like a brief"),
+], ids=["marker", "empty", "blank", "300", "2000", "2001", "image-address", "our-prompt",
+        "our-prompt-after-a-file-card", "code", "another-brief", "plain", "the-reply",
+        "japanese", "japanese-labels"])
 def test_what_counts_as_the_brief(text, why):
     assert research._chatgpt_copy_verdict(text, MARK, (PROMPT + "\n\n" + FEEDBACK,)) == why
 
 
 def test_a_brief_needs_three_lines_of_prose():
-    two = "\n\n".join(OLD_BRIEF.split("\n\n")[:3]) + "\n\n" + "x" * 400
+    two = "\n\n".join(OLD_BRIEF.split("\n\n")[:3]) + "\n\n" + "x" * 2000
     assert research._chatgpt_copy_verdict(two, MARK) == "it does not read like a brief"
-    three = "\n\n".join(OLD_BRIEF.split("\n\n")[:4]) + "\n\n" + "x" * 300
+    three = "\n\n".join(OLD_BRIEF.split("\n\n")[:4]) + "\n\n" + "x" * 2000
     assert research._chatgpt_copy_verdict(three, MARK) == ""
 
 

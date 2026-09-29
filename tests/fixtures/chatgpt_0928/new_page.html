@@ -234,7 +234,8 @@
   document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());
 
   // The reply's markdown, as a Copy button hands it out: headings, paragraphs,
-  // links, code blocks.
+  // links, code blocks, and lists with their numbers and bullets WRITTEN (the page
+  // draws them; they are not in its text).
   function replyMarkdown(root) {
     const inline = (n) => [...n.childNodes].map((c) => c.nodeType === 3 ? c.textContent
       : c.tagName === 'A' ? '[' + c.textContent + '](' + c.getAttribute('href') + ')'
@@ -242,6 +243,8 @@
     return [...root.children].map((c) => /^H[1-6]$/.test(c.tagName)
       ? '#'.repeat(parseInt(c.tagName[1], 10)) + ' ' + c.textContent
       : c.tagName === 'PRE' ? '```\n' + (c.querySelector('code') || c).textContent + '\n```'
+      : c.tagName === 'OL' ? [...c.children].map((li, i) => (i + 1) + '. ' + inline(li)).join('\n')
+      : c.tagName === 'UL' ? [...c.children].map((li) => '- ' + inline(li)).join('\n')
       : inline(c)).join('\n\n');
   }
   document.addEventListener('click', (e) => {
