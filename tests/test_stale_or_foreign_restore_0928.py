@@ -85,13 +85,10 @@ class _Node:
         p = self._parts
         self._fs.reads.append(p)
         if len(p) == 2 and p[0] == "devices":
-            answer = self._fs.device
+            answer = _next(self._fs.device)
         elif len(p) == 4 and p[0] == "users" and p[2] == "researches":
             queue = self._fs.records.get((p[1], p[3]))
-            if queue is None:
-                answer = None
-            else:
-                answer = queue.popleft() if len(queue) > 1 else queue[0]
+            answer = None if queue is None else _next(queue)
         else:
             answer = None
         if isinstance(answer, BaseException):
@@ -102,6 +99,35 @@ class _Node:
         """`users/{uid}/researches` asked for its "ongoing" records — boot
         rehydration's one query."""
         return _Ongoing(self._fs, self._parts[1])
+
+    def limit(self, _n):
+        return self
+
+    def stream(self):
+        """`devices/{id}/queue` — the start documents the idle rescan claims."""
+        return [_QueueDoc(self._fs, doc_id, data)
+                for doc_id, data in list(self._fs.queue_docs.items())]
+
+
+def _next(answers):
+    """One read's answer: in order, and the last one repeats."""
+    return answers.popleft() if len(answers) > 1 else answers[0]
+
+
+class _QueueDoc(_Snap):
+    """A start document in `devices/{id}/queue`, and its own reference."""
+
+    def __init__(self, fs, doc_id, data):
+        super().__init__(data)
+        self.id, self.reference = doc_id, self
+        self._fs = fs
+
+    def delete(self):
+        self._fs.queue_docs.pop(self.id, None)
+        self._fs.queue_deleted.append(self.id)
+
+    def update(self, _payload):
+        pass
 
 
 class _DocSnap(_Snap):
@@ -121,13 +147,15 @@ class _Ongoing:
 
 
 class _Fs:
-    """`users/{uid}/researches/{rid}` answering one read at a time, in order
-    (the last answer repeats), and `devices/{id}`."""
+    """`users/{uid}/researches/{rid}` and `devices/{id}`, each answering one
+    read at a time, in order (the last answer repeats) — a list is a sequence
+    of answers — and `devices/{id}/queue`'s start documents."""
 
-    def __init__(self, records=None, device=None):
-        self.records = {k: collections.deque(v if isinstance(v, list) else [v])
-                        for k, v in (records or {}).items()}
-        self.device = device
+    def __init__(self, records=None, device=None, queue_docs=None):
+        self.records = {k: _answers(v) for k, v in (records or {}).items()}
+        self.device = _answers(device)
+        self.queue_docs = dict(queue_docs or {})
+        self.queue_deleted: list = []
         self.reads: list = []
 
     def collection(self, name):
@@ -136,6 +164,13 @@ class _Fs:
     def record_reads(self, uid):
         return [p for p in self.reads if p[:2] == ("users", uid)]
 
+    def device_reads(self):
+        return [p for p in self.reads if len(p) == 2 and p[0] == "devices"]
+
+
+def _answers(v):
+    return collections.deque(v if isinstance(v, list) else [v])
+
 
 class _Q:
     def __init__(self):
@@ -143,6 +178,9 @@ class _Q:
 
     def put_nowait(self, job):
         self._queue.append(job)
+
+    def qsize(self):
+        return len(self._queue)
 
 
 #: A device document read that blips: who the computer is shared with cannot be
@@ -324,7 +362,12 @@ def test_a_sharers_job_is_not_dropped_when_who_shares_cannot_be_read(
     """⭐ "DON'T KNOW" IS NEVER "NOBODY". With the device document unreadable or
     missing, the owner check has no evidence — a sharer's job whose record reads
     "queued" is restored, and only the record read can drop one: the former
-    sharer's, refused, beside it."""
+    sharer's, refused, beside it.
+
+    ⚠ The refusal is what the rules say only for a record this computer never
+    wrote. One it did write carries its stamp and still READS after the account
+    is removed; that case is `test_a_blip_on_who_shares_at_boot_is_asked_again_
+    before_a_record_this_computer_wrote_is_believed`, in section 7."""
     bobs, gone = "chat_1759000000000_c", "chat_1759000000000_d"
     fs = _Fs(records={(SHARER, bobs): QUEUED, (FORMER, gone): DENIED}, device=device)
     _machine(monkeypatch, tmp_path, fs)
@@ -668,7 +711,7 @@ def test_every_research_writer_names_the_research_owners_account(monkeypatch, wr
     assert "re-pair required" not in line, line
 
 
-# ══ 6. a refusal for an account that left, on every pickup ═══════════════════
+# ══ 6. an account that left, on every pickup ═════════════════════════════════
 #
 # ⛔⛔ THE 09-28 RUN, BY THE OTHER DOOR (09-29 verify). The owner removes a
 # sharer while the computer is off; the unshare route takes them out of
@@ -676,12 +719,28 @@ def test_every_research_writer_names_the_research_owners_account(monkeypatch, wr
 # listener is handed one: its record read is refused, the pickup rule took it
 # ("a read that fails is not a deletion"), the funnel "trusted the FE-side queue
 # write", the dequeue's read was refused too — and it ran with every write
-# refused, on the owner's ChatGPT and key. A 403 for an account the device
-# document positively no longer lists is now the answer on every pickup; a
-# member's 403 (the fresh-document race) and a membership nobody could read are
-# still taken.
+# refused, on the owner's ChatGPT and key.
+#
+# ⛔⛔ AND THE RECORD READ CANNOT BE WHAT DECIDES (09-29 re-verify, measured on
+# the Firestore emulator with the real rules). Every backend write stamps the
+# record with this computer's deviceId, and the rules' `get` lets the stamping
+# device read it with no membership check. So a removed sharer's record that
+# this computer ever wrote to — a queue position while the job waited, a run
+# that already ran here — still READS "queued" after they are removed; only a
+# record it never wrote is refused. The first repair asked "who shares this
+# computer" on a refusal only, and these tests gave only the refusal, so they
+# passed while the real case ran. Every pickup is driven against BOTH answers
+# now. An account the device document positively does not list is not run
+# either way; a current member's job, even refused (the fresh-document race),
+# and a membership nobody could read are still taken.
 
 LEFTOVER = "agent-82bb870dba1140ed"
+
+#: The two answers the rules give a removed sharer's record: refused when this
+#: computer never wrote it, and readable — still "queued" — when it did.
+STAMPED = {"status": "queued", "queuePosition": 2, "deviceId": DEVICE}
+RECORDS_LEFT_BEHIND = [DENIED, STAMPED]
+RECORD_IDS = ["never-written-here", "written-here"]
 
 #: Each pickup's cases: whose job, what the device document says, and whether
 #: the job must be taken.
@@ -703,13 +762,20 @@ def _logged(monkeypatch):
     return lines
 
 
+def _docs(record, uid, rid):
+    """The Listener's research documents: a refusal for every read, or this one
+    record readable."""
+    return record if isinstance(record, BaseException) else {(uid, rid): dict(record)}
+
+
+@pytest.mark.parametrize("record", RECORDS_LEFT_BEHIND, ids=RECORD_IDS)
 @pytest.mark.parametrize("uid, device, taken", PICKUP_CASES, ids=PICKUP_IDS)
 def test_a_start_doc_left_by_an_account_that_left_is_not_run_at_serve_start(
-        monkeypatch, tmp_path, uid, device, taken):
+        monkeypatch, tmp_path, uid, device, taken, record):
     from _queue_listener import Listener
     monkeypatch.setitem(research._QUEUE_STATE, "running", False)
-    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs=DENIED,
-                   device_doc=device)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   research_docs=_docs(record, uid, LEFTOVER), device_doc=device)
     lines = _logged(monkeypatch)
     lis.feed(action="start", uid=uid, submittedBy=uid, researchId=LEFTOVER,
              topic="St Bernard", timestamp=int((time.time() - 600) * 1000))
@@ -725,17 +791,26 @@ def test_a_start_doc_left_by_an_account_that_left_is_not_run_at_serve_start(
     assert not _said(lines, LEFTOVER, "taking the job"), lines
 
 
-def test_a_resume_left_by_an_account_that_left_is_not_run(monkeypatch, tmp_path):
+@pytest.mark.parametrize("record", [
+    DENIED,
+    {"status": "paused", "deviceId": DEVICE},
+    {"status": "queued", "deviceId": DEVICE},
+    {"status": "ongoing", "deviceId": DEVICE},
+], ids=["never-written-here", "written-here-paused", "written-here-queued",
+        "written-here-ongoing"])
+def test_a_resume_left_by_an_account_that_left_is_not_run(monkeypatch, tmp_path, record):
     """⛔ THE SAME DOOR FOR A RESUME. Its run is on this disk and says whose it
-    is, so without the answer the Resume was taken on the disk's word. Beside it
-    a current sharer's Resume, refused the same way, is still taken."""
+    is, so without the answer the Resume was taken on the disk's word — and a
+    Resume is for a run that already ran HERE, so its record carries this
+    computer's stamp and reads. Beside it a current sharer's Resume and the
+    owner's, answered the same way, are still taken."""
     from _queue_listener import Listener
-    for uid, taken in ((FORMER, False), (SHARER, True)):
+    for uid, taken in ((FORMER, False), (SHARER, True), (OWNER, True)):
         rid = f"{LEFTOVER}_{uid[:4]}"
         run_id, _folder = _old_run_folder(tmp_path, rid, days=1, uid=uid,
                                           topic=f"Resumed_{uid[:4]}")
-        lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs=DENIED,
-                       device_doc=SHARED)
+        lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                       research_docs=_docs(record, uid, rid), device_doc=SHARED)
         lines = _logged(monkeypatch)
         lis.feed(action="resume", uid=uid, submittedBy=uid, researchId=rid,
                  backendRunId=run_id, email="", config={})
@@ -747,21 +822,99 @@ def test_a_resume_left_by_an_account_that_left_is_not_run(monkeypatch, tmp_path)
             assert len(_said(lines, rid, NOT_OPENABLE)) == 1, lines
 
 
+@pytest.mark.parametrize("record", RECORDS_LEFT_BEHIND, ids=RECORD_IDS)
 @pytest.mark.parametrize("uid, device, taken", PICKUP_CASES, ids=PICKUP_IDS)
 def test_the_dequeue_does_not_run_a_job_whose_account_left(
-        monkeypatch, tmp_path, uid, device, taken):
+        monkeypatch, tmp_path, uid, device, taken, record):
     """⛔ THE LAST PICKUP. A job queued while its account was a member, and the
-    account removed while it waited: the flip is refused and so is the plain
-    read after it — which used to proceed "as before"."""
+    account removed while it waited. The flip is refused either way (writes
+    need the membership); the plain read after it is refused for a record this
+    computer never wrote — which used to proceed "as before" — and READS
+    "queued" for one it did: the backend wrote the job's queue position while
+    it waited, and it ran with every write refused.
+
+    ⭐ The owner's job costs no read of who shares this computer: every job
+    passes here, and most are the owner's."""
     from _run_server_closure import run_worker_once
     monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
     lines = _logged(monkeypatch)
+    db = _Fs(records={(uid, LEFTOVER): record}, device=device)
     started = run_worker_once(monkeypatch, tmp_path, _job(uid, LEFTOVER), flip="error",
-                              db=_Fs(records={(uid, LEFTOVER): DENIED}, device=device),
-                              update_research=lambda *a, **k: True, device_id=DEVICE)
+                              db=db, update_research=lambda *a, **k: True,
+                              device_id=DEVICE)
 
+    if uid == OWNER:
+        assert db.device_reads() == [], "the owner's own job read who shares this computer"
     if taken:
         assert len(started) == 1, f"a job the rules may still let run was refused: {lines}"
         return
     assert started == [], f"a job of an account that left was run: {lines}"
     assert len(_said(lines, LEFTOVER, NOT_OPENABLE)) == 1, lines
+    assert not _said(lines, LEFTOVER, "Proceeding"), lines
+
+
+# ══ 7. the other pickups, against a record this computer wrote ═══════════════
+#
+# The idle rescan claims the start documents the listener left, and the boot
+# restore re-offers the crash snapshot. Both read the job's record through the
+# same pickup rule as the listener, so both met the readable record of section 6.
+
+def _idle_rescan(monkeypatch, tmp_path, fs):
+    """Run the real idle rescan — the second claim site — once. Returns the jobs
+    it queued, the research writes it made, and its log."""
+    from _run_server_closure import lift
+    lines = _machine(monkeypatch, tmp_path, fs)
+    jobs = _Q()
+    writes: list = []
+    monkeypatch.setattr(research, "load_worker_count", lambda: 2)
+    monkeypatch.setitem(research._REST_DEFER_SEEN, "v", False)
+    monkeypatch.setattr(research, "_exit_scheduled", False)
+    monkeypatch.setitem(research._QUEUE_STATE, "running", False)
+    monkeypatch.setitem(research._QUEUE_STATE, "recompute_deferred_fn", None)
+    monkeypatch.setattr(research, "_job_queue", jobs, raising=False)
+    monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: False)
+    monkeypatch.setattr(research, "_try_claim_queue_doc", lambda *a, **k: True)
+    monkeypatch.setattr(research, "_update_research_doc",
+                        lambda u, r, p: writes.append((u, r)) or True)
+    asyncio.run(lift("_rescan_queue_for_unclaimed")())
+    return _rids(jobs._queue), writes, lines
+
+
+@pytest.mark.parametrize("uid, device, taken", PICKUP_CASES, ids=PICKUP_IDS)
+def test_the_idle_rescan_does_not_claim_a_start_doc_of_an_account_that_left(
+        monkeypatch, tmp_path, uid, device, taken):
+    """⛔ THE SECOND CLAIM SITE. A start document the listener did not take — every
+    worker was busy — waits in the queue while the backend writes its queue
+    position to the record; the owner removes its account; a worker goes idle
+    and the rescan claims it. Its record reads "queued"."""
+    fs = _Fs(records={(uid, LEFTOVER): STAMPED}, device=device, queue_docs={"q1": {
+        "action": "start", "uid": uid, "submittedBy": uid, "researchId": LEFTOVER,
+        "topic": "St Bernard", "timestamp": int(time.time() * 1000) - 1000}})
+    queued, writes, lines = _idle_rescan(monkeypatch, tmp_path, fs)
+
+    if taken:
+        assert queued == [LEFTOVER], f"a job the rules may still let run was refused: {lines}"
+        return
+    assert queued == [], f"a start doc of an account that left was claimed to run: {lines}"
+    assert writes == [], "a record this computer may no longer write was written to"
+    assert fs.queue_deleted == ["q1"], "its start doc was left to be claimed again"
+    assert len(_said(lines, LEFTOVER, NOT_OPENABLE)) == 1, lines
+
+
+def test_a_blip_on_who_shares_at_boot_is_asked_again_before_a_record_this_computer_wrote_is_believed(
+        monkeypatch, tmp_path):
+    """⛔⛔ THE BOOT RESTORE, WHEN ITS OWNER CHECK HAS NO ANSWER. The device read
+    blips once at boot, so the owner check cannot drop the former sharer's
+    entry, and its record — written here while it waited — reads "queued": the
+    restore put it back. Asked again when the record is read, the device
+    document answers, and the entry goes. The current sharer's job beside it is
+    restored."""
+    gone, bobs = "chat_1759000000000_v", "chat_1759000000000_w"
+    fs = _Fs(records={(FORMER, gone): STAMPED, (SHARER, bobs): QUEUED},
+             device=[DEVICE_UNREADABLE, SHARED])
+    lines = _machine(monkeypatch, tmp_path, fs)
+    path = _snapshot(tmp_path, [_job(FORMER, gone, topic="Gone"), _job(SHARER, bobs)])
+
+    assert _boot(path, _Q()) == [bobs], f"a job of an account that left was restored: {lines}"
+    assert _in_file(path) == [bobs], "the former sharer's entry stays to come back"
+    assert len(_said(lines, gone, NOT_OPENABLE)) == 1, lines

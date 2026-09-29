@@ -16967,7 +16967,8 @@ def _pickup_withdrawn(uid, research_id, where: str, *,
     down, the record).
 
     The reason is "deleted" (the read succeeded and there is no record),
-    "archived", or — for a caller that asks, below — "denied", and None means
+    "archived", or "denied" (the job's account is not this computer's, below),
+    and None means
     take the job. The record is the document's data
     when it could be read and exists, else None — so a caller that needs the
     status for its own checks does not read it twice.
@@ -16989,25 +16990,33 @@ def _pickup_withdrawn(uid, research_id, where: str, *,
     rule written per path is a rule one path forgets, and a Resume that named
     its run was that path: it never read the record at all.
 
-    ⛔⛔ EXCEPT A REFUSAL FOR AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — on
-    every pickup (2026-09-28, widened on the 09-29 verify). The rules let this
-    computer read the record of every account it runs for, so a 403 for an
-    account the device document positively does not list is the rules saying it
-    is not one of them any more. The boot restore took an eight-day-old job of
-    such an account and ran it with every write refused, on the owner's ChatGPT
-    and key, for nobody — and the start listener did the same with a start
-    document a removed sharer left in the queue while the computer was off (the
-    unshare route leaves those behind), because "every pickup holds a job a
-    member sent moments ago" is not true of a document found at serve start.
-    Such a refusal answers "denied", and the one line that says why is written
-    here. A member's 403, and one whose membership cannot be read, is still
-    taken: that is the fresh-document race the rules file documents.
+    ⛔⛔ EXCEPT A JOB OF AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — on every
+    pickup, asked BEFORE the record is read (2026-09-28; widened on the 09-29
+    verify; moved ahead of the read on its re-verify). The boot restore took an
+    eight-day-old job of such an account and ran it with every write refused,
+    on the owner's ChatGPT and key, for nobody — and the start listener did the
+    same with a start document a removed sharer left in the queue while the
+    computer was off (the unshare route leaves those behind), because "every
+    pickup holds a job a member sent moments ago" is not true of a document
+    found at serve start. Such a job answers "denied", and the one line that
+    says why is written here.
+    ⛔⛔ WHETHER THE READ IS REFUSED CANNOT BE WHAT DECIDES. The rules refuse a
+    removed account's record only when this computer never wrote to it; one it
+    did write carries its deviceId, and the rules let the stamping device read
+    it with no membership check. The repair before this asked "who shares this
+    computer" on a 403 only, so a job that had waited here long enough to be
+    given a queue position — and every Resume, whose run already ran here —
+    read "queued" and was taken. The device document is the evidence, read or
+    refused. A member's 403, and a job whose membership cannot be read, is
+    still taken: that is the fresh-document race the rules file documents.
     ⭐ `denied_is_answer`, which only the boot restore passes, makes EVERY 403
-    the answer: its copy can be days old, and it has asked who the members are
-    before it reads."""
+    the answer: its copy can be days old, and nobody sent it just now."""
     rid = str(research_id or "").strip()
     if not (_firebase_db and uid and rid):
         return None, None
+    if _known_not_a_member(uid):
+        _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)
+        return "denied", None
     try:
         snap = (_firebase_db.collection("users").document(uid)
                 .collection("researches").document(rid).get())
@@ -17016,7 +17025,7 @@ def _pickup_withdrawn(uid, research_id, where: str, *,
         exists = bool(snap.exists)
         record = (snap.to_dict() or {}) if exists else None
     except Exception as err:
-        if _is_denied_read(err) and (denied_is_answer or _known_not_a_member(uid)):
+        if _is_denied_read(err) and denied_is_answer:
             _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)
             return "denied", None
         with _machine_log_scope():
@@ -17727,10 +17736,17 @@ def _device_members() -> "set[str] | None":
     that cannot be told: not paired, no Firestore, a read that failed, or no
     document to read.
 
-    ⭐ NONE IS "DON'T KNOW", NEVER "NOBODY". The boot restore drops a job only
-    on positive evidence that its owner is not a member; a device read that
-    blipped leaves the decision to the record read, which is refused for a job
-    whose owner really is gone."""
+    ⭐ NONE IS "DON'T KNOW", NEVER "NOBODY". A pickup drops a job only on
+    positive evidence that its owner is not a member, and a device read that
+    blipped is no evidence.
+
+    ⛔⛔ AND THE RECORD READ CANNOT STAND IN FOR IT (09-29 re-verify, measured on
+    the Firestore emulator with the real rules). A gone account's record stays
+    READABLE while it carries this computer's deviceId, and every backend write
+    stamps one — a queue position while the job waited, a run that already ran
+    here. Only a record this computer never wrote is refused. So a blip here is
+    not settled by the record read: the pickup rule asks this again at every
+    pickup, and the dequeue asks it before any job runs."""
     paired = str(load_paired_uid() or "").strip()
     device_id = str(load_device_id() or "").strip()
     if not (paired and device_id and _firebase_db is not None):
@@ -17757,11 +17773,18 @@ def _device_members() -> "set[str] | None":
 def _known_not_a_member(uid) -> bool:
     """True only on POSITIVE evidence that `uid` is none of this computer's
     accounts: the device document was read, and names it neither as the owner
-    nor among those the computer is shared with. Asked by a pickup whose read
-    of the job's record was refused — see `_pickup_withdrawn`. "Can't tell" is
-    False, so the job is taken, as it always was."""
+    nor among those the computer is shared with. Asked by every pickup before
+    it reads the job's record, and by the dequeue before any job runs — see
+    `_pickup_withdrawn`. "Can't tell" is False, so the job is taken, as it
+    always was.
+
+    ⭐ THE PAIRED ACCOUNT IS ONE WITHOUT ASKING. Every job passes here and most
+    are the owner's; they cost no read of the device document."""
+    uid = str(uid or "").strip()
+    if uid == str(load_paired_uid() or "").strip():
+        return False
     members = _device_members()
-    return members is not None and str(uid or "").strip() not in members
+    return members is not None and uid not in members
 
 
 def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int, int]":
@@ -17802,7 +17825,10 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     things now drop an entry, each on positive evidence and each with one line:
       · it has waited longer than `_STALE_RUN_S`, the startup sweep's horizon;
       · its owner is neither this computer's account nor one it is shared with
-        (`_device_members`) — asked before any read of the record;
+        (`_device_members`) — asked before any read of the record, here for
+        every owner the entry names and again by the pickup rule for its uid,
+        so a device read that blips once is not the last word: the record of
+        a removed account this computer ever wrote to still reads "queued";
       · the rules refused this computer its record (`denied_is_answer`).
     A read that FAILED — a timeout, a dropped connection, a 5xx — is still not
     an answer: the pickup rule takes the job and the funnel holds it, as
@@ -17875,8 +17901,10 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
             skipped += 1
             withdrew = True
             continue
-        # ⛔⛔ NOT ONE OF THIS COMPUTER'S ACCOUNTS — before any read. The device
-        # document is read once, and only for a job somebody else queued.
+        # ⛔⛔ NOT ONE OF THIS COMPUTER'S ACCOUNTS — before any read, for every
+        # owner the entry names. The device document is read here once, and
+        # only for a job somebody else queued; the pickup rule below asks
+        # again for the entry's uid.
         foreign = {u for u in _job_owner_uids(j) if u != paired} if paired else set()
         if foreign:
             if not members_read:
@@ -78691,9 +78719,22 @@ async def run_server(port=8000):
             # current_job param a Phoenix restart would lose this in-flight
             # research.
             _persist_pending_queue(current_job=job)
+            # ⛔⛔ AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — asked before the
+            # flip, of every job (09-29 re-verify). The owner removed it while
+            # its job waited here. Its record still READS "queued": the backend
+            # wrote its queue position meanwhile, and the rules let the device
+            # that stamped a record read it with no membership check. Asked
+            # only when the read after a refused flip was refused too, the job
+            # ran with every write refused, on the owner's ChatGPT and key. See
+            # `_pickup_withdrawn`, whose answer this is.
+            _account_gone = _known_not_a_member(job.get("uid"))
+            if _account_gone:
+                _log_pickup_not_run("dequeue", job.get("research_id"),
+                                    _RESTORE_NOT_OPENABLE)
             # Flip this run's research doc from queued → ongoing. No-op for
             # the very first start in an idle backend (already ongoing).
-            flip_outcome = _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
+            flip_outcome = (None if _account_gone else
+                            _flip_queued_to_ongoing(job.get("uid"), job.get("research_id")))
             # Q8 (2026-04-30): bail ONLY when the flip is skipped AND the
             # actual current status is a terminal/recovery state (cancelled
             # mid-run, paused after BE restart, watchdog-stopped, user-
@@ -78724,7 +78765,7 @@ async def run_server(port=8000):
                 # cannot drift apart.
                 _PICKUP_WITHDRAWN_STATUS,
             }
-            should_run = True
+            should_run = not _account_gone
             # ⚠ 2026-08-06 — "COULD NOT EVALUATE" IS NOT "PROCEED". The flip has
             # failed on every run in this corpus (20 occurrences, zero successes),
             # and it returned None, which fell straight through to should_run=True
@@ -78752,19 +78793,12 @@ async def run_server(port=8000):
                         log("[flip] the transaction was refused and the doc could "
                             "not be read either — proceeding, as before", "WARN")
                 except Exception as _fe:
-                    # ⛔⛔ UNLESS THE RULES REFUSED IT FOR AN ACCOUNT THIS
-                    # COMPUTER NO LONGER RUNS FOR (09-29 verify) — removed while
-                    # its job waited here. Run anyway, it went ahead with every
-                    # write refused, on the owner's ChatGPT and key; see
-                    # `_pickup_withdrawn`, whose answer this is.
-                    if _is_denied_read(_fe) and _known_not_a_member(job.get("uid")):
-                        should_run = False
-                        _log_pickup_not_run("dequeue", job.get("research_id"),
-                                            _RESTORE_NOT_OPENABLE)
-                    else:
-                        log(f"[flip] the transaction was refused and the fallback "
-                            f"read also failed ({type(_fe).__name__}) — "
-                            f"proceeding, as before", "WARN")
+                    # A member's job, or one whose membership could not be
+                    # read: an account this computer no longer runs for was
+                    # stood down before the flip, whatever this read says.
+                    log(f"[flip] the transaction was refused and the fallback "
+                        f"read also failed ({type(_fe).__name__}) — "
+                        f"proceeding, as before", "WARN")
             # ⛔⛔ THE LAST PICKUP EVERY JOB PASSES (wave 10.10). "missing" was
             # a WARN and a run: a Resume taken before its research was deleted
             # reached this point, found no record, and ran and emailed anyway.
