@@ -474,6 +474,28 @@ def test_live_the_census_sees_the_user_message(chrome, page, logs, layout):
     assert res.get("structRan") is True, res
 
 
+@pytest.mark.parametrize("reply_text", ["not yet drawn", "drawn"])
+def test_live_the_activity_walker_reads_the_new_pages_assistant_unit(chrome, page, reply_text):
+    """⛔ The new page has no <article>, and its one turn also holds the user's
+    bubble, so the walker had no turn to read before the reply text mounted
+    (the "chips 0->0" shape) and read only the text's `div.group` after it.
+    The status row sits in the assistant unit beside the text, never inside
+    it. ⚠ Where ChatGPT draws that row is not captured — this is the unit."""
+    _load(chrome, page, "new", thread=True)
+    chrome.run(page.evaluate("""(drop) => {
+        const unit = [...document.querySelectorAll(
+            '[data-chatgpt-search-unit-key$=":assistant"]')].pop();
+        if (drop) unit.querySelector('[data-markdown-text-style]').parentElement.remove();
+        const row = document.createElement('div');
+        row.innerHTML = '<span>Searched 8 websites</span>';
+        unit.insertBefore(row, unit.querySelector('h4').nextSibling);
+    }""", reply_text == "not yet drawn"))
+    inline = chrome.run(page.evaluate(research._CHATGPT_INLINE_ACTIVITY_JS))
+    assert inline is not None, "no turn picked on the new page"
+    assert inline["dbg"]["scope"].startswith("assistant-unit"), inline["dbg"]
+    assert "Searched 8 websites" in (inline["status_line"] + inline["progress"]), inline
+
+
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_live_the_scraper_reads_the_reply_its_links_and_headings(chrome, page, logs, layout):
     _load(chrome, page, layout, thread=True)
@@ -518,6 +540,23 @@ def test_live_a_password_box_beside_the_composer_is_not_a_lost_session(chrome, p
         d.innerHTML = '<p>Enter your password to unlock connectors</p><input type="password">';
         document.body.appendChild(d);
     }"""))
+    expired, why = chrome.run(research.detect_session_expiry(page, "chatgpt", "ChatGPT"))
+    assert expired is False, why
+
+
+@pytest.mark.parametrize("platform,editor", [
+    ("gemini", '<div contenteditable="true" data-placeholder="Enter a prompt here"></div>'),
+    ("claude", '<div class="ProseMirror" contenteditable="true" role="textbox"></div>'),
+])
+def test_live_chatgpts_markers_do_not_hide_a_sign_in_on_other_platforms(chrome, page, platform, editor):
+    """ChatGPT's composer list names a generic editor and a plain "Send"; on
+    Claude or Gemini a sign-in dialog over a still-drawn chat is still a lost
+    session — and the same page on ChatGPT is not (the control)."""
+    chrome.run(page.set_content(
+        f'<body><main>{editor}<button aria-label="Send">Send</button></main>'
+        '<div><p>Please sign in to continue</p><input type="password"></div></body>'))
+    expired, why = chrome.run(research.detect_session_expiry(page, platform, platform))
+    assert (expired, why) == (True, "login_form_appeared")
     expired, why = chrome.run(research.detect_session_expiry(page, "chatgpt", "ChatGPT"))
     assert expired is False, why
 

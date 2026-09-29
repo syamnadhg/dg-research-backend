@@ -155,10 +155,18 @@ MUTANTS = [
        "    \"chatgpt\": ['[data-message-author-role=\"assistant\"]:last-of-type',\n")]),
     ("R13", RESEARCH, "the session-expiry check is back on the old composer strings — a "
      "password box beside the new composer reads as signed out",
-     [("                '__CG_SEND__, [data-testid=\"send-button\"], button[aria-label*=\"Send prompt\"], ' +\n"
-       "                '__CG_COMPOSER__, ' +\n",
-       "                '[data-testid=\"send-button\"], button[aria-label*=\"Send prompt\"], ' +\n"
-       "                'div[contenteditable=\"true\"]#prompt-textarea, ' +\n")]),
+     [("            composer_sel = f\"{CHATGPT_SEND_SEL}, {CHATGPT_COMPOSER_SEL}, {composer_sel}\"\n",
+       "            composer_sel = composer_sel\n")]),
+    ("R15", RESEARCH, "⛔ ChatGPT's markers join the session check on EVERY platform — a "
+     "Gemini or Claude sign-in over a drawn chat no longer reads as signed out",
+     [("        if platform.lower() == \"chatgpt\":\n"
+       "            composer_sel = f\"{CHATGPT_SEND_SEL}",
+       "        if True:\n"
+       "            composer_sel = f\"{CHATGPT_SEND_SEL}")]),
+    ("R16", RESEARCH, "⛔ the activity walker loses the new page's assistant unit — "
+     "no turn before the reply text mounts, only the text's div after",
+     [("        if (units.length) { turn = units[units.length - 1]; scope = 'assistant-unit'; }",
+       "        if (false) { turn = units[units.length - 1]; scope = 'assistant-unit'; }")]),
     ("R14", RESEARCH, "the snapshot's in-turn test is back on the old turn marker",
      [("            try {\n                inTurn = !!el.closest('__CG_TURN__, '",
        "            try {\n                inTurn = !!el.closest('[data-testid^=\"conversation-turn\"], '")]),

@@ -33106,6 +33106,18 @@ _CHATGPT_INLINE_ACTIVITY_JS = _cg_js("""() => {
     const arts = main.querySelectorAll('article');
     let turn = arts.length ? arts[arts.length - 1] : null;
     let scope = turn ? 'article' : '';
+    // ⭐ 2026-09-29 — THE NEW PAGE'S ASSISTANT UNIT. The new page has no
+    // <article>, its reply marker is the reply's TEXT (whose parent is a
+    // `div.group` that leaves out the rest of the reply), and its ONE
+    // `[data-turn-key]` holds the user's bubble too, so the turn arm below
+    // skips it. Before the reply text mounts, that left this walker NULL (the
+    // 08-20 "chips 0->0" shape). The unit is the reply's own container in the
+    // owner's capture. ⚠ UNKNOWN: whether the unit is drawn before any reply
+    // text — no capture of the thinking phase exists.
+    if (!turn) {
+        const units = main.querySelectorAll('[data-chatgpt-search-unit-key$=":assistant"]');
+        if (units.length) { turn = units[units.length - 1]; scope = 'assistant-unit'; }
+    }
     if (!turn) {
         const asst = main.querySelectorAll('__CG_ASSISTANT__');
         turn = asst.length ? (asst[asst.length - 1].parentElement
@@ -61090,25 +61102,30 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
         if any(m in url for m in markers):
             return True, "redirect_to_login_url"
 
-        # DOM markers: visible password field + no active chat UI
-        result = await page.evaluate(_cg_js("""() => {
+        # DOM markers: visible password field + no active chat UI.
+        # ⛔ ChatGPT's own markers join ONLY on ChatGPT: its composer list names
+        # a generic `div[contenteditable][data-placeholder]` (Gemini's editor)
+        # and `button[aria-label="Send"]`, so on Claude or Gemini they would
+        # hide a real sign-in dialog behind a composer that is still drawn.
+        composer_sel = ('[data-testid="send-button"], button[aria-label*="Send prompt"], '
+                        'div[contenteditable="true"]#prompt-textarea, '
+                        'textarea[placeholder*="Message"], [data-test-id="send-button"]')
+        if platform.lower() == "chatgpt":
+            composer_sel = f"{CHATGPT_SEND_SEL}, {CHATGPT_COMPOSER_SEL}, {composer_sel}"
+        result = await page.evaluate("""(composerSel) => {
             const pwInput = document.querySelector('input[type="password"]:not([style*="display: none"])');
             if (!pwInput) return { expired: false };
             // Heuristic: if there's a visible password input AND no chat composer/send button,
             // we're on a login page. Use offsetParent check to filter hidden elements.
             if (pwInput.offsetParent === null) return { expired: false };
-            const hasComposer = document.querySelector(
-                '__CG_SEND__, [data-testid="send-button"], button[aria-label*="Send prompt"], ' +
-                '__CG_COMPOSER__, ' +
-                'textarea[placeholder*="Message"], [data-test-id="send-button"]'
-            );
+            const hasComposer = document.querySelector(composerSel);
             if (hasComposer) return { expired: false };
             const text = (document.body.innerText || '').toLowerCase();
             const loginPhrases = ['sign in to', 'log in to', 'please sign in',
                 'welcome back', 'enter your password', 'email address'];
             const hasLoginText = loginPhrases.some(p => text.includes(p));
             return { expired: hasLoginText };
-        }"""))
+        }""", composer_sel)
         if isinstance(result, dict) and result.get("expired"):
             return True, "login_form_appeared"
         return False, ""
