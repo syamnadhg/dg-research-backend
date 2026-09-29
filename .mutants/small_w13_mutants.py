@@ -13,6 +13,11 @@
        it saw becomes "Claude's usage limit is reached — it resets <when>";
        the fresh-tab second try is not made. Driven through the real
        run_phase2 launch against a local page in headless Chrome.
+  T* — ChatGPT's new page: the step list under "Thinking ▾" is open, and
+       Phase 1 leaves it alone. `_CHATGPT_STEP_LIST_JS` sees a line holding its
+       label twice with a shown list after it; the P1 open check accepts it;
+       the vision step's mission names the list and looks for it first. Driven
+       by the real state read and the real run_phase1 on the rebuilt page.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 the real agent_loop, Browser.screenshot and execute_action; the real run_phase2
@@ -36,11 +41,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 RESEARCH = "research.py"
 
-TESTS = ["tests/test_cua_empty_screenshot_0929.py", "tests/test_claude_usage_limit_0916.py"]
+TESTS = ["tests/test_cua_empty_screenshot_0929.py", "tests/test_claude_usage_limit_0916.py",
+         "tests/test_chatgpt_thinking_list_0929.py"]
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 _IMG_OLD = ('{"type": "image", "source": {"type": "base64", "media_type": "image/png", '
             '"data": await _anchored_screenshot()}}')
+
+#: The P1 vision mission, as this wave writes it and as it was before.
+NEW_MISSION = '                                    "Open the research activity for the latest response in "\n                                    "this ChatGPT Pro/Thinking conversation. The target is "\n                                    "the line directly below the last sent message — on "\n                                    "the newer page a line such as \'Thinking ▾\' or "\n                                    "\'Searching the web ▾\', otherwise a shimmering status "\n                                    "line; whatever its wording, that line is the target. "\n                                    "ONE click only — it is a toggle. LOOK FIRST: if a "\n                                    "list of the model\'s steps (short lines such as "\n                                    "\'Searched 48 websites\' or \'Validated financial "\n                                    "claims\') is ALREADY showing directly under that line, "\n                                    "or a row of small website chips (favicon + domain), "\n                                    "it is already open — do not click at all. Otherwise "\n                                    "click the line once; expected result: that list of "\n                                    "steps appears directly under it (on the older page, a "\n                                    "row of website chips). A right-side panel is a valid "\n                                    "outcome too but is not what this mode does any more. "\n                                    "Never click \'Answer now\', the X, a step or a chip.",'
+OLD_MISSION = '                                    "Open the research activity for the latest response in "\n                                    "this ChatGPT Pro/Thinking conversation: click the "\n                                    "shimmering status line directly below the last sent "\n                                    "message — whatever its wording, the shimmer is the "\n                                    "target. ONE click only — it is a toggle. Expected "\n                                    "result: a row of small website chips (favicon + "\n                                    "domain, e.g. a few site names side by side, possibly "\n                                    "ending in an \'N more\' chip) appears INLINE directly "\n                                    "under that line. If those chips are ALREADY showing, "\n                                    "it is already open — do not click at all. A right-"\n                                    "side panel is a valid outcome too but is not what "\n                                    "this mode does any more. Never click \'Answer now\', "\n                                    "the X, or a chip.",'
 
 MUTANTS = [
     # ═══ E — never an empty picture ═════════════════════════════════════════
@@ -145,6 +155,54 @@ MUTANTS = [
     ("U16", RESEARCH, "the page is read again after the limit was noted — the same line "
      "every three seconds",
      [("    if note or page is None:\n        return\n", "    if page is None:\n        return\n")]),
+
+    # ═══ T — the new page's step list is open ═══════════════════════════════
+    ("T1", RESEARCH, "⛔⛔ Phase 1's open check ignores the list — it presses the line "
+     "every 30 s (the 09-29 defect)",
+     [('                or st.get("inline_chip_row") or st.get("inline_step_list"))',
+       '                or st.get("inline_chip_row"))')]),
+    ("T2", RESEARCH, "⛔⛔ the state read never records the list",
+     [('        if isinstance(sl, dict) and sl.get("open"):\n',
+       '        if False:\n')]),
+    ("T3", RESEARCH, "⛔ any element with words is the line — a folded list's block, "
+     "or the old page's single line, reads as open",
+     [("        if (texts.length !== 2 || texts[0] !== texts[1]) continue;\n",
+       "        if (!texts.length) continue;\n")]),
+    ("T4", RESEARCH, "⛔ two DIFFERENT texts count as the doubled label — a folded "
+     "block (line + hidden list) reads as open",
+     [("        if (texts.length !== 2 || texts[0] !== texts[1]) continue;\n",
+       "        if (texts.length !== 2) continue;\n")]),
+    ("T5", RESEARCH, "the reply's own text can be the line",
+     [("        if (h.closest('__CG_REPLY_TEXT__')) continue;\n", "")]),
+    ("T6", RESEARCH, "the person's message can be the line",
+     [("        if (h.closest('__CG_USER__')) continue;\n", "")]),
+    ("T7", RESEARCH, "the message box can be the line",
+     [("        if (h.closest('form, __CG_COMPOSER__')) continue;\n", "")]),
+    ("T8", RESEARCH, "an icon between the line and the list is taken for the list — "
+     "open reads as closed",
+     [("        while (list && !(list.textContent || '').trim()) list = list.nextElementSibling;\n",
+       "")]),
+    ("T9", RESEARCH, "⛔⛔ a folded (hidden) list reads as open — Phase 1 never opens it",
+     [("        if (!list || !shown(list)) continue;\n", "        if (!list) continue;\n")]),
+    ("T10", RESEARCH, "a list folded by hiding its words reads as open",
+     [("        if (!steps.length) continue;\n", "")]),
+    ("T11", RESEARCH, "OVER-REACH: what comes after the BLOCK is read as the list — "
+     "the reply under a folded line reads as open",
+     [("        let list = h.nextElementSibling;\n",
+       "        let list = h.parentElement && h.parentElement.nextElementSibling;\n")]),
+    ("T12", RESEARCH, "the log names no shape for the list",
+     [('    if st.get("inline_step_list"):\n        return "steps"\n', "")]),
+    ("T13", RESEARCH, "the log does not say how much of the list shows",
+     [("""                                + (f", {_st_pre.get('inline_step_rows', 0)} step lines showing\"\n""",
+       """                                + (f", step lines showing\"\n""")]),
+    ("T14", RESEARCH, "the count of step lines is wrong",
+     [("        out.rows = steps.length;\n", "        out.rows = 1;\n")]),
+    ("T15", RESEARCH, "⛔⛔ the vision step's mission promises website chips again — "
+     "it presses the open list shut (10:10:18)",
+     [(NEW_MISSION, OLD_MISSION)]),
+    ("T16", RESEARCH, "the mission no longer names the list of steps",
+     [("\"list of the model's steps (short lines such as \"",
+       "\"row of website chips (such as \"")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

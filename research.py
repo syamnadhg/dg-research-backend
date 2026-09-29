@@ -33891,6 +33891,74 @@ _CHATGPT_SIDE_PANEL_JS = _cg_js("""() => {
 }""")
 
 
+# ⛔⛔ 2026-09-29 — THE NEW PAGE'S STEP LIST, OPEN, READ AS CLOSED. While ChatGPT
+# thinks, the new page shows a "Thinking ▾" line with the model's steps listed
+# under it ("Validated financial claims", "Searched 69 websites", ...), and the
+# list is ALREADY OPEN. Nothing here could see it: no side panel, no region
+# named "thought"/"activity", no hostname chips. So Phase 1 read it as closed
+# and pressed the line every ~30 s — a toggle — folding the list shut and open
+# again in the person's tab, and paid the vision step up to three times a brief
+# to open a list that was open. The vision step saw it happen (10:10:18):
+# "clicking on "Thinking ▾" collapsed the activity list (it was previously
+# expanded showing the steps) … I accidentally closed what was already open."
+#
+# Measured, from that day's own panel-miss snapshot rows (0.1.13's census of the
+# live page; first class token in brackets):
+#   * the line: SPAN[inline-flex] whose text is the label TWICE ("Thinking\n
+#     Thinking" — one copy is a SPAN[cadencedShimmerSweep-…]), in every capture
+#     whatever the label said ("Searching the web", "Extracting Credit Map …");
+#   * the list directly under it: DIV[-ms-2], its rows DIV[MarkdownRoot-…] or
+#     DIV[min-w-0], one step per row; their container's text is the line and
+#     then the list ("Thinking\nThinking\n\nCrafted a refined research brief…");
+#   * finished, the line reads "Worked for 7m 23s", once, and the list is gone.
+# The line is the element holding the two copies (the snapshot keeps the
+# OUTERMOST element of a given text, and it kept SPAN[inline-flex], so nothing
+# wraps it), and the list is what comes right after it. So "open" is: a line
+# whose label is drawn twice, followed by a shown element with words in it. The
+# doubled label is what keeps this off the OLD page, whose status line is drawn
+# once. Its own probe, not a field of `_CHATGPT_INLINE_ACTIVITY_JS`: that
+# walker returns nothing at all when it finds no turn, and whether the reply's
+# unit exists before any reply text is not known (no capture of the thinking
+# phase's markup exists) — the line must be seen either way.
+# ⚠ ASSUMED: that a closed list is hidden or removed (the vision step saw it
+# fold; the markup of the folded state was never captured).
+_CHATGPT_STEP_LIST_JS = _cg_js("""() => {
+    const out = { open: false, rows: 0, label: '' };
+    const main = document.querySelector('main') || document.body;
+    const lines = (n) => (n.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+    const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    let all;
+    try { all = main.querySelectorAll('*'); } catch (e) { return out; }
+    if (all.length > 8000) return out;
+    for (const h of all) {
+        // Cheap first: only a short element can be the line.
+        const tc = h.textContent || '';
+        if (tc.length < 6 || tc.length > 250) continue;
+        // The line: the element holding its label twice — two children with
+        // words, the same words. (Not one that merely CONTAINS the line: with
+        // the list folded, the block's own text is the label twice too.)
+        const texts = [...h.children].map(c => lines(c).join(' ')).filter(Boolean);
+        if (texts.length !== 2 || texts[0] !== texts[1]) continue;
+        // Never the person's message, the message box, or the reply itself.
+        if (h.closest('__CG_REPLY_TEXT__')) continue;
+        if (h.closest('__CG_USER__')) continue;
+        if (h.closest('form, __CG_COMPOSER__')) continue;
+        // What it opens: whatever comes right after the line (past anything
+        // with no text, such as an icon), shown and with words in it.
+        let list = h.nextElementSibling;
+        while (list && !(list.textContent || '').trim()) list = list.nextElementSibling;
+        if (!list || !shown(list)) continue;
+        const steps = lines(list);
+        if (!steps.length) continue;
+        out.open = true;
+        out.rows = steps.length;
+        out.label = texts[0].slice(0, 60);
+        break;
+    }
+    return out;
+}""")
+
+
 async def _chatgpt_activity_state(page):
     """#913: shape-agnostic ChatGPT activity state — what is open RIGHT NOW.
 
@@ -33912,7 +33980,10 @@ async def _chatgpt_activity_state(page):
            # folded into `inline_expanded`. `_chatgpt_p1_activity_open` is the
            # only thing that treats it as open; P2's call sites read it in the
            # log and act on nothing. See `_CHATGPT_INLINE_ACTIVITY_JS`.
-           "inline_chip_row": False, "inline_chips": 0}
+           "inline_chip_row": False, "inline_chips": 0,
+           # 2026-09-29: the new page's step list under "Thinking ▾", open — P1
+           # only, like the chip row. See `_CHATGPT_STEP_LIST_JS`.
+           "inline_step_list": False, "inline_step_rows": 0}
     try:
         _hit = await page.evaluate(_CHATGPT_SIDE_PANEL_JS)
         if _hit:
@@ -33928,6 +33999,13 @@ async def _chatgpt_activity_state(page):
             out["thread_len"] = int(il.get("partial_text_len", 0) or 0)
             out["inline_chips"] = int(il.get("chips", 0) or 0)
             out["inline_chip_row"] = bool(il.get("chip_row"))
+    except Exception:
+        pass
+    try:
+        sl = await page.evaluate(_CHATGPT_STEP_LIST_JS)
+        if isinstance(sl, dict) and sl.get("open"):
+            out["inline_step_list"] = True
+            out["inline_step_rows"] = int(sl.get("rows", 0) or 0)
     except Exception:
         pass
     if not out["side_panel"]:
@@ -33978,10 +34056,14 @@ def _chatgpt_p1_activity_open(st):
     small in-turn node and never click its strip — the 2026-08-06 regression that
     cost a phase its entire narration. So P2 keeps the strict pair, P1 adds the
     chip row, and the chip count travels in the log either way.
+
+    2026-09-29: and the new page's step list under "Thinking ▾", for the same
+    reason — it was open, read as closed, and pressed shut every ~30 s. See
+    `_CHATGPT_STEP_LIST_JS`.
     """
     st = st or {}
     return bool(st.get("side_panel") or st.get("inline_expanded")
-                or st.get("inline_chip_row"))
+                or st.get("inline_chip_row") or st.get("inline_step_list"))
 
 
 def _chatgpt_open_shape(st):
@@ -33998,6 +34080,8 @@ def _chatgpt_open_shape(st):
         return "inline"
     if st.get("inline_chip_row"):
         return "chips"
+    if st.get("inline_step_list"):
+        return "steps"
     return "none"
 
 
@@ -42587,6 +42671,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             log(f"[{label}] activity already open (shape={_shape}"
                                 + (f", {_st_pre.get('inline_chips', 0)} chips"
                                    if _shape == "chips" else "")
+                                + (f", {_st_pre.get('inline_step_rows', 0)} step lines showing"
+                                   if _shape == "steps" else "")
                                 + f") at elapsed={elapsed_sec}s — no click needed")
                             res = None
                         else:
@@ -42690,19 +42776,28 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                     # verifiers disagreed about the same open drawer.
                                     # Telling the model to expect a panel that cannot
                                     # appear is an instruction to keep clicking.
+                                    # ⛔ 2026-09-29 — AND AGAIN FOR THE NEW PAGE. The
+                                    # list under "Thinking ▾" is the model's STEPS, not
+                                    # website chips, and it is usually open already;
+                                    # told to expect chips, the vision step pressed it
+                                    # shut (10:10:18). It now looks for the list first.
                                     "Open the research activity for the latest response in "
-                                    "this ChatGPT Pro/Thinking conversation: click the "
-                                    "shimmering status line directly below the last sent "
-                                    "message — whatever its wording, the shimmer is the "
-                                    "target. ONE click only — it is a toggle. Expected "
-                                    "result: a row of small website chips (favicon + "
-                                    "domain, e.g. a few site names side by side, possibly "
-                                    "ending in an 'N more' chip) appears INLINE directly "
-                                    "under that line. If those chips are ALREADY showing, "
-                                    "it is already open — do not click at all. A right-"
-                                    "side panel is a valid outcome too but is not what "
-                                    "this mode does any more. Never click 'Answer now', "
-                                    "the X, or a chip.",
+                                    "this ChatGPT Pro/Thinking conversation. The target is "
+                                    "the line directly below the last sent message — on "
+                                    "the newer page a line such as 'Thinking ▾' or "
+                                    "'Searching the web ▾', otherwise a shimmering status "
+                                    "line; whatever its wording, that line is the target. "
+                                    "ONE click only — it is a toggle. LOOK FIRST: if a "
+                                    "list of the model's steps (short lines such as "
+                                    "'Searched 48 websites' or 'Validated financial "
+                                    "claims') is ALREADY showing directly under that line, "
+                                    "or a row of small website chips (favicon + domain), "
+                                    "it is already open — do not click at all. Otherwise "
+                                    "click the line once; expected result: that list of "
+                                    "steps appears directly under it (on the older page, a "
+                                    "row of website chips). A right-side panel is a valid "
+                                    "outcome too but is not what this mode does any more. "
+                                    "Never click 'Answer now', the X, a step or a chip.",
                                     model=CUA_MODEL, max_iterations=5,
                                     verbose=verbose, target_page=page),
                                 timeout=120.0)
