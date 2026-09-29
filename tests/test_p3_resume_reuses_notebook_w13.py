@@ -387,7 +387,7 @@ def resumed(tmp_path, monkeypatch):
         await research.run_pipeline(**kw)
     monkeypatch.setattr(research, "run_pipeline_captured", _relaunch)
 
-    def _run(audio):
+    def _run(audio, crash_retries=0):
         if audio is None:
             async def _podcast_step(browser, cua_client, notebook_url, queue_dir, verbose=False,
                                     podcast_length="long", prefer_existing_audio=False):
@@ -407,7 +407,8 @@ def resumed(tmp_path, monkeypatch):
         monkeypatch.setattr(research, "run_phase3_audio", _podcast_step)
         asyncio.run(research.run_pipeline(
             topic="Grid storage", resume_dir=str(queue_dir),
-            uid=None, email=None, api_key="test-key"))
+            uid=None, email=None, api_key="test-key",
+            _crash_retries=crash_retries))
         return seen
 
     return _run, nb, queue_dir, seen
@@ -770,3 +771,84 @@ def test_the_login_command_pauses_the_run_instead_of_relaunching(resumed, monkey
     assert "login_interrupt" in seen["plan"]
     assert "browser_crash" not in seen["plan"]
     assert len(seen["audio"]) == 1 and 300 not in seen["waits"]
+
+
+# ══ 4. …until the relaunches are spent: then the report goes out without it ═
+
+def _recorded_real_plan(seen):
+    def _plan(qd, rd, kind, crash_retries):
+        seen["plan"].append(kind)
+        return _REAL_PLAN(qd, rd, kind, crash_retries)
+    return _plan
+
+
+def _watch_the_hand_off(monkeypatch):
+    """Record the hand-off to the Doc and email step, and every event."""
+    handed_off, events = [], []
+    monkeypatch.setattr(research, "_post_fe_p4p5_trigger",
+                        lambda *a, **k: handed_off.append(a))
+    monkeypatch.setattr(research, "emit_event",
+                        lambda event_type, phase=None, agent=None, **data:
+                        events.append((event_type, phase, data)))
+    return handed_off, events
+
+
+@pytest.mark.parametrize("crash_retries", [
+    0,   # every Chrome launch of this research dies under its download
+    1,   # 09-16: a mid-poll crash had already spent one relaunch
+    2,   # every relaunch already spent: the first death ends the podcast step
+])
+def test_chrome_dying_under_every_download_still_delivers_the_report(
+        resumed, monkeypatch, crash_retries):
+    """⛔⛔ CROSS-VERIFY'S FINDING, EXECUTED. Chrome dies under EVERY download
+    click. Each death relaunches Chrome into the same notebook while the crash
+    budget lasts. Once it is spent the run ends as it did before wave 13 — the
+    report and the notebook link handed off without the podcast — and NOT on
+    "Research stopped: Chrome kept closing" with nothing delivered and
+    delivery.json left "ongoing". It ends there at once, too: no five-minute
+    retries on a browser that is gone."""
+    run, nb, queue_dir, seen = resumed
+    nb.ready = 1
+    nb.downloads = ["chrome died"] * 6
+    handed_off, events = _watch_the_hand_off(monkeypatch)
+    monkeypatch.setattr(research, "_plan_pipeline_auto_retry", _recorded_real_plan(seen))
+    run(None, crash_retries=crash_retries)
+
+    launches = research.BROWSER_CRASH_MAX_RETRIES + 1 - crash_retries
+    assert len(_FakeBrowser.instances) == launches, (
+        "Chrome was not reopened exactly while the relaunches lasted")
+    assert seen["downloads"] == ["chrome died"] * launches
+    assert [a["url"] for a in seen["audio"]] == [NB_URL] * launches
+    assert seen["created"] == 0
+    assert not [c for c in seen["cards"] if str(c).startswith("Research stopped")], (
+        f"the run ended on a crash card with nothing delivered: {seen['cards']}")
+    assert "Couldn't save the audio file" not in seen["cards"]
+    assert handed_off, "the report was never handed off to the Doc and email step"
+    delivery = json.loads((queue_dir / "delivery.json").read_text(encoding="utf-8"))
+    assert delivery["status"] == "completed"
+    skipped = [d for kind, phase, d in events if kind == "phase_skipped" and phase == 3]
+    assert [d["reason"] for d in skipped] == ["audio_unavailable_after_auto_retries"]
+    assert [link["url"] for link in skipped[0]["links"]] == [NB_URL], (
+        "the notebook link did not go out with the report")
+    assert 300 not in seen["waits"], (
+        "the run waited five minutes to retry on a browser that is gone")
+    assert any("not reopened for the podcast" in ln for ln in seen["lines"])
+
+
+def test_the_login_command_still_pauses_the_run_once_the_relaunches_are_spent(
+        resumed, monkeypatch):
+    """The relaunch budget is for Chrome CRASHES. The login command closing
+    Chrome is not one and never relaunched anything: it still pauses the run
+    at its checkpoint, so after the sign-in a Retry comes back for the podcast
+    — the run is not ended without it."""
+    run, _nb, _qd, _seen = resumed
+    handed_off, _events = _watch_the_hand_off(monkeypatch)
+
+    async def _audio(browser, _url, _prefer):
+        browser.die()
+        monkeypatch.setattr(research, "_login_interrupt_active", lambda: True)
+        return {"audio_path": None, "audio_stored_url": ""}
+    seen = run(_audio, crash_retries=research.BROWSER_CRASH_MAX_RETRIES)
+
+    assert "login_interrupt" in seen["plan"]
+    assert not handed_off, "the run was ended without the podcast during a sign-in"

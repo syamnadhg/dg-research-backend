@@ -15,6 +15,11 @@
        no-audio loop both ask the browser first, the loop before it gives up
        too, and a dead one unwinds as a browser crash — or as a login-command
        pause — so the run relaunches Chrome and resumes into the same notebook.
+       The loop is the ONE place that unwinds: the download only hands back no
+       file, and once the Chrome relaunches are spent the loop ends the podcast
+       step at once and the report goes out with the notebook link — never the
+       "Chrome kept closing" card with nothing delivered (cross-verify, 09-29).
+       The login command's close spends none of that budget and still pauses.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 the REAL `run_pipeline` driven from a resume directory into Phase 3, the real
@@ -108,18 +113,25 @@ MUTANTS = [
     # ═══ B — a dead browser is never retried on ═════════════════════════════
     ("B1", RESEARCH, "⛔ a download on a dead browser is reported as a failed download, "
      "with a Retry that cannot work",
-     [("            if await _browser_context_is_dead(browser):\n"
-       "                raise _p3_browser_gone(\"while the podcast was downloading\")\n",
-       "")]),
+     [("                    \"this time\", \"WARN\")\n"
+       "            else:\n"
+       "                fail_phase(3, \"Couldn't save the audio file\",",
+       "                    \"this time\", \"WARN\")\n"
+       "            if True:\n"
+       "                fail_phase(3, \"Couldn't save the audio file\",")]),
     ("B2", RESEARCH, "⛔⛔ the no-audio loop retries on the dead browser — three five-"
      "minute waits, then no podcast",
      [("                if await _browser_context_is_dead(browser):\n"
-       "                    raise _p3_browser_gone(\"before the podcast could be downloaded\")\n",
+       "                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:\n"
+       "                        raise _p3_browser_gone(\"before the podcast could be downloaded\")\n"
+       "                    _p3_chrome_spent = True\n",
        "")]),
     ("B3", RESEARCH, "⛔ the loop asks only before a wait, not before it gives up — "
      "Chrome dying on the last retry ends the run without the podcast",
      [("                if await _browser_context_is_dead(browser):\n"
-       "                    raise _p3_browser_gone(\"before the podcast could be downloaded\")\n",
+       "                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:\n"
+       "                        raise _p3_browser_gone(\"before the podcast could be downloaded\")\n"
+       "                    _p3_chrome_spent = True\n",
        ""),
       ("                _audio_auto_retries += 1\n"
        "                _wait_min = _AUDIO_RETRY_INTERVAL_SEC // 60",
@@ -142,6 +154,36 @@ MUTANTS = [
        "    log(f\"[Phase3] the browser is gone {where}"),
       ("    return RuntimeError(f\"research browser died {where} (browser crash)\")",
        "    return RuntimeError(f\"research browser died {where}\")")]),
+
+    # ═══ C — once the relaunches are spent, the report still goes out ═══════
+    ("C1", RESEARCH, "⛔⛔ the download spends a Chrome relaunch on every death — once "
+     "they run out the run ends on \"Chrome kept closing\" with nothing delivered",
+     [("                log(\"[Phase3] Chrome closed under the podcast download — no file \"\n"
+       "                    \"this time\", \"WARN\")",
+       "                raise _p3_browser_gone(\"while the podcast was downloading\")")]),
+    ("C2", RESEARCH, "⛔⛔ the loop unwinds a dead browser with no relaunch left — the "
+     "crash card, no hand-off, delivery left \"ongoing\"",
+     [("                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:",
+       "                    if True:")]),
+    ("C3", RESEARCH, "⛔ one unwind past the budget: the last death still ends on the "
+     "crash card",
+     [("                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:",
+       "                    if _login_interrupt_active() or _crash_retries <= BROWSER_CRASH_MAX_RETRIES:")]),
+    ("C4", RESEARCH, "a relaunch that was still owed is not made — the podcast given up "
+     "one Chrome too early",
+     [("                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:",
+       "                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES - 1:")]),
+    ("C5", RESEARCH, "⛔ the login command's close is counted as a crash — past the budget "
+     "the run is ended without the podcast while the person signs in",
+     [("                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:",
+       "                    if _crash_retries < BROWSER_CRASH_MAX_RETRIES:")]),
+    ("C6", RESEARCH, "⛔ with the relaunches spent the loop still waits five minutes, three "
+     "times, retrying on a browser that is gone",
+     [("                if _p3_chrome_spent or _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:",
+       "                if _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:")]),
+    ("C7", RESEARCH, "the log says \"after 3 auto-retries\" about retries that never ran",
+     [("                    if _p3_chrome_spent:\n",
+       "                    if False:\n")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

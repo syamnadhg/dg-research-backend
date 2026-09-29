@@ -69082,12 +69082,24 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # ⛔⛔ Wave 13: unless the browser died under the download. That
             # is no failed download — nothing here can download anything
             # until Chrome is relaunched, and the card's Retry would meet the
-            # same dead browser. Unwind the way the poll loop above does.
+            # same dead browser. So no card, and no file.
+            #
+            # ⛔⛔ AND NO UNWIND FROM HERE EITHER. This site used to raise the
+            # crash itself, which spent a Chrome relaunch on every death — and
+            # once the relaunches ran out the run ended on "Chrome kept
+            # closing" with nothing delivered, where before this wave it had
+            # delivered the report and the notebook link without the podcast.
+            # Both callers hand an empty result to run_pipeline's no-audio
+            # loop, which asks the same question first thing and is the ONE
+            # place that decides: relaunch while the crash budget lasts,
+            # otherwise the notebook link only.
             if await _browser_context_is_dead(browser):
-                raise _p3_browser_gone("while the podcast was downloading")
-            fail_phase(3, "Couldn't save the audio file",
-                       "NotebookLM finished the audio but we couldn't download it. Retry to try again, or Skip it.",
-                       agent="notebooklm")
+                log("[Phase3] Chrome closed under the podcast download — no file "
+                    "this time", "WARN")
+            else:
+                fail_phase(3, "Couldn't save the audio file",
+                           "NotebookLM finished the audio but we couldn't download it. Retry to try again, or Skip it.",
+                           agent="notebooklm")
 
     # ── Transcode to a streamable mp3 (2026-07-23) ──
     # NotebookLM's .m4a keeps its moov atom at the end of the file, so a
@@ -76354,15 +76366,34 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # the podcast — which was finished and waiting in the notebook.
                 # A dead browser unwinds instead: relaunch, resume, and the
                 # resume goes back to that notebook and downloads it.
+                #
+                # ⛔⛔ BUT ONLY WHILE A RELAUNCH IS COMING. Chrome is reopened
+                # at most BROWSER_CRASH_MAX_RETRIES times; an unwind past that
+                # ends the run on "Chrome kept closing", with the report never
+                # handed off. Once they are spent, a dead browser ends the
+                # podcast step here instead — at once, since every retry below
+                # would fail on it — and the run delivers the report and the
+                # notebook link without the podcast, as it did before wave 13.
+                # The login command's close is no crash and spends none of the
+                # budget: it still pauses the run, so after the sign-in Retry
+                # comes back for the podcast.
+                _p3_chrome_spent = False
                 if await _browser_context_is_dead(browser):
-                    raise _p3_browser_gone("before the podcast could be downloaded")
-                if _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:
+                    if _login_interrupt_active() or _crash_retries < BROWSER_CRASH_MAX_RETRIES:
+                        raise _p3_browser_gone("before the podcast could be downloaded")
+                    _p3_chrome_spent = True
+                if _p3_chrome_spent or _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:
                     # Exhausted auto-retries → graceful, non-blocking fallback:
                     # continue with notebook-link-only. P5 still delivers the
                     # notebook link + report; P4 (YouTube) cascades off. Inform
                     # the user with a dismissible amber warning (NOT a red error
                     # — the run succeeded apart from the podcast file).
-                    log(f"Phase 3: audio still missing after {_AUDIO_MAX_AUTO_RETRIES} auto-retries — continuing with notebook link only", "WARN")
+                    if _p3_chrome_spent:
+                        log(f"Phase 3: Chrome closed again and has already been reopened "
+                            f"{_crash_retries} times, so it is not reopened for the podcast "
+                            f"— continuing with notebook link only", "WARN")
+                    else:
+                        log(f"Phase 3: audio still missing after {_AUDIO_MAX_AUTO_RETRIES} auto-retries — continuing with notebook link only", "WARN")
                     try:
                         emit_event(
                             "pipeline_warning", phase=3, agent="notebooklm",
