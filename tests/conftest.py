@@ -463,6 +463,36 @@ def _no_boot_entry_is_held_from_another_test(monkeypatch):
 
 
 @pytest.fixture(scope="session")
+def _config_dir(tmp_path_factory):
+    """One scratch directory for the whole session — see the fixture below."""
+    return tmp_path_factory.mktemp("sr-config")
+
+
+@pytest.fixture(autouse=True)
+def _no_test_is_paired_to_the_developers_account(_config_dir, monkeypatch):
+    """⛔⛔ Which account this computer is paired to is read from
+    `research_config.json`, and `RESEARCH_CONFIG_PATH` is baked from the REAL
+    home at import — the fixture above that moves `_STATE_DIR` does not move it.
+    So on a developer's paired machine every test saw that developer's real
+    uid and device id, and on CI none — and the boot restore now drops a job
+    whose owner is not this computer's (2026-09-28), which made its tests'
+    answers depend on whose laptop ran them. Nobody is paired unless a test
+    says so; the module caches are cleared too, since a test that set them
+    would otherwise pair the next one. raising=True, so a rename breaks here.
+
+    ⭐ A FILE NAME OF ITS OWN PER TEST, in one directory for the session: a test
+    that writes the config cannot leave it for the next, and no directory is
+    made per test (the cost `_serve_token_dir` above measured)."""
+    import research
+    monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH",
+                        _config_dir / f"research_config_{os.urandom(8).hex()}.json",
+                        raising=True)
+    monkeypatch.setattr(research, "_device_id", None, raising=True)
+    monkeypatch.setattr(research, "_device_paired_uid", None, raising=True)
+    yield
+
+
+@pytest.fixture(scope="session")
 def _serve_token_dir(tmp_path_factory):
     """One scratch directory for the whole session — see the fixture below."""
     return tmp_path_factory.mktemp("sr-serve-token")

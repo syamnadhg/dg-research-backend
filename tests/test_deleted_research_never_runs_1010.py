@@ -50,7 +50,8 @@ ARCHIVED = {"status": "archived", "statusBeforeArchive": "queued", "topic": TOPI
 
 #: What a Firestore read that fails looks like. The 403 shape is the one the
 #: enqueue funnel already trusts ("the queue write was authenticated FE-side"),
-#: so it lets a taken job be seen all the way into the queue; the transient one
+#: so it lets a taken job be seen all the way into the queue — everywhere but
+#: the boot restore, where a 403 is an answer since 2026-09-28; the transient one
 #: is what the funnel refuses on its own, and is used where that matters.
 DENIED = PermissionError("403 Missing or insufficient permissions")
 TRANSIENT = TimeoutError("DeadlineExceeded")
@@ -460,9 +461,15 @@ def test_boot_restore_takes_an_ordinary_research(monkeypatch, tmp_path):
     assert restored == [RID]
 
 
-def test_boot_restore_takes_an_unreadable_research_the_funnel_trusts(monkeypatch, tmp_path):
-    restored, _kept = _restore(monkeypatch, tmp_path, Store("unreadable", error=DENIED), [_job()])
-    assert restored == [RID]
+def test_boot_restore_drops_a_research_the_rules_refuse_it(monkeypatch, tmp_path):
+    """⛔⛔ REVERSED 2026-09-28, by the owner's decision. This pinned "the funnel
+    trusts a 403, so the boot restore takes it" — and on 09-28 that took an
+    eight-day-old job of an account this computer was no longer shared with and
+    ran it with every write refused. At boot a 403 is an answer: dropped, and
+    its entry goes. `test_stale_or_foreign_restore_0928` holds the rest."""
+    restored, kept = _restore(monkeypatch, tmp_path, Store("unreadable", error=DENIED), [_job()])
+    assert restored == []
+    assert kept == []
 
 
 def test_boot_restore_keeps_an_unreadable_research_the_funnel_refuses(monkeypatch, tmp_path):
