@@ -71,11 +71,28 @@ _HELPER_GUARD = """        log(f"[send-logs] refusing ({error_class}) with NO ro
             f"is known, so the app cannot be told why", "WARN")
         return"""
 
-_HELPER_PARK = """    patch = {"status": "failed", "errorClass": error_class}
-    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,
-                                machine_included=machine_included)
-            and _write_log_bundle_status(owner_uid, code, patch)):
-        _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)"""
+# ⚠ RE-ANCHORED 2026-09-29 (wave 13): the helper now writes through the quiet
+# `_log_bundle_row_write`, parks only a row that failed to reach the account,
+# and its patch carries the row's scope. S9/S11/S12 make the same claims.
+_PATCH = """    patch = {"status": "failed", "errorClass": error_class,
+             "machineIncluded": bool(machine_included)}
+"""
+_OPEN_Q = ("_log_bundle_row_write(owner_uid, code, _log_bundle_open_fields("
+           "device_id, request_id, machine_included), create=True)")
+_HELPER_PARK = _PATCH + """    outcome = _log_bundle_row_write(
+        owner_uid, code, _log_bundle_open_fields(device_id, request_id, machine_included),
+        create=True)
+    if outcome == "ok":
+        outcome = _log_bundle_row_write(owner_uid, code, patch)
+    if outcome == "ok":
+        return
+    if outcome == "denied":
+        log(f"[send-logs] the account refused the {error_class} receipt — not kept "
+            f"for later, because it would only be refused again", "WARN")
+        return
+    log(f"[send-logs] could not write the {error_class} receipt now — kept, to be "
+        f"sent once the account can be reached", "WARN")
+    _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)"""
 
 _READ_FAIL = """        _refuse_log_bundle_with_row(load_paired_uid() or "", code, device_id,
                                     request_id, "DeviceReadFailed")"""
@@ -178,8 +195,7 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      "against a missing document is a silent no-op, so every refusal is "
      "invisible exactly as before — and nothing raises",
      [(_HELPER_PARK,
-       """    patch = {"status": "failed", "errorClass": error_class}
-    if not _write_log_bundle_status(owner_uid, code, patch):
+       _PATCH + """    if _log_bundle_row_write(owner_uid, code, patch) != "ok":
         _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)""")],
      [T_NEW, T_SEND]),
     ("S11", SRC, "under", "⛔⛔ THE DEFECT THE ADVERSARIAL REVIEW FOUND, RESTORED. "
@@ -188,17 +204,15 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      "fails for the same reason. The fix's own headline case then delivers "
      "nothing and the app is back to guessing the software is out of date",
      [(_HELPER_PARK,
-       """    patch = {"status": "failed", "errorClass": error_class}
-    _open_log_bundle_row(owner_uid, code, device_id, request_id)
-    _write_log_bundle_status(owner_uid, code, patch)""")],
+       _PATCH + f"""    if {_OPEN_Q} == "ok":
+        _log_bundle_row_write(owner_uid, code, patch)""")],
      [T_NEW, T_SEND]),
     ("S12", SRC, "over", "every refusal is parked as well as written, so the "
      "reconnect drain replays create-then-patch against a row that is already "
      "failed — refused by the rule, and warning on every tick forever",
      [(_HELPER_PARK,
-       """    patch = {"status": "failed", "errorClass": error_class}
-    _open_log_bundle_row(owner_uid, code, device_id, request_id)
-    _write_log_bundle_status(owner_uid, code, patch)
+       _PATCH + f"""    if {_OPEN_Q} == "ok":
+        _log_bundle_row_write(owner_uid, code, patch)
     _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)""")],
      [T_NEW, T_SEND]),
     # ⛔⛔ S10's FIRST FORM WAS AN EQUIVALENT MUTANT, and it survived by

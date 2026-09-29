@@ -193,10 +193,15 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "refusal row is CREATED at 'failed', which the rule denies — so the app "
      "never sees the refusal and falls through to its two-minute quiet timeout, "
      "telling the user the machine did not answer while it is online and refused",
-     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,\n'
-       '                                machine_included=machine_included)\n'
-       '            and _write_log_bundle_status(owner_uid, code, patch)):',
-       '    if not _write_log_bundle_status(owner_uid, code,\n                                   {**patch, "deviceId": device_id,\n                                    "requestId": request_id}, create=True):')],
+     # ⚠ RE-ANCHORED 2026-09-29 (wave 13): the helper writes through the quiet
+     # `_log_bundle_row_write` now. Same claim: the row is created at 'failed'.
+     [('    outcome = _log_bundle_row_write(\n'
+       '        owner_uid, code, _log_bundle_open_fields(device_id, request_id, machine_included),\n'
+       '        create=True)\n'
+       '    if outcome == "ok":\n'
+       '        outcome = _log_bundle_row_write(owner_uid, code, patch)\n',
+       '    outcome = _log_bundle_row_write(owner_uid, code, {**patch, "deviceId": device_id,\n'
+       '                                    "requestId": request_id}, create=True)\n')],
      [T_SEND]),
     # ⛔ R1c's ORIGINAL FORM WAS RETIRED 2026-08-21, not weakened. It mutated the
     # cooldown branch's own copy of the create-then-patch pair; that pair now has
@@ -208,15 +213,17 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # setting".
     ("R1c", "under", "the refusal row is never OPENED, only patched — so the "
      "update lands on nothing and every refusal is invisible again",
-     [('    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,\n'
-       '                                machine_included=machine_included)\n'
-       '            and _write_log_bundle_status(owner_uid, code, patch)):',
-       '    if not (_write_log_bundle_status(owner_uid, code, patch)\n            and True):')],
+     [('    outcome = _log_bundle_row_write(\n'
+       '        owner_uid, code, _log_bundle_open_fields(device_id, request_id, machine_included),\n'
+       '        create=True)\n'
+       '    if outcome == "ok":\n'
+       '        outcome = _log_bundle_row_write(owner_uid, code, patch)\n',
+       '    outcome = _log_bundle_row_write(owner_uid, code, patch)\n')],
      [T_SEND]),
     ("R1d", "over", "the open is allowed to carry any status, so the one clause "
      "that makes a row mean \"the machine started\" stops holding",
-     [('        {"status": "collecting", "deviceId": device_id, "requestId": request_id,',
-       '        {"status": "done", "deviceId": device_id, "requestId": request_id,')],
+     [('    return {"status": "collecting", "deviceId": device_id, "requestId": request_id,',
+       '    return {"status": "done", "deviceId": device_id, "requestId": request_id,')],
      [T_SEND]),
     ("R2", "under", "the uploading step is never reported, so the app jumps from "
      "collecting to done and a slow upload looks like a hang",
@@ -236,13 +243,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ⚠ RE-ANCHORED 2026-09-21 (wave 10.9): the except block now retries a denied
     # write without the left-out counts first. Same claim on the final give-up.
     ("R5", "over", "a status-write failure aborts an upload that was working",
-     [('        log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "\n            f"continues; the row will look stale", "WARN")\n        return False',
+     [('        return ("denied" if _is_synth_permission_denied(exc, ignore=exc.__context__)\n'
+       '                else "failed")',
        '        raise')],
      [T_SEND]),
     ("R6", "under", "the request nonce is dropped, so the app cannot tell a "
      "stale row from the one it just asked for",
-     [('        {"status": "collecting", "deviceId": device_id, "requestId": request_id,',
-       '        {"status": "collecting", "deviceId": device_id, "requestId": "",')],
+     [('    return {"status": "collecting", "deviceId": device_id, "requestId": request_id,',
+       '    return {"status": "collecting", "deviceId": device_id, "requestId": "",')],
      [T_SEND]),
     ("R7", "under", "an exception in the worker writes no failure at all",
      [('            _write_log_bundle_status(row_uid, code, {\n                "status": "failed", "errorClass": type(exc).__name__,',

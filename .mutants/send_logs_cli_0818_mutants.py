@@ -162,11 +162,17 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_CLI]),
     ("R1c", "under", "the parked replay creates from the patch again, reproducing "
      "the denial it exists to work around",
-     [('        if (_open_log_bundle_row(owner, code, row.get("deviceId") or "")\n                and _write_log_bundle_status(owner, code, row.get("patch") or {})):',
-       '        if _write_log_bundle_status(owner, code, row.get("patch") or {}, create=True):')],
+     # ⚠ RE-ANCHORED 2026-09-29 (wave 13): the replay is `_replay_parked_bundle_row`.
+     [('    opened = _log_bundle_row_write(\n'
+       '        owner, code,\n'
+       '        _log_bundle_open_fields(row.get("deviceId") or "", "",\n'
+       '                                patch.get("machineIncluded") is not False),\n'
+       '        create=True)',
+       '    opened = _log_bundle_row_write(owner, code, patch, create=True)')],
      [T_CLI]),
     ("R2", "under", "nothing ever replays the parked rows",
-     [('                _drain_queued_log_bundle_rows()\n', '')],
+     [('                    await asyncio.to_thread(_drain_queued_log_bundle_rows)\n',
+       '                    pass\n')],
      [T_CLI]),
     ("R3", "under", "the drain deletes rows it could not write, losing them",
      [('        if still_owed:\n            path.write_text("\\n".join(still_owed) + "\\n", encoding="utf-8")\n        else:\n            path.unlink()',
@@ -175,12 +181,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("R4", "under", "⛔⛔ the replay hangs off the outage-cleared EDGE, which never "
      "fires for a terminal --send-logs: that process has no Firestore client to "
      "have been down in the first place",
-     [('                _drain_queued_log_bundle_rows()\n', ''),
+     [('                    await asyncio.to_thread(_drain_queued_log_bundle_rows)\n',
+       '                    pass\n'),
       ('def _clear_firestore_down(', 'def _clear_firestore_down_UNUSED(')],
      [T_CLI]),
     ("R5", "under", "the drain reports success for rows it never wrote",
-     [('        if (_open_log_bundle_row(owner, code, row.get("deviceId") or "")\n                and _write_log_bundle_status(owner, code, row.get("patch") or {})):\n            landed += 1\n        else:\n            still_owed.append(line)',
-       '        _open_log_bundle_row(owner, code, row.get("deviceId") or "")\n        _write_log_bundle_status(owner, code, row.get("patch") or {})\n        landed += 1')],
+     [('        outcome = _replay_parked_bundle_row(row)\n',
+       '        _replay_parked_bundle_row(row)\n        outcome = "ok"\n')],
      [T_CLI]),
 
     # ══ the open route ══════════════════════════════════════════════════

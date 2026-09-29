@@ -81,9 +81,9 @@ CLI_SPREAD = ('                     "sizeBytes": int(summary["sizeBytes"]),\n'
 RETRY_IF = "            if len(bare) == len(body) or not _is_synth_permission_denied(denied):"
 STRIP = "            bare = {k: v for k, v in body.items() if k not in _LOG_BUNDLE_LEFT_OUT_KEYS}"
 KEYS = '_LOG_BUNDLE_LEFT_OUT_KEYS = ("droppedForSize", "runsNotAttributed", "runsOtherMembers")'
-GIVE_UP = ('        log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "\n'
-           '            f"continues; the row will look stale", "WARN")\n'
-           "        return False")
+# ⚠ RE-ANCHORED 2026-09-29 (wave 13): the give-up is the quiet writer's verdict now.
+GIVE_UP = ('        return ("denied" if _is_synth_permission_denied(exc, ignore=exc.__context__)\n'
+           '                else "failed")')
 DONE_APPLIED = ('                    "runsApplied": int(summary["maxRunsApplied"]),\n'
                 "                    # On")
 
