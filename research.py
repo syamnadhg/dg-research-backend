@@ -7201,7 +7201,7 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
             # device-command listener thread, where the token can be stale).
             _grpc_write_with_heal(
                 lambda snap=snap, patch=patch: snap.reference.update(_be_payload(patch)),
-                what=f"sweep:{stopped_by} {snap.id[:8]}")
+                what=f"sweep:{stopped_by} {snap.id[:8]}", uid=paired_uid)
             swept_n += 1
         except Exception as _sw_err:
             swept_fail += 1
@@ -7924,7 +7924,8 @@ def _recompute_deferred_queue_positions_locked() -> None:
         try:
             # #720: heal a stale-token 403 on the renumber; rebuild the batch
             # inside the op so a retry commits a fresh batch, not a consumed one.
-            _grpc_write_with_heal(_commit_chunk, what=f"deferred queue-pos batch [{i}:{i+CHUNK}]")
+            _grpc_write_with_heal(_commit_chunk, what=f"deferred queue-pos batch [{i}:{i+CHUNK}]",
+                                  uid=_batch_heal_uid(chunk))
         except Exception as e:
             log(f"[deferred-recompute] batch commit failed [{i}:{i+CHUNK}]: {e}", "WARN")
 
@@ -8515,14 +8516,64 @@ def _config_device_id_uncached() -> "str | None":
         return None
 
 
-def _grpc_write_with_heal(op, *, what: str):
+def _structural_heal_advice(uid, claims: dict, *, own_pairing: bool) -> str:
+    """What the structural latch tells the reader to do.
+
+    ⛔⛔ RE-PAIRING IS ADVICE ONLY FOR THIS COMPUTER'S OWN TREE. A denied write
+    into ANOTHER account's research — `uid` is not the token's `ownerUid` — is
+    the rules saying that account is not among this computer's (not paired to
+    it, or no longer shared with it). Re-pairing changes nothing there, and on
+    09-28 the line sent the owner to re-pair over a job of an account the
+    computer had stopped being shared with.
+
+    ⭐ THE EXCEPTION IS THIS COMPUTER'S OWN PAIRING BEING AT FAULT —
+    `own_pairing`, whoever's research the write was for: the token's deviceId
+    disagrees with the config, or the token carries none at all. A token with
+    no claim has every user-tree write refused, and boot says "re-pair
+    required" for it; the three refusals in a row can land on a sharer's run,
+    and the line then blamed the sharer's account (09-29 verify)."""
+    owner = str((claims or {}).get("ownerUid") or load_paired_uid() or "")
+    if uid and owner and uid != owner and not own_pairing:
+        return (f"This write was to research owned by another account "
+                f"({str(uid)[:8]}…), not the one this computer is paired to "
+                f"({owner[:8]}…) — the job belongs to another account, and "
+                f"re-pairing will not fix it; only that account being given this "
+                f"computer again would.")
+    return "A force-refresh cannot fix this — re-pair required."
+
+
+def _batch_heal_uid(patches) -> "str | None":
+    """Whose tree a queue-position batch is charged to in the heal's advice:
+    the first account in it that is not this computer's own, else None (the
+    paired owner).
+
+    ⛔ Firestore refuses a WHOLE batch for one record it will not take. A
+    renumber batch updates every waiting job's record, from every account, so
+    one removed sharer's record refuses the owner's updates with it — and with
+    no uid the structural line blamed this computer's pairing and said
+    "re-pair required" (09-29 verify)."""
+    paired = str(load_paired_uid() or "")
+    for uid_v, _rid_v, _patch in patches:
+        if uid_v and str(uid_v) != paired:
+            return str(uid_v)
+    return None
+
+
+def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
     """Run a gRPC user-tree write `op` (a zero-arg callable). On a synth-user
     rules denial, force the credential to re-mint a claim-bearing idToken and
     retry `op` ONCE; re-raise so the caller's existing try/except still logs +
     degrades. Throttled to ≤1 force-refresh per `_GRPC_HEAL_COOLDOWN_S`; latches
     structural after `_GRPC_HEAL_STRUCTURAL_AFTER` unhealed denials. Logs the
     token vs (uncached) config deviceId + the likely denying clause so the true
-    mechanism is diagnosable (#720)."""
+    mechanism is diagnosable (#720).
+
+    ⛔ `uid` IS WHOSE TREE THE WRITE LANDS IN, passed by every write to a
+    research (2026-09-28). The structural line told the owner "re-pair
+    required" for a run of an account this computer was no longer shared with
+    — re-pairing this computer to its own owner changes nothing about another
+    account's research. When `uid` is not the token's owner the line says
+    whose the research is instead; see `_structural_heal_advice`."""
     global _grpc_heal_last_ts, _grpc_heal_consec_fail, _grpc_heal_structural
     try:
         result = op()
@@ -8599,6 +8650,7 @@ def _grpc_write_with_heal(op, *, what: str):
         except Exception as ref_e:
             log(f"[grpc-heal] {what}: force-refresh failed: {ref_e}", "WARN")
         tok_did = before.get("deviceId")
+        own_pairing = not tok_did or bool(cfg_did and tok_did != cfg_did)
         if not tok_did:
             cause = "token MISSING deviceId claim — read-side deviceMemberOf (a refresh CLEARS this)"
         elif cfg_did and tok_did != cfg_did:
@@ -8659,9 +8711,9 @@ def _grpc_write_with_heal(op, *, what: str):
                     _grpc_heal_structural = True
                     log(
                         f"[grpc-heal] STRUCTURAL: {_consec} consecutive "
-                        f"heals failed to clear the synth-user 403 ({cause}). A force-"
-                        f"refresh cannot fix this — re-pair required. Suppressing further "
-                        f"force-refreshes until a write succeeds.",
+                        f"heals failed to clear the synth-user 403 ({cause}). "
+                        f"{_structural_heal_advice(uid, before, own_pairing=own_pairing)} "
+                        f"Suppressing further force-refreshes until a write succeeds.",
                         "ERROR",
                     )
             if not _latched:
@@ -14990,7 +15042,7 @@ def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_u
                     "createdAt": int(time.time() * 1000),
                     **({"audioUrl": audio_url} if audio_url else {}),
                 })),
-            what=f"audio {audio_id}")
+            what=f"audio {audio_id}", uid=_fb_uid)
     except Exception as e:
         log(f"Failed to sync audio to Firestore: {e}", "WARN")
 
@@ -15192,7 +15244,7 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
                     # nothing about a normal research changes.
                     **({"expireAt": _expire_at} if _expire_at else {}),
                 })),
-            what=f"document {doc_type}")
+            what=f"document {doc_type}", uid=_fb_uid)
         if _expire_at:
             # ⛔ SO THE LEASE CAN CARRY THIS REPORT'S FUSE FORWARD TOO — see
             # `_renew_incognito_leases`. Remembered only once it landed, and
@@ -16076,6 +16128,9 @@ def start_firestore_start_listener(job_queue, loop):
                         job_queue.put_nowait({
                             "topic": t, "email": e, "config": c, "run_id": r,
                             "uid": u, "research_id": ri, "resume_dir": rd_path,
+                            # ⛔ ITS OWN CLOCK: the run id and the folder are
+                            # as old as the run — see `_job_age_s`.
+                            "queued_at_ms": int(time.time() * 1000),
                         })
                     except Exception as ex:
                         log(f"Resume: put_nowait failed: {ex}", "WARN")
@@ -16155,9 +16210,11 @@ def start_firestore_start_listener(job_queue, loop):
             # queue doc staleSkipped so it doesn't replay on future
             # listener attaches.
             # ⭐ THE ONE PICKUP RULE (wave 10.10) — deleted or archived stands
-            # down and takes the queue doc with it; an unreadable record is
-            # taken, as this branch always did ("allowing through"). The record
-            # it read is handed on, so the checks below do not read it again.
+            # down and takes the queue doc with it, and so does a refusal for an
+            # account the device document no longer lists (a removed sharer's
+            # leftover doc, 09-29); any other unreadable record is taken, as
+            # this branch always did ("allowing through"). The record it read
+            # is handed on, so the checks below do not read it again.
             _withdrawn, _rd_found = _pickup_withdrawn(uid, research_id, "start")
             if _withdrawn:
                 try:
@@ -16894,12 +16951,43 @@ def _log_pickup_stand_down(where: str, research_id, reason: str) -> None:
             f"standing down, nothing is picked up", "INFO")
 
 
-def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict | None]":
+#: What a pickup says about a job this computer may no longer run for. One
+#: sentence for both ways of knowing it — the job's owner is not among the
+#: computer's accounts, or the rules refused to show the computer its record.
+_RESTORE_NOT_OPENABLE = ("not run: this computer can no longer open that research "
+                         "— it belongs to an account it is not paired to or no "
+                         "longer shared with")
+
+
+def _log_pickup_not_run(where: str, research_id, why: str, level: str = "WARN") -> None:
+    """The line a job the machine drops, rather than stands down, writes: the
+    machine's, and never the topic — for the reasons `_log_pickup_stand_down`
+    gives."""
+    with _machine_log_scope():
+        log(f"[pickup:{where}] {str(research_id or '')[:8]}… {why}", level)
+
+
+def _is_denied_read(err: BaseException) -> bool:
+    """True when a Firestore read was REFUSED by the rules (403), as opposed to
+    one that failed on the way — a timeout, a dropped connection, a 5xx.
+
+    ⭐ The funnel's own test for "denied", moved here unchanged so the boot
+    restore asks the same question the funnel always has."""
+    s = str(err)
+    return (type(err).__name__ == "PermissionDenied" or "403" in s
+            or "PERMISSION_DENIED" in s
+            or "Missing or insufficient permissions" in s)
+
+
+def _pickup_withdrawn(uid, research_id, where: str, *,
+                      denied_is_answer: bool = False) -> "tuple[str | None, dict | None]":
     """Read the research record before a job is taken: (why it must stand
     down, the record).
 
-    The reason is "deleted" (the read succeeded and there is no record) or
-    "archived", and None means take the job. The record is the document's data
+    The reason is "deleted" (the read succeeded and there is no record),
+    "archived", or "denied" (the job's account is not this computer's, below),
+    and None means
+    take the job. The record is the document's data
     when it could be read and exists, else None — so a caller that needs the
     status for its own checks does not read it twice.
 
@@ -16918,10 +17006,35 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
     ⭐ ONE DEFINITION FOR EVERY PICKUP — start, Resume, the idle rescan, the
     dequeue, the boot restore, the rehydrate and the dead-worker reconcile. A
     rule written per path is a rule one path forgets, and a Resume that named
-    its run was that path: it never read the record at all."""
+    its run was that path: it never read the record at all.
+
+    ⛔⛔ EXCEPT A JOB OF AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — on every
+    pickup, asked BEFORE the record is read (2026-09-28; widened on the 09-29
+    verify; moved ahead of the read on its re-verify). The boot restore took an
+    eight-day-old job of such an account and ran it with every write refused,
+    on the owner's ChatGPT and key, for nobody — and the start listener did the
+    same with a start document a removed sharer left in the queue while the
+    computer was off (the unshare route leaves those behind), because "every
+    pickup holds a job a member sent moments ago" is not true of a document
+    found at serve start. Such a job answers "denied", and the one line that
+    says why is written here.
+    ⛔⛔ WHETHER THE READ IS REFUSED CANNOT BE WHAT DECIDES. The rules refuse a
+    removed account's record only when this computer never wrote to it; one it
+    did write carries its deviceId, and the rules let the stamping device read
+    it with no membership check. The repair before this asked "who shares this
+    computer" on a 403 only, so a job that had waited here long enough to be
+    given a queue position — and every Resume, whose run already ran here —
+    read "queued" and was taken. The device document is the evidence, read or
+    refused. A member's 403, and a job whose membership cannot be read, is
+    still taken: that is the fresh-document race the rules file documents.
+    ⭐ `denied_is_answer`, which only the boot restore passes, makes EVERY 403
+    the answer: its copy can be days old, and nobody sent it just now."""
     rid = str(research_id or "").strip()
     if not (_firebase_db and uid and rid):
         return None, None
+    if _known_not_a_member(uid):
+        _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)
+        return "denied", None
     try:
         snap = (_firebase_db.collection("users").document(uid)
                 .collection("researches").document(rid).get())
@@ -16930,6 +17043,9 @@ def _pickup_withdrawn(uid, research_id, where: str) -> "tuple[str | None, dict |
         exists = bool(snap.exists)
         record = (snap.to_dict() or {}) if exists else None
     except Exception as err:
+        if _is_denied_read(err) and denied_is_answer:
+            _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)
+            return "denied", None
         with _machine_log_scope():
             log(f"[pickup:{where}] {rid[:8]}… record unreadable "
                 f"({type(err).__name__}) — taking the job: a read that fails is "
@@ -16949,7 +17065,8 @@ def _safe_enqueue(job_queue, job, source: str,
                   *, take_unreadable: bool = False,
                   hold_unreadable: "list | None" = None,
                   record_seen: "dict | None" = None,
-                  read_options: "dict | None" = None) -> bool:
+                  read_options: "dict | None" = None,
+                  denied: "list | None" = None) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -17014,6 +17131,14 @@ def _safe_enqueue(job_queue, job, source: str,
     ⭐ `read_options`, when given, go to the record read's `get()` — the held
     entry's re-offer bounds its read with them; see `_ask_about_held_entry`.
     Every other caller reads with the client's defaults, as it always has.
+
+    ⛔⛔ `denied`, when given, turns a 403 from "trust the FE" into an ANSWER
+    (2026-09-28): the job is refused, appended here, and never held. Only the
+    boot restore and its re-offer pass it — the two callers acting on a local
+    copy nobody sent just now. The rules let this computer read every record of
+    the accounts it runs for, so a refusal means the job's owner is not one of
+    them any more (see `_pickup_withdrawn`). A caller that gives no list trusts
+    the FE-side queue write, exactly as before.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -17085,12 +17210,11 @@ def _safe_enqueue(job_queue, job, source: str,
             # we're acting on was authenticated FE-side (the FE rule for
             # devices/{id}/queue gates create on submittedBy==auth.uid).
             # Any OTHER exception is the caller's call — see the docstring.
-            err_str = str(e)
-            if (
-                "403" in err_str
-                or "PERMISSION_DENIED" in err_str
-                or "Missing or insufficient permissions" in err_str
-            ):
+            if _is_denied_read(e):
+                if denied is not None:
+                    denied.append(job)
+                    _log_pickup_not_run(source, rid, _RESTORE_NOT_OPENABLE)
+                    return False
                 log(
                     f"[safe_enqueue:{source}] existence check denied (user-mode read "
                     f"rule blocks synth user) — trusting FE-side queue write",
@@ -17286,13 +17410,17 @@ def _ask_about_held_entry(job) -> "tuple[str, dict]":
     executor some seventy other off-loop calls share. One attempt with a
     deadline — `retry=None` and `timeout` — ends the thread with the round, and
     the loop's own bound stays as a backstop for a hang the deadline does not
-    cover."""
+    cover.
+
+    ⛔ A REFUSAL IS AN ANSWER HERE TOO (2026-09-28) — "no", so the entry is let
+    go and no later rewrite carries it; see `_restore_pending_queue_snapshot`."""
     staged, unread, record = _StagedQueue(), [], {}
     took = _safe_enqueue(staged, job, source="disk-restore-retry",
                          allowed_statuses=("queued", "ongoing"),
                          hold_unreadable=unread, record_seen=record,
                          read_options={"retry": None,
-                                       "timeout": _RESTART_RETRY_READ_TIMEOUT_S})
+                                       "timeout": _RESTART_RETRY_READ_TIMEOUT_S},
+                         denied=[])
     if unread:
         return "unread", {}
     return ("take" if took else "no"), record
@@ -17356,10 +17484,11 @@ async def _reoffer_unread_restores(job_queue) -> None:
     them for as long as its read took, every round. A read that does not answer
     within `_RESTART_RETRY_READ_TIMEOUT_S` counts as unread.
 
-    ⚠ #728 HOLDS ONLY FOR A RECORD THAT CAN BE READ. The funnel trusts a 403
-    ("the FE-side queue write"), so a held entry whose read is denied is started
-    — here as at boot, where the restore does the same. Holding on a 403 instead
-    would stop every restore on a machine whose reads of the record are denied.
+    ⛔⛔ A 403 IS "NO", HERE AS AT BOOT (2026-09-28). This used to say the funnel
+    trusts a 403 and the held entry is started. The rules let this computer read
+    the record of every account it runs for, so a refusal means the job's owner
+    is no longer one of them — and "trusted", such a job ran with every write
+    refused, on the owner's ChatGPT and key, for nobody.
 
     ⭐ Still unreadable, an entry stays held and carried by every snapshot
     rewrite, and whatever is left when the schedule ends waits for the next
@@ -17541,6 +17670,141 @@ def _shed_from_pending_snapshot(job_queue) -> None:
         _forget_pending_queue_snapshot(_pending_queue_snapshot_path(), job_queue)
 
 
+#: How long a run can sit untouched before this computer treats it as left
+#: behind — the startup sweep's horizon for a run folder, and the boot
+#: restore's for a snapshot entry. One number, so the two cannot disagree about
+#: whether a run is still somebody's.
+_STALE_RUN_S = 7 * 86400
+
+
+def _job_run_dir(job) -> "Path | None":
+    """The run folder a queued job names — `resume_dir`, else `queues/<run_id>`
+    — the same place `_safe_enqueue` looks for its `.stop`."""
+    rd = (job or {}).get("resume_dir")
+    if rd:
+        return Path(rd)
+    run_id = (job or {}).get("run_id")
+    if run_id:
+        return Path(__file__).parent / "queues" / str(run_id)
+    return None
+
+
+def _job_age_s(job, now: "float | None" = None) -> "float | None":
+    """Seconds since a queued job last showed any sign of life, or None when
+    nothing about it can tell.
+
+    ⭐ THE NEWEST OF ITS CLOCKS. The run id's `YYYYMMDD_HHMMSS` stamp is minted
+    when a NEW run is queued, so a job that never started is exactly as old as
+    it says. A folder that has been worked in since shows it too.
+
+    ⛔⛔ A JOB QUEUED FOR AN OLD RUN CARRIES ITS OWN — `queued_at_ms` (09-29
+    verify). A Resume, and the supervised auto-resume at boot, queue a run whose
+    id and folder are as old as the run, and a Resume rewrites the folder's
+    files in place, which moves neither. Judged by those two, a Resume pressed
+    minutes ago on a run parked ten days back was dropped at the next boot as
+    "waited 10 days", its record left "ongoing" with nothing running it. Those
+    two paths stamp the moment they queue it, and the snapshot carries it."""
+    now = time.time() if now is None else now
+    seen = []
+    clock = (job or {}).get("queued_at_ms")
+    if isinstance(clock, (int, float)):
+        seen.append(clock / 1000)
+    for key in ("run_id", "resume_dir"):
+        m = _RUN_ID_STAMP_RE.search(str((job or {}).get(key) or ""))
+        if m:
+            try:
+                seen.append(datetime.strptime(m.group(1), "%Y%m%d_%H%M%S").timestamp())
+            except ValueError:
+                pass
+    d = _job_run_dir(job)
+    if d is not None:
+        try:
+            seen.append(d.stat().st_mtime)
+        except OSError:
+            pass
+    return (now - max(seen)) if seen else None
+
+
+def _job_owner_uids(job) -> "set[str]":
+    """Whose research a queued job is: the uid the snapshot entry carries, and
+    the one its run folder's `owner.json` names when that file is about the
+    same research."""
+    owners = set()
+    uid = str((job or {}).get("uid") or "").strip()
+    if uid:
+        owners.add(uid)
+    d = _job_run_dir(job)
+    if d is not None:
+        try:
+            meta = json.loads((d / "owner.json").read_text(encoding="utf-8"))
+            if (isinstance(meta, dict)
+                    and str(meta.get("researchId") or "") in
+                    ("", str((job or {}).get("research_id") or ""))):
+                o = str(meta.get("uid") or "").strip()
+                if o:
+                    owners.add(o)
+        except Exception:
+            pass
+    return owners
+
+
+def _device_members() -> "set[str] | None":
+    """Every account this computer runs research for right now — the one it is
+    paired to, and the ones its device document shares it with — or None when
+    that cannot be told: not paired, no Firestore, a read that failed, or no
+    document to read.
+
+    ⭐ NONE IS "DON'T KNOW", NEVER "NOBODY". A pickup drops a job only on
+    positive evidence that its owner is not a member, and a device read that
+    blipped is no evidence.
+
+    ⛔⛔ AND THE RECORD READ CANNOT STAND IN FOR IT (09-29 re-verify, measured on
+    the Firestore emulator with the real rules). A gone account's record stays
+    READABLE while it carries this computer's deviceId, and every backend write
+    stamps one — a queue position while the job waited, a run that already ran
+    here. Only a record this computer never wrote is refused. So a blip here is
+    not settled by the record read: the pickup rule asks this again at every
+    pickup, and the dequeue asks it before any job runs."""
+    paired = str(load_paired_uid() or "").strip()
+    device_id = str(load_device_id() or "").strip()
+    if not (paired and device_id and _firebase_db is not None):
+        return None
+    try:
+        snap = _firebase_db.collection("devices").document(device_id).get()
+        if not snap.exists:
+            return None
+        doc = snap.to_dict() or {}
+    except Exception as err:
+        log(f"[pending_queue] could not read who this computer is shared with "
+            f"({type(err).__name__}) — the record read decides instead", "DEBUG")
+        return None
+    shared = doc.get("sharedWith") or []
+    if not isinstance(shared, list):
+        return None
+    members = {paired}
+    if isinstance(doc.get("ownerUid"), str) and doc["ownerUid"]:
+        members.add(doc["ownerUid"])
+    members.update(s for s in shared if isinstance(s, str) and s)
+    return members
+
+
+def _known_not_a_member(uid) -> bool:
+    """True only on POSITIVE evidence that `uid` is none of this computer's
+    accounts: the device document was read, and names it neither as the owner
+    nor among those the computer is shared with. Asked by every pickup before
+    it reads the job's record, and by the dequeue before any job runs — see
+    `_pickup_withdrawn`. "Can't tell" is False, so the job is taken, as it
+    always was.
+
+    ⭐ THE PAIRED ACCOUNT IS ONE WITHOUT ASKING. Every job passes here and most
+    are the owner's; they cost no read of the device document."""
+    uid = str(uid or "").strip()
+    if uid == str(load_paired_uid() or "").strip():
+        return False
+    members = _device_members()
+    return members is not None and uid not in members
+
+
 def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int, int]":
     """Boot's disk fallback (Phoenix T3): re-offer the jobs a crash left behind.
 
@@ -17568,7 +17832,25 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     HELD in `_UNREAD_RESTORES`, which every snapshot rewrite carries, and is
     offered again by a retry this starts on the running loop — boot calls it
     on the loop. With no loop running the entry is still held and carried; it
-    is just not asked about again before the next boot."""
+    is just not asked about again before the next boot.
+
+    ⛔⛔ A JOB THIS COMPUTER MAY NO LONGER RUN IS DROPPED, NOT RESTORED, AND ITS
+    ENTRY GOES (2026-09-28). A serve on 09-28 restored a job queued EIGHT days
+    earlier by an account this computer was no longer shared with: its record
+    read was refused, the pickup rule took it anyway ("a read that fails is not
+    a deletion"), the funnel trusted the 403, and it ran with every write
+    refused — on the owner's ChatGPT and key, a run nobody could see. Three
+    things now drop an entry, each on positive evidence and each with one line:
+      · it has waited longer than `_STALE_RUN_S`, the startup sweep's horizon;
+      · its owner is neither this computer's account nor one it is shared with
+        (`_device_members`) — asked before any read of the record, here for
+        every owner the entry names and again by the pickup rule for its uid,
+        so a device read that blips once is not the last word: the record of
+        a removed account this computer ever wrote to still reads "queued";
+      · the rules refused this computer its record (`denied_is_answer`).
+    A read that FAILED — a timeout, a dropped connection, a 5xx — is still not
+    an answer: the pickup rule takes the job and the funnel holds it, as
+    before."""
     path = Path(path)
     if not path.exists():
         return (0, 0)
@@ -17620,23 +17902,59 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     skipped = 0
     refused = []
     withdrew = False
+    paired = str(load_paired_uid() or "").strip()
+    members: "set[str] | None" = None
+    members_read = False
     for j in disk_jobs:
+        rid = str((j or {}).get("research_id") or "")
+        # ⛔⛔ TOO OLD TO BE ANYBODY'S NOW — before any read, on the startup
+        # sweep's own horizon. Nobody is watching a tile for a week.
+        age = _job_age_s(j)
+        if age is not None and age > _STALE_RUN_S:
+            _log_pickup_not_run(
+                "disk-restore", rid,
+                f"not run: it has waited {int(age // 86400)} days, past the "
+                f"{_STALE_RUN_S // 86400}-day limit for a job left behind — "
+                f"nobody is waiting for it now", "INFO")
+            skipped += 1
+            withdrew = True
+            continue
+        # ⛔⛔ NOT ONE OF THIS COMPUTER'S ACCOUNTS — before any read, for every
+        # owner the entry names. The device document is read here once, and
+        # only for a job somebody else queued; the pickup rule below asks
+        # again for the entry's uid.
+        foreign = {u for u in _job_owner_uids(j) if u != paired} if paired else set()
+        if foreign:
+            if not members_read:
+                members, members_read = _device_members(), True
+            if members is not None and not foreign <= members:
+                _log_pickup_not_run("disk-restore", rid, _RESTORE_NOT_OPENABLE)
+                skipped += 1
+                withdrew = True
+                continue
         # ⛔⛔ THE PICKUP RULE FIRST, AND ITS ANSWER IS THE ONE THAT SHEDS
         # (wave 10.10). The funnel below refuses a deleted or archived research
         # too, but it cannot say WHY — it refuses on a failed read as well, and
         # a refusal must be kept for the next boot — so nothing ever shed a
         # deleted research's entry: it was re-offered and refused at every boot
         # until a worker boundary happened to rewrite the file. Only this
-        # answer removes an entry; an unreadable record is kept.
+        # answer removes an entry; an unreadable record is kept — unless the
+        # rules REFUSED the read, which is an answer too (see the docstring).
         if _pickup_withdrawn((j or {}).get("uid"), (j or {}).get("research_id"),
-                             "disk-restore")[0]:
+                             "disk-restore", denied_is_answer=True)[0]:
             skipped += 1
             withdrew = True
             continue
+        denied: list = []
         if _safe_enqueue(job_queue, j, source="disk-restore",
                          allowed_statuses=("queued", "ongoing"),
-                         hold_unreadable=_UNREAD_RESTORES):
+                         hold_unreadable=_UNREAD_RESTORES, denied=denied):
             restored += 1
+        elif denied:
+            # The pickup rule's read answered and this one was refused: the
+            # same answer, arrived a moment later. Shed, never kept.
+            skipped += 1
+            withdrew = True
         else:
             skipped += 1
             refused.append(j)
@@ -18274,7 +18592,7 @@ def _emit_to_firestore(event):
             lambda: _firebase_db.collection("users").document(_fb_uid)
                 .collection("researches").document(_fb_research_id)
                 .collection("pipeline_events").add(_be_payload(doc_data)),
-            what="emit_event",
+            what="emit_event", uid=_fb_uid,
         )
         # ⭐ The seq is returned so the caller can NAME this event to the web
         # app. Returning None on the bail and on failure is load-bearing: the
@@ -18346,7 +18664,7 @@ def update_link_in_firestore(kind: str, url: str, **fields):
                 _firebase_db.collection("users").document(_fb_uid)
                     .collection("researches").document(_fb_research_id),
                 _be_payload({"links": {kind: payload}}), _fb_research_id),
-            what=f"link {kind}",
+            what=f"link {kind}", uid=_fb_uid,
         )
     except Exception as e:
         log(f"Firestore link update failed ({kind}): {e}", "WARN")
@@ -18388,7 +18706,7 @@ def append_user_source_in_firestore(kind: str, url: str, label: str = "", phase:
                     .collection("researches").document(_fb_research_id),
                 _be_payload({"userSources": _gcfs.ArrayUnion([entry])}),
                 _fb_research_id),
-            what=f"userSource {entry['kind']}",
+            what=f"userSource {entry['kind']}", uid=_fb_uid,
         )
     except Exception as e:
         log(f"Firestore userSources append failed ({kind}): {e}", "WARN")
@@ -18536,7 +18854,7 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
             lambda: _firebase_db.collection("users").document(uid)
                 .collection("researches").document(research_id)
                 .update(_be_payload(_with_incognito_renewal(updates, research_id))),
-            what=f"update research {research_id[:8]}…",
+            what=f"update research {research_id[:8]}…", uid=uid,
         )
         return True
     except Exception as e:
@@ -18655,7 +18973,7 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
                 _firebase_db.collection("users").document(uid)
                     .collection("researches").document(research_id),
                 _be_payload(data), research_id, merge=merge),
-            what=f"set research {research_id[:8]}…",
+            what=f"set research {research_id[:8]}…", uid=uid,
         )
         return True
     except Exception as e:
@@ -18755,7 +19073,7 @@ def _lease_renew_record(uid, rid) -> str:
             lambda: _firebase_db.collection("users").document(uid)
                 .collection("researches").document(rid)
                 .update(_be_payload(_with_incognito_renewal({}, rid))),
-            what=f"update research {rid[:8]}…",
+            what=f"update research {rid[:8]}…", uid=uid,
         )
         return "renewed"
     except Exception as e:
@@ -18857,7 +19175,7 @@ def _renew_incognito_leases() -> dict:
                         .collection("researches").document(rid)
                         .collection("documents").document(doc_id)
                         .update(_be_payload({"expireAt": _incognito_expire_at(rid)})),
-                    what=f"incognito lease document {doc_id}")
+                    what=f"incognito lease document {doc_id}", uid=uid)
                 out["documents"] += 1
             except Exception as e:
                 out["failed"] += 1
@@ -19383,7 +19701,8 @@ def _record_cloud_kick_refusal(uid, research_id, reason: str) -> bool:
         ref.update(_be_payload({"phases": phases}))
 
     try:
-        _grpc_write_with_heal(_op, what=f"cloud-kick refusal rid={research_id[:8]}…")
+        _grpc_write_with_heal(_op, what=f"cloud-kick refusal rid={research_id[:8]}…",
+                              uid=uid)
         return True
     except Exception as e:
         log(f"FE trigger: could not record the refusal on the document: {e}", "WARN")
@@ -19879,7 +20198,7 @@ def _do_phase_terminal_status_write(phase_num: int, status: str):
             ref.update(_be_payload({"phases": phases}))
 
     try:
-        _grpc_write_with_heal(_op, what=f"phase-status phase={phase_num}")
+        _grpc_write_with_heal(_op, what=f"phase-status phase={phase_num}", uid=_fb_uid)
     except Exception as e:
         log(f"Firestore phase-status write failed (phase={phase_num}, status={status}): {e}", "WARN")
 
@@ -19984,7 +20303,7 @@ def _start_command_listener(uid, research_id, loop):
     try:
         for d in _fs_where(col_ref, "processed", "==", True).stream():
             try:
-                _grpc_write_with_heal(lambda d=d: d.reference.delete(), what="cmd-sweep delete")
+                _grpc_write_with_heal(lambda d=d: d.reference.delete(), what="cmd-sweep delete", uid=uid)
             except Exception:
                 pass
     except Exception as _sweep_err:
@@ -20034,7 +20353,7 @@ def _start_command_listener(uid, research_id, loop):
                 try:
                     _grpc_write_with_heal(
                         lambda: doc.reference.update({"processed": True, "staleSkipped": True}),
-                        what="cmd stale-skip mark")
+                        what="cmd stale-skip mark", uid=uid)
                 except Exception:
                     pass
                 continue
@@ -20097,7 +20416,7 @@ def _start_command_listener(uid, research_id, loop):
                         f"re-acked only", "INFO")
                     try:
                         _grpc_write_with_heal(lambda: doc.reference.delete(),
-                                              what="cmd duplicate delete")
+                                              what="cmd duplicate delete", uid=uid)
                     except Exception:
                         pass
                     continue
@@ -20119,7 +20438,7 @@ def _start_command_listener(uid, research_id, loop):
                             "processed": True,
                             "pongedAt": int(time.time() * 1000),
                         }),
-                        what="cmd ping pong")
+                        what="cmd ping pong", uid=uid)
                 except Exception:
                     pass
                 continue
@@ -20134,7 +20453,7 @@ def _start_command_listener(uid, research_id, loop):
                 try:
                     _grpc_write_with_heal(
                         lambda: doc.reference.update({"processed": True}),
-                        what="cmd stop mark")
+                        what="cmd stop mark", uid=uid)
                 except Exception:
                     pass
                 loop.call_soon_threadsafe(_controls.request_stop)
@@ -20524,7 +20843,7 @@ def _start_command_listener(uid, research_id, loop):
                         try:
                             _grpc_write_with_heal(
                                 lambda: doc.reference.update({"processed": True}),
-                                what="cmd agent-decision-stop mark")
+                                what="cmd agent-decision-stop mark", uid=uid)
                         except Exception:
                             pass
                         loop.call_soon_threadsafe(_controls.request_stop)
@@ -20543,7 +20862,7 @@ def _start_command_listener(uid, research_id, loop):
             # os._exit may kill the buffered delete. Ping action also keeps
             # update() because pingBackendForResearch reads pongedAt back.
             try:
-                _grpc_write_with_heal(lambda: doc.reference.delete(), what="cmd tail delete")
+                _grpc_write_with_heal(lambda: doc.reference.delete(), what="cmd tail delete", uid=uid)
             except Exception:
                 pass
 
@@ -71062,7 +71381,7 @@ def _record_hand_off(queue_dir, research, phase3_began_ms) -> None:
                 {**handoff, "phases": rows}, rid)))
 
     try:
-        _grpc_write_with_heal(_op, what=f"hand-off rid={rid[:8]}…")
+        _grpc_write_with_heal(_op, what=f"hand-off rid={rid[:8]}…", uid=uid)
     except Exception as e:
         log(f"hand-off: phase 3's end did not reach the record ({e}) — "
             f"writing the hand-off on its own", "WARN")
@@ -77067,6 +77386,9 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                     # the app — the fail-closed direction.
                                     "submitted_by": str(
                                         data.get("submittedBy") or "").strip(),
+                                    # ⛔ ITS OWN CLOCK: the run id and the folder
+                                    # are as old as the run — see `_job_age_s`.
+                                    "queued_at_ms": int(time.time() * 1000),
                                 }, source="rehydrate-supervised-auto-resume"):
                                     rehydrated += 1
                                     auto_resumed = True
@@ -77717,7 +78039,7 @@ async def run_server(port=8000):
     # local artifact; nothing to sweep there anymore.)
     try:
         now_ts = time.time()
-        STALE_SECONDS = 7 * 86400
+        STALE_SECONDS = _STALE_RUN_S  # the boot restore's horizon too
         KEEP_STATUSES = {"completed", "paused", "paused_backend_restart"}
         swept = 0
         if queues_root.exists():
@@ -77772,7 +78094,7 @@ async def run_server(port=8000):
                                     try:
                                         _grpc_write_with_heal(
                                             lambda sd=sd: sd.reference.delete(),
-                                            what="cascade-sweep cmd delete")
+                                            what="cascade-sweep cmd delete", uid=uid)
                                     except Exception: pass
                             except Exception: pass
                     except Exception: pass
@@ -77782,7 +78104,8 @@ async def run_server(port=8000):
                 except Exception: pass
                 swept += 1
         if swept:
-            log(f"[startup-sweep] purged {swept} stale run(s) older than 7 days", "INFO")
+            log(f"[startup-sweep] purged {swept} stale run(s) older than "
+                f"{_STALE_RUN_S // 86400} days", "INFO")
     except Exception as _se:
         log(f"[startup-sweep] failed: {_se}", "WARN")
 
@@ -78282,7 +78605,7 @@ async def run_server(port=8000):
             _flip_tx = _firebase_db.transaction()
             outcome = _grpc_write_with_heal(
                 lambda: _flip_txn(_flip_tx),
-                what=f"flip queued→ongoing {research_id_val[:8]}…",
+                what=f"flip queued→ongoing {research_id_val[:8]}…", uid=uid_val,
             )
             if outcome.startswith("skipped"):
                 log(f"[flip] {research_id_val[:8]}… {outcome} — leaving status as-is (cancel race won)", "INFO")
@@ -78440,7 +78763,8 @@ async def run_server(port=8000):
             try:
                 # #720: heal a stale-token 403 on the renumber; rebuild the batch
                 # inside the op so a retry commits a fresh batch, not a consumed one.
-                _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]")
+                _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]",
+                                      uid=_batch_heal_uid(chunk))
             except Exception as e:
                 log(f"Failed to commit queue-position batch [{i}:{i+CHUNK}]: {e}", "WARN")
         # #890: publish the refreshed queueOwners union (local + deferred).
@@ -79047,9 +79371,22 @@ async def run_server(port=8000):
             # current_job param a Phoenix restart would lose this in-flight
             # research.
             _persist_pending_queue(current_job=job)
+            # ⛔⛔ AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — asked before the
+            # flip, of every job (09-29 re-verify). The owner removed it while
+            # its job waited here. Its record still READS "queued": the backend
+            # wrote its queue position meanwhile, and the rules let the device
+            # that stamped a record read it with no membership check. Asked
+            # only when the read after a refused flip was refused too, the job
+            # ran with every write refused, on the owner's ChatGPT and key. See
+            # `_pickup_withdrawn`, whose answer this is.
+            _account_gone = _known_not_a_member(job.get("uid"))
+            if _account_gone:
+                _log_pickup_not_run("dequeue", job.get("research_id"),
+                                    _RESTORE_NOT_OPENABLE)
             # Flip this run's research doc from queued → ongoing. No-op for
             # the very first start in an idle backend (already ongoing).
-            flip_outcome = _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
+            flip_outcome = (None if _account_gone else
+                            _flip_queued_to_ongoing(job.get("uid"), job.get("research_id")))
             # Q8 (2026-04-30): bail ONLY when the flip is skipped AND the
             # actual current status is a terminal/recovery state (cancelled
             # mid-run, paused after BE restart, watchdog-stopped, user-
@@ -79080,7 +79417,7 @@ async def run_server(port=8000):
                 # cannot drift apart.
                 _PICKUP_WITHDRAWN_STATUS,
             }
-            should_run = True
+            should_run = not _account_gone
             # ⚠ 2026-08-06 — "COULD NOT EVALUATE" IS NOT "PROCEED". The flip has
             # failed on every run in this corpus (20 occurrences, zero successes),
             # and it returned None, which fell straight through to should_run=True
@@ -79108,6 +79445,9 @@ async def run_server(port=8000):
                         log("[flip] the transaction was refused and the doc could "
                             "not be read either — proceeding, as before", "WARN")
                 except Exception as _fe:
+                    # A member's job, or one whose membership could not be
+                    # read: an account this computer no longer runs for was
+                    # stood down before the flip, whatever this read says.
                     log(f"[flip] the transaction was refused and the fallback "
                         f"read also failed ({type(_fe).__name__}) — "
                         f"proceeding, as before", "WARN")
@@ -79385,7 +79725,7 @@ async def run_server(port=8000):
                             try:
                                 _grpc_write_with_heal(
                                     lambda sd=sd: sd.reference.delete(),
-                                    what="delete_run cmd delete")
+                                    what="delete_run cmd delete", uid=uid)
                             except Exception: pass
                     except Exception as _se:
                         log(f"[delete_run] commands sweep: {_se}", "WARN")

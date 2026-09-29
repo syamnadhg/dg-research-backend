@@ -77,9 +77,10 @@ EXISTS = ("            if not snap.exists:\n"
           '                log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… '
           'no longer exists in Firestore", "INFO")')
 STATUS = "            if status not in allowed_statuses:"
+#: ⛔ RE-AIMED 2026-09-28: the boot restore also hands the funnel a `denied` list.
 RESTORE_CALL = ('        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
                 '                         allowed_statuses=("queued", "ongoing"),\n'
-                '                         hold_unreadable=_UNREAD_RESTORES):')
+                '                         hold_unreadable=_UNREAD_RESTORES, denied=denied):')
 REHYDRATE_CALL = '}, source="rehydrate-supervised-auto-resume"):'
 
 MUTANTS = [
@@ -144,7 +145,7 @@ MUTANTS = [
      [(RESTORE_CALL, '        if _safe_enqueue(job_queue, j, source="disk-restore",\n'
                      '                         allowed_statuses=("queued", "ongoing"),\n'
                      "                         take_unreadable=True,\n"
-                     '                         hold_unreadable=_UNREAD_RESTORES):')]),
+                     '                         hold_unreadable=_UNREAD_RESTORES, denied=denied):')]),
     ("T9", "over", "⛔ the rehydrate auto-resumes a run it could not check "
      "instead of offering a Resume",
      [(REHYDRATE_CALL, '}, source="rehydrate-supervised-auto-resume", take_unreadable=True):')]),

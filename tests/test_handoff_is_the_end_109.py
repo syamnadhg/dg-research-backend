@@ -507,7 +507,7 @@ def _record(monkeypatch, existing):
                         raising=False)
     monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
     monkeypatch.setattr(research, "_grpc_write_with_heal",
-                        lambda op, what="": op())
+                        lambda op, what="", uid=None: op())
     ok = research._record_cloud_kick_refusal(OWNER, RID, "the cloud said no")
     return ok, written
 

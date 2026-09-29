@@ -101,13 +101,21 @@ class _Chain:
             if isinstance(self._db.research_docs, Exception):
                 raise self._db.research_docs
             return _ResearchSnap(self._db.research_docs.get(key))
+        # devices/{id} — who this computer is shared with. None (the default)
+        # is no document, as it always read here; an exception is a read that
+        # fails.
+        if len(self._path) == 2 and self._path[0] == "devices":
+            if isinstance(self._db.device_doc, Exception):
+                raise self._db.device_doc
+            return _ResearchSnap(self._db.device_doc)
         return _ResearchSnap(None)
 
 
 class FakeDb:
-    def __init__(self, box, queue_docs=None, research_docs=None):
+    def __init__(self, box, queue_docs=None, research_docs=None, device_doc=None):
         self.queue = QueueCol(box, queue_docs)
         self.research_docs = research_docs if research_docs is not None else {}
+        self.device_doc = device_doc
         self.reads: list = []
 
     def collection(self, name):
@@ -184,9 +192,9 @@ class Listener:
     def __init__(self, monkeypatch, tmp_path, *, owner="uid-owner",
                  queue_docs=None, research_docs=None, current_job=None,
                  deque_jobs=None, real_terminal_check=False,
-                 last_completed=None):
+                 last_completed=None, device_doc=None):
         box: dict = {}
-        self.db = FakeDb(box, queue_docs, research_docs)
+        self.db = FakeDb(box, queue_docs, research_docs, device_doc)
         self.writes: list = []
         self.incoming: list = []
         self.jobs = _JobQueue(deque_jobs)

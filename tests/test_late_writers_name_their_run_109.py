@@ -92,7 +92,7 @@ def world(monkeypatch):
     events: list = []
     monkeypatch.setattr(research, "_firebase_db", db)
     monkeypatch.setattr(research, "load_device_id", lambda: "dev-1")
-    monkeypatch.setattr(research, "_grpc_write_with_heal", lambda op, *, what: op())
+    monkeypatch.setattr(research, "_grpc_write_with_heal", lambda op, *, what, uid=None: op())
     monkeypatch.setattr(research, "_threading", types.SimpleNamespace(Thread=_NextRunFirst))
     monkeypatch.setattr(_NextRunFirst, "started", [])
     monkeypatch.setattr(_NextRunFirst, "switch", True)
