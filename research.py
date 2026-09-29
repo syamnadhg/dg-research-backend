@@ -39962,15 +39962,21 @@ CUA_LOOK_ONLY = frozenset({"mouse_move", "scroll", "wait"})
 CUA_NEVER_CLICK_SEND = CHATGPT_SEND_SEL + ', button[type="submit"]'
 #: ⛔ What Phase 1's COPY mission may never click (wave 13): Send, as above, and
 #: Regenerate under the reply — a stray click there would throw the finished
-#: brief away and start writing a new one. (Captured label; it opens a menu.)
-CUA_NEVER_CLICK_COPY = CUA_NEVER_CLICK_SEND + ', button[aria-label="Regenerate response"]'
+#: brief away and start writing a new one (captured label; it opens a menu).
+#: Share sits right next to Copy and opens the dialog that makes a public link
+#: to the chat; Edit message under the user's own message opens an editor whose
+#: Send re-submits the prompt, which throws the brief away like Regenerate. The
+#: copy mission needs none of them.
+CUA_NEVER_CLICK_COPY = (CUA_NEVER_CLICK_SEND + ', button[aria-label="Regenerate response"]'
+                        ', button[aria-label="Share"], button[aria-label="Share prompt"]'
+                        ', button[aria-label="Edit message"]')
 #: What agent_loop says when `never_click` refuses a click, per mission: the
 #: button(s) the list names, what the mission is for, and what to click
 #: instead. "caret" (the default) is the wording the caret missions always had.
 _NEVER_CLICK_SAY = {
     "caret": ("Send", "only puts the cursor in the message box",
               "Click inside the message box itself, never on Send."),
-    "copy": ("Send or Regenerate", "only clicks the Copy button under ChatGPT's latest reply",
+    "copy": ("Send, Regenerate, Share or Edit", "only clicks the Copy button under ChatGPT's latest reply",
              "Click only the Copy button directly under ChatGPT's latest reply."),
 }
 
@@ -54254,18 +54260,31 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 #      come back the clipboard cannot be trusted here, and nothing is clicked;
 #   2. the Copy button under the latest reply is clicked (a real click);
 #   3. no such button (a future rename) → the CUA clicks it — clicks only, and
-#      never on Send or Regenerate;
-#   4. the clipboard is read, and kept only if it is not the marker, is long
-#      enough, is not our own prompt, and reads like a brief.
+#      never on Send, Regenerate, Share or Edit;
+#   4. the clipboard is read, and kept only if it is not the marker, is as long
+#      as the page read requires, is not our own prompt, reads like a brief,
+#      and is text THIS ChatGPT page shows.
 # ⛔ The marker is what makes the read mean anything. Without it a click that
 # copied nothing hands back whatever the clipboard held before — an earlier
 # run's brief, say — as this run's.
+# ⛔ The marker proves only that SOMETHING changed the clipboard, not that the
+# Copy button did. Fleet workers on one computer each run their own Chrome but
+# share ONE clipboard, and another worker's Phase 2 paste (or its own Copy)
+# writes a whole brief there — so a copy is kept only when its opening lines of
+# prose are on this page (`_chatgpt_copy_on_page`).
 
-#: Shortest copy that can be the brief: the "brief looks unusually short" card's
-#: floor. Real briefs measure 46-73 KB (see run_phase1).
-_CG_COPY_MIN_CHARS = 500
+#: Shortest copy that can be the brief: the page read's own floor (T2 in
+#: extract_chatgpt_response keeps only MORE than this many characters of prose;
+#: the salvage offer uses the same figure). A reply the page read refuses as too
+#: short — a clarifying question, a refusal — is refused here too, and Phase 1
+#: shows "No brief was generated" as it did before the Copy fallback. Real briefs
+#: measure 46-73 KB (see run_phase1).
+_CG_COPY_MIN_CHARS = _MIN_SALVAGEABLE_BRIEF_LEN
 #: How long to wait, after the click, for the clipboard to change.
 _CG_COPY_READ_S = 5.0
+#: How long the found Copy button may take to be clickable before the CUA
+#: presses it instead.
+_CG_COPY_CLICK_MS = 5000
 #: The copy mission's cap on the CUA.
 _CG_COPY_CUA_S = 150.0
 
@@ -54300,15 +54319,24 @@ _CHATGPT_COPY_BUTTON_JS = _cg_js("""() => {
 
 #: Characters that crowd a line of code and are rare in prose.
 _CG_CODE_CHARS = frozenset("{}[]()<>=;$\\|`")
+#: Letters of the scripts written WITHOUT spaces between words (Thai, Lao,
+#: Myanmar, Khmer, Japanese kana, Chinese characters): a line of theirs has no
+#: word gaps to count, so its letters are counted instead. Built from code
+#: points — the ranges read the same in every editor and tool.
+_CG_UNSPACED_RE = re.compile("[" + "".join(f"{chr(a)}-{chr(b)}" for a, b in (
+    (0x0E00, 0x0EFF), (0x1000, 0x109F), (0x1780, 0x17FF), (0x3040, 0x30FF),
+    (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))) + "]")
 
 
 def _brief_prose_line(line: str) -> bool:
-    """A line of prose: eight words or more, not crowded with code symbols, and
-    not a code comment ("#" or "//" first — a long comment reads like prose; a
+    """A line of prose: eight words or more (or, in a script written without
+    spaces, twenty letters or more), not crowded with code symbols, and not a
+    code comment ("#" or "//" first — a long comment reads like prose; a
     markdown heading is not counted either, and a brief does not need it to be)."""
     if line.lstrip().startswith(("#", "//")):
         return False
-    if len(re.findall(r"[^\W\d_]{2,}", line)) < 8:
+    if (len(re.findall(r"[^\W\d_]{2,}", line)) < 8
+            and len(_CG_UNSPACED_RE.findall(line)) < 20):
         return False
     return sum(ch in _CG_CODE_CHARS for ch in line) < 0.05 * len(line)
 
@@ -54319,8 +54347,8 @@ def _chatgpt_copy_verdict(text, marker, ours=()) -> str:
     t = (text or "").strip()
     if not t or t == marker:
         return "nothing was copied"
-    if len(t) < _CG_COPY_MIN_CHARS:
-        return f"it was only {len(t)} characters"
+    if (n := _doc_img_prose_len(t)) <= _CG_COPY_MIN_CHARS:
+        return f"it was only {n} characters"
     head = _norm_prompt_text(t)[:400]
     for p in ours:
         want = _norm_prompt_text(p)[:60]
@@ -54329,6 +54357,45 @@ def _chatgpt_copy_verdict(text, marker, ours=()) -> str:
     if sum(1 for ln in t.splitlines() if _brief_prose_line(ln)) < 3:
         return "it does not read like a brief"
     return ""
+
+
+#: How much of a line's start is looked for on the page: its first this-many
+#: letters and digits (about a dozen English words).
+_CG_ON_PAGE_PROBE = 60
+#: The page's text, as a person sees it.
+_CG_PAGE_TEXT_JS = "() => (document.body && document.body.innerText) || ''"
+
+
+def _cg_letters(s: str) -> str:
+    """Only the letters and digits of `s`, in order: the same words in the same
+    order, whatever spacing, punctuation or markdown sits between them."""
+    return "".join(re.findall(r"[^\W_]+", s))
+
+
+def _brief_line_probe(line: str) -> str:
+    """The opening of one line of the copy, as the page shows it: an image shows
+    no text, a link shows only its words, and a list's number or bullet is drawn
+    by the page rather than written in its text."""
+    line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+    line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)
+    line = re.sub(r"^\s*(?:(?:[-*+>]|\d+[.)])\s+)+", "", line)
+    return _cg_letters(line)[:_CG_ON_PAGE_PROBE]
+
+
+async def _chatgpt_copy_on_page(page, text) -> bool:
+    """True when the copy is text THIS ChatGPT page shows: at least two of its
+    first three lines of prose open with words the page shows, in the same
+    order. Another program's brief on the shared clipboard (another worker's
+    paste, the owner's own copy) is not on this page. One line may miss: a
+    source chip ChatGPT draws inside a sentence is on the page and not in the
+    copy."""
+    probes = [p for p in (_brief_line_probe(ln) for ln in text.splitlines()
+                          if _brief_prose_line(ln)) if p][:3]
+    try:
+        shown = _cg_letters(await page.evaluate(_CG_PAGE_TEXT_JS) or "")
+    except Exception:
+        shown = ""
+    return bool(probes) and sum(p in shown for p in probes) >= min(2, len(probes))
 
 
 async def _chatgpt_find_copy_button(page):
@@ -54366,6 +54433,10 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
     run_phase1 calls it ONLY when the page read came back empty (see the note
     above). `ours`: the prompts we sent, which a copy must not be."""
     marker = f"superresearch-copy-check-{os.urandom(8).hex()}"
+    # The clipboard answers only the tab in front (verified_paste_brief does the
+    # same): a ChatGPT tab behind another tab reads it back empty.
+    with contextlib.suppress(Exception):
+        await page.bring_to_front()
     try:
         armed = await page.evaluate(_CG_COPY_ARM_JS, marker)
     except Exception as e:
@@ -54378,7 +54449,7 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
     btn = await _chatgpt_find_copy_button(page)
     if btn is not None:
         try:
-            await btn.click(timeout=5000)
+            await btn.click(timeout=_CG_COPY_CLICK_MS)
             how = "ChatGPT's Copy button"
         except Exception as e:
             log(f"Phase 1: the Copy button under ChatGPT's reply could not be clicked "
@@ -54408,6 +54479,10 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
         log(f"Phase 1: what the Copy button gave was not used — {why}", "WARN")
         return ""
     text = _strip_chatgpt_citation_tokens(text).strip()
+    if not await _chatgpt_copy_on_page(page, text):
+        log("Phase 1: what the Copy button gave was not used — it is not text on this "
+            "ChatGPT page (something else changed the clipboard)", "WARN")
+        return ""
     log(f"Phase 1: brief taken from {how} ({len(text)} chars)")
     return text
 
