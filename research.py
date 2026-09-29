@@ -50362,13 +50362,24 @@ _CHATGPT_COMPOSER_WAIT_S = 8.0
 _CHATGPT_SENT_MATCH_CHARS = 120
 _PROMPT_NORM_DROP = re.compile("[" + "".join(map(chr, (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF))) + "]")
 _MAC_EDIT_LETTERS = frozenset("acvxz")
+#: Typography a rich-text box may substitute as you type: curly quotes, en/em
+#: dashes, the ellipsis. Folded to ASCII on BOTH sides of a comparison.
+_PROMPT_TYPO_ASCII = str.maketrans({0x2018: "'", 0x2019: "'", 0x201C: '"', 0x201D: '"',
+                                    0x2013: "-", 0x2014: "-", 0x2026: "..."})
+#: A markdown marker at the start of a line — "- ", "1. ", "# ", "> ". A box with
+#: markdown shortcuts turns such a line into a list item / heading / quote, whose
+#: text no longer carries the marker. Dropped on BOTH sides.
+_PROMPT_MD_LINE_MARK = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)]|#{1,6}|>)[ \t]+", re.M)
 
 
 def _norm_prompt_text(s) -> str:
-    """Whitespace-normalised text for comparing a prompt with what a page shows.
+    """Normalised text for comparing a prompt with what a page shows.
     An empty ProseMirror box reads "\\n"; a pasted newline may come back as a
-    space. Neither is a different prompt."""
-    return " ".join(_PROMPT_NORM_DROP.sub("", str(s or "")).split())
+    space; a rich-text box may curl a quote or turn "- item" into a bullet.
+    None of those is a different prompt — while a dropped or extra character
+    ("est" for "test") still is."""
+    t = _PROMPT_NORM_DROP.sub("", str(s or "")).translate(_PROMPT_TYPO_ASCII)
+    return " ".join(_PROMPT_MD_LINE_MARK.sub("", t).split())
 
 
 def _chatgpt_text_is_prompt_start(text, prompt, *, span=None) -> bool:

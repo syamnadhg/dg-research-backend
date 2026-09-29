@@ -22,7 +22,8 @@
   the button. body[data-sr-fixture="thread"] loads a finished exchange with Stop
   still showing (a reply "generating"). TEST HOOKS, not page behaviour:
   body[data-mangle="N"] — the next N inserts lose their first character, so the
-  read-back check can be exercised; body[data-sendmangle] — Send posts the text
+  read-back check can be exercised; body[data-richtext] — the box curls
+  apostrophes and turns "- " lines into bullets; body[data-sendmangle] — Send posts the text
   minus its first character; body[data-menu-closed-by] / [data-sent-via] record
   how the menu closed (escape / outside) and how the message went (button /
   enter).
@@ -158,6 +159,24 @@
     setTimeout(() => { addReply(); setAction('voice'); }, 400);
   }
   box.addEventListener('input', (e) => {
+    if (document.body.dataset.richtext && /^insert/.test(e.inputType || '')) {
+      // TEST HOOK: a box with typography and markdown shortcuts — a straight
+      // apostrophe is curled, a "- " line becomes a bullet (no marker in its text).
+      const parts = (box.innerText || '').split(/\n+/).filter(Boolean);
+      box.replaceChildren();
+      let ul = null;
+      for (const raw of parts) {
+        const line = raw.split("'").join(String.fromCharCode(0x2019));
+        const p = document.createElement('p');
+        if (/^- /.test(line)) {
+          if (!ul) { ul = document.createElement('ul'); box.appendChild(ul); }
+          const li = document.createElement('li');
+          p.textContent = line.slice(2); li.appendChild(p); ul.appendChild(li);
+        } else {
+          ul = null; p.textContent = line; box.appendChild(p);
+        }
+      }
+    }
     const n = parseInt(document.body.dataset.mangle || '0', 10);
     if (n > 0 && /^insert/.test(e.inputType || '')) {
       document.body.dataset.mangle = String(n - 1);

@@ -16,7 +16,8 @@ submit, "sent" means our prompt, and the CUA's keys on macOS.
        the prompt (in the submit, the verifier, the CUA confirm), the CUA fix
        runs only when the box holds the prompt or nothing, the CUA fallback only
        places the caret and never runs after Send was pressed, and ctrl+a/c/v/x/z
-       are Command on macOS.
+       are Command on macOS. The comparison folds what a rich-text box does to
+       typing (curled quotes, "- " lines made bullets) and nothing else.
 
 ⛔ THE STATIC MARKER PIN IS DESELECTED (`-k "not every_marker_accepts"`). It
 would kill every M* mutant by reading the constant, and a harness that scores
@@ -255,6 +256,14 @@ MUTANTS = [
      [("        if _norm_prompt_text(await _chatgpt_box_text(box)):\n"
        "            # Something is already in the box",
        "        if False:\n            # Something is already in the box")]),
+    ("S28", RESEARCH, "⛔ a bullet the box made from \"- item\" reads as a different prompt "
+     "— the read-back refuses EVERY send on a box with markdown shortcuts",
+     [("    return \" \".join(_PROMPT_MD_LINE_MARK.sub(\"\", t).split())",
+       "    return \" \".join(t.split())")]),
+    ("S29", RESEARCH, "⛔ a curled apostrophe reads as a different prompt — any topic with "
+     "\"don't\" in it is never sent",
+     [("    t = _PROMPT_NORM_DROP.sub(\"\", str(s or \"\")).translate(_PROMPT_TYPO_ASCII)",
+       "    t = _PROMPT_NORM_DROP.sub(\"\", str(s or \"\"))")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

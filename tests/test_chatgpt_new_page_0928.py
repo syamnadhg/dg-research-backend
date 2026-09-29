@@ -343,6 +343,29 @@ def test_live_a_lossy_read_back_is_cleared_and_retyped(chrome, page, fast, logs,
     assert any("read-back mismatch (try 1/2)" in m for _lv, m in logs), logs
 
 
+def test_live_a_box_that_curls_quotes_and_makes_bullets_still_sends(chrome, page, fast, logs):
+    """The read-back must not turn a rich-text box's own typography into a
+    refusal: a curled apostrophe and a "- " line rendered as a bullet are the
+    same prompt. (Without this the check would block EVERY send on such a box.)"""
+    rich = ("Write a brief on the St Bernard. Don't skip the sources.\n\n"
+            "- history of the hospice dogs\n- health and screening")
+    _load(chrome, page, "new")
+    chrome.run(page.evaluate("() => { document.body.dataset.richtext = '1'; }"))
+    assert chrome.run(research.submit_chatgpt_direct(_browser(page), rich)) is True, logs
+    sent = chrome.run(page.evaluate(USERS_JS))
+    assert len(sent) == 1 and chr(0x2019) in sent[0] and "- history" not in sent[0], sent
+    assert not any("read-back mismatch" in m for _lv, m in logs), logs
+
+
+def test_the_comparison_folds_typography_and_markdown_markers_only():
+    n = research._norm_prompt_text
+    assert n("Don" + chr(0x2019) + "t “stop” — now" + chr(0x2026)) == \
+        n("Don't \"stop\" - now...")
+    assert n("Intro\n\n- one\n* two\n3. three\n# Head\n> quote") == "Intro one two three Head quote"
+    assert n("est") != n("test")
+    assert n("a-b 1.5 #tag") == "a-b 1.5 #tag"          # mid-line marks are text
+
+
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_live_a_box_that_never_holds_the_prompt_sends_nothing(chrome, page, fast, logs, layout):
     _load(chrome, page, layout)
