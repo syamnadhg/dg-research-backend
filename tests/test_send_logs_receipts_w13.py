@@ -315,7 +315,9 @@ def test_a_row_that_cannot_reach_the_account_is_kept_and_tried_later(env, fail):
     fs.fail = None
     _ticks(clock, 400)                      # the network is back
     assert not research._queued_bundle_rows_path().exists()
-    assert fs.docs[f"users/{OWNER}/logBundles/{CODES[0]}"]["status"] == "done"
+    row = fs.docs[f"users/{OWNER}/logBundles/{CODES[0]}"]
+    # The terminal's bundle is the whole machine's, and its row says so.
+    assert row["status"] == "done" and row["machineIncluded"] is True
 
 
 def test_the_wait_between_tries_doubles_from_thirty_seconds_to_half_an_hour(env):
