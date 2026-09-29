@@ -22,6 +22,16 @@ On the agent that means:
           `do` and never in the router, which stays network-free.
   term    the same lines under `agent device allow-all <id> yes`.
 
+⭐ AND WHAT THE REVIEW OF 2026-09-29 ADDED. People left out when the computer is
+NOT full are people the owner removed — the web app says "people you removed stay
+out", and so do both clients now, with no pointer to a phrase the router does not
+read. The route's `allowAll` rides `waiting`: not in effect says nobody was let in,
+never "Nothing to change"; a retry that found nobody says "Nobody is waiting now.".
+`device requests` names the yes that lets the people waiting on an Allow-all
+computer in. The admit call runs on what is left of a deadline counted from the
+start of the switch, so the bridge answers before either client gives up; its 401
+re-mint is executed here. SKILL.md's turn-on row gets its question from `do`.
+
 Every test drives the real handler over HTTP, or the real command with the bridge
 stubbed at its HTTP helper — nothing here reads the source to decide what the code
 does. The mutants are in .mutants/admit_waiting_0929_mutants.py.
@@ -30,7 +40,10 @@ does. The mutants are in .mutants/admit_waiting_0929_mutants.py.
 from __future__ import annotations
 
 import importlib.util
+import json
+import re
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +75,8 @@ ADMIT = "/api/devices/access-request/admit-waiting"
 # What the route answers when it let three people in and nobody is left.
 THREE_IN = (200, {"ok": True, "allowAll": True, "admitted": 3, "stillWaiting": 0,
                   "full": False})
+# …and what rides the reply for it: the route's `allowAll` is carried (review).
+THREE_WAITING = {"admitted": 3, "stillWaiting": 0, "full": False, "allowAll": True}
 UNCONFIRMED = {"unconfirmed": True}
 
 
@@ -173,7 +188,7 @@ def test_allow_all_on_lets_everyone_already_waiting_in(live, fields, body, write
     assert FakeFS.events == writes + [("post", ADMIT)]
     got = r.json()
     assert got["changed"] is True and got["allowAll"] is True
-    assert got["waiting"] == {"admitted": 3, "stillWaiting": 0, "full": False}
+    assert got["waiting"] == THREE_WAITING
 
 
 @pytest.mark.parametrize("body", [{"allowAll": True},
@@ -190,7 +205,7 @@ def test_allow_all_yes_on_a_computer_already_on_is_the_retry(live, body):
     assert _admits(live) == [(ADMIT, {"deviceId": "dev-a1"})]
     got = r.json()
     assert got["changed"] is False and got["allowAll"] is True
-    assert got["waiting"] == {"admitted": 3, "stillWaiting": 0, "full": False}
+    assert got["waiting"] == THREE_WAITING
 
 
 # ── nothing else lets anybody in ────────────────────────────────────────────────
@@ -322,19 +337,26 @@ def test_only_a_200_with_real_counts_is_a_confirmation(live, reply):
 @pytest.mark.parametrize("reply, want", [
     ((200, {"ok": True, "allowAll": True, "admitted": 25, "stillWaiting": 4,
             "full": True}),
-     {"admitted": 25, "stillWaiting": 4, "full": True}),
+     {"admitted": 25, "stillWaiting": 4, "full": True, "allowAll": True}),
     ((200, {"ok": True, "allowAll": True, "admitted": 0, "stillWaiting": 0,
             "full": False}),
-     {"admitted": 0, "stillWaiting": 0, "full": False}),
-    # the route's no-op (Allow all not in effect on its live read): nothing to say
+     {"admitted": 0, "stillWaiting": 0, "full": False, "allowAll": True}),
+    # ⛔ the route's no-op (Allow all not in effect on its live read) is CARRIED
+    # (review, 2026-09-29): dropped, it read as "nobody was waiting"
     ((200, {"ok": True, "allowAll": False, "admitted": 0, "stillWaiting": 0,
             "full": False}),
-     {"admitted": 0, "stillWaiting": 0, "full": False}),
-    # `full` is strict, as every reader of a server flag here is
+     {"admitted": 0, "stillWaiting": 0, "full": False, "allowAll": False}),
+    # `full` and `allowAll` are strict, as every reader of a server flag here is
     ((200, {"ok": True, "allowAll": True, "admitted": 1, "stillWaiting": 2,
             "full": "true"}),
-     {"admitted": 1, "stillWaiting": 2, "full": False}),
-], ids=["full", "nobody-waiting", "route-no-op", "full-not-a-bool"])
+     {"admitted": 1, "stillWaiting": 2, "full": False, "allowAll": True}),
+    ((200, {"ok": True, "allowAll": "true", "admitted": 0, "stillWaiting": 0,
+            "full": False}),
+     {"admitted": 0, "stillWaiting": 0, "full": False, "allowAll": False}),
+    ((200, {"ok": True, "admitted": 0, "stillWaiting": 0, "full": False}),
+     {"admitted": 0, "stillWaiting": 0, "full": False, "allowAll": False}),
+], ids=["full", "nobody-waiting", "route-no-op", "full-not-a-bool",
+        "allow-all-not-a-bool", "allow-all-missing"])
 def test_the_counts_ride_the_reply(live, reply, want):
     _owned(visibility="public")
     live.box["reply"] = reply
@@ -365,6 +387,161 @@ def test_the_real_helper_gets_the_long_wait_and_a_timeout_is_unconfirmed(
     assert seen == [(bridge.config.FE_BASE + ADMIT, {"deviceId": "dev-a1"},
                      {"Authorization": "Bearer tok"}, bridge._FE_ADMIT_TIMEOUT)]
     assert bridge._FE_ADMIT_TIMEOUT > bridge._FE_JSON_TIMEOUT
+
+
+def _fe_reply(status: int, body: dict) -> requests.Response:
+    """A real `requests.Response`, so the real `_fe_json_body` decodes it."""
+    r = requests.models.Response()
+    r.status_code = status
+    r._content = json.dumps(body).encode("utf-8")
+    r.headers["Content-Type"] = "application/json"
+    return r
+
+
+@pytest.fixture()
+def remint(monkeypatch):
+    """The REAL `_fe_api_post` against a web app that refuses the first token it
+    is shown (401) and answers the next — the stale cached ID token the helper's
+    docstring measures at up to fifty-five minutes past a dead refresh token."""
+    monkeypatch.setattr(bridge, "_fe_api_post", _REAL_FE_API_POST)
+    real_post = requests.post
+    box = {"sent": [], "minted": []}
+
+    def _post(url, *a, **kw):
+        # ⛔ `/api/` too: the conftest FE_BASE is a prefix of any 127.0.0.1:9xxx
+        # port the bridge under test may be listening on.
+        if not str(url).startswith(bridge.config.FE_BASE + "/api/"):
+            return real_post(url, *a, **kw)
+        box["sent"].append((url, kw.get("json"), kw["headers"]["Authorization"]))
+        if len(box["sent"]) == 1:
+            return _fe_reply(401, {"error": "unauthorized"})
+        return _fe_reply(*THREE_IN)
+    monkeypatch.setattr(requests, "post", _post)
+
+    def _id_token(force=False):
+        box["minted"].append(force)
+        return "fresh" if force else "stale"
+    box["id_token"] = _id_token
+    box["real_post"] = real_post
+    return box
+
+
+def test_a_refused_sign_in_is_reminted_once_and_the_sweep_is_confirmed(live, remint):
+    """⛔⛔ THE 401 RETRY, EXECUTED (review, 2026-09-29). No test reached it: the
+    only one on the real helper raised a timeout, and a `retry_401=False` mutant
+    survived. A cached token the web app's `checkRevoked` refuses is re-minted
+    with force and sent once more — and that second answer is the one relayed."""
+    live.sess.id_token = remint["id_token"]
+    _owned(visibility="public")
+    r = remint["real_post"](live.base + "/device/visibility",
+                            json={"deviceId": "dev-a1", "allowAll": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["waiting"] == THREE_WAITING
+    url = bridge.config.FE_BASE + ADMIT
+    assert remint["sent"] == [(url, {"deviceId": "dev-a1"}, "Bearer stale"),
+                              (url, {"deviceId": "dev-a1"}, "Bearer fresh")]
+    assert remint["minted"] == [False, True]
+
+
+def test_without_room_for_a_second_leg_a_refused_sign_in_is_unconfirmed(remint):
+    """⛔ …BUT ONLY WHILE TWO FULL LEGS STILL FIT THE DEADLINE. Late in the switch
+    the 401 is "could not confirm" at once — the same yes again is the retry, and
+    it starts with a whole budget."""
+    sess = SimpleNamespace(uid="u1", id_token=remint["id_token"])
+    got = bridge._admit_waiting(sess, "dev-a1", time.monotonic() - 10)
+    assert got == UNCONFIRMED
+    assert [auth for _u, _j, auth in remint["sent"]] == ["Bearer stale"]
+    assert remint["minted"] == [False]
+
+
+# ── the admit call has a deadline, counted from the start of the switch ─────────
+
+@pytest.fixture()
+def admit_kw(monkeypatch):
+    seen: list = []
+
+    def _post(_sess, path, payload, **kw):
+        seen.append(kw)
+        return THREE_IN
+    monkeypatch.setattr(bridge, "_fe_api_post", _post)
+    return seen
+
+
+_SESS = SimpleNamespace(uid="u1", id_token=lambda force=False: "tok")
+
+
+@pytest.mark.parametrize("spent, wait, retry", [
+    # a quick owner read and write: the route's whole wait, and room for the retry
+    (0, 30, True),
+    # fifty-five left: one full leg fits, a second would not
+    (10, 30, False),
+    # fifteen left: the wait is what is left, never the whole thirty
+    (50, 15, False),
+], ids=["fresh", "one-leg-left", "short"])
+def test_the_route_is_asked_on_what_is_left_of_the_budget(admit_kw, spent, wait, retry):
+    """⛔⛔ THE BRIDGE ANSWERS BEFORE THE CLIENTS GIVE UP (review, 2026-09-29).
+    The owner read is two queries (fifteen each), the write fifteen, a clear-first
+    fifteen more — with the route's thirty and a re-mint on top the handler could
+    pass the clients' seventy-five, and a switch that landed read "no response".
+    So the route gets what is left of the budget, and the 401 leg only when both
+    legs fit."""
+    got = bridge._admit_waiting(_SESS, "dev-a1", time.monotonic() - spent)
+    assert got == THREE_WAITING
+    [kw] = admit_kw
+    assert kw["retry_401"] is retry
+    assert wait - 2 <= kw["timeout"] <= wait
+
+
+def test_with_too_little_left_the_route_is_not_asked(admit_kw):
+    """Under the floor there is no wait worth giving a sweep of 25 people: the
+    answer is "could not confirm" and the retry starts with a whole budget."""
+    got = bridge._admit_waiting(_SESS, "dev-a1",
+                                time.monotonic() - bridge._ADMIT_BUDGET + 2)
+    assert got == UNCONFIRMED
+    assert admit_kw == []
+
+
+def test_the_budget_fits_inside_both_clients_wait():
+    """Ten seconds under the clients' seventy-five — the reply, and a re-mint."""
+    assert bridge._ADMIT_BUDGET + 10 <= 75
+    assert bridge._ADMIT_BUDGET >= 2 * bridge._FE_ADMIT_TIMEOUT
+    assert 0 < bridge._ADMIT_MIN_WAIT < bridge._FE_ADMIT_TIMEOUT
+
+
+@pytest.mark.parametrize("fields", [{"visibility": "public"},
+                                    {"visibility": "public", "allowAll": True}],
+                         ids=["switched-on", "already-on"])
+def test_the_deadline_counts_from_the_start_of_the_switch(live, monkeypatch, fields):
+    """⛔ THE CLOCK STARTS WHEN THE REQUEST DOES, not when the route is asked: the
+    owner read (slow here) is part of what the client is waiting through. With a
+    budget a hair over the route's thirty, a read that took longer than that hair
+    must leave the route less than thirty."""
+    _owned(**fields)
+    monkeypatch.setattr(bridge, "_ADMIT_BUDGET", bridge._FE_ADMIT_TIMEOUT + 0.3)
+
+    def _slow_read(self, uid):
+        time.sleep(0.6)
+        return [dict(d) for d in FakeFS.devices]
+    monkeypatch.setattr(FakeFS, "list_devices", _slow_read)
+    r = _vis(live, allowAll=True)
+    assert r.status_code == 200, r.text
+    [kw] = [kw for path, _p, kw in live.box["calls"] if path == ADMIT]
+    assert kw["timeout"] < bridge._FE_ADMIT_TIMEOUT - 0.2
+    assert kw["retry_401"] is False
+
+
+@pytest.mark.parametrize("fields", [{"visibility": "public"},
+                                    {"visibility": "public", "allowAll": True}],
+                         ids=["switched-on", "already-on"])
+def test_a_switch_past_its_budget_still_answers_allow_all_on(live, monkeypatch, fields):
+    """Nothing left: the route is not asked, and the reply is still a 200 saying
+    Allow all is on, with the people waiting unconfirmed — the retry line."""
+    _owned(**fields)
+    monkeypatch.setattr(bridge, "_ADMIT_BUDGET", 0)
+    r = _vis(live, allowAll=True)
+    assert r.status_code == 200, r.text
+    assert r.json()["allowAll"] is True and r.json()["waiting"] == UNCONFIRMED
+    assert _admits(live) == []
 
 
 # ══ the chat (sr.py) ═════════════════════════════════════════════════════════
@@ -415,26 +592,42 @@ def _switched(waiting=None, changed=True):
 ON_HEAD = "✓ “Studio PC” now lets anyone join at once."
 ALREADY_HEAD = "✓ “Studio PC” already lets anyone join at once."
 
+
+def _w(admitted=0, still=0, full=False, allow_all=True):
+    """A confirmed `waiting`, as the bridge relays the route's 200."""
+    return {"admitted": admitted, "stillWaiting": still, "full": full,
+            "allowAll": allow_all}
+
+
+NOT_IN_EFFECT = ("Nobody who was waiting was let in — Allow all isn’t in effect for "
+                 "it right now.")
+
 _CHAT_LINES = [
-    ("three-in", {"admitted": 3, "stillWaiting": 0, "full": False},
-     ["3 people who were already waiting joined too."]),
-    ("one-in", {"admitted": 1, "stillWaiting": 0, "full": False},
-     ["1 person who was already waiting joined too."]),
-    ("full", {"admitted": 25, "stillWaiting": 4, "full": True},
+    ("three-in", _w(3), ["3 people who were already waiting joined too."]),
+    ("one-in", _w(1), ["1 person who was already waiting joined too."]),
+    ("full", _w(25, 4, True),
      ["25 people who were already waiting joined too.",
       "4 people are still waiting — it’s full (25 people), so they stay in your "
       "requests."]),
-    ("full-one-left", {"admitted": 0, "stillWaiting": 1, "full": True},
+    ("full-one-left", _w(0, 1, True),
      ["1 person is still waiting — it’s full (25 people), so they stay in your "
       "requests."]),
-    ("left-to-decide", {"admitted": 2, "stillWaiting": 2, "full": False},
+    # ⛔ NOT FULL, SO THESE ARE PEOPLE THE OWNER REMOVED (review, 2026-09-29) — the
+    # planner leaves nobody else out, the decide route refuses to approve them,
+    # and the web app says it in these words. "For you to decide — ask me who’s
+    # waiting" sent the owner to approve people they cannot, by a phrase the
+    # router does not read.
+    ("removed-stay-out", _w(2, 2),
      ["2 people who were already waiting joined too.",
-      "2 people are still waiting for you to decide — ask me who’s waiting."]),
-    ("one-left-to-decide", {"admitted": 0, "stillWaiting": 1, "full": False},
-     ["1 person is still waiting for you to decide — ask me who’s waiting."]),
+      "2 people are still waiting — people you removed stay out."]),
+    ("one-removed-stays-out", _w(0, 1),
+     ["1 person is still waiting — people you removed stay out."]),
     ("unconfirmed", {"unconfirmed": True},
      ["Allow all is on, but I couldn’t confirm that anyone already waiting was let "
       "in — say “allow all yes” again to retry."]),
+    # ⛔ THE ROUTE FOUND ALLOW ALL NOT IN EFFECT (review, 2026-09-29) — a computer
+    # part-way through a Reset, say. Nobody was let in, and the owner is told.
+    ("not-in-effect", _w(allow_all=False), [NOT_IN_EFFECT]),
 ]
 
 
@@ -452,8 +645,7 @@ def test_the_chat_says_who_joined_right_under_the_switch(chat, waiting, want):
     assert lines[1 + len(want)].startswith("Anyone signed in can join “Studio PC”")
 
 
-@pytest.mark.parametrize("waiting", [None, {"admitted": 0, "stillWaiting": 0,
-                                            "full": False}],
+@pytest.mark.parametrize("waiting", [None, _w()],
                          ids=["older-bridge", "nobody-waiting"])
 def test_nobody_waiting_adds_nothing(chat, waiting):
     chat.box["post"]["/device/visibility"] = _switched(waiting)
@@ -467,18 +659,44 @@ def test_nobody_waiting_adds_nothing(chat, waiting):
 def test_already_on_says_who_joined_instead_of_nothing_to_change(chat):
     """The retry on a computer that already lets anyone join: "Nothing to change"
     over two people who just got in would be false."""
-    chat.box["post"]["/device/visibility"] = _switched(
-        {"admitted": 2, "stillWaiting": 0, "full": False}, changed=False)
+    chat.box["post"]["/device/visibility"] = _switched(_w(2), changed=False)
     sr.cmd_device_allow_all(_ns(value="yes", device=""))
     lines = chat.out().splitlines()
     assert lines[:2] == [ALREADY_HEAD, "2 people who were already waiting joined too."]
 
 
-def test_already_on_with_nobody_waiting_still_says_nothing_to_change(chat):
-    chat.box["post"]["/device/visibility"] = _switched(
-        {"admitted": 0, "stillWaiting": 0, "full": False}, changed=False)
+def test_a_retry_that_found_nobody_says_nobody_is_waiting_now(chat):
+    """⭐ THE ROUTE ANSWERED 0/0, SO THAT IS WHAT THE OWNER HEARS (review,
+    2026-09-29) — the web app's button says the same. "Nothing to change" says
+    nothing about the people the owner said yes again to let in."""
+    chat.box["post"]["/device/visibility"] = _switched(_w(), changed=False)
+    sr.cmd_device_allow_all(_ns(value="yes", device=""))
+    lines = chat.out().splitlines()
+    assert lines[0] == ALREADY_HEAD + " Nobody is waiting now."
+    assert lines[1].startswith("Anyone signed in can join “Studio PC”")
+
+
+def test_an_older_bridge_that_found_it_on_still_says_nothing_to_change(chat):
+    """No `waiting` at all: nobody was asked, so nothing is claimed about them."""
+    chat.box["post"]["/device/visibility"] = _switched(changed=False)
     sr.cmd_device_allow_all(_ns(value="yes", device=""))
     assert chat.out().splitlines()[0] == ALREADY_HEAD + " Nothing to change."
+
+
+@pytest.mark.parametrize("changed, head", [(True, ON_HEAD), (False, ALREADY_HEAD)],
+                         ids=["switched-on", "already-on"])
+def test_allow_all_not_in_effect_on_the_web_is_said_never_nothing_to_change(
+        chat, changed, head):
+    """⛔⛔ THE WEB APP'S LIVE READ SAID NO (review, 2026-09-29). The bridge reads
+    public + the tick; the route also needs the computer fully paired, so a
+    computer part-way through a Reset lets nobody in. "Already lets anyone join
+    at once. Nothing to change." was the whole reply — the owner never heard it."""
+    chat.box["post"]["/device/visibility"] = _switched(_w(allow_all=False),
+                                                       changed=changed)
+    sr.cmd_device_allow_all(_ns(value="yes", device=""))
+    out = chat.out()
+    assert out.splitlines()[:2] == [head, NOT_IN_EFFECT]
+    assert "Nothing to change" not in out and "Nobody is waiting now" not in out
 
 
 @pytest.mark.parametrize("run", [
@@ -584,6 +802,66 @@ def test_no_other_question_looks_at_the_requests(chat):
     assert [c for c in chat.calls if c[1] == "/devices/requests"] == []
 
 
+# ── the requests screen names the yes that lets them in ─────────────────────────
+
+CHAT_ON = dict(CHAT_OWNED, allowAll=True)
+
+
+def _let_in(n_phrase: str) -> str:
+    return (f"“Studio PC” lets anyone join at once, and {n_phrase} waiting for it — "
+            f"to let them in too, say: allow all yes for “Studio PC”.")
+
+
+def _requests_out(chat, devices, rows):
+    chat.box["get"]["/devices"] = (200, {"devices": devices})
+    chat.box["get"]["/devices/requests"] = (200, {"incoming": rows, "requests": []})
+    assert sr.cmd_device_requests(_ns()) == 0
+    return chat.out().splitlines()
+
+
+@pytest.mark.parametrize("rows, n_phrase", [
+    ([_row("dev-a1", "Sam"), _row("dev-a1", "Kim"), _row("dev-z9", "Ann")],
+     "2 people are"),
+    ([_row("dev-a1", "Sam")], "1 person is"),
+], ids=["two", "one"])
+def test_device_requests_names_the_yes_that_lets_the_people_waiting_in(
+        chat, rows, n_phrase):
+    """⛔⛔ THE CHAT'S "LET THEM IN (N)" (review, 2026-09-29). The web app shows the
+    button on an Allow-all computer with people waiting; the chat's way is "allow
+    all yes" again (owner decision 4) — and nothing told the owner so. A computer
+    ticked before this shipped, or whose sweep was unconfirmed, kept its people
+    waiting on the one screen that lists them."""
+    lines = _requests_out(chat, [CHAT_ON, dict(CHAT_SHARED)], rows)
+    assert _let_in(n_phrase) in lines
+    assert not any("nobody waits here" in ln for ln in lines)
+
+
+@pytest.mark.parametrize("devices, rows", [
+    # approval mode: Approve is the answer, and the screen already says so
+    ([dict(CHAT_OWNED)], [_row("dev-a1")]),
+    # somebody else's computer is never this account's to switch
+    ([dict(CHAT_SHARED)], [_row("dev-b2")]),
+    # the people waiting are on another computer
+    ([CHAT_ON], [_row("dev-z9")]),
+], ids=["approval-mode", "not-owned", "waiting-elsewhere"])
+def test_device_requests_names_it_only_for_an_owned_allow_all_computer_with_people(
+        chat, devices, rows):
+    lines = _requests_out(chat, devices, rows)
+    assert not any("allow all yes" in ln for ln in lines)
+
+
+def test_the_yes_it_names_is_the_switch_on_question_for_that_computer(chat):
+    """⛔ A PHRASE THE ROUTER READS, EXECUTED — the line this replaced pointed at
+    "who’s waiting", which reaches the catch-all. This one is the switch-on
+    question for the named computer, counted by `do`."""
+    lines = _requests_out(chat, [CHAT_ON], [_row("dev-a1")])
+    [said] = [ln for ln in lines if "allow all yes" in ln]
+    phrase = said.split("say: ", 1)[1].rstrip(".")
+    argv, asked = sr._nl_resolve(phrase)
+    assert argv is None
+    assert asked == [sr._NL_CONFIRMS["device-allow-all"].format(name="“Studio PC”")]
+
+
 # ══ the terminal (cli.py) ════════════════════════════════════════════════════
 
 @pytest.fixture()
@@ -609,22 +887,24 @@ def _cli(argv):
 
 T_HEAD = "✓ Studio PC now lets anyone join at once."
 
+T_NOT_IN_EFFECT = ("     Nobody who was waiting was let in — Allow all isn't in effect "
+                   "for it right now.")
+
 _TERM_LINES = [
-    ("three-in", {"admitted": 3, "stillWaiting": 0, "full": False},
-     ["     3 people who were already waiting joined too."]),
-    ("one-in", {"admitted": 1, "stillWaiting": 0, "full": False},
-     ["     1 person who was already waiting joined too."]),
-    ("full", {"admitted": 25, "stillWaiting": 1, "full": True},
+    ("three-in", _w(3), ["     3 people who were already waiting joined too."]),
+    ("one-in", _w(1), ["     1 person who was already waiting joined too."]),
+    ("full", _w(25, 1, True),
      ["     25 people who were already waiting joined too.",
       "     1 person is still waiting — it's full (25 people), so they stay in "
       "your requests."]),
-    ("left-to-decide", {"admitted": 0, "stillWaiting": 2, "full": False},
-     ["     2 people are still waiting for you to decide — see "
-      "`agent device requests`."]),
+    # ⛔ not full: people the owner removed (review, 2026-09-29) — never "decide"
+    ("removed-stay-out", _w(0, 2),
+     ["     2 people are still waiting — people you removed stay out."]),
     ("unconfirmed", {"unconfirmed": True},
      ["     Allow all is on, but it couldn't be confirmed that anyone already "
       "waiting was let in —",
       "     run `agent device allow-all dev-a1 yes` again to retry."]),
+    ("not-in-effect", _w(allow_all=False), [T_NOT_IN_EFFECT]),
 ]
 
 
@@ -640,21 +920,94 @@ def test_the_terminal_says_who_joined_right_under_the_switch(term, waiting, want
 
 
 def test_the_terminal_says_nothing_extra_when_nobody_was_waiting(term):
-    term.box["post"]["/device/visibility"] = _switched(
-        {"admitted": 0, "stillWaiting": 0, "full": False})
+    term.box["post"]["/device/visibility"] = _switched(_w())
     _cli(["device", "allow-all", "dev-a1", "yes"])
     lines = term.out().splitlines()
     assert lines[1].startswith("     Anyone signed in can join it")
     assert not any("waiting" in ln for ln in lines)
 
 
+T_ALREADY = "✓ Studio PC already lets anyone join at once."
+
+
 def test_the_terminal_already_on_says_who_joined_instead_of_nothing_to_change(term):
-    term.box["post"]["/device/visibility"] = _switched(
-        {"admitted": 2, "stillWaiting": 0, "full": False}, changed=False)
+    term.box["post"]["/device/visibility"] = _switched(_w(2), changed=False)
     _cli(["device", "allow-all", "dev-a1", "yes"])
     lines = term.out().splitlines()
-    assert lines[0].replace(cli._OK, "✓") == "✓ Studio PC already lets anyone join at once."
+    assert lines[0].replace(cli._OK, "✓") == T_ALREADY
     assert lines[1] == "     2 people who were already waiting joined too."
+
+
+@pytest.mark.parametrize("waiting, head", [
+    # ⭐ the route answered 0/0: what it found, not "Nothing to change" (review)
+    (_w(), T_ALREADY + " Nobody is waiting now."),
+    # an older bridge asked nobody, and claims nothing about them
+    (None, T_ALREADY + " Nothing to change."),
+], ids=["nobody-waiting", "older-bridge"])
+def test_the_terminal_retry_that_found_nobody_says_so(term, waiting, head):
+    term.box["post"]["/device/visibility"] = _switched(waiting, changed=False)
+    _cli(["device", "allow-all", "dev-a1", "yes"])
+    assert term.out().splitlines()[0].replace(cli._OK, "✓") == head
+
+
+@pytest.mark.parametrize("changed", [True, False], ids=["switched-on", "already-on"])
+def test_the_terminal_says_allow_all_is_not_in_effect_never_nothing_to_change(
+        term, changed):
+    term.box["post"]["/device/visibility"] = _switched(_w(allow_all=False),
+                                                       changed=changed)
+    _cli(["device", "allow-all", "dev-a1", "yes"])
+    out = term.out()
+    assert out.splitlines()[1] == T_NOT_IN_EFFECT
+    assert "Nothing to change" not in out and "Nobody is waiting now" not in out
+
+
+def _t_requests(term, devices, rows):
+    term.box["get"]["/devices"] = (200, {"devices": devices})
+    term.box["get"]["/devices/requests"] = (200, {"incoming": rows, "requests": []})
+    assert _cli(["device", "requests"]) == 0
+    return term.out().splitlines()
+
+
+@pytest.mark.parametrize("rows, n_phrase", [
+    ([_row("dev-a1", "Sam"), _row("dev-a1", "Kim"), _row("dev-z9", "Ann")],
+     "2 people are"),
+    ([_row("dev-a1")], "1 person is"),
+], ids=["two", "one"])
+def test_the_terminal_requests_name_the_command_that_lets_them_in(term, rows, n_phrase):
+    """The terminal's "Let them in (N)" (review, 2026-09-29): the whole command,
+    with the computer's id, as every other row on this screen prints one."""
+    lines = _t_requests(term, [CHAT_ON, dict(CHAT_SHARED)], rows)
+    assert (f"     Studio PC lets anyone join at once, and {n_phrase} waiting for it "
+            f"— let them in with:  agent device allow-all dev-a1 yes") in lines
+    assert not any("nobody waits here" in ln for ln in lines)
+
+
+@pytest.mark.parametrize("devices, rows", [
+    ([dict(CHAT_OWNED)], [_row("dev-a1")]),
+    ([dict(CHAT_SHARED)], [_row("dev-b2")]),
+    ([CHAT_ON], [_row("dev-z9")]),
+], ids=["approval-mode", "not-owned", "waiting-elsewhere"])
+def test_the_terminal_requests_name_it_only_for_an_owned_allow_all_computer_with_people(
+        term, devices, rows):
+    lines = _t_requests(term, devices, rows)
+    assert not any("allow-all" in ln for ln in lines)
+
+
+@pytest.mark.parametrize("argv, value_help", [
+    (["device", "allow-all", "--help"], "yes = anyone who asks joins at once"),
+    (["device", "visibility", "--help"], "with public: anyone who asks joins at once"),
+], ids=["allow-all", "visibility-allow-all"])
+def test_the_terminal_help_says_anyone_already_waiting_joins_too(capsys, argv,
+                                                                 value_help):
+    """⛔ THE TERMINAL HAS NO CONFIRM STEP (review, 2026-09-29): its help is the only
+    place a CLI owner reads what the yes does before it does it — and the web app
+    and the chat both say the people waiting join too."""
+    with pytest.raises(SystemExit) as done:
+        _cli(argv)
+    assert done.value.code == 0
+    said = " ".join(capsys.readouterr().out.split())
+    start = said.index(value_help)
+    assert "anyone already waiting joins too (up to 25 people)" in said[start:start + 220]
 
 
 @pytest.mark.parametrize("argv", [["device", "allow-all", "dev-a1", "yes"],
@@ -688,3 +1041,47 @@ def test_the_confirm_rule_says_a_yes_lets_the_waiting_people_in_and_names_the_re
     assert "up to 25 people in all" in para
     assert ("when the reply could not confirm them the retry is the same "
             "`device-allow-all yes`, confirmed again") in para
+
+
+def _skill_row(first_example: str) -> "tuple[str, str]":
+    """(what the user says, what you run) — the routing-table row that opens with
+    this example."""
+    text = _SKILL.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    rows = [ln for ln in text.split("\n") if ln.startswith(f'| "{first_example}"')]
+    assert len(rows) == 1, rows
+    cells = [c.strip() for c in rows[0].strip().strip("|").split(" | ")]
+    assert len(cells) == 2, cells
+    return cells[0], cells[1]
+
+
+def test_the_turn_on_row_gets_its_question_from_the_client():
+    """⛔⛔ THE ROW IS THE MAIN PATH, AND IT WAS THE OLD QUESTION (review,
+    2026-09-29). The host maps "turn on allow all" straight from this row and
+    reaches `do` only when no row fits — so the count `do` puts in never reached
+    the owner, and the parenthetical the host relayed said nothing about the
+    people waiting. Now the row asks `do` for the question, and says what it
+    holds, pinned against the question itself so the two cannot drift again."""
+    says, runs = _skill_row("turn on allow all")
+    question = sr._NL_CONFIRMS["device-allow-all"]
+    assert sr._AA_WAITING_JOIN in question
+    assert runs.startswith('**confirm** — run `sr.py do "<the user\'s message, '
+                           'verbatim>"` and relay the client\'s question verbatim (')
+    held = runs[runs.index("verbatim ("):runs.index(") — then `sr.py device-allow-all yes`")]
+    assert sr._AA_WAITING_JOIN.rstrip(".").lower() in held.lower()
+    # …and every example in the row reaches that very question through `do`
+    examples = re.findall(r'"([^"]+)"', says)
+    assert len(examples) >= 10, examples
+    for said in examples:
+        argv, asked = sr._nl_resolve(said)
+        assert argv is None, (said, argv)
+        assert asked == [question.format(name="that computer")], said
+
+
+_README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def test_the_readme_row_says_anyone_already_waiting_joins_too():
+    text = _README.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    rows = [ln for ln in text.split("\n") if ln.startswith("/sr device-allow-all yes|no")]
+    assert len(rows) == 1, rows
+    assert "anyone already waiting joins too" in rows[0]

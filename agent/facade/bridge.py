@@ -2062,14 +2062,26 @@ _FE_ASK_TIMEOUT = 35
 # client. `admit-waiting` grants them in one transaction, syncs the machine's
 # claims once and sends each of them a notice, so it gets its own wait, PER CALL
 # for the reason `_FE_UNLINK_TIMEOUT` records. ⛔ And both clients wait seventy-five
-# on `/device/visibility` to match: the owner read and the write (fifteen each),
-# this, and a re-minted sign-in — a 401 is answered before any work, so a retried
-# call's first leg is short. At their old forty a slow sweep read as a lost switch.
+# on `/device/visibility` (at their old forty a slow sweep read as a lost switch).
 _FE_ADMIT_TIMEOUT = 30
 _ADMIT_WAITING_PATH = "/api/devices/access-request/admit-waiting"
+# ⛔⛔ …AND THE CALL HAS A DEADLINE, COUNTED FROM THE START OF THE SWITCH (review,
+# 2026-09-29). This comment used to add the budget up as the owner read and the
+# write at fifteen each, and the owner read is TWO queries — `list_devices` runs the
+# owned query, then the shared-with one, fifteen each — so thirty, the write
+# fifteen and this thirty were already the clients' seventy-five, before a
+# clear-first write, a re-mint or a 401's second leg. Past that the client printed
+# "no response (is the bridge running?)" over a switch that HAD landed. So the
+# route gets what is left of sixty-five — ten under the clients' wait, for the
+# reply and a mint — and never more than its own thirty; the 401 retry leg only while two
+# full legs still fit (a 401 is answered before any work, so its first leg is
+# short — but not provably); and under five seconds it is not asked at all:
+# "could not confirm", and the same yes again, with a whole budget, is the retry.
+_ADMIT_BUDGET = 65
+_ADMIT_MIN_WAIT = 5
 
 
-def _admit_waiting(sess: "AccountSession", device_id: str) -> dict:
+def _admit_waiting(sess: "AccountSession", device_id: str, started: float) -> dict:
     """Ask the web app to let in everyone already waiting on one of this account's
     machines, now that its Allow all is on — the `waiting` field of the owner
     switch's reply.
@@ -2090,10 +2102,27 @@ def _admit_waiting(sess: "AccountSession", device_id: str) -> dict:
     that same unknown, never a zero — "nobody was waiting" over people still
     waiting would leave the owner nothing to retry.
 
-    Returns `{"admitted", "stillWaiting", "full"}` when the route answered.
+    ⛔ `started` IS THE MOMENT `/device/visibility` BEGAN, never this call's: the
+    owner read and the writes before it are part of what the client is waiting
+    through (`_ADMIT_BUDGET`).
+
+    ⛔ AND THE ROUTE'S `allowAll` RIDES ALONG (review, 2026-09-29). It answers
+    `allowAll: false` with zero counts when Allow all is not in effect on its live
+    read — the bridge reads public and the tick, the web app also needs the
+    computer fully paired, so one part-way through a Reset lets nobody in. Dropped,
+    that read as "nobody was waiting" and the owner heard "Nothing to change".
+
+    Returns `{"admitted", "stillWaiting", "full", "allowAll"}` when the route
+    answered.
     """
+    left = _ADMIT_BUDGET - (time.monotonic() - started)
+    if left < _ADMIT_MIN_WAIT:
+        log.warning("admit waiting: not asked on %s — %.1fs left of the switch's "
+                    "budget", device_id, left)
+        return {"unconfirmed": True}
     status, body = _fe_api_post(sess, _ADMIT_WAITING_PATH, {"deviceId": device_id},
-                                timeout=_FE_ADMIT_TIMEOUT)
+                                retry_401=left >= 2 * _FE_ADMIT_TIMEOUT,
+                                timeout=min(_FE_ADMIT_TIMEOUT, left))
     admitted, still = body.get("admitted"), body.get("stillWaiting")
     counts = all(isinstance(n, int) and not isinstance(n, bool) and n >= 0
                  for n in (admitted, still))
@@ -2104,9 +2133,11 @@ def _admit_waiting(sess: "AccountSession", device_id: str) -> dict:
                     status, body.get("reason") or body.get("error") or "no counts")
         return {"unconfirmed": True}
     full = body.get("full") is True
+    in_effect = body.get("allowAll") is True
     log.info("admit waiting: %s admitted=%d still=%d full=%s allowAll=%s", device_id,
-             admitted, still, full, body.get("allowAll"))
-    return {"admitted": admitted, "stillWaiting": still, "full": full}
+             admitted, still, full, in_effect)
+    return {"admitted": admitted, "stillWaiting": still, "full": full,
+            "allowAll": in_effect}
 
 
 def _fe_json_body(r: "requests.Response") -> dict:
@@ -5765,6 +5796,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             retry). Its answer rides the reply as `waiting`. Never on OFF, private,
             a plain public, or a write that was refused, unconfirmed or revoked.
             """
+            # ⛔ THE CLIENT'S CLOCK STARTS HERE, SO THE ROUTE'S DEADLINE DOES TOO
+            # (review, 2026-09-29) — `_ADMIT_BUDGET`.
+            started = time.monotonic()
             body_in = self._read_json()
             device_id = _body_str(body_in, "deviceId")
             if not device_id:
@@ -5854,7 +5888,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # it IS on — the no-op holds only when both fields already match —
                 # while a flag-less "public" on the same computer is not a yes.
                 if allow is True:
-                    same["waiting"] = _admit_waiting(sess, device_id)
+                    same["waiting"] = _admit_waiting(sess, device_id, started)
                 self._json(200, same)
                 return
             # ⛔⛔ AN OLD TICK IS CLEARED ALONE BEFORE ALLOW ALL GOES ON (wave 12
@@ -5954,7 +5988,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # the back of a switch that may not be on. `allow is True` is the yes
             # itself: OFF, private and a plain public never reach the route.
             if allow is True:
-                done["waiting"] = _admit_waiting(sess, device_id)
+                done["waiting"] = _admit_waiting(sess, device_id, started)
             self._json(200, done)
 
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,

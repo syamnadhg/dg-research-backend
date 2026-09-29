@@ -2121,8 +2121,12 @@ def _device_switch(device_id: str, payload: dict, asked_all) -> int:
         # ⭐ WHO ELSE GOT IN, straight under the switch (2026-09-29) — and
         # "Nothing to change" only when there is nothing else to say.
         waiting = _waiting_lines_t(body, device_id)
+        # ⭐ A RETRY THE WEB APP ANSWERED 0/0 SAYS SO (review, 2026-09-29); an older
+        # bridge, which asked nobody, keeps the old sentence. As the chat's.
+        idle = (" Nobody is waiting now." if isinstance(body.get("waiting"), dict)
+                else " Nothing to change.")
         print(f"{_OK} {name} {'now lets' if changed else 'already lets'} anyone "
-              f"join at once.{'' if changed or waiting else ' Nothing to change.'}")
+              f"join at once.{'' if changed or waiting else idle}")
         for line in waiting:
             print(line)
     elif asked_all is False and state == "public":
@@ -2159,6 +2163,8 @@ def _waiting_lines_t(body: dict, device_id: str) -> "list[str]":
     ⛔ NOTHING WHEN NOBODY WAS WAITING, and nothing from an older bridge. ⛔ An
     unconfirmed sweep never says Allow all failed — the tick was saved before the
     web app was asked — and running the same yes again is the retry.
+    ⛔⛔ Left out when it is NOT full means removed, and a route that found Allow
+    all not in effect says so (review, 2026-09-29) — the chat's reasons.
     """
     waiting = body.get("waiting")
     if not isinstance(waiting, dict):
@@ -2167,6 +2173,9 @@ def _waiting_lines_t(body: dict, device_id: str) -> "list[str]":
         return ["     Allow all is on, but it couldn't be confirmed that anyone "
                 "already waiting was let in —",
                 f"     run `agent device allow-all {device_id} yes` again to retry."]
+    if waiting.get("allowAll") is not True:
+        return ["     Nobody who was waiting was let in — Allow all isn't in effect "
+                "for it right now."]
     lines = []
     joined = waiting.get("admitted") or 0
     if joined:
@@ -2177,8 +2186,7 @@ def _waiting_lines_t(body: dict, device_id: str) -> "list[str]":
         who = "1 person is" if left == 1 else f"{left} people are"
         lines.append(f"     {who} still waiting — it's full (25 people), so they stay "
                      f"in your requests." if waiting.get("full") is True
-                     else f"     {who} still waiting for you to decide — see "
-                          f"`agent device requests`.")
+                     else f"     {who} still waiting — people you removed stay out.")
     return lines
 
 
@@ -2219,6 +2227,12 @@ def _print_allow_all_owner_lines(incoming: list) -> None:
     ⛔ Not for a computer that still has somebody waiting (past the instant-join
     limit the web app files an ordinary ask), and a failed look prints nothing.
     The chat client's `_allow_all_owner_lines`, in this file's voice.
+
+    ⭐⭐ THAT COMPUTER GETS THE COMMAND THAT LETS THEM IN (review, 2026-09-29) —
+    the web app's "Let them in (N)", which is the same yes run again (owner
+    decision 4): a computer ticked before the sweep shipped, or whose sweep was
+    unconfirmed, kept its people waiting on the one screen that lists them. From
+    the same look, with the whole command, as every other row here prints one.
     """
     res = _bridge_get("/devices")
     if res is None or res[0] != 200 or not isinstance(res[1], dict):
@@ -2230,6 +2244,13 @@ def _print_allow_all_owner_lines(incoming: list) -> None:
             print(f"     {d.get('name') or d.get('id')} lets anyone join at once, so "
                   f"nobody waits here — see who's on it in the web app (Shared "
                   f"with).")
+        elif isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True:
+            n = sum(1 for r in incoming if isinstance(r, dict)
+                    and str(r.get("deviceId") or "") == str(d.get("id") or ""))
+            who = "1 person is" if n == 1 else f"{n} people are"
+            print(f"     {d.get('name') or d.get('id')} lets anyone join at once, and "
+                  f"{who} waiting for it — let them in with:  agent device "
+                  f"allow-all {d.get('id')} yes")
 
 
 def _device_requests() -> int:
@@ -3770,9 +3791,13 @@ def build_parser() -> argparse.ArgumentParser:
     # ⭐ WAVE 12 — `public --allow-all` is the one step that makes a computer public
     # AND lets anyone who asks join at once. store_true: it takes no value, so it
     # can never swallow the positional after it.
+    # ⛔ AND THE PEOPLE ALREADY WAITING JOIN TOO (review, 2026-09-29). This surface
+    # has no confirm step, so the help is the only place a terminal owner reads it
+    # before the yes does it; the web app and the chat both say it first.
     dvvis.add_argument("--allow-all", dest="allow_all", action="store_true",
                        help="with public: anyone who asks joins at once — no "
-                            "approval step")
+                            "approval step — and anyone already waiting joins too "
+                            "(up to 25 people)")
     dvvis.set_defaults(func=cmd_device)
     # ⭐ WAVE 12 — yes makes it public too (one write); no leaves it public, and
     # people ask again. Nobody who already joined is removed by either.
@@ -3782,7 +3807,8 @@ def build_parser() -> argparse.ArgumentParser:
     dvaa.add_argument("deviceId", help="your computer's id (from `agent device`)")
     dvaa.add_argument("value", choices=("yes", "no"),
                       help="yes = anyone who asks joins at once (and it becomes "
-                           "public); no = you approve each person again")
+                           "public), and anyone already waiting joins too (up to "
+                           "25 people); no = you approve each person again")
     dvaa.set_defaults(func=cmd_device)
 
     sl = sub.add_parser("send-logs", parents=[common],

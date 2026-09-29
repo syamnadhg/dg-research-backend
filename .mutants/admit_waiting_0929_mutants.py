@@ -14,7 +14,18 @@ on (2026-09-29).
        anyone already waiting joins too — counted in `do`, for that computer only,
        never in the router.
   T* — cli.py: the terminal's copy of the same lines, and its 75s wait.
-  K* — SKILL.md: the one line beside the Allow-all confirm rule.
+  K* — SKILL.md: the one line beside the Allow-all confirm rule, and the turn-on
+       row, which gets its question from `do` and says the people waiting join.
+  R* — agent/README.md: the command row says it too.
+
+⭐ THE REVIEW OF 2026-09-29 added: people left out of a computer that is NOT full
+are people the owner removed, in both clients; the route's `allowAll` rides
+`waiting` and "not in effect" is said, never "Nothing to change"; a retry that
+found nobody says "Nobody is waiting now."; `device requests` names the yes (or
+the command) that lets the people waiting on an Allow-all computer in; the
+terminal's help says the waiting people join; the admit call runs on what is left
+of a deadline counted from the start of the switch, with the 401 re-mint only
+while two legs fit — and that re-mint is executed (B17 is its `retry_401=False`).
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every mutated
 Python file must still COMPILE. Both are harness faults, counted OUT.
@@ -28,6 +39,9 @@ file is not evidence that the guard just written works.
 
   python .mutants/admit_waiting_0929_mutants.py
   python .mutants/admit_waiting_0929_mutants.py B1 S9 T3
+
+(stdout and stderr are put in utf-8 at the top of `__main__`: redirected to a file
+on Windows they are cp1252, and the first "✓ killed" crashed the run.)
 """
 import hashlib
 import os
@@ -43,6 +57,7 @@ BRIDGE = "agent/facade/bridge.py"
 SR = "agent/facade/skill/scripts/sr.py"
 CLI = "agent/facade/cli.py"
 SKILL = "agent/facade/skill/SKILL.md"
+README = "agent/README.md"
 
 _OWN = "tests/test_allow_all_admit_waiting_0929.py"
 SUITES = {
@@ -50,6 +65,7 @@ SUITES = {
     SR: (AGENT, _OWN),
     CLI: (AGENT, _OWN),
     SKILL: (AGENT, _OWN),
+    README: (AGENT, _OWN),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
@@ -60,7 +76,8 @@ MUTANTS = [
      "the retry the owner chose does nothing, and a computer ticked before this "
      "shipped keeps its waiting people waiting",
      [('                if allow is True:\n'
-       '                    same["waiting"] = _admit_waiting(sess, device_id)\n', '')]),
+       '                    same["waiting"] = _admit_waiting(sess, device_id, started)\n',
+       '')]),
     ("B2", BRIDGE, "⛔⛔ any no-op on an Allow-all computer — a plain 'make it public', "
      "an OFF that already holds — lets everyone waiting in",
      [('                if allow is True:\n                    same["waiting"]',
@@ -68,7 +85,8 @@ MUTANTS = [
     ("B3", BRIDGE, "⛔⛔ THE FEATURE IS GONE: switching Allow all on never lets anyone "
      "already waiting in",
      [('            if allow is True:\n'
-       '                done["waiting"] = _admit_waiting(sess, device_id)\n', '')]),
+       '                done["waiting"] = _admit_waiting(sess, device_id, started)\n',
+       '')]),
     ("B4", BRIDGE, "⛔⛔ going private, switching Allow all OFF or a plain publish lets "
      "everyone waiting in",
      [('            if allow is True:\n                done["waiting"]',
@@ -86,10 +104,13 @@ MUTANTS = [
        'isinstance(n, int) and not isinstance(n, bool)')]),
     ("B9", BRIDGE, "⛔ `full` is read loosely — a string says the computer is full",
      [('    full = body.get("full") is True\n', '    full = bool(body.get("full"))\n')]),
+    # ⛔ RE-AIMED 2026-09-29 (review): the wait became what is left of the budget,
+    # capped at the route's own. Same defect — the kwarg gone, the shared fifteen.
     ("B10", BRIDGE, "⛔ the route gets the shared fifteen seconds — a sweep that committed "
      "comes back 'could not confirm'",
-     [('{"deviceId": device_id},\n                                timeout=_FE_ADMIT_TIMEOUT)',
-       '{"deviceId": device_id})')]),
+     [('                                retry_401=left >= 2 * _FE_ADMIT_TIMEOUT,\n'
+       '                                timeout=min(_FE_ADMIT_TIMEOUT, left))',
+       '                                retry_401=left >= 2 * _FE_ADMIT_TIMEOUT)')]),
     ("B11", BRIDGE, "⛔ the contract's path is wrong — every sweep is a 404",
      [('_ADMIT_WAITING_PATH = "/api/devices/access-request/admit-waiting"\n',
        '_ADMIT_WAITING_PATH = "/api/devices/access-request/decide"\n')]),
@@ -97,24 +118,55 @@ MUTANTS = [
      [('                log.warning("device visibility write failed: %s", e)\n',
        '                log.warning("device visibility write failed: %s", e)\n'
        '                if allow is True:\n'
-       '                    _admit_waiting(sess, device_id)\n')]),
+       '                    _admit_waiting(sess, device_id, started)\n')]),
     ("B13", BRIDGE, "⛔⛔ a revoked sign-in's switch still asks the route",
      [('                # A revoked sign-in sends nothing, so after a landed clear the\n',
-       '                _admit_waiting(sess, device_id)\n'
+       '                _admit_waiting(sess, device_id, started)\n'
        '                # A revoked sign-in sends nothing, so after a landed clear the\n')]),
     ("B14", BRIDGE, "⛔⛔ the sweep runs BEFORE the write lands — on a switch that may "
      "never go on, and twice on one that does",
      [('            clear_first = want_all is True and current != "public" and stored\n',
        '            if allow is True:\n'
-       '                _admit_waiting(sess, device_id)\n'
+       '                _admit_waiting(sess, device_id, started)\n'
        '            clear_first = want_all is True and current != "public" and stored\n')]),
+
+    # ─── the review of 2026-09-29: the deadline, the 401 re-mint, `allowAll` ───
+    ("B15", BRIDGE, "⛔⛔ the deadline ignores the owner read and the writes — the bridge "
+     "answers after the client gave up, and a switch that landed reads 'no response'",
+     [('    left = _ADMIT_BUDGET - (time.monotonic() - started)\n',
+       '    left = _ADMIT_BUDGET\n')]),
+    ("B16", BRIDGE, "⛔ the 401 leg runs whatever is left — a second full wait past the "
+     "budget",
+     [('retry_401=left >= 2 * _FE_ADMIT_TIMEOUT,', 'retry_401=True,')]),
+    ("B17", BRIDGE, "⛔⛔ a stale cached sign-in is never re-minted — every sweep reads "
+     "'could not confirm' for up to fifty-five minutes after a sign-out elsewhere",
+     [('retry_401=left >= 2 * _FE_ADMIT_TIMEOUT,', 'retry_401=False,')]),
+    ("B18", BRIDGE, "⛔ the route's wait is not cut to what is left — the budget holds "
+     "only on paper",
+     [('timeout=min(_FE_ADMIT_TIMEOUT, left))', 'timeout=_FE_ADMIT_TIMEOUT)')]),
+    ("B19", BRIDGE, "⛔ with seconds left the route is still asked, on a wait no sweep "
+     "of 25 people can meet",
+     [('    if left < _ADMIT_MIN_WAIT:\n', '    if False:\n')]),
+    ("B20", BRIDGE, "⛔⛔ the route's 'not in effect' is dropped — the owner hears "
+     "'Nothing to change' over nobody let in",
+     [('    in_effect = body.get("allowAll") is True\n', '    in_effect = True\n')]),
+    ("B21", BRIDGE, "⛔ `allowAll` is read loosely — the string 'true' is in effect",
+     [('    in_effect = body.get("allowAll") is True\n',
+       '    in_effect = bool(body.get("allowAll"))\n')]),
+    ("B22", BRIDGE, "⛔ the switched-on clock starts at the route call, not the request",
+     [('done["waiting"] = _admit_waiting(sess, device_id, started)',
+       'done["waiting"] = _admit_waiting(sess, device_id, time.monotonic())')]),
+    ("B23", BRIDGE, "⛔ the retry's clock starts at the route call, not the request",
+     [('same["waiting"] = _admit_waiting(sess, device_id, started)',
+       'same["waiting"] = _admit_waiting(sess, device_id, time.monotonic())')]),
 
     # ═══ S — the chat (sr.py) ══════════════════════════════════════════════════
     ("S1", SR, "⛔⛔ the owner is never told who joined",
      [('                 *waiting,\n', '')]),
+    # ⛔ RE-AIMED 2026-09-29 (review): the idle sentence became `idle`. Same defect.
     ("S2", SR, "⛔ 'Nothing to change' over people a retry just let in",
-     [('                      + ("" if waiting else " Nothing to change."),\n',
-       '                      + " Nothing to change.",\n')]),
+     [('                      + ("" if waiting else idle),\n',
+       '                      + idle,\n')]),
     ("S3", SR, "⛔⛔ an unconfirmed sweep says nothing — the owner never learns to retry",
      [('    if waiting.get("unconfirmed"):\n        return [_WAITING_UNCONFIRMED]\n', '')]),
     ("S4", SR, "⛔ an older bridge with no `waiting` crashes the reply",
@@ -157,12 +209,48 @@ MUTANTS = [
      [('    left = waiting.get("stillWaiting") or 0\n    if left:\n',
        '    left = waiting.get("stillWaiting") or 0\n    if True:\n')]),
 
+    # ─── the review of 2026-09-29 ───
+    ("S18", SR, "⛔⛔ a route that found Allow all not in effect is relayed as nobody "
+     "waiting — 'Nothing to change' over nobody let in",
+     [('    if waiting.get("allowAll") is not True:\n        return [_WAITING_NOT_IN_EFFECT]\n',
+       '')]),
+    ("S19", SR, "⛔⛔ people the owner removed are sent to decide — an Approve that is "
+     "refused, by a phrase the router cannot read",
+     [('else f"{who} still waiting — people you removed stay out.")',
+       'else f"{who} still waiting for you to decide — ask me who’s waiting.")')]),
+    ("S20", SR, "⛔ a retry the route answered 0/0 still says 'Nothing to change'",
+     [('idle = (" Nobody is waiting now." if isinstance(body.get("waiting"), dict)',
+       'idle = (" Nobody is waiting now." if False')]),
+    ("S21", SR, "⛔ an older bridge, which asked nobody, says 'Nobody is waiting now.'",
+     [('idle = (" Nobody is waiting now." if isinstance(body.get("waiting"), dict)',
+       'idle = (" Nobody is waiting now." if True')]),
+    ("S22", SR, "⛔⛔ device requests never names the yes that lets the people waiting in",
+     [('            and str(d.get("id") or "") not in waiting] + _let_them_in_lines(\n'
+       '                body.get("devices") or [], incoming)\n',
+       '            and str(d.get("id") or "") not in waiting]\n')]),
+    ("S23", SR, "⛔ the yes is offered for a computer that asks the owner about each person",
+     [('if not (isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True):',
+       'if not (isinstance(d, dict) and d.get("owned")):')]),
+    ("S24", SR, "⛔ the yes is offered for a computer this account only shares",
+     [('if not (isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True):',
+       'if not (isinstance(d, dict) and d.get("allowAll") is True):')]),
+    ("S25", SR, "⛔ the count takes people waiting on the owner's other computers",
+     [('and str(r.get("deviceId") or "") == str(d.get("id") or ""))', 'and True)')]),
+    ("S26", SR, "⛔ the phrase names no computer — with several owned, the yes is a "
+     "'which one?' first",
+     [('say: allow all yes for “{name}”.")', 'say: allow all yes.")')]),
+    ("S27", SR, "⛔ '1 people are waiting for it'",
+     [('who = "1 person is" if n == 1 else', 'who = "1 person is" if False else')]),
+    ("S28", SR, "⛔ an Allow-all computer with nobody waiting is offered 'let them in'",
+     [('        if n:\n            who = "1 person is"',
+       '        if True:\n            who = "1 person is"')]),
+
     # ═══ T — the terminal (cli.py) ═════════════════════════════════════════════
     ("T1", CLI, "⛔⛔ the terminal never says who joined",
      [('        for line in waiting:\n            print(line)\n', '')]),
+    # ⛔ RE-AIMED 2026-09-29 (review): the idle sentence became `idle`. Same defect.
     ("T2", CLI, "⛔ 'Nothing to change' over people a retry just let in",
-     [("{'' if changed or waiting else ' Nothing to change.'}",
-       "{'' if changed else ' Nothing to change.'}")]),
+     [("{'' if changed or waiting else idle}", "{'' if changed else idle}")]),
     ("T3", CLI, "⛔⛔ an unconfirmed sweep says nothing — no retry is named",
      [('    if waiting.get("unconfirmed"):\n        return ["     Allow all is on',
        '    if False:\n        return ["     Allow all is on')]),
@@ -191,6 +279,43 @@ MUTANTS = [
      [('f"     run `agent device allow-all {device_id} yes` again to retry."',
        '"     run `agent device allow-all <id> yes` again to retry."')]),
 
+    # ─── the review of 2026-09-29 ───
+    ("T12", CLI, "⛔⛔ a route that found Allow all not in effect is relayed as nobody "
+     "waiting",
+     [('    if waiting.get("allowAll") is not True:\n        return ["     Nobody who',
+       '    if False:\n        return ["     Nobody who')]),
+    ("T13", CLI, "⛔⛔ people the owner removed are sent to decide",
+     [('else f"     {who} still waiting — people you removed stay out.")',
+       'else f"     {who} still waiting for you to decide — see "\n'
+       '                          f"`agent device requests`.")')]),
+    ("T14", CLI, "⛔ a retry the route answered 0/0 still says 'Nothing to change'",
+     [('idle = (" Nobody is waiting now." if isinstance(body.get("waiting"), dict)',
+       'idle = (" Nobody is waiting now." if False')]),
+    ("T15", CLI, "⛔ an older bridge, which asked nobody, says 'Nobody is waiting now.'",
+     [('idle = (" Nobody is waiting now." if isinstance(body.get("waiting"), dict)',
+       'idle = (" Nobody is waiting now." if True')]),
+    ("T16", CLI, "⛔⛔ the requests screen never names the command that lets them in",
+     [('        elif isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True:\n',
+       '        elif False:\n')]),
+    ("T17", CLI, "⛔ the command is offered for a computer in approval mode, or only shared",
+     [('        elif isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True:\n',
+       '        elif isinstance(d, dict):\n')]),
+    ("T18", CLI, "⛔ the count takes people waiting on the owner's other computers",
+     [('and str(r.get("deviceId") or "") == str(d.get("id") or ""))', 'and True)')]),
+    ("T19", CLI, "⛔ the command names no computer — it cannot be run as printed",
+     [("f\"allow-all {d.get('id')} yes\")", "f\"allow-all <id> yes\")")]),
+    ("T20", CLI, "⛔ '1 people are waiting for it'",
+     [('who = "1 person is" if n == 1 else', 'who = "1 person is" if False else')]),
+    ("T21", CLI, "⛔⛔ `allow-all yes` help never says the people waiting join too — a "
+     "terminal owner learns it after up to 25 were let in",
+     [('"public), and anyone already waiting joins too (up to "\n'
+       '                           "25 people); no = you approve each person again")',
+       '"public); no = you approve each person again")')]),
+    ("T22", CLI, "⛔ `visibility public --allow-all` help never says it either",
+     [('"approval step — and anyone already waiting joins too "\n'
+       '                            "(up to 25 people)")',
+       '"approval step")')]),
+
     # ═══ K — SKILL.md ══════════════════════════════════════════════════════════
     ("K1", SKILL, "⛔⛔ the assistant's confirm rule never says the yes lets the waiting "
      "people in, nor what the retry is",
@@ -198,6 +323,22 @@ MUTANTS = [
        'up to 25 people in all) — the question says so, the reply says who joined, and '
        'when the reply could not confirm them the retry is the same `device-allow-all '
        'yes`, confirmed again.\n', '')]),
+    # ─── the review of 2026-09-29: the turn-on row is the main path ───
+    ("K2", SKILL, "⛔⛔ the turn-on row relays its own words — the count `do` puts in "
+     "never reaches the owner",
+     [('**confirm** — run `sr.py do "<the user\'s message, verbatim>"` and relay the '
+       'client\'s question verbatim (anyone signed in joins at once',
+       '**confirm** — relay the client\'s question verbatim (anyone signed in joins at '
+       'once')]),
+    ("K3", SKILL, "⛔⛔ the turn-on row's question never says the people waiting join too",
+     [('; anyone already waiting to use it joins too, with how many when `do` can count '
+       'them; a private computer becomes public too)',
+       '; a private computer becomes public too)')]),
+
+    # ═══ R — agent/README.md ══════════════════════════════════════════════════
+    ("R1", README, "⛔ the command row never says the people waiting join too",
+     [('(yes also makes it public, and anyone already waiting joins too)',
+       '(yes also makes it public)')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.
@@ -226,6 +367,14 @@ def _digest(b: bytes) -> str:
 # every harness in this directory with `spec.loader.exec_module`, which EXECUTES
 # it — an unguarded runner turns a seconds-long check into a full run.
 if __name__ == "__main__":
+    # ⛔ UTF-8 OUT, OR THE FIRST "✓ killed" ENDS THE RUN (review, 2026-09-29):
+    # redirected on Windows, stdout is cp1252 and a check mark is a
+    # UnicodeEncodeError after mutant one. The CLI's own idiom.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if _INFLIGHT.exists():
         print("⛔⛔ A PREVIOUS RUN DIED WITH A MUTANT IN THE SOURCE:\n    "
               f"{_INFLIGHT.read_text(encoding='utf-8').strip()}\nRestore that file "

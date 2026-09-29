@@ -90,7 +90,7 @@ podcast"):
 /sr devices-public               computers other people offer   ·   device-ask <name|id>
 /sr device-requests              who's asking for yours, and what you're waiting on
 /sr device-approve [person]      ·   device-deny [person]   ·   device-visibility public|private [name]
-/sr device-allow-all yes|no [name]   anyone who asks joins at once (yes also makes it public)
+/sr device-allow-all yes|no [name]   anyone who asks joins at once (yes also makes it public, and anyone already waiting joins too)
 /sr send-logs                    package logs for support — prints the plan, sends nothing
 ```
 

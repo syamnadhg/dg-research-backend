@@ -211,6 +211,12 @@ _AA_WAITING_JOIN = "Anyone already waiting to use it joins too."
 _WAITING_UNCONFIRMED = ("Allow all is on, but I couldn’t confirm that anyone "
                         "already waiting was let in — say “allow all yes” again to "
                         "retry.")
+# ⛔ SAID WHEN THE WEB APP FOUND ALLOW ALL NOT IN EFFECT (review, 2026-09-29): the
+# bridge reads public and the tick, the web app also needs the computer fully
+# paired — one part-way through a Reset lets nobody in. The owner heard "Nothing
+# to change" over it; the web app says this in its own words.
+_WAITING_NOT_IN_EFFECT = ("Nobody who was waiting was let in — Allow all isn’t in "
+                          "effect for it right now.")
 
 # ⛔ ONE EXPLANATION OF AN EMPTY PUBLIC LIST. The two screens ask different
 # questions — "are there any?" and "I have none, is there another way?" — so the
@@ -2801,9 +2807,15 @@ def _visibility_lines(body: dict, dev: dict, asked_all) -> "list[str]":
         # "Nothing to change" only when there is nothing else to say: over two
         # people a retry just let in, it would be false.
         waiting = _waiting_lines(body)
+        # ⭐ …AND A RETRY THE WEB APP ANSWERED SAYS WHAT IT FOUND (review,
+        # 2026-09-29): with no lines, a `waiting` is the route's confirmed 0/0, and
+        # "Nothing to change" says nothing about the people the yes was for. An
+        # older bridge asks nobody and sends no `waiting`: the old sentence stays.
+        idle = (" Nobody is waiting now." if isinstance(body.get("waiting"), dict)
+                else " Nothing to change.")
         lines = [f"✓ “{name}” now lets anyone join at once." if changed
                  else f"✓ “{name}” already lets anyone join at once."
-                      + ("" if waiting else " Nothing to change."),
+                      + ("" if waiting else idle),
                  *waiting,
                  _ALLOW_ALL_MEANS.format(name=f"“{name}”")]
     elif asked_all is False and state == "public":
@@ -2853,12 +2865,20 @@ def _waiting_lines(body: dict) -> "list[str]":
     no `waiting` at all. ⛔ The people left over when it is full stay in the
     owner's requests and are told nothing (owner decision 6); the line says so, so
     the owner does not go looking for a notice that was never sent.
+
+    ⛔⛔ LEFT OUT WHEN IT IS NOT FULL MEANS REMOVED (review, 2026-09-29). The web
+    app's planner leaves nobody else out, its decide route refuses to approve
+    them, and it says "people you removed stay out". This said "for you to decide
+    — ask me who’s waiting": an Approve that is refused, by a phrase the router
+    reads as nothing. ⛔ And a route that found Allow all not in effect says so.
     """
     waiting = body.get("waiting")
     if not isinstance(waiting, dict):
         return []
     if waiting.get("unconfirmed"):
         return [_WAITING_UNCONFIRMED]
+    if waiting.get("allowAll") is not True:
+        return [_WAITING_NOT_IN_EFFECT]
     lines = []
     joined = waiting.get("admitted") or 0
     if joined:
@@ -2869,8 +2889,7 @@ def _waiting_lines(body: dict) -> "list[str]":
         who = "1 person is" if left == 1 else f"{left} people are"
         lines.append(f"{who} still waiting — it’s full (25 people), so they stay in "
                      f"your requests." if waiting.get("full") is True
-                     else f"{who} still waiting for you to decide — ask me who’s "
-                          f"waiting.")
+                     else f"{who} still waiting — people you removed stay out.")
     return lines
 
 
@@ -3047,6 +3066,9 @@ def _allow_all_owner_lines(incoming: list) -> "list[str]":
     limit (ten an hour) the web app files an ordinary ask; saying "nobody waits
     here" over that row would be false. ⛔ And a failed look adds nothing: this is
     a second fetch on a screen that already answered its own question.
+
+    ⭐ THAT COMPUTER GETS `_let_them_in_lines` INSTEAD (review, 2026-09-29), from
+    the same look.
     """
     code, body = _get("/devices")
     if code != 200 or not isinstance(body, dict):
@@ -3056,7 +3078,33 @@ def _allow_all_owner_lines(incoming: list) -> "list[str]":
             "see who's on it in the web app (Shared with)."
             for d in (body.get("devices") or [])
             if isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True
-            and str(d.get("id") or "") not in waiting]
+            and str(d.get("id") or "") not in waiting] + _let_them_in_lines(
+                body.get("devices") or [], incoming)
+
+
+def _let_them_in_lines(devices: list, incoming: list) -> "list[str]":
+    """One line per OWNED computer that lets anyone join and still has people
+    waiting: the yes that lets them in.
+
+    ⛔⛔ THE CHAT'S "LET THEM IN (N)" (review, 2026-09-29). The web app puts that
+    button in Review; chat's way is "allow all yes" again (owner decision 4), and
+    no screen said so — a computer ticked before the sweep shipped, or whose sweep
+    was unconfirmed, kept its people waiting on the one screen that lists them.
+    ⛔ THE PHRASE NAMES THE COMPUTER, because the router reads it whole: a bare
+    "allow all yes" with several computers owned is a "which one?" first.
+    """
+    lines = []
+    for d in devices:
+        if not (isinstance(d, dict) and d.get("owned") and d.get("allowAll") is True):
+            continue
+        n = sum(1 for r in incoming if isinstance(r, dict)
+                and str(r.get("deviceId") or "") == str(d.get("id") or ""))
+        if n:
+            who = "1 person is" if n == 1 else f"{n} people are"
+            name = _dev_label(d)
+            lines.append(f"“{name}” lets anyone join at once, and {who} waiting for "
+                         f"it — to let them in too, say: allow all yes for “{name}”.")
+    return lines
 
 
 def cmd_device_requests(args) -> int:

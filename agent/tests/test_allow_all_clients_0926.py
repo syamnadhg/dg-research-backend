@@ -734,7 +734,10 @@ def test_terminal_requests_with_people_waiting_still_name_the_open_computer(term
     ns.func(ns)
     out = term.out()
     assert "Lab PC lets anyone join at once, so nobody waits here" in out
-    assert "Studio PC lets anyone join at once" not in out
+    assert "Studio PC lets anyone join at once, so nobody waits here" not in out
+    # ⭐ Since 2026-09-29 the one with a real ask names the command that lets its
+    # people in instead (the terminal's "Let them in (N)").
+    assert "agent device allow-all dev-a1 yes" in out
 
 
 def test_terminal_wsl_hint_for_allow_all(monkeypatch, capsys):
