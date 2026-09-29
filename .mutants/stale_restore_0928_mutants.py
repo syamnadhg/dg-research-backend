@@ -3,7 +3,9 @@
 
 ⛔⛔ WHAT THIS CODE DECIDES.
   D* — a 403 on the job's research record is an ANSWER at boot: the pickup rule
-       says "denied" (only for the boot restore), the funnel refuses a 403 when
+       says "denied" (for every 403 at the boot restore; on the other pickups
+       only for an account known to have left — that half is
+       `stale_restore_repair_0928_mutants.py`'s), the funnel refuses a 403 when
        handed a `denied` list, the boot restore sheds such an entry, and the
        held entry's re-offer lets it go. A read that FAILED (timeout, UNAVAILABLE,
        5xx) is still taken.
@@ -11,7 +13,9 @@
        neither this computer's account nor one of its sharers is dropped BEFORE
        any read; "cannot tell who shares it" is never "nobody".
   A* — a job older than `_STALE_RUN_S` (the startup sweep's 7 days) is not
-       restored; its age is the NEWER of its run-id stamp and its folder's time.
+       restored; its age is the NEWEST of its clocks — its run-id stamp, its
+       folder's time, and the `queued_at_ms` a job queued for an old run
+       carries (that last one is `stale_restore_repair_0928_mutants.py`'s).
   H* — the heal's structural line names another account instead of "re-pair
        required" when the refused write is to another account's research (a
        device-id mismatch still says re-pair), and every pinned research writer
@@ -50,7 +54,7 @@ SUITES = {
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # ── anchors: a 403 is an answer at boot ─────────────────────────────────────
-RULE_DENIED = "        if denied_is_answer and _is_denied_read(err):"
+RULE_DENIED = "        if _is_denied_read(err) and (denied_is_answer or _known_not_a_member(uid)):"
 RULE_DENIED_LINE = ("            _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)\n"
                     '            return "denied", None')
 DENIED_TEST = ('    return (type(err).__name__ == "PermissionDenied" or "403" in s\n'
@@ -84,9 +88,10 @@ AGE_FOLDER = "            seen.append(d.stat().st_mtime)"
 AGE_NEWEST = "    return (now - max(seen)) if seen else None"
 
 # ── anchors: the heal's structural line ─────────────────────────────────────
-ADVICE_GATE = "    if uid and owner and uid != owner and not mismatch:"
-MISMATCH = "        mismatch = bool(tok_did and cfg_did and tok_did != cfg_did)"
-LATCH_ADVICE = '                        f"{_structural_heal_advice(uid, before, mismatch=mismatch)} "'
+ADVICE_GATE = "    if uid and owner and uid != owner and not own_pairing:"
+MISMATCH = "        own_pairing = not tok_did or bool(cfg_did and tok_did != cfg_did)"
+LATCH_ADVICE = ('                        f"{_structural_heal_advice(uid, before, '
+                'own_pairing=own_pairing)} "')
 SITE_EMIT = '            what="emit_event", uid=_fb_uid,'
 SITE_UPDATE = '            what=f"update research {research_id[:8]}…", uid=uid,'
 SITE_SET = '            what=f"set research {research_id[:8]}…", uid=uid,'
@@ -104,7 +109,8 @@ MUTANTS = [
      [(RULE_DENIED, "        if False:")]),
     ("D2", RESEARCH, "⛔⛔ OVER-REACH: every failed read counts as a refusal — a "
      "boot that came up before the network drops the owner's real jobs",
-     [(RULE_DENIED, "        if denied_is_answer:")]),
+     [(RULE_DENIED, "        if denied_is_answer or (_is_denied_read(err) and "
+                    "_known_not_a_member(uid)):")]),
     ("D3", RESEARCH, "the refusal is dropped but never said — no line tells the "
      "owner why a queued job did not run",
      [(RULE_DENIED_LINE, '            return "denied", None')]),
@@ -158,22 +164,23 @@ MUTANTS = [
     ("A2", RESEARCH, "the horizon is its own number, not the startup sweep's — the "
      "two can disagree about whether a run is still somebody's",
      [(AGE_GATE, "        if age is not None and age > 7 * 86400:")]),
-    ("A3", RESEARCH, "⛔ the folder's time is ignored — a run resumed today from an "
-     "old folder is dropped as stale",
+    ("A3", RESEARCH, "⛔ the folder's time is ignored — an entry an older build "
+     "wrote, for a run worked in today from an old folder, is dropped as stale",
      [(AGE_FOLDER, "            pass")]),
-    ("A4", RESEARCH, "⛔ the OLDER clock wins — a run resumed today from an old "
-     "folder is dropped as stale",
+    ("A4", RESEARCH, "⛔ the OLDER clock wins — a run worked in today from an old "
+     "folder, or resumed today, is dropped as stale",
      [(AGE_NEWEST, "    return (now - min(seen)) if seen else None")]),
 
     # ═══ H — the heal's structural line ════════════════════════════════════
     ("H1", RESEARCH, "⛔⛔ the structural line says 're-pair required' for another "
      "account's research again",
      [(ADVICE_GATE, "    if False:")]),
-    ("H2", RESEARCH, "⛔ a device-id mismatch on another account's write stops "
-     "saying re-pair — the one case where re-pairing IS the fix",
+    ("H2", RESEARCH, "⛔ a fault in this computer's own pairing (a device-id "
+     "mismatch, or no claim) on another account's write stops saying re-pair — "
+     "the case where re-pairing IS the fix",
      [(ADVICE_GATE, "    if uid and owner and uid != owner:")]),
-    ("H3", RESEARCH, "the mismatch is never seen by the advice",
-     [(MISMATCH, "        mismatch = False")]),
+    ("H3", RESEARCH, "this computer's own pairing is never seen by the advice",
+     [(MISMATCH, "        own_pairing = False")]),
     ("H4", RESEARCH, "⛔ the latch line hard-codes 're-pair required' again",
      [(LATCH_ADVICE, '                        f"A force-refresh cannot fix this — re-pair required. "')]),
     ("H5", RESEARCH, "⛔⛔ the run's event writer — the one the 09-28 log latched on "
