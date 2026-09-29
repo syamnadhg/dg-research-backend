@@ -278,6 +278,11 @@ _EXPECTED_MARKED = {
     # own run's sink is gone, and since 10.9 the next run — often somebody
     # else's — is armed by then. Its own account is `_note_cloud_handoff`.
     "_post_fe_p4p5_trigger._drive",
+    # Wave 13: the replay of parked Send Logs receipts is bundle administration,
+    # like `_work` above, and it rides the reconnect watcher — which is NOT
+    # marked — so its lines landed in whatever run was armed: 6,925 of one run
+    # log's 7,763 lines on the owner's computer. None of them is a run's fate.
+    "_drain_queued_log_bundle_rows",
 }
 
 # ⛔⛔ THE MORE IMPORTANT LIST. Each of these logs while a run is armed and each

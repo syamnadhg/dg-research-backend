@@ -357,12 +357,38 @@ def test_every_command_flushes_at_the_top_of_main():
     assert src.index("tm.flush_in_background()") < src.index("args = parser.parse_args()")
 
 
-def test_the_flush_runs_on_every_worker_not_only_worker_one():
+def test_the_flush_runs_on_every_worker_not_only_worker_one(monkeypatch):
     """⛔ The worker-1 heartbeat loop is gated `WORKER_ID == 1`, so a worker-2
-    spool anchored there would never go out at all."""
+    spool anchored there would never go out at all.
+
+    ⚠ EXECUTED since wave 13. This read "no `WORKER_ID == 1` anywhere in the
+    watcher", which stopped being the question the day the watcher gained a
+    worker-1-only step of its own (the parked Send Logs receipts' replay). So a
+    worker 2 runs the real watcher, and the flush has to happen."""
+    import asyncio
+    flushed = []
+    monkeypatch.setattr(research, "WORKER_ID", 2)
+    monkeypatch.setattr(research, "_firebase_db", object())
+    monkeypatch.setattr(research.tm, "flush_in_background",
+                        lambda *a, **k: flushed.append(1))
+
+    async def _no_dead_watches():
+        return []
+    monkeypatch.setattr(research, "_rearm_dead_watches_if_any", _no_dead_watches)
+
+    async def main():
+        task = asyncio.create_task(research._firebase_reconnect_loop())
+        await asyncio.sleep(0.2)
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+    asyncio.run(main())
+    assert flushed, "worker 2's watcher never flushed the telemetry spool"
     src = code_only_deep(research._firebase_reconnect_loop)
     assert "tm.flush_in_background()" in src
-    assert "WORKER_ID == 1" not in src
 
 
 def test_a_finished_run_flushes_what_it_just_recorded():

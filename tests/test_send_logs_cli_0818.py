@@ -400,9 +400,9 @@ def test_a_row_whose_OPEN_failed_is_parked_too(cli, monkeypatch):
 def test_parked_rows_are_replayed_and_then_forgotten(monkeypatch):
     written = []
     monkeypatch.setattr(research, "_firebase_db", object())
-    monkeypatch.setattr(research, "_write_log_bundle_status",
+    monkeypatch.setattr(research, "_log_bundle_row_write",
                         lambda o, c, patch, create=False:
-                        written.append((o, c, patch.get("status"))) or True)
+                        written.append((o, c, patch.get("status"))) or "ok")
     research._queue_log_bundle_row("user-rocky", "7QK4M2XZ", {"status": "done"},
                                    device_id="d-1")
     research._queue_log_bundle_row("user-rocky", "MJ72K62P", {"status": "done"},
@@ -417,12 +417,24 @@ def test_parked_rows_are_replayed_and_then_forgotten(monkeypatch):
     assert research._drain_queued_log_bundle_rows() == 0
 
 
-def test_a_row_that_still_cannot_be_written_stays_parked(monkeypatch):
+def test_a_row_that_cannot_reach_the_account_stays_parked(monkeypatch):
     monkeypatch.setattr(research, "_firebase_db", object())
-    monkeypatch.setattr(research, "_write_log_bundle_status", lambda *a, **k: False)
+    monkeypatch.setattr(research, "_log_bundle_row_write", lambda *a, **k: "failed")
     research._queue_log_bundle_row("user-rocky", "7QK4M2XZ", {"status": "done"})
     assert research._drain_queued_log_bundle_rows() == 0
     assert research._queued_bundle_rows_path().exists(), "the row was lost"
+
+
+def test_a_row_the_account_refuses_is_dropped_not_kept(monkeypatch):
+    """⛔⛔ FLIPPED, wave 13. This pin used to say a row that still cannot be
+    written stays parked — whatever the reason. A refusal is final, and the
+    owner's computer replayed five refused rows every five seconds for a month.
+    The whole chain, against the rules, is in test_send_logs_receipts_w13.py."""
+    monkeypatch.setattr(research, "_firebase_db", object())
+    monkeypatch.setattr(research, "_log_bundle_row_write", lambda *a, **k: "denied")
+    research._queue_log_bundle_row("user-rocky", "7QK4M2XZ", {"status": "done"})
+    assert research._drain_queued_log_bundle_rows() == 0
+    assert not research._queued_bundle_rows_path().exists()
 
 
 def test_the_drain_is_a_no_op_with_no_firestore(monkeypatch):
@@ -432,12 +444,15 @@ def test_the_drain_is_a_no_op_with_no_firestore(monkeypatch):
     assert research._queued_bundle_rows_path().exists()
 
 
-def test_the_drain_runs_on_every_worker_not_on_an_outage_edge():
+def test_the_drain_rides_the_watcher_not_an_outage_edge():
     """⛔ A `--send-logs` run from the terminal has no Firestore client at all, so
     it parks its row even when nothing was ever down. An outage-cleared edge
-    would never fire for it."""
+    would never fire for it.
+
+    ⚠ Wave 13: the watcher now hands it to a thread, on worker 1 only — that is
+    EXECUTED in test_send_logs_receipts_w13.py; this keeps the edge half."""
     src = inspect.getsource(research._firebase_reconnect_loop)
-    assert "_drain_queued_log_bundle_rows()" in src
+    assert "asyncio.to_thread(_drain_queued_log_bundle_rows)" in src
     clear = inspect.getsource(research._clear_firestore_down)
     assert "_drain_queued_log_bundle_rows" not in clear
 

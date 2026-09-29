@@ -8563,7 +8563,8 @@ def _queue_pos_batches(patches, chunk: int = 450):
             yield uid_v, i, mine[i:i + chunk]
 
 
-def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
+def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
+                          heal: bool = True):
     """Run a gRPC user-tree write `op` (a zero-arg callable). On a synth-user
     rules denial, force the credential to re-mint a claim-bearing idToken and
     retry `op` ONCE; re-raise so the caller's existing try/except still logs +
@@ -8577,7 +8578,20 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
     required" for a run of an account this computer was no longer shared with
     — re-pairing this computer to its own owner changes nothing about another
     account's research. When `uid` is not the token's owner the line says
-    whose the research is instead; see `_structural_heal_advice`."""
+    whose the research is instead; see `_structural_heal_advice`.
+
+    ⛔⛔ `heal=False` IS FOR A WRITE THAT MUST NOT SPEND THE RESEARCH WRITES'
+    SAFETY NET (wave 13). The re-mint's 30-second cooldown and the structural
+    latch are ONE per process, shared by every write. On the owner's computer
+    five Send Logs receipts the account refused for good were replayed every
+    five seconds: each one used up the re-mint, so a research write that needed
+    it inside the next 30 seconds just failed, and three in a row switched the
+    net off for everything and printed "re-pair required" — nine times in the
+    older logs, and once on worker 2 a minute after it started. Such a write
+    gets the free same-token retry below and nothing else: no force-refresh, no
+    cooldown stamp, no count toward the latch, no line blaming the pairing.
+    (A success still clears the latch, as every successful write does — the
+    heartbeat among them; landing proves the credential works.)"""
     global _grpc_heal_last_ts, _grpc_heal_consec_fail, _grpc_heal_structural
     try:
         result = op()
@@ -8634,6 +8648,8 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
             # __context__, so without it EVERY retry failure reads as a denial.
             if not _is_synth_permission_denied(_plain_e, ignore=exc):
                 raise
+        if not heal:
+            raise  # the original denial — the free retry is all this write gets
         # Throttle + structural latch under the lock so concurrent worker
         # threads can't all slip past the cooldown and fire simultaneous heals.
         with _grpc_heal_lock:
@@ -9903,9 +9919,16 @@ async def _firebase_reconnect_loop():
                 # outage-cleared edge: a `--send-logs` run from the terminal has
                 # no Firestore client at all, so it parks its row even when
                 # nothing was ever down — and an edge that never fires is no
-                # trigger. Runs on every worker, and costs one missing-file stat
-                # when there is nothing parked.
-                _drain_queued_log_bundle_rows()
+                # trigger. Costs one missing-file stat when there is nothing
+                # parked.
+                # ⛔⛔ OFF THIS LOOP, AND ON WORKER 1 ONLY (wave 13). The replay
+                # makes blocking Firestore writes, and this loop shares its event
+                # loop with the job worker: five stuck receipts froze research
+                # about one second in six on the owner's computer. And every
+                # worker drained the same file, doubling the writes and racing
+                # each other's rewrite of it.
+                if WORKER_ID == 1:
+                    await asyncio.to_thread(_drain_queued_log_bundle_rows)
                 # ⛔⛔ THE CLIENT BEING UP IS NOT THE SAME AS THE LISTENERS BEING
                 # UP, and this loop used to treat them as one thing: everything
                 # below only ever ran when `_firebase_db` had gone None. A watch
@@ -11148,17 +11171,23 @@ def _open_log_bundle_row(owner_uid: str, code: str, device_id: str,
     whose process dies mid-upload leaves a row that honestly says 'collecting'
     instead of nothing at all."""
     return _write_log_bundle_status(
-        owner_uid, code,
-        {"status": "collecting", "deviceId": device_id, "requestId": request_id,
-         # ⛔⛔ THE ROW STATES ITS OWN SCOPE, and the rule reads it. A row landing
-         # in a tree the device does not OWN is accepted only when it says it
-         # carries no machine-level material — so a device leaking a
-         # whole-machine bundle into a sharer's tree has to write a falsehood
-         # into a document we keep, rather than doing it silently. It is set on
-         # CREATE and frozen by the update rule, because otherwise a device could
-         # open honestly and flip it once the object had landed.
-         "machineIncluded": bool(machine_included)},
+        owner_uid, code, _log_bundle_open_fields(device_id, request_id, machine_included),
         create=True)
+
+
+def _log_bundle_open_fields(device_id: str, request_id: str = "",
+                            machine_included: bool = True) -> dict:
+    """The fields a row is opened with — by the live send, by a refusal, and by
+    the replay of a parked row, so all three open the same shape."""
+    return {"status": "collecting", "deviceId": device_id, "requestId": request_id,
+            # ⛔⛔ THE ROW STATES ITS OWN SCOPE, and the rule reads it. A row
+            # landing in a tree the device does not OWN is accepted only when it
+            # says it carries no machine-level material — so a device leaking a
+            # whole-machine bundle into a sharer's tree has to write a falsehood
+            # into a document we keep, rather than doing it silently. It is set
+            # on CREATE and frozen by the update rule, because otherwise a device
+            # could open honestly and flip it once the object had landed.
+            "machineIncluded": bool(machine_included)}
 
 
 def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
@@ -11169,8 +11198,39 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
     ⛔ `create=True` is reserved for `_open_log_bundle_row`. Any other status
     handed to it is refused by the rule, silently, and the caller sees only a
     WARN — see that function."""
+    outcome = _log_bundle_row_write(owner_uid, code, patch, create=create)
+    if outcome in ("denied", "failed"):
+        why = ("the account refused it" if outcome == "denied"
+               else "the account could not be reached")
+        log(f"[send-logs] status write failed ({why}) — the upload continues; "
+            f"the row will look stale", "WARN")
+    return outcome == "ok"
+
+
+def _log_bundle_row_write(owner_uid: str, code: str, patch: dict,
+                          create: bool = False) -> str:
+    """One write of a log-bundle row, saying how it went — and saying nothing
+    itself when it fails, so each caller decides whether that is worth a line:
+
+      "ok"       it landed.
+      "denied"   the account's rules refused it — they will refuse it again.
+      "failed"   anything else: the network, a timeout. It may land later.
+      "offline"  nothing to write with or to — no client, no owner, no code.
+
+    ⛔⛔ WHY THE REPLAY NEEDS THE DIFFERENCE (wave 13). A parked receipt used to be
+    kept whatever the failure, with no count and no expiry, and replayed every
+    five seconds on each worker. On the owner's computer five receipts the
+    account refuses for good made 90% of every run log for a month and grew
+    backend.log to 111 MB. A refusal is final; only a failure to reach the
+    account is worth another try.
+
+    ⛔ NOT THE RESEARCH WRITES' HEAL (`heal=False`). A receipt is best-effort; it
+    gets the free same-token retry and never the re-mint, its cooldown or the
+    structural latch — see `_grpc_write_with_heal`. Measured in the owner's
+    0.1.13 logs: 1,314 re-mints spent on receipts, and not one cleared a
+    refusal."""
     if not _firebase_db or not owner_uid or not code:
-        return False
+        return "offline"
     from datetime import timedelta, timezone
     body = dict(patch)
     body["updatedAt"] = datetime.now(timezone.utc)
@@ -11189,7 +11249,7 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
             payload = _be_payload(fields)
             _grpc_write_with_heal(
                 (lambda: ref.set(payload)) if create else (lambda: ref.update(payload)),
-                what="log_bundle_status")
+                what="log_bundle_status", heal=False)
 
         try:
             _write(body)
@@ -11211,11 +11271,15 @@ def _write_log_bundle_status(owner_uid: str, code: str, patch: dict,
             log("[send-logs] the row refused the left-out counts — the deployed "
                 "rules predate them; writing it without them", "WARN")
             _write(bare)
-        return True
+        return "ok"
     except Exception as exc:
-        log(f"[send-logs] status write failed ({type(exc).__name__}) — the upload "
-            f"continues; the row will look stale", "WARN")
-        return False
+        # ⛔ `ignore=exc.__context__`: an exception raised while a denial was
+        # being handled — the network dropping on the same-token retry, or on the
+        # write without the counts — carries that denial as its context, and the
+        # walk would call a network failure a refusal and drop a receipt that
+        # could still land. What decides is the failure itself.
+        return ("denied" if _is_synth_permission_denied(exc, ignore=exc.__context__)
+                else "failed")
 
 
 # ⭐ WHAT A BUNDLE LEFT OUT, as the row carries it (wave 10.9). The builder has
@@ -11320,11 +11384,29 @@ def _refuse_log_bundle_with_row(owner_uid: str, code: str, device_id: str,
     # on disk and let `_drain_queued_log_bundle_rows()` replay it. That runs on
     # every tick of the always-armed reconnect watcher, and it replays the OPEN
     # before the patch — a create at 'failed' is what the rule refuses.
-    patch = {"status": "failed", "errorClass": error_class}
-    if not (_open_log_bundle_row(owner_uid, code, device_id, request_id,
-                                machine_included=machine_included)
-            and _write_log_bundle_status(owner_uid, code, patch)):
-        _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)
+    #
+    # ⛔⛔ BUT NEVER A ROW THE ACCOUNT REFUSED (wave 13). A refusal is final, and a
+    # parked one was replayed every five seconds for as long as the computer
+    # ran: a sharer removed a moment before pressing Send Logs has a tree this
+    # computer may not write to at all.
+    # ⭐ The patch carries the row's scope so the replay opens it the same way:
+    # a sharer's row opened as a whole-machine row is refused by the rule.
+    patch = {"status": "failed", "errorClass": error_class,
+             "machineIncluded": bool(machine_included)}
+    outcome = _log_bundle_row_write(
+        owner_uid, code, _log_bundle_open_fields(device_id, request_id, machine_included),
+        create=True)
+    if outcome == "ok":
+        outcome = _log_bundle_row_write(owner_uid, code, patch)
+    if outcome == "ok":
+        return
+    if outcome == "denied":
+        log(f"[send-logs] the account refused the {error_class} receipt — not kept "
+            f"for later, because it would only be refused again", "WARN")
+        return
+    log(f"[send-logs] could not write the {error_class} receipt now — kept, to be "
+        f"sent once the account can be reached", "WARN")
+    _queue_log_bundle_row(owner_uid, code, patch, device_id=device_id)
 
 
 def _upload_log_bundle_via_storage_rest(local_path: "Path", owner_uid: str,
@@ -13801,7 +13883,7 @@ def _clear_local_logs(root=None, telemetry_root=None) -> dict:
 
     # ⛔⛔ THE PARKED ROWS GO FIRST, and the order is the whole point. The
     # reconnect watcher calls `_drain_queued_log_bundle_rows()` on EVERY tick of
-    # EVERY worker, and a drain RE-CREATES the cloud row it publishes. The app
+    # worker 1, and a drain RE-CREATES the cloud row it publishes. The app
     # deletes this device's cloud rows itself, so a drain landing after that
     # sweep resurrects a bundle the person just cleared. Emptying this file
     # before anything slower happens is what shrinks that window to nothing the
@@ -89860,12 +89942,63 @@ def _queue_log_bundle_row(owner_uid: str, code: str, patch: dict,
         pass
 
 
+#: A parked row that could not reach the account waits this long before the
+#: next try, doubling each time up to the cap. A REFUSED row is never retried.
+_PARKED_ROW_RETRY_S = 30
+_PARKED_ROW_RETRY_CAP_S = 1800
+
+
+def _replay_parked_bundle_row(row: dict) -> str:
+    """One parked row, replayed: `_log_bundle_row_write`'s outcome of it.
+
+    ⛔ Replays the OPEN and then the patch, in that order. Replaying the patch
+    alone as a create is what the rule refuses — the defect this helper existed
+    to work around and was itself reproducing.
+
+    ⛔⛔ A REFUSED OPEN IS NOT THE END OF IT (wave 13). A row whose open landed
+    on an earlier try and whose patch did not is refused a second open — the
+    update rule freezes `createdAt`, and an open stamps a new one — so it was
+    refused on every replay, forever, and the patch it still owed never went.
+    The patch decides: it lands on the open row, and a row that is not there
+    refuses it too.
+
+    ⭐ The row is opened in the scope its patch states. A sharer's row opened as
+    a whole-machine row is refused by the rule; a patch saying nothing is an
+    owner's (the terminal's) and opens as one."""
+    owner = row.get("ownerUid") or ""
+    code = row.get("code") or ""
+    patch = row.get("patch") or {}
+    opened = _log_bundle_row_write(
+        owner, code,
+        _log_bundle_open_fields(row.get("deviceId") or "", "",
+                                patch.get("machineIncluded") is not False),
+        create=True)
+    if opened not in ("ok", "denied"):
+        return opened
+    return _log_bundle_row_write(owner, code, patch)
+
+
+@_machine_logged
 def _drain_queued_log_bundle_rows() -> int:
     """Try the parked row writes again. Returns how many landed.
 
     Reads the whole file, rewrites what is still owed. Best-effort and silent
     when there is nothing parked, because this runs at the top of every
-    command."""
+    command.
+
+    ⛔⛔ EVERY ROW LEAVES, ONE WAY OR ANOTHER (wave 13). The owner's computer kept
+    five receipts the account refused for good and replayed them every five
+    seconds on each worker for a month — 90% of every run log, backend.log at
+    111 MB. So a row now goes one of four ways, and only one of them keeps it:
+      • it lands;
+      • the account refuses it — dropped, with one line;
+      • it is older than the bundle's own life — dropped, with one line. The
+        bucket deletes a bundle 30 days after it arrives, and a receipt landed
+        later would show as sent, newly dated, naming a file already gone;
+      • the account cannot be reached — kept, and tried again later, backing off.
+
+    ⭐ MACHINE-LOGGED: a receipt is bundle administration, like the send itself,
+    and the replay's lines were landing in whatever run was armed."""
     path = _queued_bundle_rows_path()
     try:
         lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -89873,22 +90006,37 @@ def _drain_queued_log_bundle_rows() -> int:
         return 0
     if not lines or not _firebase_db:
         return 0
+    now = time.time()
     still_owed, landed = [], 0
     for line in lines:
         try:
-            row = json.loads(line)
+            row = dict(json.loads(line))
         except Exception:
             continue  # unparseable — drop it rather than retry forever
-        # ⛔ Replays the OPEN and then the patch, in that order. Replaying the
-        # patch alone as a create is what the rule refuses — the defect this
-        # helper existed to work around and was itself reproducing.
-        owner = row.get("ownerUid") or ""
-        code = row.get("code") or ""
-        if (_open_log_bundle_row(owner, code, row.get("deviceId") or "")
-                and _write_log_bundle_status(owner, code, row.get("patch") or {})):
-            landed += 1
-        else:
+        # The support code is the read capability for its bundle: a prefix names
+        # the receipt in a log line without handing the bundle to its reader.
+        which = f"{str(row.get('code') or '')[:4]}…"
+        # ⛔ An unreadable stamp reads as the epoch, so it is dropped: nothing
+        # can show that its bundle still exists.
+        if now - _epoch_from_iso(row.get("at")) >= BUNDLE_MAX_AGE_DAYS * 86400:
+            log(f"[send-logs] a saved Send Logs receipt (code {which}) is older than "
+                f"the {BUNDLE_MAX_AGE_DAYS} days its bundle is kept — dropped instead "
+                f"of being shown as sent", "WARN")
+            continue
+        if now < float(row.get("retryAt") or 0):
             still_owed.append(line)
+            continue
+        outcome = _replay_parked_bundle_row(row)
+        if outcome == "ok":
+            landed += 1
+        elif outcome == "denied":
+            log(f"[send-logs] the account refused a saved Send Logs receipt (code "
+                f"{which}) — dropped; it will not be tried again", "WARN")
+        else:
+            row["tries"] = int(row.get("tries") or 0) + 1
+            row["retryAt"] = now + min(_PARKED_ROW_RETRY_S * 2 ** (row["tries"] - 1),
+                                       _PARKED_ROW_RETRY_CAP_S)
+            still_owed.append(json.dumps(row))
     try:
         if still_owed:
             path.write_text("\n".join(still_owed) + "\n", encoding="utf-8")
