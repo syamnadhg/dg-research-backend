@@ -37,7 +37,6 @@ import os
 import time
 import types
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
@@ -572,6 +571,7 @@ def test_a_worker_that_died_before_starting_it_puts_it_back_at_boot(monkeypatch,
     assert research._release_waiting_claims(2) == 1
     assert (mine / MARKER).exists() and not (mine / f"{MARKER}.w2").exists()
     assert (theirs / f"{MARKER}.w3").exists() and not (theirs / MARKER).exists()
+    assert len(_said(m, "worker 2", "back in the queue")) == 1, m.lines
 
 
 def test_the_run_stops_waiting_once_the_worker_that_took_it_starts_it(monkeypatch, tmp_path):
@@ -799,16 +799,27 @@ def test_the_startup_sweep_keeps_a_waiting_runs_folder_however_old(monkeypatch, 
     assert not left.exists(), "the sweep stopped sweeping"
 
 
-def test_run_server_still_runs_the_startup_sweep():
-    """The sweep was lifted out of `run_server` to be run by a test; the boot
-    must still call it."""
+def _boot_calls(name):
+    """Where `run_server`'s own body (not its nested functions) calls `name`."""
     from _run_server_closure import _SOURCE
     tree = ast.parse(_SOURCE.read_text(encoding="utf-8"))
     server = next(n for n in tree.body
                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "run_server")
-    calls = [n for n in ast.walk(server) if isinstance(n, ast.Call)
-             and getattr(n.func, "id", "") == "_startup_sweep_stale_runs"]
-    assert len(calls) == 1
+    return [n.lineno for n in ast.walk(server) if isinstance(n, ast.Call)
+            and getattr(n.func, "id", "") == name]
+
+
+def test_boot_runs_the_sweep_and_puts_taken_runs_back_before_rehydrating():
+    """⛔ `run_server` cannot be run by a test, so its two new calls are pinned
+    by where they sit: the startup sweep (lifted out to be RUN above) is still
+    called, and a worker's taken-but-unstarted runs go back in the queue
+    BEFORE rehydration looks — which must see them as waiting, not as this
+    worker's to resume."""
+    assert len(_boot_calls("_startup_sweep_stale_runs")) == 1
+    release = _boot_calls("_release_waiting_claims")
+    rehydrate = _boot_calls("_rehydrate_ongoing_for_tree")
+    assert len(release) == 1 and rehydrate, (release, rehydrate)
+    assert release[0] < min(rehydrate), "taken runs are put back after rehydration ran"
 
 
 # ══ 8. Clear Local Storage ═══════════════════════════════════════════════════
