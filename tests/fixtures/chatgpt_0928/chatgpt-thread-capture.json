@@ -1,0 +1,803 @@
+{
+ "what": "chatgpt-thread-capture",
+ "when": "2026-09-29T03:57:27.849Z",
+ "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+ "final": {
+  "buttons": [
+   {
+    "tag": "BUTTON",
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Share prompt"
+    },
+    "enabled": true
+   },
+   {
+    "tag": "BUTTON",
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Dismiss rating prompt"
+    },
+    "enabled": true
+   },
+   {
+    "tag": "BUTTON",
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-busy": "false",
+     "aria-label": "Dictate"
+    },
+    "enabled": true
+   },
+   {
+    "tag": "BUTTON",
+    "attrs": {
+     "type": "button",
+     "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+     "aria-label": "Start Voice",
+     "data-state": "closed"
+    },
+    "enabled": true
+   }
+  ],
+  "turns": [
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "group/user-message flex flex-col items-end gap-2",
+     "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+     "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+    },
+    "textLen": 5,
+    "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+    },
+    "textLen": 5,
+    "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "data-user-message-bubble": "true",
+     "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+    },
+    "textLen": 5,
+    "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+    },
+    "textLen": 0,
+    "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+   }
+  ],
+  "tree": {
+   "tag": "DIV",
+   "attrs": {
+    "class": "block-BQZwFn"
+   },
+   "textLen": 15,
+   "label": null,
+   "kids": [
+    {
+     "tag": "H4",
+     "attrs": {
+      "class": "sr-only m-0 select-none"
+     },
+     "textLen": 9,
+     "label": "You said:",
+     "kids": []
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "label": null,
+     "kids": [
+      {
+       "tag": "DIV",
+       "attrs": {
+        "class": "w-full",
+        "data-content-search-unit-key": "fallback-turn-0:0:user"
+       },
+       "textLen": 5,
+       "label": null,
+       "kids": [
+        {
+         "tag": "DIV",
+         "attrs": {
+          "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+         },
+         "textLen": 5,
+         "label": null,
+         "kids": [
+          {
+           "tag": "DIV",
+           "attrs": {
+            "data-user-message-bubble": "true",
+            "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+           },
+           "textLen": 5,
+           "label": null,
+           "kids": [
+            {
+             "tag": "DIV",
+             "attrs": {
+              "class": "flex flex-col items-end gap-1"
+             },
+             "textLen": 5,
+             "label": null,
+             "kids": [
+              {
+               "tag": "DIV",
+               "attrs": {
+                "class": "relative w-full min-w-0 text-size-chat leading-relaxed"
+               },
+               "textLen": 5,
+               "label": null,
+               "kids": [
+                {
+                 "tag": "DIV",
+                 "attrs": {
+                  "class": "",
+                  "data-search-result-target": ""
+                 },
+                 "textLen": 5,
+                 "label": null,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "tag": "DIV",
+           "attrs": {
+            "class": "flex flex-row-reverse items-center gap-1"
+           },
+           "textLen": 0,
+           "label": null,
+           "kids": [
+            {
+             "tag": "DIV",
+             "attrs": {
+              "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+             },
+             "textLen": 0,
+             "label": null,
+             "kids": [
+              {
+               "tag": "DIV",
+               "attrs": {
+                "class": "flex turn-action-controls items-center gap-0.5 browser:gap-0"
+               },
+               "textLen": 0,
+               "label": null,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "data-state": "closed",
+                  "class": "contents"
+                 },
+                 "textLen": 0,
+                 "label": null,
+                 "kids": []
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "data-state": "closed",
+                  "class": "contents"
+                 },
+                 "textLen": 0,
+                 "label": null,
+                 "kids": []
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "data-state": "closed",
+                  "class": "contents"
+                 },
+                 "textLen": 0,
+                 "label": null,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "frameCount": 10,
+ "frames": [
+  {
+   "ms": 2,
+   "why": "armed",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "submit",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Send"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": []
+  },
+  {
+   "ms": 4866,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Start Voice",
+      "data-state": "closed"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": []
+  },
+  {
+   "ms": 5340,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "submit",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Send"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": []
+  },
+  {
+   "ms": 7268,
+   "why": "after-enter",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "disabled": "",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": false
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Stop"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  },
+  {
+   "ms": 7400,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "disabled": "",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": false
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Stop"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  },
+  {
+   "ms": 8010,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "disabled": "",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": false
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Stop"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  },
+  {
+   "ms": 8917,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-label": "Share prompt"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Stop"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  },
+  {
+   "ms": 10809,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-label": "Share prompt"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Stop"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  },
+  {
+   "ms": 23103,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-label": "Share prompt"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate",
+      "disabled": ""
+     },
+     "enabled": false
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Stop"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  },
+  {
+   "ms": 25103,
+   "why": "dom",
+   "buttons": [
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-label": "Share prompt"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-label": "Dismiss rating prompt"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+      "aria-busy": "false",
+      "aria-label": "Dictate"
+     },
+     "enabled": true
+    },
+    {
+     "tag": "BUTTON",
+     "attrs": {
+      "type": "button",
+      "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+      "aria-label": "Start Voice",
+      "data-state": "closed"
+     },
+     "enabled": true
+    }
+   ],
+   "turns": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex flex-col items-end gap-2",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "ef145496-bc36-4eb0-a3ff-1321c82efb4a"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-user-message-bubble": "true",
+      "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+     },
+     "textLen": 5,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0,
+     "path": "DIV > DIV > DIV > DIV > DIV > DIV > DIV > DIV"
+    }
+   ]
+  }
+ ]
+}

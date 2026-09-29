@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+  ChatGPT's OLD page — the markup every ChatGPT selector in research.py was
+  written against before 2026-09-28, reconstructed from those selectors (there is
+  no capture of it; it is the page the old code worked on, e.g. the 2026-09-20
+  run): the message box is div#prompt-textarea.ProseMirror, each message is
+  [data-message-author-role] inside its own article[data-testid^=conversation-turn],
+  the reply's text is its .markdown, and Send / Stop carry data-testid.
+  It exists to prove the old page STILL works after the markers learned the new
+  one. Same script contract as new_page.html: body[data-sr-fixture="thread"]
+  loads a finished exchange with Stop showing; body[data-mangle] is a test hook.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ChatGPT</title>
+<style>
+  body { margin: 0; font: 16px/1.5 sans-serif; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+             overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  main { display: block; width: 1000px; margin: 0 auto; }
+  form { margin-top: 24px; padding: 8px; border: 1px solid #ccc; }
+  .ProseMirror { min-height: 26px; outline: none; }
+  button { min-width: 24px; min-height: 24px; }
+</style>
+</head>
+<body data-sr-fixture="chat" data-sr-prompt="">
+<main>
+<div class="flex h-full flex-col" role="presentation">
+<div class="flex flex-col text-sm" id="sr-transcript"></div>
+</div>
+<form>
+<div contenteditable="true" translate="no" class="ProseMirror" id="prompt-textarea"><p data-placeholder="Ask anything" class="placeholder"><br class="ProseMirror-trailingBreak"></p></div>
+<button type="button" data-testid="model-switcher-dropdown-button" aria-haspopup="menu" aria-expanded="false" data-state="closed">ChatGPT 5 Pro</button>
+<span id="sr-action"><button id="composer-submit-button" data-testid="send-button" aria-label="Send prompt" disabled><svg></svg></button></span>
+</form>
+</main>
+
+<template id="sr-user-turn"><article data-testid="conversation-turn-1" data-scroll-anchor="false"><h5 class="sr-only">You said:</h5><div class="flex w-full flex-col gap-1 empty:hidden items-end rtl:items-start"><div data-message-author-role="user" data-message-id="b3a1c2d4-0000-4000-8000-000000000001"><div class="whitespace-pre-wrap"></div></div></div></article></template>
+
+<template id="sr-assistant-turn"><article data-testid="conversation-turn-2" data-scroll-anchor="true"><h6 class="sr-only">ChatGPT said:</h6><div data-message-author-role="assistant" data-message-id="b3a1c2d4-0000-4000-8000-000000000002"><div class="markdown prose w-full break-words dark:prose-invert light"></div></div></article></template>
+
+<template id="sr-reply"><h2>Research brief: the St Bernard</h2><p>Scope: the breed's history in the Alps, its rescue work at the Great St Bernard Pass, health and temperament, and today's breeding standards. The report should separate what the historical record supports from the legends that grew around the breed in the nineteenth century, and it should say plainly where the two cannot be told apart.</p><p>Start from the breed standard at <a href="https://example.org/st-bernard-breed-standard" target="_blank" rel="noopener">the breed standard page</a> and the hospice archives, then work outwards to the kennel club registries, veterinary literature on giant breeds, and first-hand accounts from the monks and travellers who crossed the pass before the tunnel opened.</p><p>Questions to answer: when the hospice first kept dogs and for what work; how the rescue reputation formed and which rescues are documented; how the short-haired and long-haired varieties diverged; what the modern standard requires and why it changed; which health problems are most common and what screening breeders use; and how life expectancy compares with other giant breeds.</p><p>Method: prefer primary sources and peer-reviewed veterinary studies; quote dates and numbers with their source; where sources disagree, give both and say which is better supported. Keep marketing material and breeder advertising out of the evidence, and flag any figure that appears only in popular articles.</p><p>Structure: an executive summary of no more than one page; a history section; a section on working roles past and present; a health and welfare section with a table of conditions, prevalence and screening; a section on the breed standard; and a closing list of open questions the evidence could not settle.</p><p>Out of scope: other mastiff-type breeds except where a comparison explains a St Bernard trait; training advice; and product recommendations of any kind. If a source discusses the breed only in passing, cite it only for the point it actually makes, and do not let a single anecdote stand in for a pattern.</p><p>Deliverable: a structured report with sections, sources and open questions for the research agent to pursue, written for a reader who knows dogs but not this breed, with every claim traceable to a cited source.</p></template>
+
+<script>
+(() => {
+  const EMPTY = '<p data-placeholder="Ask anything" class="placeholder"><br class="ProseMirror-trailingBreak"></p>';
+  const box = document.getElementById('prompt-textarea');
+  const slot = document.getElementById('sr-action');
+  const transcript = document.getElementById('sr-transcript');
+  const text = () => (box.innerText || '').split(String.fromCharCode(0x200b)).join('').trim();
+  const clone = (id) => document.getElementById(id).content.cloneNode(true);
+
+  function setAction(kind) {
+    if (kind === 'stop') {
+      slot.innerHTML = '<button data-testid="stop-button" aria-label="Stop streaming"><svg></svg></button>';
+    } else {
+      slot.innerHTML = '<button id="composer-submit-button" data-testid="send-button" aria-label="Send prompt"'
+        + (kind === 'send' ? '' : ' disabled') + '><svg></svg></button>';
+    }
+  }
+  function addExchange(userText, withReply) {
+    const u = clone('sr-user-turn');
+    u.querySelector('.whitespace-pre-wrap').textContent = userText;
+    transcript.appendChild(u);
+    const addReply = () => {
+      const a = clone('sr-assistant-turn');
+      a.querySelector('.markdown').appendChild(clone('sr-reply'));
+      transcript.appendChild(a);
+    };
+    if (withReply) addReply();
+    return addReply;
+  }
+  function send(via) {
+    const t = text();
+    if (!t) return;
+    document.body.dataset.sentVia = via;
+    const addReply = addExchange(t, false);
+    box.innerHTML = EMPTY;
+    setAction('stop');
+    setTimeout(() => { addReply(); setAction('idle'); }, 400);
+  }
+  box.addEventListener('input', (e) => {
+    const n = parseInt(document.body.dataset.mangle || '0', 10);
+    if (n > 0 && /^insert/.test(e.inputType || '')) {
+      document.body.dataset.mangle = String(n - 1);
+      const p = document.createElement('p');
+      p.textContent = text().slice(1);
+      box.replaceChildren(p);
+    }
+    setAction(text() ? 'send' : 'idle');
+  });
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send('enter'); }
+  });
+  slot.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (b && b.getAttribute('data-testid') === 'send-button' && !b.disabled) {
+      e.preventDefault(); send('button');
+    }
+  });
+  document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());
+
+  if (document.body.dataset.srFixture === 'thread') {
+    addExchange(document.body.dataset.srPrompt || 'hello', true);
+    setAction('stop');
+  }
+})();
+</script>
+</body>
+</html>

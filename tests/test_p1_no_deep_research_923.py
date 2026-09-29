@@ -129,7 +129,9 @@ def test_called_in_run_phase1_before_submit():
         "run_phase1 must actually invoke the clear-DR helper."
     )
     clear_at = src.index("_chatgpt_clear_deep_research(")
-    submit_at = src.index("submit_chatgpt_direct(browser, prompt)")
+    # Re-anchored 2026-09-28: the call now also asks for the submit's outcome
+    # (whether Send was pressed), so the CUA fallback never re-types after it.
+    submit_at = src.index("submit_chatgpt_direct(browser, prompt, outcome=_p1_submit)")
     assert clear_at < submit_at, (
         "the Deep Research tool must be cleared BEFORE the brief prompt is "
         "submitted — otherwise the brief still runs in Deep Research mode."

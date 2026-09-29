@@ -482,10 +482,16 @@ def test_the_new_chat_click_is_a_real_press_not_a_synthetic_one():
 
 def test_a_fresh_composer_now_means_an_empty_thread():
     src = code_only_deep(research._chatgpt_force_new_chat)
-    assert "data-message-author-role" in src, (
+    assert "_CHATGPT_NEW_CHAT_STATE_JS" in src, (
         "the composer selector is true on a conversation page too — emptiness "
         "is the question that separates a fresh chat from someone else's thread"
     )
+    # ⭐ 2026-09-28: the count must see a message on the OLD page AND the new
+    # one (tests/test_chatgpt_new_page_0928.py runs it in Chrome on both).
+    js = research._CHATGPT_NEW_CHAT_STATE_JS
+    assert "[data-message-author-role]" in js
+    assert '[data-user-message-bubble="true"]' in js
+    assert '[data-markdown-text-style="assistant-message"]' in js
 
 
 def test_the_new_chat_decision_logs_the_url_it_decided_on():

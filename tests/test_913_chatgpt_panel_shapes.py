@@ -51,7 +51,11 @@ _SRC = Path(research.__file__).read_text(encoding="utf-8")
 def test_opener_has_structural_pass0():
     src = inspect.getsource(research._open_chatgpt_activity_panel)
     assert "PASS 0" in src and "STRUCTURAL" in src
-    assert 'data-message-author-role="user"' in src, (
+    # ⭐ 2026-09-28: read off the ASSEMBLED JS — the user-message marker is
+    # spliced in, and it must name the old page's message AND the new page's.
+    _js0 = js_constant(research._open_chatgpt_activity_panel, "JS")
+    assert ('data-message-author-role="user"' in _js0
+            and 'data-user-message-bubble="true"' in _js0), (
         "PASS 0 must anchor on the last SENT (user) message — the status "
         "line sits directly below it and its wording mutates with progress")
     assert "picked.anchor = 'structural'" in src

@@ -163,14 +163,19 @@ Steps:
 
 PROMPT_SUBMIT_FALLBACK = SYSTEM_BASE + """
 
-Your task: Submit a research prompt to ChatGPT.
+Your task: put the text cursor in ChatGPT's message box. NOTHING else.
+
+The program types the prompt itself, reads it back and sends it only when it is
+exactly right. Anything you type would be sent in its place.
 
 Steps:
-1. If there's a modal/overlay, dismiss it.
-2. Click the message input area at the bottom.
-3. Type the provided research prompt.
-4. Press Enter or click Send.
-5. Say "Message sent successfully"."""
+1. If a menu, popover or dialog is open, press Escape (at most twice) to close it.
+2. Click once inside the message box at the bottom of the page (it may read
+   "Ask ChatGPT" or "Ask anything"). It may show no visible cursor or outline —
+   that is normal; do not keep clicking to "activate" it.
+3. Do NOT type anything — not even a test word. Do NOT paste. Do NOT press
+   Enter. Do NOT click Send. Do NOT use select-all or Delete.
+4. Say "box focused" once you have clicked inside it, or describe what blocks it."""
 
 PROMPT_ATTACH_PDF = SYSTEM_BASE + """
 

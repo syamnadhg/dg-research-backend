@@ -130,13 +130,26 @@ def evaluate_js(fn, *, contains: str = "") -> str:
     logic silently stops matching and the test passes or fails for the wrong reason.
     """
     hits = []
+    owner = sys.modules.get(getattr(fn, "__module__", "") or "")
     for node in ast.walk(_string_literals(fn)):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "evaluate" and node.args):
             arg = node.args[0]
+            value = None
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                if not contains or contains in arg.value:
-                    hits.append(arg.value)
+                value = arg.value
+            # ⭐ 2026-09-28 — `page.evaluate(_cg_js("""…"""), …)`: ChatGPT's page
+            # markers spliced in. Resolved with the module's own splice, so the
+            # string returned is the one Playwright receives.
+            elif (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+                  and arg.func.id == "_cg_js" and len(arg.args) == 1
+                  and isinstance(arg.args[0], ast.Constant)
+                  and isinstance(arg.args[0].value, str)
+                  and callable(getattr(owner, "_cg_js", None))):
+                value = owner._cg_js(arg.args[0].value)
+            if value is not None:
+                if not contains or contains in value:
+                    hits.append(value)
     assert hits, f"no page.evaluate(<literal>) in {fn.__name__} matching {contains!r}"
     assert len(hits) == 1, f"{len(hits)} candidate evaluate() strings in {fn.__name__}"
     return hits[0]
@@ -185,6 +198,17 @@ def js_constant(fn, name: str) -> str:
             # the live module rather than re-parsed, so escapes match production.
             val = getattr(owner, node.id, None)
             return val if isinstance(val, str) else None
+        # ⭐ 2026-09-28 — ChatGPT's page markers are SPLICED into page JS by
+        # `_cg_js("""…""")` (one place for the old AND the new markup). Resolved by
+        # calling the module's own splice on the folded argument, so the string a
+        # test feeds node is byte-for-byte the one `page.evaluate` receives. Only
+        # that one function: an arbitrary call is not a string this shim can know.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_cg_js" and len(node.args) == 1
+                and not node.keywords):
+            inner = _fold(node.args[0])
+            splice = getattr(owner, "_cg_js", None)
+            return splice(inner) if (inner is not None and callable(splice)) else None
         return None
 
     for node in ast.walk(_string_literals(fn)):
