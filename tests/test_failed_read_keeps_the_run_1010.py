@@ -39,7 +39,12 @@ from _run_server_closure import lift
 
 UID = "uid-alice"
 RID = "chat_1758600000000_3"
-RUN = "Alice_topic_20260923_101500"
+#: ⛔ A STAMP FROM NOW, NEVER A DATE (Windows review, 2026-09-29). The boot
+#: restore drops an entry whose run id is older than `_STALE_RUN_S` (7 days), so
+#: a fixed stamp turned these tests red a week after they were written, and the
+#: ones expecting a drop stayed green for the wrong reason.
+_NOW_STAMP = time.strftime("%Y%m%d_%H%M%S")
+RUN = f"Alice_topic_{_NOW_STAMP}"
 TOPIC = "a paid research somebody is watching"
 
 QUEUED = {"status": "queued", "topic": TOPIC}

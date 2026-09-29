@@ -54,9 +54,14 @@ from _run_server_closure import lift
 
 UID = "uid-alice"
 RID = "chat_1758600000000_7"
-RUN = "Alice_topic_20260923_101500"
+#: ⛔ A STAMP FROM NOW, NEVER A DATE (Windows review, 2026-09-29). The boot
+#: restore drops an entry whose run id is older than `_STALE_RUN_S` (7 days), so
+#: a fixed stamp turned these tests red a week after they were written, and the
+#: ones expecting a drop stayed green for the wrong reason.
+_NOW_STAMP = time.strftime("%Y%m%d_%H%M%S")
+RUN = f"Alice_topic_{_NOW_STAMP}"
 INCOG = "incog_1758600000000_7"
-INCOG_RUN = "incognito_1758600000000_7_20260923_101500"
+INCOG_RUN = f"incognito_1758600000000_7_{_NOW_STAMP}"
 TOPIC = "a paid research somebody is watching"
 
 QUEUED = {"status": "queued", "topic": TOPIC}
@@ -464,7 +469,7 @@ def test_a_resume_here_takes_a_held_run_before_its_job_reaches_the_queue(
 
 
 MALLORY = "uid-mallory"
-MALLORY_RUN = "Mallory_topic_20260923_101500"
+MALLORY_RUN = f"Mallory_topic_{_NOW_STAMP}"
 
 
 def _mallorys_resume(monkeypatch, tmp_path):

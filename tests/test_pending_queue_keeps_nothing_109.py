@@ -38,6 +38,7 @@ Run:  pytest tests/test_pending_queue_keeps_nothing_109.py -v
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -52,8 +53,14 @@ TOPIC = "whether my results came back positive"
 EMAIL = "someone@example.com"
 BRIEF = "I am asking for a friend and I do not want this on the machine"
 
+#: ⛔ A STAMP FROM NOW, NEVER A DATE (Windows review, 2026-09-29). The boot
+#: restore drops an entry whose run id is older than `_STALE_RUN_S` (7 days), so
+#: a fixed stamp turned these tests red a week after they were written, and the
+#: ones expecting a drop stayed green for the wrong reason.
+_NOW_STAMP = time.strftime("%Y%m%d_%H%M%S")
 
-def _job(rid, run_id="incognito_1758400000000_4_20260922_101500"):
+
+def _job(rid, run_id=f"incognito_1758400000000_4_{_NOW_STAMP}"):
     """The dict the start listener builds and the worker carries — the only
     thing that survives the hop from the listener thread to the pipeline."""
     return {

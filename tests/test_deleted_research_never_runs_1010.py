@@ -40,7 +40,12 @@ from _run_server_closure import lift, run_worker_once
 
 UID = "uid-alice"
 RID = "chat_1758600000000_1"
-RUN = "Alice_topic_20260923_101500"
+#: ⛔ A STAMP FROM NOW, NEVER A DATE (Windows review, 2026-09-29). The boot
+#: restore drops an entry whose run id is older than `_STALE_RUN_S` (7 days), so
+#: a fixed stamp turned these tests red a week after they were written, and the
+#: ones expecting a drop stayed green for the wrong reason.
+_NOW_STAMP = time.strftime("%Y%m%d_%H%M%S")
+RUN = f"Alice_topic_{_NOW_STAMP}"
 TOPIC = "a private topic nobody else may read"
 
 #: The four records every path is executed against. `None` is a deleted
@@ -479,7 +484,7 @@ def test_boot_restore_keeps_an_unreadable_research_the_funnel_refuses(monkeypatc
     store = Store("unreadable", error=TRANSIENT)
     other = "chat_1758600000000_2"
     restored, kept = _restore(monkeypatch, tmp_path, store,
-                              [_job(), _job(other, "Other_topic_20260923_101600")])
+                              [_job(), _job(other, f"Other_topic_{_NOW_STAMP}")])
     assert restored == []
     assert kept == [RID], "an entry whose record could not be read was thrown away"
 
