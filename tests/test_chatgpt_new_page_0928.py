@@ -708,15 +708,13 @@ def test_without_a_chatgpt_prompt_nothing_changes_for_other_platforms(monkeypatc
     assert calls == []
 
 
-def test_phase_one_verifies_with_its_prompt_and_the_fallback_only_focuses():
+def test_phase_one_closes_the_menu_first_and_the_fallback_mission_only_focuses():
+    """Wording and order only. What Phase 1 DOES with its prompt, the fallback
+    and the focused box is executed in test_chatgpt_p1_repair_0928.py."""
     src = inspect.getsource(research.run_phase1)
     # The tier step's menu is closed before anything else touches the page.
     assert src.index("_chatgpt_close_open_menus(browser.page") < src.index(
         "submit_chatgpt_direct(browser, prompt")
-    assert src.count("chatgpt_prompt=prompt") == 1
-    assert src.count("chatgpt_prompt=followup") == 1
-    assert src.count('.get("state") == "not_sent"') == 2
-    assert src.count("use_focused=True") == 2
     import prompts
     assert "Do NOT type anything" in prompts.PROMPT_SUBMIT_FALLBACK
     assert "Press Enter or click Send" not in prompts.PROMPT_SUBMIT_FALLBACK

@@ -47,7 +47,10 @@ RESEARCH = "research.py"
 PROMPTS = "prompts.py"
 
 TESTS = ["tests/test_chatgpt_new_page_0928.py", "tests/test_p1_no_deep_research_923.py",
-         "tests/test_vision_act_wiring.py"]
+         "tests/test_vision_act_wiring.py",
+         # ⛔ S16-S18 (Phase 1's wiring) die HERE, on run_phase1 executed — the
+         # source-count pin they died on before measured nothing (09-29 verify).
+         "tests/test_chatgpt_p1_repair_0928.py"]
 DESELECT = "not every_marker_accepts"
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
