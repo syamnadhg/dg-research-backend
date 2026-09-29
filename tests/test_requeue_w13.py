@@ -313,6 +313,8 @@ def test_move_to_queue_keeps_the_run_puts_it_first_and_restarts_the_worker(
     machine already survives with everything kept. No stop is requested and no
     `.stop` is written: either would end the run instead."""
     m, job, folder = _running(monkeypatch, tmp_path)
+    _o, older = _run_folder(tmp_path, OTHER_RID, uid=OWNER, topic="Waiting_Already")
+    _moved_marker(older, OWNER, OTHER_RID, moved_at_ms=int(time.time() * 1000) - 60_000)
     stops: list = []
     monkeypatch.setattr(research, "_controls",
                         types.SimpleNamespace(request_stop=lambda: stops.append(1)))
@@ -337,7 +339,9 @@ def test_move_to_queue_keeps_the_run_puts_it_first_and_restarts_the_worker(
     rests = [u["restingWorkerIds"] for u in m.store.device_updates if "restingWorkerIds" in u]
     assert rests and list(rests[0].values) == [2], "the worker was not kept off"
     owners = [u["queueOwners"] for u in m.store.device_updates if "queueOwners" in u]
-    assert owners and owners[-1][0] == {"uid": SHARER, "runId": RID, "position": 1}, owners
+    assert owners and owners[-1] == [{"uid": SHARER, "runId": RID, "position": 1},
+                                     {"uid": OWNER, "runId": OTHER_RID, "position": 2}], (
+        "the moved run is not #1 with what already waited moved down one")
     assert fate == ["deleted"], "the command was not taken away by the worker it named"
     assert len(_said(m, "REQUEUE", RID[:8], "moved to the front of the queue")) == 1, m.lines
 
@@ -692,10 +696,10 @@ def test_moved_runs_are_published_first_and_everything_else_moves_down(monkeypat
     store = _Store(queue_docs=_deferred_start())
     m = _machine(monkeypatch, tmp_path, store)
     monkeypatch.setattr(research, "_local_pending_owner_entries", lambda: [])
-    _a, earlier = _run_folder(tmp_path, "chat_earlier_move", uid=OWNER, topic="Earlier")
+    _a, earlier = _run_folder(tmp_path, "chat_earlier_move", uid=SHARER, topic="Earlier")
     _b, later = _run_folder(tmp_path, RID, uid=SHARER, topic="Later")
     now = int(time.time() * 1000)
-    _moved_marker(earlier, OWNER, "chat_earlier_move", moved_at_ms=now - 5000)
+    _moved_marker(earlier, SHARER, "chat_earlier_move", moved_at_ms=now - 5000)
     _moved_marker(later, SHARER, RID, moved_at_ms=now)
 
     research._recompute_deferred_queue_positions_locked()
@@ -711,9 +715,10 @@ def test_moved_runs_are_published_first_and_everything_else_moves_down(monkeypat
     assert pos[OTHER_RID]["queuedBehindRunId"] == "chat_earlier_move"
     assert pos[OTHER_RID]["queueTotalAhead"] == 2
     assert (pos[OTHER_RID]["queueAheadFromSelf"], pos[OTHER_RID]["queueAheadFromOthers"]) == (
-        1, 1), "the runs waiting ahead were not counted by whose they are"
+        0, 2), "the runs waiting ahead were not counted by whose they are"
     assert (pos["chat_earlier_move"]["queueAheadFromSelf"],
-            pos["chat_earlier_move"]["queueAheadFromOthers"]) == (0, 1)
+            pos["chat_earlier_move"]["queueAheadFromOthers"]) == (1, 0), (
+        "the person's own run ahead was counted as somebody else's")
     assert all("status" not in p for p in pos.values()), pos
     del m
 
@@ -802,18 +807,23 @@ def _in_file(path):
     return [j.get("research_id") for j in ([s.get("current")] + s.get("pending", [])) if j]
 
 
-def test_the_moved_run_is_not_restored_from_the_snapshot_however_old(monkeypatch, tmp_path):
-    """⛔⛔ The run the owner moved is the job this worker was running, so it is
-    in the snapshot as `current`. Restored, it would run on the worker that was
-    turned off; dropped as stale after a week, it would be lost. It is the
-    queue's: not restored, the snapshot lets go of its copy, and its folder and
-    marker stay. Beside it an ordinary waiting job is restored."""
+@pytest.mark.parametrize("days", [0, 10], ids=["today", "ten-days-ago"])
+def test_the_moved_run_is_not_restored_from_the_snapshot_however_old(monkeypatch, tmp_path, days):
+    """⛔⛔ The run the owner moved is the job its worker was running, so it is
+    in that worker's snapshot as `current`. Restored, it would run here while
+    the queue hands it to another worker too; dropped as stale after a week, it
+    would be lost. It is the queue's: not restored, the snapshot lets go of its
+    copy, and its folder and marker stay — whatever its age. Beside it an
+    ordinary waiting job is restored."""
     store = _Store(records={(SHARER, RID): {"status": "queued"},
                             (OWNER, OTHER_RID): {"status": "queued"}})
     m = _machine(monkeypatch, tmp_path, store, worker=2)
-    monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: True)
-    run_id, folder = _run_folder(tmp_path, RID, days=10)
+    monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: False)
+    run_id, folder = _run_folder(tmp_path, RID, days=days)
     _moved_marker(folder, SHARER, RID)
+    if days:
+        then = time.time() - days * 86400
+        os.utime(folder, (then, then))
     other = _job(OWNER, OTHER_RID, f"Other_{_stamp()}")
     path = _snapshot(tmp_path, _job(SHARER, RID, run_id), [other])
     q = _Q()
@@ -823,7 +833,7 @@ def test_the_moved_run_is_not_restored_from_the_snapshot_however_old(monkeypatch
     assert [j["research_id"] for j in q._queue] == [OTHER_RID], m.lines
     assert RID not in _in_file(path), "the snapshot still carries the moved run"
     assert folder.is_dir() and (folder / MARKER).exists()
-    assert not _said(m, RID[:8], "waited 10 days"), "the moved run was judged by its age"
+    assert not _said(m, RID[:8], "waited"), "the moved run was judged by its age"
 
 
 def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
@@ -839,12 +849,14 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         m = _machine(monkeypatch, base, store, worker=2)
         monkeypatch.setattr(research, "_worker_is_resting", lambda *a, _r=resting, **k: _r)
         run_id, folder = _run_folder(base, RID)
+        other_id, other_folder = _run_folder(base, OTHER_RID, uid=OWNER, topic="Other")
         path = _snapshot(base, _job(SHARER, RID, run_id),
-                         [_job(OWNER, OTHER_RID, f"Other_{_stamp()}")])
+                         [_job(OWNER, OTHER_RID, other_id)])
         q = _Q()
         research._restore_pending_queue_snapshot(path, q, set())
         assert [j["research_id"] for j in q._queue] == expect, (resting, m.lines)
         assert (folder / MARKER).exists() is resting
+        assert not (other_folder / MARKER).exists(), "a job it had only queued was parked"
         assert _statuses(m, RID) == (["queued"] if resting else []), m.writes
         assert m.published.wait(5) if resting else not m.published.is_set()
 
