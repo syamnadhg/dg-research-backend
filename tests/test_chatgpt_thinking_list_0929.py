@@ -47,8 +47,18 @@ straight in the exchange's column, the one the census agrees with, and the
 audit's three guesses), whether step rows carry data-markdown-text-style (`md_attr`),
 that a press on the line toggles the list (the vision step saw exactly that
 twice), that the list starts open, how a folded list is hidden (`collapsed`:
-display none, or invisible), and an icon between the line and the list
-(`iconBetween`).
+display none, invisible, or taken off the page), and what sits around the two
+copies of the label (`header`, see HEADERS). The census skips any element with
+more than two children, so a row holding the copies with an icon and the
+chevron the vision step saw ("Thinking ▾") never shows in a capture; each
+layout here gives back that day's rows (section 0).
+
+⛔ 2026-09-29 review: the first version found the list only when it came right
+after the element holding the copies. With the chevron in between — in a row
+around the copies, or inside the inline-flex span — it read the open list as
+closed and Phase 1 pressed it as before. An icon placed between the line and
+the list (the old `iconBetween`) was dropped: its block has three children, so
+the census would have skipped the block row the 07:40:58 capture has.
 
 Nothing leaves the machine: the page is set in headless Chrome, and a Phase 1
 run is served from a reserved never-resolving host through a route that answers
@@ -65,6 +75,7 @@ import pytest
 
 import research
 import test_chatgpt_new_page_0928 as base
+import test_p1_inline_chips_0819 as _chips
 from _domshim import js_constant
 
 chrome = base.chrome
@@ -120,11 +131,48 @@ SCRIPT = r"""
     return d;
   }
   // The line: the label twice (a shimmer copy and a plain one) — or, for the
-  // old page's shape, once.
+  // old page's shape, once. Three layouts, all giving back the census rows the
+  // live page gave (section 0):
+  //   'pair'  — the element holding the two copies is the line, the list right
+  //             after it (the audit's layout);
+  //   'row'   — the two copies sit in a row with an icon before them and the
+  //             chevron after ("Thinking ▾"; the vision step also saw a globe
+  //             icon while searching). The row has three children, which the
+  //             census skips, so it never shows in a capture;
+  //   'stack' — the chevron is inside the inline-flex span, and the two copies
+  //             are stacked in one grid cell (one label on screen, the label
+  //             twice in the page's text);
+  //   'overlay' — the row again, but the inline-flex span holds ONE wrapper
+  //             in which the plain copy lies over the shimmer copy — so the
+  //             list is two elements out from the one holding the copies, and
+  //             one of them has nothing beside it.
   function header(label) {
+    const two = cfg.once ? '' : '<span aria-hidden="true">' + label + '</span>';
+    const chevron = '<svg class="chev" width="12" height="12" aria-hidden="true"></svg>';
+    const icon = '<span class="icon-slot"><svg width="12" height="12" aria-hidden="true"></svg></span>';
+    if (cfg.header === 'row') {
+      return '<div class="flex items-center gap-1" data-sr-toggle="1">' + icon
+           + '<span class="inline-flex items-center">'
+           + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span>' + two + '</span>'
+           + chevron + '</div>';
+    }
+    if (cfg.header === 'overlay') {
+      return '<div class="flex items-center gap-1" data-sr-toggle="1">' + icon
+           + '<span class="inline-flex items-center"><span style="position:relative">'
+           + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span>'
+           + (cfg.once ? '' : '<span aria-hidden="true" style="position:absolute;inset:0">'
+                              + label + '</span>')
+           + '</span></span>' + chevron + '</div>';
+    }
+    if (cfg.header === 'stack') {
+      return '<span class="inline-flex items-center" data-sr-toggle="1">'
+           + '<span style="display:grid">'
+           + '<span class="cadencedShimmerSweep-ICUAVH" style="grid-area:1/1">' + label + '</span>'
+           + (cfg.once ? '' : '<span aria-hidden="true" style="grid-area:1/1">' + label + '</span>')
+           + '</span>' + chevron + '</span>';
+    }
     return '<span class="inline-flex items-center" data-sr-toggle="1">'
-         + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span>'
-         + (cfg.once ? '' : '<span aria-hidden="true">' + label + '</span>') + '</span>';
+         + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span>' + two + '</span>';
   }
   function makeBlock() {
     const b = document.createElement('div');
@@ -135,20 +183,23 @@ SCRIPT = r"""
     // than two children, while each row was the outermost element of its text.
     const list = '<div class="-ms-2 flex flex-col" data-sr-list="1">'
                + '<div class="flex flex-col" data-sr-rows="1"></div></div>';
-    const icon = cfg.iconBetween ? '<svg width="12" height="12" aria-hidden="true"></svg>' : '';
-    b.innerHTML = header(labels[0]) + icon + list;
+    b.innerHTML = header(labels[0]) + list;
     const l = b.querySelector('[data-sr-list]');
     for (const [k, t] of ROWS) b.querySelector('[data-sr-rows]').appendChild(row(k, t));
+    // Folded: hidden, invisible, or taken off the page altogether.
     if (cfg.collapsed === 'invisible') l.style.visibility = 'hidden';
+    else if (cfg.collapsed === 'removed') l.remove();
     else if (cfg.collapsed) l.hidden = true;
     b.addEventListener('click', (e) => {
       if (!e.target.closest('[data-sr-toggle]')) return;
       window.__srPresses = (window.__srPresses || 0) + 1;
       document.body.dataset.srPresses = String(window.__srPresses);
       if (cfg.deadToggle) return;
-      const x = b.querySelector('[data-sr-list]');
-      if (!x) return;
-      x.hidden = !x.hidden;
+      if (cfg.collapsed === 'removed') {
+        if (l.isConnected) l.remove(); else b.appendChild(l);
+      } else {
+        l.hidden = !l.hidden;
+      }
       window.__srToggles += 1;
       document.body.dataset.srToggles = String(window.__srToggles);
     });
@@ -297,6 +348,13 @@ def _list_shown(chrome, page):
 #: around it — which rules out the audit's three, kept here as the other guesses.
 PLACES = ["column", "unit", "block-unit", "block-plain"]
 
+#: What sits around the two copies of the label (see `header` in SCRIPT):
+#: "pair" — nothing, the list right after them; "row" — an icon before and the
+#: chevron after, in a row of three; "stack" — the chevron inside the inline-flex
+#: span, the copies stacked in a grid cell; "overlay" — the row, with the copies
+#: overlaid in a lone wrapper inside the inline-flex span.
+HEADERS = ["pair", "row", "stack", "overlay"]
+
 
 # ═══ 0. The rebuilt block IS the captured one ═════════════════════════════════
 
@@ -321,40 +379,49 @@ CAPTURES = {
 }
 
 
+@pytest.mark.parametrize("header", HEADERS)
 @pytest.mark.parametrize("when", sorted(CAPTURES))
-def test_the_rebuilt_block_reads_like_the_captured_one(chrome, page, logs, when):
+def test_the_rebuilt_block_reads_like_the_captured_one(chrome, page, logs, when, header):
     """The fixture, through the program's own panel-miss census, gives back the
-    rows the live page gave that day."""
+    rows the live page gave that day — in every layout of the line, none of
+    them inside anything the census calls interactive (`inter`: false, as
+    captured)."""
     label, rows, want = CAPTURES[when]
-    _thinking(chrome, page, place="column", labels=[label], rows=rows)
+    _thinking(chrome, page, place="column", labels=[label], rows=rows, header=header)
     got = chrome.run(page.evaluate(js_constant(research._log_chatgpt_thread_snapshot, "JS")))["rows"]
-    got = [(r["t"], r["tag"], r["cl"]) for r in got]
     for w in want:
-        assert w in got, (w, got)
+        assert w in [(r["t"], r["tag"], r["cl"]) for r in got], (w, got)
+    line = [r for r in got if r["cl"] == "inline-flex"]
+    assert len(line) == 1 and line[0]["inter"] is False, line
 
 
 # ═══ 1. Open is open; folded, finished and the old shape are not ══════════════
 
+@pytest.mark.parametrize("header", HEADERS)
 @pytest.mark.parametrize("md_attr", ["", "assistant-message"])
 @pytest.mark.parametrize("place", PLACES)
-def test_the_open_step_list_reads_as_open(chrome, page, logs, place, md_attr):
-    """⭐⭐ THE FIX, where the audit measured it read as closed in all six variants."""
-    _thinking(chrome, page, place=place, mdAttr=md_attr)
+def test_the_open_step_list_reads_as_open(chrome, page, logs, place, md_attr, header):
+    """⭐⭐ THE FIX, where the audit measured it read as closed in all six
+    variants — and, since the 09-29 review, with the chevron between the copies
+    and the list ("row", "stack", "overlay"), where the first version still read
+    it as closed."""
+    _thinking(chrome, page, place=place, mdAttr=md_attr, header=header)
+    assert _list_shown(chrome, page)
     st = _state(chrome, page)
     assert research._chatgpt_p1_activity_open(st) is True, st
     assert research._chatgpt_open_shape(st) == "steps"
     assert st["inline_step_rows"] == len(ROWS)
 
 
-def test_an_icon_between_the_line_and_the_list_is_passed_over(chrome, page, logs):
-    _thinking(chrome, page, place="column", iconBetween=True)
-    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is True
-
-
-@pytest.mark.parametrize("how", [True, "invisible"])
+@pytest.mark.parametrize("header", HEADERS)
+@pytest.mark.parametrize("how", [True, "invisible", "removed"])
 @pytest.mark.parametrize("place", PLACES)
-def test_a_folded_list_reads_as_closed(chrome, page, logs, place, how):
-    _thinking(chrome, page, place=place, collapsed=how)
+def test_a_folded_list_reads_as_closed(chrome, page, logs, place, how, header):
+    """⛔ Folded, whatever the fold does. Taken off the page ("removed"), the
+    line is alone in its block and the look for the list carries on past the
+    block — where, with the block inside the reply's unit, the next thing is
+    the reply's own "ChatGPT said:" heading. That is never the list."""
+    _thinking(chrome, page, place=place, collapsed=how, header=header)
     assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
 
 
@@ -364,12 +431,38 @@ def test_the_finished_line_reads_as_closed(chrome, page, logs):
     assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
 
 
-def test_a_line_drawn_once_is_not_this_list(chrome, page, logs):
+@pytest.mark.parametrize("header", HEADERS)
+def test_a_line_drawn_once_is_not_this_list(chrome, page, logs, header):
     """⛔ The doubled label is what keeps this off the OLD page: its status line
     is drawn once, and rows under it are not the new page's list — reading them
     as open would stop Phase 1 ever opening the old page's chip row."""
-    _thinking(chrome, page, place="column", once=True)
+    _thinking(chrome, page, place="column", once=True, header=header)
     assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
+
+
+# ── pages that are not this list at all ─────────────────────────────────────
+
+PANELS = Path(__file__).parent / "fixtures" / "panels"
+_OTHER_PAGES = (
+    [(f"{layout}_page{'_thread' if thread else ''}", lambda layout=layout, thread=thread:
+      base._html_for(layout, thread=thread))
+     for layout in ("new", "old") for thread in (False, True)]
+    + [(p.name, lambda p=p: p.read_text(encoding="utf-8"))
+       for p in sorted(PANELS.glob("chatgpt_*.html"))]
+    + [("chips_searching", lambda: _chips._page(_chips._turn("Searching the web", chips=True))),
+       ("chips_none", lambda: _chips._page(_chips._turn("Mapped security coverage"))),
+       ("chips_done", lambda: _chips._page(_chips._turn("Searched 20 websites", chips=True,
+                                                         shimmer=False)))])
+
+
+@pytest.mark.parametrize("name,build", _OTHER_PAGES, ids=[n for n, _b in _OTHER_PAGES])
+def test_the_captured_pages_and_the_older_shapes_are_not_this_list(chrome, page, logs,
+                                                                   name, build):
+    """The owner's captures of the new and old pages (a chat and a thread), the
+    08-06 panel captures and the 08-19 chip-row pages: none holds this list, and
+    the look for it — which now moves out from the line — finds none."""
+    chrome.run(page.set_content(build()))
+    assert chrome.run(page.evaluate(research._CHATGPT_STEP_LIST_JS))["open"] is False
 
 
 # ── what may LOOK like the line and a list, and is not ──────────────────────
@@ -410,6 +503,39 @@ def test_the_container_of_a_folded_line_is_not_the_line(chrome, page, logs):
     assert _static(chrome, page, '<div><div><span class="inline-flex"><span>Thinking</span>'
                    '<span>Thinking</span></span><div hidden>Validated financial claims</div>'
                    '</div><div><p>Scope: the breed</p></div></div>') is False
+
+
+LONE = '<div><span class="inline-flex"><span>Thinking</span><span>Thinking</span></span></div>'
+
+
+def test_the_reply_after_a_lone_line_is_not_its_list(chrome, page, logs):
+    """⛔ A folded list taken off the page leaves the line alone in its block,
+    and the look carries on past the block. When what it meets there is the
+    reply — its "ChatGPT said:" heading and its words — that is not the list."""
+    assert _static(chrome, page, f'<div>{LONE}<div><h4 class="sr-only" data-conversation-role='
+                   '"assistant">ChatGPT said:</h4><div>Scope: the breed</div></div></div>') is False
+
+
+def test_the_look_for_the_list_never_leaves_the_conversation(chrome, page, logs):
+    """A line that is all the conversation holds: the words after the
+    conversation (the page's own footer) are not its list."""
+    chrome.run(page.set_content("<style>.inline-flex{display:inline-flex}</style>"
+                                f"<main>{LONE}</main>"
+                                "<div>ChatGPT can make mistakes. Check important info.</div>"))
+    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
+
+
+@pytest.mark.parametrize("header", HEADERS)
+@pytest.mark.parametrize("place", ["column", "block-plain"])
+def test_a_folded_line_at_the_end_of_the_exchange_is_not_open(chrome, page, logs, place,
+                                                              header):
+    """⛔ The list taken off the page and no reply yet — which is what that
+    day's snapshots show while ChatGPT thinks (no "ChatGPT said:" anywhere).
+    The look moves out only through what holds no other words, so it stops at
+    the exchange (it holds the person's message) and never reaches the message
+    box below."""
+    _thinking(chrome, page, place=place, reply="absent", collapsed="removed", header=header)
+    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
 
 
 # ═══ 2. Phase 1, executed: the line is never pressed while the list shows ═════
@@ -519,10 +645,13 @@ def p1run(chrome, page, fast, logs, monkeypatch):
     return run
 
 
-@pytest.mark.parametrize("place,reply", [("column", "empty"), ("column", "absent"),
-                                         ("unit", "empty"), ("block-unit", "empty"),
-                                         ("block-plain", "absent")])
-def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply):
+@pytest.mark.parametrize("place,reply,header", [
+    ("column", "empty", "pair"), ("column", "absent", "pair"), ("unit", "empty", "pair"),
+    ("block-unit", "empty", "pair"), ("block-plain", "absent", "pair"),
+    # ⛔ 09-29 review: the chevron between the copies and the list — the first
+    # version pressed the line 49-50 times in these nine seconds, as before.
+    ("column", "empty", "row"), ("column", "empty", "stack"), ("unit", "empty", "overlay")])
+def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply, header):
     """⭐⭐ THE OWNER'S SYMPTOM, executed: the real Phase 1 (submit, poll, open
     check, opener, vision escalation, extraction) on the thinking page. Before
     the fix the audit counted 50 presses in nine seconds and three vision calls;
@@ -530,7 +659,7 @@ def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply)
     never asked. (Once it has finished the list is gone and Phase 1 may still
     try to open the finished line — that is not this defect, and it presses
     nothing here.)"""
-    out = p1run(place=place, reply=reply, finishMs=9000,
+    out = p1run(place=place, reply=reply, finishMs=9000, header=header,
                 labels=["Searching the web", "Thinking", "Searching liquidcompute.com"])
     assert HEADING in out.text, out.text[:200]
     assert out.presses == 0 and out.toggles == 0, (out.presses, out.toggles)
@@ -539,10 +668,11 @@ def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply)
                for m in out.lines), [m for m in out.lines if "activity" in m][:10]
 
 
-def test_a_folded_list_is_opened_once_and_then_left_alone(p1run):
+@pytest.mark.parametrize("header,how", [("pair", True), ("pair", "removed"), ("row", True)])
+def test_a_folded_list_is_opened_once_and_then_left_alone(p1run, header, how):
     """The list starts folded: one press opens it, the open list is recognised,
     and nothing presses it again."""
-    out = p1run(place="column", reply="empty", finishMs=9000, collapsed=True)
+    out = p1run(place="column", reply="empty", finishMs=9000, collapsed=how, header=header)
     assert HEADING in out.text
     assert out.toggles == 1, out.toggles
     assert any("activity opened via DOM" in m and "shape=steps" in m for m in out.lines)

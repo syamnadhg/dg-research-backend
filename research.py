@@ -33911,12 +33911,23 @@ _CHATGPT_SIDE_PANEL_JS = _cg_js("""() => {
 #     DIV[min-w-0], one step per row; their container's text is the line and
 #     then the list ("Thinking\nThinking\n\nCrafted a refined research brief…");
 #   * finished, the line reads "Worked for 7m 23s", once, and the list is gone.
-# The line is the element holding the two copies (the snapshot keeps the
-# OUTERMOST element of a given text, and it kept SPAN[inline-flex], so nothing
-# wraps it), and the list is what comes right after it. So "open" is: a line
-# whose label is drawn twice, followed by a shown element with words in it. The
-# doubled label is what keeps this off the OLD page, whose status line is drawn
-# once. Its own probe, not a field of `_CHATGPT_INLINE_ACTIVITY_JS`: that
+# So "open" is: a line whose label is drawn twice, followed by a shown element
+# with words in it. The doubled label is what keeps this off the OLD page, whose
+# status line is drawn once.
+# ⛔ 2026-09-29 (review) — WHAT COMES "AFTER THE LINE" IS NOT ALWAYS ITS NEXT
+# ELEMENT. The snapshot skips any element with more than two children, so it
+# cannot see a row that holds the two copies AND an icon and the chevron the
+# vision step saw ("Thinking ▾", a globe icon while searching), nor a chevron
+# inside SPAN[inline-flex] with the copies stacked one level down. Both give
+# exactly that day's snapshot rows, and in both the element holding the copies
+# is followed by the chevron, not the list — the first version read the open
+# list as closed there and Phase 1 pressed it as before. So the look for the
+# list starts at the element holding the copies and moves out through what is
+# around it while that holds no other words (the row, a wrapper), and the list
+# is the first thing after it with words. It stops at the reply's own heading:
+# a folded list taken off the page leaves the line alone in its block, and the
+# look must not carry on past the block and take the reply for the list.
+# Its own probe, not a field of `_CHATGPT_INLINE_ACTIVITY_JS`: that
 # walker returns nothing at all when it finds no turn, and whether the reply's
 # unit exists before any reply text is not known (no capture of the thinking
 # phase's markup exists) — the line must be seen either way.
@@ -33943,11 +33954,27 @@ _CHATGPT_STEP_LIST_JS = _cg_js("""() => {
         if (h.closest('__CG_REPLY_TEXT__')) continue;
         if (h.closest('__CG_USER__')) continue;
         if (h.closest('form, __CG_COMPOSER__')) continue;
-        // What it opens: whatever comes right after the line (past anything
-        // with no text, such as an icon), shown and with words in it.
-        let list = h.nextElementSibling;
-        while (list && !(list.textContent || '').trim()) list = list.nextElementSibling;
-        if (!list || !shown(list)) continue;
+        // What it opens: the first thing after the line with words in it
+        // (past anything with none, such as an icon or a chevron), shown.
+        // The two copies may sit inside a row with such things — an icon
+        // before them, the chevron after, a wrapper around them — so the look
+        // starts at the element holding the copies and moves out through each
+        // element around it that holds no other words.
+        const words = (n) => (n.textContent || '').trim();
+        const own = words(h);
+        let list = null;
+        for (let n = h; n && n !== main; n = n.parentElement) {
+            if (words(n) !== own) break;
+            let s = n.nextElementSibling;
+            while (s && !words(s)) s = s.nextElementSibling;
+            if (s) { list = s; break; }
+        }
+        // ⛔ Never the reply. A folded list taken off the page leaves the line
+        // alone in its block, and the look then carries on past the block: if
+        // what it meets is the reply ("ChatGPT said:"), there is no list.
+        if (!list || list.matches('[data-conversation-role]')
+                || list.querySelector('[data-conversation-role]')) continue;
+        if (!shown(list)) continue;
         const steps = lines(list);
         if (!steps.length) continue;
         out.open = true;

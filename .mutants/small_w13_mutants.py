@@ -18,6 +18,10 @@
        label twice with a shown list after it; the P1 open check accepts it;
        the vision step's mission names the list and looks for it first. Driven
        by the real state read and the real run_phase1 on the rebuilt page.
+       T17+ (09-29 review): the chevron may sit between the copies and the list
+       (in a row around them, or inside the inline-flex span), so the list is
+       looked for outward from the line, through what holds no other words, and
+       never taken from the reply's own heading.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 the real agent_loop, Browser.screenshot and execute_action; the real run_phase2
@@ -178,18 +182,16 @@ MUTANTS = [
      [("        if (h.closest('__CG_USER__')) continue;\n", "")]),
     ("T7", RESEARCH, "the message box can be the line",
      [("        if (h.closest('form, __CG_COMPOSER__')) continue;\n", "")]),
-    ("T8", RESEARCH, "an icon between the line and the list is taken for the list — "
-     "open reads as closed",
-     [("        while (list && !(list.textContent || '').trim()) list = list.nextElementSibling;\n",
-       "")]),
+    ("T8", RESEARCH, "⛔ the chevron (or an icon) after the copies is taken for the "
+     "list — open reads as closed in the review's layouts",
+     [("            while (s && !words(s)) s = s.nextElementSibling;\n", "")]),
     ("T9", RESEARCH, "⛔⛔ a folded (hidden) list reads as open — Phase 1 never opens it",
-     [("        if (!list || !shown(list)) continue;\n", "        if (!list) continue;\n")]),
+     [("        if (!shown(list)) continue;\n", "")]),
     ("T10", RESEARCH, "a list folded by hiding its words reads as open",
      [("        if (!steps.length) continue;\n", "")]),
-    ("T11", RESEARCH, "OVER-REACH: what comes after the BLOCK is read as the list — "
-     "the reply under a folded line reads as open",
-     [("        let list = h.nextElementSibling;\n",
-       "        let list = h.parentElement && h.parentElement.nextElementSibling;\n")]),
+    ("T11", RESEARCH, "⛔ OVER-REACH: the look moves out past what holds other words — "
+     "a folded line at the end of the exchange takes the message box for its list",
+     [("            if (words(n) !== own) break;\n", "")]),
     ("T12", RESEARCH, "the log names no shape for the list",
      [('    if st.get("inline_step_list"):\n        return "steps"\n', "")]),
     ("T13", RESEARCH, "the log does not say how much of the list shows",
@@ -203,6 +205,30 @@ MUTANTS = [
     ("T16", RESEARCH, "the mission no longer names the list of steps",
      [("\"list of the model's steps (short lines such as \"",
        "\"row of website chips (such as \"")]),
+
+    # ═══ T17+ — the 09-29 review: the list is looked for OUTWARD from the line ═══
+    ("T17", RESEARCH, "⛔⛔ the look never moves out from the element holding the copies — "
+     "with the chevron after them the open list reads as closed and Phase 1 presses "
+     "it (the review's two layouts)",
+     [("        for (let n = h; n && n !== main; n = n.parentElement) {\n",
+       "        for (let n = h; n === h; n = n.parentElement) {\n")]),
+    ("T18", RESEARCH, "⛔ the look moves out only past something with a neighbour — a "
+     "lone wrapper around the copies hides the list",
+     [("            if (words(n) !== own) break;\n",
+       "            if (words(n) !== own || (n !== h && n.children.length < 2)) break;\n")]),
+    ("T19", RESEARCH, "⛔⛔ the reply's own heading is taken for the list — a folded list "
+     "taken off the page reads as open and is never opened",
+     [("        if (!list || list.matches('[data-conversation-role]')\n"
+       "                || list.querySelector('[data-conversation-role]')) continue;\n",
+       "        if (!list) continue;\n")]),
+    ("T20", RESEARCH, "the reply is taken for the list when its heading is inside it",
+     [("        if (!list || list.matches('[data-conversation-role]')\n"
+       "                || list.querySelector('[data-conversation-role]')) continue;\n",
+       "        if (!list || list.matches('[data-conversation-role]')) continue;\n")]),
+    ("T21", RESEARCH, "the look leaves the conversation — the page's footer reads as "
+     "a lone line's list",
+     [("        for (let n = h; n && n !== main; n = n.parentElement) {\n",
+       "        for (let n = h; n; n = n.parentElement) {\n")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.
