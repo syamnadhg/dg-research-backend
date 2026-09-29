@@ -292,7 +292,9 @@ MUTANTS = [
     ("S11", SR, "⛔ EVERY WATCHER ALREADY ARMED KEEPS ITS ~2-MINUTE INTERVAL FOREVER — the "
      "arm is idempotent by name again, so the minute-anchored schedule reaches only "
      "chats armed after the change",
-     [("                if not moved:\n"
+     # ⚠ RE-ANCHORED 2026-09-28: the failure-lane carry-over joined the condition
+     # (`laned`); the mutant still drops the whole check.
+     [("                if not moved and not laned:\n"
        "                    return True  # genuinely armed — idempotent no-op",
        "                return True  # genuinely armed — idempotent no-op")]),
     # ═══ W — the watcher (reaches the person with no model turn) ═══════════════

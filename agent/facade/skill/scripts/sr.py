@@ -1076,6 +1076,11 @@ def _build_stream_cron_job(script_name: str, job_name: str, origin: dict | None,
         "last_delivery_error": None,
         "deliver": "origin" if origin else "local",
         "origin": origin,
+        # ⛔⛔ HERMES' OWN NOTICES ABOUT THIS JOB NEVER REACH THE CHAT (2026-09-28).
+        # A gateway restart that lands mid-tick used to post "⚠️ Cron job
+        # 'sr-stream-…' was interrupted … No result was produced for this run" to
+        # the person, out of nowhere. See `_WATCHER_FAILURE_LANE`.
+        "failure_deliver": _WATCHER_FAILURE_LANE,
         "enabled_toolsets": None,
         "workdir": None,
     }
@@ -1123,6 +1128,9 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
         # moment this client holds the store. See `_migrate_stream_schedules`.
         moved = (_migrate_stream_schedules(data["jobs"], schedule)
                  if _is_stream_job_name(job_name) else [])
+        # ⭐ AND THE FAILURE LANE, host-wide and once per row, for the daily notice's
+        # row as well as every chat's (`_migrate_failure_lane`).
+        laned = _migrate_failure_lane(data["jobs"])
         if existing is not None:
             # Present — but "present" only counts as ARMED if it can actually run. A
             # disabled/paused row is skipped by the runtime's due-scan before any
@@ -1130,7 +1138,7 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
             # with no way back (a re-arm would keep finding it). Revive it in place
             # instead of appending a duplicate (duplicates break name lookups).
             if existing.get("enabled", True) and existing.get("state") != "paused":
-                if not moved:
+                if not moved and not laned:
                     return True  # genuinely armed — idempotent no-op
             else:
                 existing.update({"enabled": True, "state": "scheduled", "paused_at": None,
@@ -1153,6 +1161,9 @@ def _arm_stream_cron(script_name: str, job_name: str, origin: dict | None,
         if moved:
             _watcher_log(f"arm {job_name}: moved {len(moved)} watcher row(s) to "
                          f"{schedule.get('display', '')!r}: {', '.join(moved)}")
+        if laned:
+            _watcher_log(f"arm {job_name}: failure lane {_WATCHER_FAILURE_LANE!r} on "
+                         f"{len(laned)} row(s): {', '.join(laned)}")
         if existing is None:
             _watcher_log(f"arm {job_name}: new row, schedule "
                          f"{schedule.get('display', '')!r}")
@@ -1260,6 +1271,44 @@ def _first_run_at(schedule: "dict | None") -> str:
 
 def _is_stream_job_name(name: object) -> bool:
     return isinstance(name, str) and (name == "sr-stream" or name.startswith("sr-stream-"))
+
+
+# ⛔⛔ WHERE HERMES SENDS ITS OWN NOTICES ABOUT OUR WATCHER JOBS: NOWHERE (2026-09-28).
+# When the gateway shuts down or restarts mid-tick it stops the job and posts
+# "⚠️ Cron job 'sr-stream-…' was interrupted — the gateway is restarting and killed
+# the run before it finished. No result was produced for this run." to the job's
+# chat — news about plumbing the person never set up, arriving out of nowhere. So
+# does a script failure or a timeout. Hermes routes every one of those through the
+# row's FAILURE lane, `failure_deliver` when the row carries one ("`failure_deliver:
+# local` is the structural opt-out" — cron/scheduler_delivery.py
+# `_resolve_delivery_targets(for_failure=True)`, gateway/run_shutdown.py), while
+# the messages themselves keep following `deliver`. Upstream since v2026.9.14; an
+# older Hermes ignores the key and behaves as before. Our scripts already exit 0
+# on every path, so no failure the person could act on is lost.
+_WATCHER_FAILURE_LANE = "local"
+
+
+def _is_watcher_job_name(name: object) -> bool:
+    """Every cron row this client writes: the per-chat watchers and the daily notice."""
+    return _is_stream_job_name(name) or name == "sr-update-notice"
+
+
+def _migrate_failure_lane(jobs: list) -> "list[str]":
+    """Give every watcher row on this host that has no failure lane ours, in place;
+    returns the names it changed.
+
+    ⭐ ONCE PER ROW, like `_migrate_stream_schedules`: a row that already carries
+    `failure_deliver` is never touched again. ⛔ AND A VALUE SOMEBODY SET IS THEIRS:
+    only a row WITHOUT the key is changed — a hand-set lane (or one Hermes' own
+    cronjob tool wrote) stays exactly as it is."""
+    changed: "list[str]" = []
+    for job in jobs:
+        if (not isinstance(job, dict) or not _is_watcher_job_name(job.get("name"))
+                or "failure_deliver" in job):
+            continue
+        job["failure_deliver"] = _WATCHER_FAILURE_LANE
+        changed.append(str(job.get("name")))
+    return changed
 
 
 def _schedule_key(schedule: object) -> "tuple | None":
@@ -4797,7 +4846,8 @@ def _stream_arm_directive_lines(script_name: str, job_name: str) -> list[str]:
         "Arm this chat's live-progress watchdog NOW with your cronjob tool so run "
         "progress and the 🎉 completion post here on their own:",
         f'  cronjob: create no_agent=true schedule="every 1m" '
-        f'script="{script_name}" name="{job_name}"',
+        f'script="{script_name}" name="{job_name}" '
+        f'failure_deliver="{_WATCHER_FAILURE_LANE}"',
         "Create it now. Skip ONLY if your cronjob tool already lists a job with this "
         "exact name (then leave that one — do not duplicate) or if your runtime has "
         "no cronjob tool. Do NOT skip just because no run looks active yet — a "
@@ -4806,7 +4856,8 @@ def _stream_arm_directive_lines(script_name: str, job_name: str) -> list[str]:
         "Arm the once-daily skill-update notice the same way (skip only if a job "
         "named sr-update-notice is already listed):",
         '  cronjob: create no_agent=true schedule="every 1d" '
-        'script="sr_update_notice.py" name="sr-update-notice"',
+        'script="sr_update_notice.py" name="sr-update-notice" '
+        f'failure_deliver="{_WATCHER_FAILURE_LANE}"',
     ]
 
 
