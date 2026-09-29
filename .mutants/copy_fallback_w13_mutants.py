@@ -10,13 +10,20 @@ button when the page read comes back empty.
        before anything is pressed; the CUA is held to clicks, never Send or
        Regenerate, told the copy mission's words, given the copy mission's
        prompt; no CUA → no click; citation tokens dropped; the clipboard is
-       waited for after the click.
+       waited for after the click; never Share, Share prompt or Edit message;
+       the ChatGPT tab brought to the front first; a Copy button that cannot be
+       clicked is left to the CUA; a copy that is not on this page is refused.
   L* — which button: the last Copy on the page, never a code block's, never one
        inside a reply's text, never one before the latest reply, never a hidden
        one, never the user's "Copy message".
-  V* — what counts as the brief: not the marker, long enough, not our prompt
-       (anywhere near its start), three lines of prose — a code comment and a
-       line crowded with code symbols are not prose.
+  V* — what counts as the brief: not the marker, MORE than 2000 characters of
+       prose (the page read's own floor; an image's address does not count),
+       not our prompt (anywhere near its start), three lines of prose — a code
+       comment and a line crowded with code symbols are not prose; a line in a
+       script written without spaces counts by its letters (twenty or more).
+  N* — on this page: two of the first three lines of prose open (their first
+       sixty letters and digits) with words the page shows; a link shows only
+       its words, a list's number is drawn by the page.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 real headless Chrome against the rebuilt pages (served at a routed local
@@ -92,9 +99,8 @@ MUTANTS = [
        "allow=CUA_CLICK_ONLY, never_click=None,")]),
     ("C6", RESEARCH, "⛔ Regenerate is off the never-click list — one stray click throws "
      "the finished brief away",
-     [("CUA_NEVER_CLICK_COPY = CUA_NEVER_CLICK_SEND + ', button[aria-label=\"Regenerate "
-       "response\"]'",
-       "CUA_NEVER_CLICK_COPY = CUA_NEVER_CLICK_SEND")]),
+     [("CUA_NEVER_CLICK_SEND + ', button[aria-label=\"Regenerate response\"]'",
+       "CUA_NEVER_CLICK_SEND + ''")]),
     ("C7", RESEARCH, "the copy CUA is told the caret mission's words on a refusal",
      [("never_click_say=\"copy\"), timeout=_CG_COPY_CUA_S)",
        "never_click_say=\"caret\"), timeout=_CG_COPY_CUA_S)")]),
@@ -114,6 +120,34 @@ MUTANTS = [
      "moment after the click is refused",
      [("        if time.monotonic() >= deadline:\n            return marker",
        "        if True:\n            return marker")]),
+    ("C13", RESEARCH, "⛔ Share is off the never-click list — a stray click next to Copy "
+     "opens the dialog that makes a public link to the chat",
+     [("', button[aria-label=\"Share\"], button[aria-label=\"Share prompt\"]'",
+       "', button[aria-label=\"Share prompt\"]'")]),
+    ("C14", RESEARCH, "Share prompt is off the never-click list",
+     [("', button[aria-label=\"Share\"], button[aria-label=\"Share prompt\"]'",
+       "', button[aria-label=\"Share\"]'")]),
+    ("C15", RESEARCH, "⛔ Edit message is off the never-click list — its Send re-submits "
+     "the prompt and throws the brief away",
+     [("\n                        ', button[aria-label=\"Edit message\"]')",
+       ")")]),
+    ("C16", RESEARCH, "the ChatGPT tab is not brought to the front — behind another tab "
+     "the clipboard reads back empty and the brief is lost",
+     [("        await page.bring_to_front()\n    try:\n"
+       "        armed = await page.evaluate(_CG_COPY_ARM_JS, marker)",
+       "        pass\n    try:\n"
+       "        armed = await page.evaluate(_CG_COPY_ARM_JS, marker)")]),
+    ("C17", RESEARCH, "a Copy button that cannot be clicked ends the fallback — the CUA "
+     "never gets to press it",
+     [("could not be clicked \"\n"
+       "                f\"({(str(e) or type(e).__name__)[:120]})\", \"WARN\")\n",
+       "could not be clicked \"\n"
+       "                f\"({(str(e) or type(e).__name__)[:120]})\", \"WARN\")\n"
+       "            return \"\"\n")]),
+    ("C18", RESEARCH, "⛔⛔ a copy that is not on this page is kept — another worker's "
+     "brief on the shared clipboard becomes this run's",
+     [("    if not await _chatgpt_copy_on_page(page, text):",
+       "    if False:")]),
 
     # ═══ L — which button ══════════════════════════════════════════════════
     ("L1", RESEARCH, "⛔⛔ a code block's Copy is pressed",
@@ -143,8 +177,26 @@ MUTANTS = [
      [("    if not t or t == marker:",
        "    if not t:")]),
     ("V2", RESEARCH, "no length floor",
-     [("    if len(t) < _CG_COPY_MIN_CHARS:",
+     [("    if (n := _doc_img_prose_len(t)) <= _CG_COPY_MIN_CHARS:",
        "    if False:")]),
+    ("V9", RESEARCH, "⛔ the floor is 500 again — a clarifying question from ChatGPT "
+     "becomes the brief",
+     [("_CG_COPY_MIN_CHARS = _MIN_SALVAGEABLE_BRIEF_LEN",
+       "_CG_COPY_MIN_CHARS = 500")]),
+    ("V10", RESEARCH, "exactly 2000 characters passes — the page read keeps only MORE",
+     [("    if (n := _doc_img_prose_len(t)) <= _CG_COPY_MIN_CHARS:",
+       "    if (n := _doc_img_prose_len(t)) < _CG_COPY_MIN_CHARS:")]),
+    ("V11", RESEARCH, "an image's address counts toward the floor",
+     [("    if (n := _doc_img_prose_len(t)) <= _CG_COPY_MIN_CHARS:",
+       "    if (n := len(t)) <= _CG_COPY_MIN_CHARS:")]),
+    ("V12", RESEARCH, "a script written without spaces never reads like prose — a "
+     "Japanese brief is refused",
+     [("            and len(_CG_UNSPACED_RE.findall(line)) < 20):",
+       "            and True):")]),
+    ("V13", RESEARCH, "one letter of such a script makes a line prose — a list of short "
+     "labels passes as a brief",
+     [("            and len(_CG_UNSPACED_RE.findall(line)) < 20):",
+       "            and len(_CG_UNSPACED_RE.findall(line)) < 1):")]),
     ("V3", RESEARCH, "⛔⛔ our own prompt passes as the brief",
      [("        if want and want in head:",
        "        if False:")]),
@@ -162,8 +214,32 @@ MUTANTS = [
      [("    return sum(ch in _CG_CODE_CHARS for ch in line) < 0.05 * len(line)",
        "    return True")]),
     ("V8", RESEARCH, "a single word is a line of prose",
-     [("    if len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 8:",
-       "    if len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 1:")]),
+     [("    if (len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 8\n",
+       "    if (len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 1\n")]),
+]
+
+MUTANTS += [
+    # ═══ N — is it on this page ═══════════════════════════════════════════
+    ("N1", RESEARCH, "⛔⛔ one shared line is enough — another worker's brief that ends "
+     "the way every brief ends passes",
+     [("sum(p in shown for p in probes) >= min(2, len(probes))",
+       "sum(p in shown for p in probes) >= 1")]),
+    ("N2", RESEARCH, "every one of the first three lines must be on the page — a source "
+     "chip inside a sentence costs the brief",
+     [("sum(p in shown for p in probes) >= min(2, len(probes))",
+       "sum(p in shown for p in probes) >= len(probes)")]),
+    ("N3", RESEARCH, "a link's address is looked for on the page, where only its words "
+     "show",
+     [(r'''    line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)''' + "\n",
+       "")]),
+    ("N4", RESEARCH, "a list's numbers are looked for on the page, which draws them — a "
+     "brief written as a numbered list is refused",
+     [(r'''    line = re.sub(r"^\s*(?:(?:[-*+>]|\d+[.)])\s+)+", "", line)''' + "\n",
+       "")]),
+    ("N5", RESEARCH, "the whole line is looked for — a source chip late in a line costs "
+     "that line",
+     [("    return _cg_letters(line)[:_CG_ON_PAGE_PROBE]",
+       "    return _cg_letters(line)")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.
