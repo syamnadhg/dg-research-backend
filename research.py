@@ -27909,7 +27909,7 @@ async def _shadow_observed_cua(
     context_hint, cua_coro_factory, expected_outcome="",
     mission_prompt="", success_text="", high_stakes=False,
     read_only=False, act_timeout_s=90.0, act_max_steps=0,
-    pre_cua_net_probe=None,
+    pre_cua_net_probe=None, act_allow=None,
 ):
     """The Vision↔CUA dispatch point for every hotspot (name kept for
     grep-stability across logs/memory even though it now covers more than
@@ -27950,6 +27950,9 @@ async def _shadow_observed_cua(
       For non-idempotent hotspots (audio-generate, #778) where a partial Vision
       attempt may have already mutated state (started generating) so re-running
       the full CUA mission would double-act. Off/shadow never invoke it.
+    - act_allow: the allow-list the site's CUA runs under (CUA_CLICK_ONLY). A
+      Vision step outside it is NOT executed — Vision hands over to the CUA,
+      which is held to the same list.
 
     Act success returns {"status": "vision_success", "text": ..., "vision_acted":
     True} — the agent_loop dict shape every caller already parses.
@@ -27996,6 +27999,9 @@ async def _shadow_observed_cua(
     if _mode == "tier2":
         # ── ACT: Vision drives; CUA is the safety net ──
         _final = None
+        _act_kw = {}
+        if act_allow is not None:
+            _act_kw["refuse"] = lambda r: _vision_refusal(r, act_allow)
         try:
             _steps = 1 if read_only else (act_max_steps or _vision.ACT_MAX_STEPS_DEFAULT)
             _final = await asyncio.wait_for(_vision.act_loop(
@@ -28008,6 +28014,7 @@ async def _shadow_observed_cua(
                 max_steps=_steps,
                 read_only=read_only,
                 should_abort=lambda: _controls.is_stop() or _controls.is_pause(),
+                **_act_kw,
             ), timeout=act_timeout_s)
         except Exception as _ae:
             log(f"[act:{hotspot_id}] act path failed "
@@ -39563,6 +39570,39 @@ class Browser:
 
 # ── Action Executor ────────────────────────────────────────────────────────────
 
+#: ⛔⛔ What a CUA may do while the PROGRAM owns the typing: ChatGPT's Phase 1
+#: caret placement, and the verify gate's diagnosis and fix while a ChatGPT
+#: prompt is in play. It may point, click once, scroll, wait and press Escape.
+#: Anything else is refused and logged: a typed word, Enter, a paste,
+#: select-all, a drag, a right-click menu. (A screenshot touches nothing and is
+#: always allowed.) On 2026-09-28 the fallback's CUA typed "test" on its own
+#: initiative, and "do NOT type" in its mission was all that stood in its way.
+CUA_CLICK_ONLY = frozenset({"left_click", "mouse_move", "scroll", "wait", "key:Escape"})
+
+
+def _cua_refusal(action, params, allow) -> str:
+    """'' when `allow` (None: anything) lets a CUA take this action, else the
+    action as the refusal names it. A key is allowed by its mapped name
+    ("key:Escape"), so "esc" and "Escape" are one key, and a combo holding any
+    other key is refused."""
+    if allow is None:
+        return ""
+    if action == "key":
+        p = params or {}
+        combo = _cua_key_combo(p.get("key") or p.get("text", ""))
+        return "" if f"key:{combo}" in allow else f"key {combo!r}"
+    return "" if action in allow else str(action)
+
+
+def _vision_refusal(result, allow) -> str:
+    """`_cua_refusal` for a Vision act step, which names its actions its own
+    way: a Vision "click" is a left_click, and a "key" carries its key."""
+    act = getattr(result, "action", "")
+    if act == "click":
+        act = "left_click"
+    return _cua_refusal(act, {"key": getattr(result, "key", None) or ""}, allow)
+
+
 async def execute_action(browser, action, params):
     """Execute a CUA action. Returns screenshot base64."""
     if action == "screenshot":
@@ -39619,8 +39659,13 @@ async def execute_action(browser, action, params):
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
                      phase=None, agent_name=None, target_page=None,
-                     abort_event=None):
+                     abort_event=None, allow=None):
     """CUA agent loop — proven from original research.py.
+
+    allow (optional): the only actions this mission may take (CUA_CLICK_ONLY).
+    Anything else the model asks for is NOT carried out: it is logged as
+    REFUSED and the model is told so. A mission's "do not type" is otherwise
+    only a request.
 
     target_page (optional): Playwright Page reference. When provided, every
     screenshot re-anchors to this tab via bring_to_front. Prevents the
@@ -39876,6 +39921,15 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 ss = await _anchored_screenshot()
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id,
                     "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}}]})
+            elif refused := _cua_refusal(act, tb.input, allow):
+                log(f"[cua] REFUSED {refused} — this task may only click, scroll, wait or "
+                    f"press Escape; nothing was typed, pressed or sent", "WARN")
+                tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
+                    {"type": "text", "text": f"Action '{act}' was NOT carried out: this task "
+                     f"may only click, scroll, wait or press Escape. Do not type or press Enter."},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                 "data": await _anchored_screenshot()}},
+                ]})
             else:
                 ss = await execute_action(browser, act, tb.input)
                 # Re-anchor after action — execute_action may have navigated,
@@ -40335,10 +40389,14 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
     then also requires the LAST user message on screen to start with it, on the
     DOM path and on the CUA-confirm path alike, and the CUA fix — which may
     click Send — runs only once the box holds the prompt or nothing. On
-    2026-09-28 the fix sent "est" and the Stop button alone verified it.
+    2026-09-28 the fix sent "est" and the Stop button alone verified it. With a
+    prompt in play the diagnosis and the fix are also held to CUA_CLICK_ONLY:
+    only the program types, so neither may type a word or press Enter.
     """
+    _cua_allow = None
     if chatgpt_prompt:
         verify_fn = _chatgpt_sent_prompt_verifier(chatgpt_prompt, label, inner=verify_fn)
+        _cua_allow = CUA_CLICK_ONLY
     for i in range(max_retries):
         if await verify_fn(page):
             log(f"[{label}] ✓ Verified — actively generating")
@@ -40372,7 +40430,7 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                 return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
                     "Look at the BOTTOM of the chat. Is there a Stop button visible? "
                     "Is there a loading animation or spinner? Is the AI actively generating?",
-                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose, allow=_cua_allow)
 
             # #839 act tier (read_only): a Vision verdict must land in the
             # returned text with the same plain-English signals the parser
@@ -40466,7 +40524,7 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
             async def _fix_cua():
                 return await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
                     "Fix whatever is blocking the research from starting. Click any needed buttons.",
-                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose, allow=_cua_allow)
 
             # #839 act tier: click-only recovery (the mission forbids typing);
             # success is judged by the Phase-4 DOM re-checks either way.
@@ -40478,7 +40536,8 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                              "(Start/confirm/Send). NEVER type or paste text",
                 expected_outcome="the blocking button is clicked and generation starts",
                 cua_coro_factory=_fix_cua,
-                mission_prompt=PROMPT_FIX_ISSUE)
+                mission_prompt=PROMPT_FIX_ISSUE,
+                act_allow=_cua_allow)
             log(f"[{label}] CUA fix attempt: {(fix or {}).get('text', '')[:200]}")
             await asyncio.sleep(5)
             continue
@@ -54840,7 +54899,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # never sends: the program types the prompt, reads it back and sends it —
     # the same checked path as above. A fallback that typed for itself sent
     # "est" on 2026-09-28. And never after Send was already pressed: that
-    # would put the prompt in the thread twice.
+    # would put the prompt in the thread twice. CUA_CLICK_ONLY makes "never
+    # types" mechanical — the mission's wording alone is only a request.
     if not submitted and cua_client and _p1_submit.get("state") == "not_sent":
         log("Falling back to CUA to put the caret in the message box "
             "(it types nothing and sends nothing)...")
@@ -54849,7 +54909,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
                 "Click inside ChatGPT's message box so the text cursor is in it. "
                 "Do NOT type, paste, press Enter or click Send.",
-                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+                model=CUA_MODEL, max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY)
 
         # #839 act tier: side-effect-only (result ignored); what counts is the
         # checked submit right after it and the verify gate below.
@@ -54861,7 +54921,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                          "prompt, reads it back and sends it itself)",
             expected_outcome="the text cursor is in ChatGPT's message box",
             cua_coro_factory=_submit_cua,
-            mission_prompt=PROMPT_SUBMIT_FALLBACK)
+            mission_prompt=PROMPT_SUBMIT_FALLBACK,
+            act_allow=CUA_CLICK_ONLY)
         submitted = await submit_chatgpt_direct(browser, prompt, use_focused=True,
                                                 outcome=_p1_submit)
 
@@ -54982,7 +55043,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
                     "Click inside ChatGPT's message box so the text cursor is in it. "
                     "Do NOT type, paste, press Enter or click Send.",
-                    model=CUA_MODEL, max_iterations=8, verbose=verbose)
+                    model=CUA_MODEL, max_iterations=8, verbose=verbose,
+                    allow=CUA_CLICK_ONLY)
 
             # #839 act tier: side-effect-only; the checked submit right after it
             # and the follow-up verify gate below are the ground truth.
@@ -54993,7 +55055,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                              "NOT type, paste, press Enter or click Send",
                 expected_outcome="the text cursor is in ChatGPT's message box",
                 cua_coro_factory=_submit_fu_cua,
-                mission_prompt=PROMPT_SUBMIT_FALLBACK)
+                mission_prompt=PROMPT_SUBMIT_FALLBACK,
+                act_allow=CUA_CLICK_ONLY)
             submitted_fu = await submit_chatgpt_direct(browser, followup, use_focused=True,
                                                        outcome=_fu_submit)
         # Wait for the updated response

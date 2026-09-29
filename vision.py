@@ -1079,6 +1079,7 @@ async def act_loop(
     max_steps: int = ACT_MAX_STEPS_DEFAULT,
     should_abort: Callable[[], bool] | None = None,
     read_only: bool = False,
+    refuse: Callable[[ActionResult], str] | None = None,
 ) -> ActionResult:
     """ACT MODE (DG_VISION_TIER=act / tier2): Vision DRIVES the page toward a
     mission goal, one bounded step at a time — the tier-2 acting sibling of
@@ -1110,6 +1111,10 @@ async def act_loop(
     - ``should_abort`` (caller's stop/abort probe) is checked before every
       step; on trip the loop stops WITHOUT falling through to more actions —
       the caller re-checks its own flag to distinguish stop from escalate.
+    - ``refuse`` (the caller's allow-list): a non-empty answer for a proposed
+      step means this mission may not take it (a typed word or Enter where the
+      program owns the typing) — the step is NOT executed, and the loop
+      escalates to CUA, which is held to the same list.
     """
     vc = vision or default_client()
     ctx = dict(flow_context)
@@ -1198,6 +1203,12 @@ async def act_loop(
         if read_only:
             final = _act_synth(
                 f"read-only hotspot — vision proposed {result.action}; deferring to CUA"
+            )
+            break
+        refused = refuse(result) if refuse is not None else ""
+        if refused:
+            final = _act_synth(
+                f"refused {refused} — this mission may not type or send; deferring to CUA"
             )
             break
 
