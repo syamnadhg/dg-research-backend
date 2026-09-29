@@ -233,7 +233,9 @@ def test_the_worker_watchdog_s_verdict_reaches_the_owner(armed, monkeypatch, cap
         asyncio=types.SimpleNamespace(
             sleep=_fast_sleep, ensure_future=asyncio.ensure_future,
             create_task=asyncio.create_task, TimeoutError=asyncio.TimeoutError,
-            CancelledError=asyncio.CancelledError),
+            CancelledError=asyncio.CancelledError,
+            # The dequeue's membership ask (09-29): off the loop, bounded.
+            wait_for=asyncio.wait_for, to_thread=asyncio.to_thread),
         run_pipeline_captured=_pipeline,
         _firebase_db=None,
         load_device_id=lambda: None,
