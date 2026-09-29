@@ -40095,6 +40095,28 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 pass
         return await browser.screenshot()
 
+    # ⛔⛔ 2026-09-29 — AN EMPTY PICTURE ENDS THE WHOLE STEP. A busy ChatGPT tab
+    # (writing a long answer) timed out both of `Browser.screenshot`'s tries, and
+    # the "" it returned went into the next tool result as an image. Anthropic
+    # refuses the WHOLE request for that ("image.source.base64: image cannot be
+    # empty", 400) and this loop treats a 400 as the end: the vision step failed
+    # outright instead of looking again (10:07:03 → 10:07:21, the second of three
+    # tries at ChatGPT's activity). Every picture after the first goes through
+    # here: an empty one is taken once more, and if that fails too the model is
+    # told in words. Only the first screenshot keeps its own guard below.
+    async def _screen_block(ss=None):
+        if ss is None:
+            ss = await _anchored_screenshot()
+        if not ss:
+            ss = await _anchored_screenshot()
+        if ss:
+            return {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                "data": ss}}
+        log("[cua] The page did not give a screenshot twice in a row (it is busy) — "
+            "telling the vision model in words instead of sending an empty picture", "WARN")
+        return {"type": "text", "text": "The screenshot could not be taken because the page "
+                "is busy. Wait a moment, then take another screenshot."}
+
     initial_ss = await _anchored_screenshot()
     if not initial_ss:
         return {"status": "error", "text": "Could not take initial screenshot"}
@@ -40318,15 +40340,14 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 log("Stuck — same action 5x. Injecting hint.", "WARN")
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": "You seem stuck. Try a different approach."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": await _anchored_screenshot()}},
+                    await _screen_block(),
                 ]})
                 recent_actions.clear()
                 continue
 
             if act == "screenshot":
-                ss = await _anchored_screenshot()
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id,
-                    "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}}]})
+                    "content": [await _screen_block()]})
             elif refused := _cua_refusal(act, tb.input, allow):
                 _may = ", ".join(sorted(allow))
                 log(f"[cua] REFUSED {refused} — this task may only use: {_may}; "
@@ -40334,8 +40355,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": f"Action '{act}' was NOT carried out: this task "
                      f"may only use: {_may}. Do not type or press Enter."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                                 "data": await _anchored_screenshot()}},
+                    await _screen_block(),
                 ]})
             elif (never_click and act == "left_click"
                     and await _cua_click_lands_on(browser, tb.input, never_click)):
@@ -40344,8 +40364,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": "That click was NOT carried out: it would have "
                      "clicked Send. Click inside the message box itself, never on Send."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                                 "data": await _anchored_screenshot()}},
+                    await _screen_block(),
                 ]})
             else:
                 ss = await execute_action(browser, act, tb.input)
@@ -40358,7 +40377,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                         pass
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": f"Action '{act}' executed."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}},
+                    await _screen_block(ss),
                 ]})
             # Emit CUA action event for frontend visibility
             if agent_name and act != "screenshot":
