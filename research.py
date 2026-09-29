@@ -7924,7 +7924,8 @@ def _recompute_deferred_queue_positions_locked() -> None:
         try:
             # #720: heal a stale-token 403 on the renumber; rebuild the batch
             # inside the op so a retry commits a fresh batch, not a consumed one.
-            _grpc_write_with_heal(_commit_chunk, what=f"deferred queue-pos batch [{i}:{i+CHUNK}]")
+            _grpc_write_with_heal(_commit_chunk, what=f"deferred queue-pos batch [{i}:{i+CHUNK}]",
+                                  uid=_batch_heal_uid(chunk))
         except Exception as e:
             log(f"[deferred-recompute] batch commit failed [{i}:{i+CHUNK}]: {e}", "WARN")
 
@@ -8539,6 +8540,23 @@ def _structural_heal_advice(uid, claims: dict, *, own_pairing: bool) -> str:
                 f"re-pairing will not fix it; only that account being given this "
                 f"computer again would.")
     return "A force-refresh cannot fix this — re-pair required."
+
+
+def _batch_heal_uid(patches) -> "str | None":
+    """Whose tree a queue-position batch is charged to in the heal's advice:
+    the first account in it that is not this computer's own, else None (the
+    paired owner).
+
+    ⛔ Firestore refuses a WHOLE batch for one record it will not take. A
+    renumber batch updates every waiting job's record, from every account, so
+    one removed sharer's record refuses the owner's updates with it — and with
+    no uid the structural line blamed this computer's pairing and said
+    "re-pair required" (09-29 verify)."""
+    paired = str(load_paired_uid() or "")
+    for uid_v, _rid_v, _patch in patches:
+        if uid_v and str(uid_v) != paired:
+            return str(uid_v)
+    return None
 
 
 def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
@@ -78112,7 +78130,8 @@ async def run_server(port=8000):
             try:
                 # #720: heal a stale-token 403 on the renumber; rebuild the batch
                 # inside the op so a retry commits a fresh batch, not a consumed one.
-                _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]")
+                _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]",
+                                      uid=_batch_heal_uid(chunk))
             except Exception as e:
                 log(f"Failed to commit queue-position batch [{i}:{i+CHUNK}]: {e}", "WARN")
         # #890: publish the refreshed queueOwners union (local + deferred).

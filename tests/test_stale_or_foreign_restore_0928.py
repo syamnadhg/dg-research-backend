@@ -31,8 +31,9 @@ import base64
 import collections
 import json
 import os
+import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytest
 
@@ -190,7 +191,11 @@ SHARED = {"ownerUid": OWNER, "sharedWith": [SHARER]}
 
 
 def _job(uid, rid, *, days=0.0, topic="Topic", **extra):
-    stamp = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d_%H%M%S")
+    # ⛔ From the epoch, not wall-clock arithmetic: `now - timedelta(days=8)`
+    # across a spring-forward change is 8 days minus an hour, which the code
+    # (parsing the stamp back as local time) rightly calls 7 — a week-long red
+    # gate every March on a machine on Pacific time (09-29 verify).
+    stamp = datetime.fromtimestamp(time.time() - days * 86400).strftime("%Y%m%d_%H%M%S")
     job = {"uid": uid, "research_id": rid, "run_id": f"{topic}_{stamp}",
            "topic": "a topic", "email": "someone@example.com", "config": {}}
     job.update(extra)
@@ -590,6 +595,9 @@ class _DenyingDb:
 
     add = update = set = get = _deny
 
+    def transaction(self):
+        return object()
+
 
 def _heal_machine(monkeypatch, *, token_device=DEVICE, config_device=DEVICE):
     db = _DenyingDb({"deviceId": token_device, "ownerUid": OWNER})
@@ -690,6 +698,10 @@ WRITERS = {
     "phase-status": lambda: research._do_phase_terminal_status_write(1, "complete"),
     "cloud-kick-refusal": lambda: research._record_cloud_kick_refusal(
         FORMER, RUN_RID, "the cloud said no"),
+    # ⛔ The dequeue's queued→ongoing flip: the FIRST refused write in the 09-28
+    # log. A run_server closure, lifted and run for real (09-29 verify).
+    "flip": lambda: __import__("_run_server_closure").lift("_flip_queued_to_ongoing")(
+        FORMER, RUN_RID),
 }
 
 
@@ -704,11 +716,132 @@ def test_every_research_writer_names_the_research_owners_account(monkeypatch, wr
     monkeypatch.setattr(research, "_fb_research_id", RUN_RID)
     monkeypatch.setattr(research, "_fb_seq", 0)
     monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
+    # The flip's transaction wrapper would drive a real BeginTransaction; the
+    # body it wraps reads the record, which the fake refuses like the rules do.
+    from google.cloud import firestore as _gcf
+    monkeypatch.setattr(_gcf, "transactional", lambda f: f)
+    # What the flip's failure line takes from run_server rather than the module.
+    monkeypatch.setattr(research, "_flip_txn_stage", lambda *_a: "", raising=False)
     _deny_three_times(WRITERS[writer])
 
     [line] = _structural(lines)
     assert "the job belongs to another account" in line, line
     assert "re-pair required" not in line, line
+
+
+class _RenumberDb(_DenyingDb):
+    """The queue-position renumber's reads answer; its ONE batch is refused,
+    the way Firestore refuses a whole batch for one record it will not take."""
+
+    def __init__(self, claims, deferred):
+        super().__init__(claims)
+        self._deferred = deferred
+        self.batched: list = []
+
+    def collection(self, name):
+        db = self
+
+        class _Doc:
+            def __init__(self, path):
+                self.path = path
+
+            def collection(self, sub):
+                if sub == "queue":
+                    return _Queue()
+                return _Col(self.path + (sub,))
+
+            def get(self):
+                return collections.namedtuple("S", "exists")(False)
+
+            def update(self, _patch):
+                pass
+
+        class _Col:
+            def __init__(self, path):
+                self.path = path
+
+            def document(self, key):
+                return _Doc(self.path + (key,))
+
+        class _Queue:
+            def limit(self, _n):
+                return self
+
+            def stream(self):
+                return [collections.namedtuple("Q", "id to_dict")(
+                    f"q{i}", (lambda d=d: dict(d))) for i, d in enumerate(db._deferred)]
+
+        return _Col((name,))
+
+    def batch(self):
+        db = self
+
+        class _Batch:
+            def update(self, ref, _patch):
+                db.batched.append(ref.path)
+
+            def commit(self):
+                db._deny()
+        return _Batch()
+
+
+#: Two waiting jobs, the owner's first: the batch holds the owner's record AND
+#: the removed sharer's, and one refused record refuses both.
+WAITING = [(OWNER, "rid-owner"), (FORMER, "rid-former")]
+
+
+def _renumber_deferred(db):
+    db._deferred = [{"topic": "t", "researchId": rid, "uid": uid, "submittedBy": uid,
+                     "action": "start", "processed": False, "timestamp": 1000 + i}
+                    for i, (uid, rid) in enumerate(WAITING)]
+    research._recompute_deferred_queue_positions()
+
+
+def _renumber_local(monkeypatch):
+    from _run_server_closure import lift
+    jq = type("JQ", (), {})()
+    jq._queue = [{"uid": uid, "research_id": rid} for uid, rid in WAITING]
+    monkeypatch.setattr(research, "_job_queue", jq, raising=False)
+    monkeypatch.setattr(research, "_QUEUE_STATE", {}, raising=False)
+    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
+    lift("_recompute_queue_positions")()
+
+
+@pytest.mark.parametrize("renumber", ["deferred", "local"])
+def test_a_refused_renumber_batch_holding_another_accounts_record_does_not_say_re_pair(
+        monkeypatch, renumber):
+    """⛔ THE BATCH WRITERS (09-29 verify). The renumber updates every waiting
+    job's record in ONE batch; a removed sharer's record refuses the owner's
+    with it. The heal was handed no uid, so it charged the refusal to this
+    computer's pairing and said "re-pair required"."""
+    db = _RenumberDb({"deviceId": DEVICE, "ownerUid": OWNER}, [])
+    _db, lines = _heal_machine(monkeypatch)
+    monkeypatch.setattr(research, "_firebase_db", db)
+    monkeypatch.setattr(research, "load_device_id", lambda: DEVICE)
+    monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
+    for _ in range(research._GRPC_HEAL_STRUCTURAL_AFTER):
+        (_renumber_deferred(db) if renumber == "deferred" else _renumber_local(monkeypatch))
+
+    assert ("users", FORMER, "researches", "rid-former") in db.batched, db.batched
+    [line] = _structural(lines)
+    assert "the job belongs to another account" in line and FORMER[:8] in line, line
+    assert "re-pair required" not in line, line
+
+
+def test_a_refused_renumber_of_only_the_owners_jobs_still_says_re_pair(monkeypatch):
+    """The control: a batch of the owner's own records only is this computer's
+    own tree, and the advice stays re-pairing."""
+    db = _RenumberDb({"deviceId": DEVICE, "ownerUid": OWNER}, [])
+    _db, lines = _heal_machine(monkeypatch)
+    monkeypatch.setattr(research, "_firebase_db", db)
+    monkeypatch.setattr(research, "load_device_id", lambda: DEVICE)
+    monkeypatch.setattr(research, "_be_payload", lambda p: dict(p))
+    monkeypatch.setattr(sys.modules[__name__], "WAITING", [(OWNER, "rid-1"), (OWNER, "rid-2")])
+    for _ in range(research._GRPC_HEAL_STRUCTURAL_AFTER):
+        _renumber_deferred(db)
+
+    [line] = _structural(lines)
+    assert "re-pair required" in line and "another account" not in line, line
 
 
 # ══ 6. an account that left, on every pickup ═════════════════════════════════
