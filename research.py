@@ -9362,6 +9362,11 @@ def _rest_keepalive_pass():
 # put back by that worker's next boot (`_release_waiting_claims`).
 WAITING_MARKER = ".waiting_for_worker"
 
+#: What a waiting run's marker is renamed to once somebody stopped or cancelled
+#: it, beside the run's `.stop`: it no longer waits, holds no folder, and every
+#: worker's copy of the cancel can still tell it was a run the queue held.
+WAITING_ENDED = f"{WAITING_MARKER}.ended"
+
 #: The device-command action the app sends for "Move to queue".
 REQUEUE_ACTION = "requeue"
 
@@ -9416,7 +9421,12 @@ def _waiting_runs() -> "list[dict]":
     """Every run waiting in this computer's queue, FRONT FIRST. The one moved
     most recently leads: a moved run goes to #1 and whatever was already
     waiting moves down one (the owner's rule, 2026-09-29). Each is its marker's
-    record, with `_dir` — the run folder."""
+    record, with `_dir` — the run folder.
+
+    ⛔ A RUN ENDED FOR GOOD (`.stop` beside it) IS NOT WAITING, whatever marker
+    is left: listed, it stayed the amber #1 and held every new start back
+    behind a run that will never run. Its marker is retired here, so it no
+    longer holds the folder either."""
     out: "list[dict]" = []
     try:
         dirs = [d for d in (Path(__file__).parent / "queues").iterdir() if d.is_dir()]
@@ -9426,6 +9436,9 @@ def _waiting_runs() -> "list[dict]":
         marker = d / WAITING_MARKER
         try:
             if not marker.exists():
+                continue
+            if (d / ".stop").exists():
+                _retire_waiting_marker(marker)
                 continue
             rec = json.loads(marker.read_text(encoding="utf-8"))
         except Exception:
@@ -9459,34 +9472,128 @@ def _waiting_record_patch() -> dict:
     }
 
 
-def _park_waiting_run(job, *, from_worker) -> "Path | None":
+def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None":
     """Put `job`'s run at the front of this computer's queue: write its marker,
     naming the whole job, so whichever worker takes it can resume it without
     asking anyone. The run folder, or None when the job names no person, or
     the write failed — which is also the answer for a run with no folder yet:
-    it has nothing to keep, and a folder is never made up for it here."""
+    it has nothing to keep, and a folder is never made up for it here.
+
+    ⭐ `behind` — a job a RESTING worker had only QUEUED in its own line when a
+    restart came (wave 13 repair). It goes to the BACK of the waiting runs, in
+    the order its line had it, which is where the published order already
+    showed it; restored into that line instead, the worker that is off ran it.
+    Its marker carries the job exactly as it was queued (`queued_job`), so the
+    worker that takes it runs what this one would have. A job that has not
+    started has no folder yet: one is made for it here, holding only its place,
+    and the pipeline starts in it as it would have.
+
+    ⛔ A TAKEN MARKER LEFT IN THE FOLDER GOES. The run is being put back now, so
+    no worker is about to start it from an earlier claim; left, a `.w<N>`
+    beside the new marker made worker N's claim fail on every tick on Windows
+    (a rename onto an existing name is refused there) and put the run back
+    again at N's next boot."""
     run_dir = _job_run_dir(job)
     uid = str((job or {}).get("uid") or "").strip()
     rid = str((job or {}).get("research_id") or "").strip()
     if run_dir is None or not (uid and rid):
         return None
+    if behind and not run_dir.exists():
+        try:
+            run_dir.mkdir(parents=True)
+        except Exception as e:
+            log(f"[moved-run] could not make a place in the queue for {rid[:8]}…: {e}", "WARN")
+            return None
+    now_ms = int(time.time() * 1000)
     rec = {
         "uid": uid, "research_id": rid, "run_id": run_dir.name,
         "topic": str(job.get("topic") or ""),
         "email": str(job.get("email") or ""),
         "config": dict(job.get("config") or {}),
         "submitted_by": str(job.get("submitted_by") or "").strip(),
-        "moved_at_ms": int(time.time() * 1000),
+        "moved_at_ms": (min([w["moved_at_ms"] for w in _waiting_runs()] + [now_ms]) - 1
+                        if behind else now_ms),
         "from_worker": int(from_worker),
     }
+    if behind:
+        rec["queued_job"] = dict(job)
     tmp = run_dir / f"{WAITING_MARKER}.tmp"
     try:
+        for stale in run_dir.glob(f"{WAITING_MARKER}.w*"):
+            stale.unlink(missing_ok=True)
         tmp.write_text(json.dumps(rec), encoding="utf-8")
         os.replace(tmp, run_dir / WAITING_MARKER)
     except Exception as e:
         log(f"[moved-run] could not put {rid[:8]}… in the queue: {e}", "WARN")
         return None
     return run_dir
+
+
+def _retire_waiting_marker(marker) -> bool:
+    """Rename a waiting or taken marker to `WAITING_ENDED`: the run no longer
+    waits and holds nothing. True when this call did it — False when another
+    worker (or thread) got there first, or the rename failed."""
+    try:
+        os.replace(marker, Path(marker).parent / WAITING_ENDED)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        log(f"[moved-run] could not end the wait in {Path(marker).parent.name}: {e}", "DEBUG")
+        return False
+
+
+def _end_waiting_run(uid, research_id) -> "dict | None":
+    """A cancel or a stop of a run waiting in this computer's queue, or taken
+    by a worker that has not started it (wave 13 repair). Ends it for good —
+    `.stop` FIRST, which every pickup refuses, then its markers retired — and
+    returns its marker's record. Also returns the record when another worker's
+    copy of the same cancel ended it a moment earlier (`WAITING_ENDED`), so
+    that copy writes the same thing and never the purge. None when no marker
+    in any folder names this person's research.
+
+    ⛔⛔ BEFORE THIS, A MOVED RUN COULD NOT BE STOPPED WITH ITS WORK KEPT: no
+    worker held it, so the start listener wrote the "cancelled before
+    starting" patch — `cancelled: true`, the app's delete-on-close, on a run
+    with finished steps — and the owner's Stop was dropped and the run ran
+    later. Its marker stayed too, so it stayed the amber #1 and held every new
+    start back."""
+    uid, rid = str(uid or ""), str(research_id or "")
+    if not (uid and rid):
+        return None
+    try:
+        dirs = [d for d in (Path(__file__).parent / "queues").iterdir() if d.is_dir()]
+    except Exception:
+        return None
+    for d in dirs:
+        try:
+            live = [m for m in [d / WAITING_MARKER, *d.glob(f"{WAITING_MARKER}.w*")]
+                    if m.exists()]
+            ended = d / WAITING_ENDED
+            names = live + ([ended] if ended.exists() else [])
+        except Exception:
+            continue
+        rec = None
+        for m in names:
+            try:
+                r = json.loads(m.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if (isinstance(r, dict) and str(r.get("uid") or "") == uid
+                    and str(r.get("research_id") or "") == rid):
+                rec = r
+                break
+        if rec is None:
+            continue
+        try:
+            (d / ".stop").touch()
+        except Exception as e:
+            log(f"[moved-run] could not end {d.name}: {e}", "WARN")
+        for m in live:
+            _retire_waiting_marker(m)
+        rec["_dir"] = d
+        return rec
+    return None
 
 
 def _claim_waiting_run(worker_id) -> "dict | None":
@@ -9509,8 +9616,13 @@ def _claim_waiting_run(worker_id) -> "dict | None":
         uid = str(rec.get("uid") or "")
         rid = str(rec.get("research_id") or "")
         taken = d / _waiting_taken_name(worker_id)
+        # ⛔ `os.replace`, NOT `os.rename`: Windows refuses a rename onto a name
+        # that exists, and a taken marker this worker left behind made its
+        # claim fail on every tick — this worker then took nothing at all,
+        # not even a deferred start. The SOURCE still decides between
+        # workers: only one rename of it can find it.
         try:
-            os.rename(d / WAITING_MARKER, taken)
+            os.replace(d / WAITING_MARKER, taken)
         except FileNotFoundError:
             continue  # a sibling worker took it first
         except OSError as e:
@@ -9530,6 +9642,15 @@ def _claim_waiting_run(worker_id) -> "dict | None":
                     f"waiting in the queue", "INFO")
             _drop_waiting_claim(d, worker_id)
             continue
+        queued_job = rec.get("queued_job")
+        if isinstance(queued_job, dict):
+            # A job a resting worker had only queued: run exactly as it was
+            # queued (a new run starts in the place kept for it).
+            log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the queue — "
+                f"a run that had not started on the worker that is off", "INFO")
+            return dict(queued_job, uid=uid, research_id=rid,
+                        run_id=str(queued_job.get("run_id") or d.name),
+                        queued_at_ms=int(time.time() * 1000), moved_run=True)
         log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the front of "
             f"the queue — it goes on from the start of the step it was on", "INFO")
         return {
@@ -9605,7 +9726,21 @@ async def _offer_waiting_run(job_queue) -> bool:
     if job is None:
         return False
     if not _safe_enqueue(job_queue, job, source="moved-run", take_unreadable=True):
-        await asyncio.to_thread(_drop_waiting_claim, job.get("resume_dir"), WORKER_ID)
+        run_dir = _job_run_dir(job)
+        await asyncio.to_thread(_drop_waiting_claim, run_dir, WORKER_ID)
+        # ⛔⛔ A RUN THAT HAS USED UP ITS AUTOMATIC ATTEMPTS IS NOT LEFT
+        # "QUEUED". The funnel refuses it — only a person's Retry spends a new
+        # budget — and with its marker gone nothing would ever run it, while
+        # its record said queued at #1 for ever, with no card and no Resume.
+        # It gets the card a restart gives any interrupted run.
+        if (run_dir is not None and not (run_dir / ".stop").exists()
+                and _no_auto_retry_marked(run_dir)):
+            rid = str(job.get("research_id") or "")
+            await asyncio.to_thread(_update_research_doc, job["uid"], rid,
+                                    _restart_recovery_patch(rid))
+            log(f"[moved-run] {rid[:8]}… has used up its automatic attempts — "
+                f"offered to its person to resume instead", "INFO")
+            _kick_queue_publish()
         return False
     from google.cloud.firestore import DELETE_FIELD as _DF
     await asyncio.to_thread(_update_research_doc, job["uid"], job["research_id"], {
@@ -9648,6 +9783,28 @@ def _keep_worker_resting(worker_id) -> None:
     except Exception as e:
         log(f"[moved-run] could not mark worker {worker_id} as off (the app "
             f"already did): {e}", "DEBUG")
+
+
+def _forget_running_job_in_snapshot() -> None:
+    """The move: rewrite this worker's queue snapshot without the job it is
+    running, under the lock Reset Backend and the worker's own boundary write
+    it under (wave 13 repair). Its waiting line is written back as it is.
+
+    ⛔⛔ THE SNAPSHOT STILL NAMED THE MOVED RUN AS THIS WORKER'S JOB. The worker
+    came back from its restart, read it, and — off — put the run back at #1
+    over the run another worker had taken meanwhile, or — turned back on —
+    started a second pipeline on it: two browsers on one run. The run is the
+    queue's now, and its marker is the one description of it that stays."""
+    lock = _QUEUE_STATE.get("_hard_reset_lock")
+    persist = _QUEUE_STATE.get("persist_fn")
+    if lock is None or persist is None:
+        return
+    try:
+        with lock:
+            if not _QUEUE_STATE.get("_hard_reset_in_progress"):
+                persist(current_job=None)
+    except Exception as e:
+        log(f"[device-cmds] REQUEUE: could not rewrite the queue snapshot: {e}", "WARN")
 
 
 def _requeue_target_worker(data) -> int:
@@ -9717,6 +9874,7 @@ def _handle_requeue_command(data) -> str:
     if _fb_research_id == rid:
         _fb_uid = None
         _fb_research_id = None
+    _forget_running_job_in_snapshot()
     _update_research_doc(uid, rid, _waiting_record_patch())
     _keep_worker_resting(WORKER_ID)
     _publish_queue_positions_now()
@@ -9768,17 +9926,43 @@ def _drain_waiting_runs() -> "list[dict]":
     return out
 
 
-def _park_instead_of_resuming(job, *, where: str) -> bool:
+def _park_instead_of_resuming(job, *, where: str, behind: bool = False,
+                              status: "str | None" = None) -> bool:
     """Boot, on a RESTING worker: a run a restart interrupted goes to the front
     of the queue instead of resuming here, and waits for an awake worker. True
-    when it was put there. Blocking (disk + Firestore). (A run that keeps
-    nothing never reaches here: both callers end it first.)"""
+    when it was put there. Blocking (disk + Firestore).
+
+    `behind`: a job the worker had only queued goes to the back of the waiting
+    runs instead (see `_park_waiting_run`). Its record already says queued —
+    `status`, as the caller read it — and is written only when it does not.
+
+    ⛔ NOT A RUN THAT KEEPS NOTHING (it cannot wait on this disk), and ⛔⛔ NOT
+    ONE THAT HAS USED UP ITS AUTOMATIC ATTEMPTS OR WAS ENDED FOR GOOD
+    (`.no_auto_retry`, `.stop`). The queue's own funnel refuses both, so parked,
+    such a run lost its Retry card to the "queued" write and then waited for
+    ever with nothing to run it. False here, and the caller does what it did
+    before this wave — the Resume card a restart gives."""
     rid = str((job or {}).get("research_id") or "")
-    if _park_waiting_run(job, from_worker=WORKER_ID) is None:
+    if _is_incognito_research(rid):
         return False
-    _update_research_doc(str(job.get("uid") or ""), rid, _waiting_record_patch())
-    log(f"[{where}] {rid[:8]}… — worker {WORKER_ID} is off, so the run waits at the "
-        f"front of the queue for a worker that is on", "INFO")
+    run_dir = _job_run_dir(job)
+    if run_dir is not None and ((run_dir / ".stop").exists()
+                                or _no_auto_retry_marked(run_dir)):
+        log(f"[{where}] {rid[:8]}… has used up its automatic attempts or was ended — "
+            f"not put in the queue", "INFO")
+        return False
+    if _park_waiting_run(job, from_worker=WORKER_ID, behind=behind) is None:
+        return False
+    if not behind:
+        _update_research_doc(str(job.get("uid") or ""), rid, _waiting_record_patch())
+        log(f"[{where}] {rid[:8]}… — worker {WORKER_ID} is off, so the run waits at the "
+            f"front of the queue for a worker that is on", "INFO")
+    else:
+        if status != "queued":
+            _update_research_doc(str(job.get("uid") or ""), rid, {"status": "queued"})
+        log(f"[{where}] {rid[:8]}… — worker {WORKER_ID} is off, so the run it had "
+            f"queued waits in the queue, behind the runs already waiting, for a "
+            f"worker that is on", "INFO")
     _kick_queue_publish()
     return True
 
@@ -16309,6 +16493,9 @@ def start_firestore_start_listener(job_queue, loop):
                                     and not _job_is_another_persons(j, _u))
                         kept = [j for j in dq if not _cancels(j)]
                         removed = any(_cancels(j) for j in dq)
+                        # One this worker took from the queue for a worker and
+                        # has not started yet (wave 13) — see below.
+                        removed_taken = any(_cancels(j) and j.get("moved_run") for j in dq)
                         dq.clear()
                         for j in kept:
                             dq.append(j)
@@ -16364,6 +16551,47 @@ def start_firestore_start_listener(job_queue, loop):
                                     f"Cancel: deferred start doc scan failed (non-fatal): {_se}",
                                     "DEBUG",
                                 )
+                        # ⭐⭐ WAVE 13 REPAIR — A RUN WAITING IN THIS COMPUTER'S
+                        # QUEUE FOR A WORKER (the owner moved it there, or a
+                        # resting worker's restart handed it back), or taken
+                        # from it and not started. No worker runs it and no
+                        # start document names it, so every branch here missed
+                        # it: the "cancelled before starting" purge landed on a
+                        # run with finished steps, the owner's Stop was dropped
+                        # and the run ran later, and its marker kept it the
+                        # amber #1, holding every new start back. It is ended
+                        # for good now, and written the way the run it was
+                        # would have been: one that was RUNNING as a running
+                        # run's stop or cancel is — its steps never reset, and
+                        # the owner's Stop keeps everything; a job that was only
+                        # QUEUED as a job that never started.
+                        _waiting_rec = (_end_waiting_run(u, rid)
+                                        if _start_doc_id is None and (removed_taken or not removed)
+                                        else None)
+                        if _waiting_rec is not None and _waiting_rec.get("queued_job") is not None:
+                            removed = True
+                            _kick_queue_publish()
+                        elif _waiting_rec is not None or removed_taken:
+                            if _firebase_db:
+                                from google.cloud.firestore import DELETE_FIELD as _DF
+                                _update_research_doc(u, rid, dict(
+                                    _owner_control_patch(oc, running=True) or {
+                                        "status": "stopped",
+                                        "summary": "Cancelled",
+                                        "cancelled": True,
+                                        "queuePosition": _DF,
+                                        "queuedBehindRunId": _DF,
+                                        "queuedBehindTitle": _DF,
+                                    }, movedToQueueAt=_DF))
+                            _kick_queue_publish()
+                            log(f"Cancel: rid={rid[:8]}… was waiting in the queue for a "
+                                f"worker — ended as a running run is"
+                                f"{' (owner '+oc+')' if oc else ''}", "INFO")
+                            try:
+                                dref.delete()
+                            except Exception:
+                                pass
+                            return
                         # Owner-STOP of a running run: only the worker holding
                         # current_job (handled in the sync + late re-check
                         # branches above) writes the terminal status. An idle
@@ -18537,9 +18765,12 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # this snapshot as the job this worker was running, and however long
         # it waits it must be neither restored here nor dropped as stale. The
         # queue holds it; the snapshot lets go of its copy.
-        if _run_dir_waiting(_job_run_dir(j)):
-            log(f"[pending_queue] {rid[:24]}… is waiting in the queue for a worker "
-                f"— left there", "INFO")
+        # ⛔ AND SO IS ONE ANOTHER WORKER HAS TAKEN and not started yet — its
+        # taken marker is the only sign of that (this worker's own taken
+        # markers went back to waiting before this ran).
+        if _run_dir_held_by_queue(_job_run_dir(j)):
+            log(f"[pending_queue] {rid[:24]}… is waiting in the queue for a worker, "
+                f"or one has taken it — left there", "INFO")
             skipped += 1
             withdrew = True
             continue
@@ -18580,9 +18811,25 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # 58d705e, 2026-09-29): one device read per restore, not one more per
         # entry. A read that FAILED is not an answer, so the pickup asks again —
         # a blip at boot must not keep a former sharer's job.
-        if _pickup_withdrawn((j or {}).get("uid"), (j or {}).get("research_id"),
-                             "disk-restore", denied_is_answer=True,
-                             members=_MEMBERS_UNREAD if members is None else members)[0]:
+        withdrawn, record = _pickup_withdrawn(
+            (j or {}).get("uid"), (j or {}).get("research_id"),
+            "disk-restore", denied_is_answer=True,
+            members=_MEMBERS_UNREAD if members is None else members)
+        if withdrawn:
+            skipped += 1
+            withdrew = True
+            continue
+        # ⛔⛔ WAVE 13 REPAIR — A RUN ANOTHER WORKER RUNS NOW IS NOT THIS
+        # SNAPSHOT'S. The worker a run was moved off came back and found it
+        # here as its own job: a sibling had taken it from the queue in the
+        # seconds between, and this restore put it back at #1 over that live
+        # run, or started a second pipeline on it. The same question the
+        # restart's retries ask: a live sibling lock, or a record that says
+        # another worker runs it.
+        why = _run_taken_since_boot((j or {}).get("uid"), rid, record, job_queue,
+                                    unstamped_is_worker_1=False)
+        if why is not None:
+            log(f"[pending_queue] {rid[:24]}… not restored — {why}", "INFO")
             skipped += 1
             withdrew = True
             continue
@@ -18590,8 +18837,15 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # goes to the front of the queue instead of resuming here: the same
         # rule the rehydrate scan follows, for the runs that scan cannot see
         # (a sharer's, while sharer rehydration is off, is the common one).
-        if j is cur and _worker_is_resting() and _park_instead_of_resuming(
-                j, where="pending_queue"):
+        # ⭐ AND THE JOBS IT HAD ONLY QUEUED go behind it (wave 13 repair):
+        # restored into this line, the worker that is off ran them one after
+        # another while the published order showed them waiting. Only on a
+        # record that was read and still says it wants to run — a park writes
+        # "queued", and a Resume card or a stop must not be written over.
+        if (_worker_is_resting()
+                and (record or {}).get("status") in ("queued", "ongoing")
+                and _park_instead_of_resuming(j, where="pending_queue", behind=j is not cur,
+                                              status=(record or {}).get("status"))):
             skipped += 1
             withdrew = True
             continue
@@ -77975,12 +78229,21 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 # die before starting it. Resuming it here or offering a
                 # Resume card would run it twice or strand it; it is put back
                 # to "queued" and left for the next awake worker.
-                if _run_dir_waiting(_run_dir_inside_queues(_corroborated_run_id(
-                        data.get("backendRunId"), research_id, tree_uid))):
+                _queue_dir_now = _run_dir_inside_queues(_corroborated_run_id(
+                    data.get("backendRunId"), research_id, tree_uid))
+                if _run_dir_waiting(_queue_dir_now):
                     _update_research_doc(tree_uid, research_id, _waiting_record_patch())
                     log(f"[rehydrate] {research_id[:24]}… is waiting in the queue for "
                         f"a worker — left there", "INFO")
                     _kick_queue_publish()
+                    continue
+                # ⛔ AND ONE ANOTHER WORKER HAS TAKEN FROM THE QUEUE and not yet
+                # started (wave 13 repair) — this worker's own taken runs went
+                # back to waiting before this scan. That worker is about to run
+                # it and its record is that worker's to write: nothing here.
+                if _run_dir_held_by_queue(_queue_dir_now):
+                    log(f"[rehydrate] {research_id[:24]}… was taken from the queue by "
+                        f"another worker — left to it", "INFO")
                     continue
                 # ⛔⛔ AFTER THE HAND-OFF THE RUN IS THE CLOUD'S, AND THIS SCAN
                 # USED TO TAKE IT BACK (wave 10.9, 542-4). The query is

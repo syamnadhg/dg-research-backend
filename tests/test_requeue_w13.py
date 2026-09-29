@@ -601,13 +601,15 @@ def test_a_run_a_sibling_took_first_is_skipped_and_the_next_one_taken(monkeypatc
 
 
 def test_a_moved_run_ended_for_good_is_not_taken_and_stops_waiting(monkeypatch, tmp_path):
-    """A run somebody ended for good (`.stop`) while it waited is refused by
-    the queue's own funnel: not run, not left half-taken, and its record is
-    not told it is running."""
+    """A run somebody ended for good (`.stop`) while it waited is not waiting
+    any more: not run, not left half-taken, its record not told it is running
+    — and it no longer holds the front, so the start deferred behind it is
+    taken instead (wave 13 repair: it used to stay #1 and hold every start)."""
     m, folder = _waiting(monkeypatch, tmp_path, worker=1)
     (folder / ".stop").touch()
-    assert _rescan(monkeypatch, m) == []
+    assert [j["research_id"] for j in _rescan(monkeypatch, m)] == [OTHER_RID]
     assert not (folder / MARKER).exists() and not (folder / f"{MARKER}.w1").exists()
+    assert not research._run_dir_held_by_queue(folder), "an ended run still holds its folder"
     assert [w for w in m.writes if w[1] == RID] == []
 
 
@@ -840,25 +842,37 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         monkeypatch, tmp_path):
     """⭐ The runs boot rehydration cannot see (a sharer's, while sharer
     rehydration is off) come back through the snapshot. On a resting worker
-    the one it was RUNNING goes to the front of the queue; a job it had merely
-    queued is restored as before. Beside it, an awake worker restores both."""
-    for resting, expect in ((True, [OTHER_RID]), (False, [RID, OTHER_RID])):
+    the one it was RUNNING goes to the front of the queue — and (wave 13
+    repair) a job it had only QUEUED goes behind it instead of into the line
+    of a worker that is off, which ran it while the order showed it waiting.
+    That job has not started, so it has no folder yet: a place is made for it,
+    holding the job exactly as it was queued. Its record already says queued
+    and is not written. Beside it, an awake worker restores both."""
+    for resting, expect in ((True, []), (False, [RID, OTHER_RID])):
         base = tmp_path / ("resting" if resting else "awake")
         store = _Store(records={(SHARER, RID): {"status": "ongoing"},
                                 (OWNER, OTHER_RID): {"status": "queued"}})
         m = _machine(monkeypatch, base, store, worker=2)
         monkeypatch.setattr(research, "_worker_is_resting", lambda *a, _r=resting, **k: _r)
         run_id, folder = _run_folder(base, RID)
-        other_id, other_folder = _run_folder(base, OTHER_RID, uid=OWNER, topic="Other")
-        path = _snapshot(base, _job(SHARER, RID, run_id),
-                         [_job(OWNER, OTHER_RID, other_id)])
+        other_id = f"Other_{_stamp()}"
+        other_folder = base / "queues" / other_id
+        other = _job(OWNER, OTHER_RID, other_id, brief_text="the brief as sent")
+        path = _snapshot(base, _job(SHARER, RID, run_id), [other])
         q = _Q()
         research._restore_pending_queue_snapshot(path, q, set())
         assert [j["research_id"] for j in q._queue] == expect, (resting, m.lines)
         assert (folder / MARKER).exists() is resting
-        assert not (other_folder / MARKER).exists(), "a job it had only queued was parked"
+        assert (other_folder / MARKER).exists() is resting, "the queued job is not behind it"
         assert _statuses(m, RID) == (["queued"] if resting else []), m.writes
+        assert _statuses(m, OTHER_RID) == [], "a record that says queued was written again"
         assert m.published.wait(5) if resting else not m.published.is_set()
+        if resting:
+            waiting = research._waiting_runs()
+            assert [w["research_id"] for w in waiting] == [RID, OTHER_RID], (
+                "the job it had only queued jumped the run it was running")
+            assert waiting[1]["queued_job"] == other, "the job was not kept as it was queued"
+            assert sorted(p.name for p in other_folder.iterdir()) == [MARKER]
 
 
 # ══ 7. a waiting run keeps its folder ═════════════════════════════════════════
