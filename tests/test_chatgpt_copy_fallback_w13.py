@@ -296,6 +296,8 @@ def test_live_p1_an_empty_page_read_takes_the_brief_from_the_copy_button(chrome,
     assert _lines(logs, "the page read came back empty — taking the brief from "
                         "ChatGPT's Copy button"), logs
     assert _lines(logs, "Phase 1: brief taken from ChatGPT's Copy button ("), logs
+    # At once — not after the three-minute re-read.
+    assert not _lines(logs, "brief generated but extraction empty"), logs
 
 
 def test_live_p1_the_old_pages_copy_button_gives_the_brief(chrome, page, p1, logs, monkeypatch):
@@ -584,6 +586,19 @@ def test_live_a_clipboard_that_cannot_be_read_is_never_used(chrome, page, quick,
     finally:
         chrome.run(chrome.ctx.grant_permissions(["clipboard-read", "clipboard-write"],
                                                 origin=ORIGIN))
+
+
+def test_live_a_clipboard_that_does_not_keep_the_marker_is_never_used(chrome, page, quick, logs):
+    """The marker is written and something else reads back (a clipboard tool
+    that rewrites it, a write that did not land): the clipboard cannot tell a
+    copy from what was there, so the Copy button is not pressed."""
+    _open(chrome, page, "new", thread=True, reply_actions=True)
+    # The same (isolated) script world the reads run in; the page's own code
+    # cannot reach it.
+    chrome.run(page.evaluate("() => { navigator.clipboard.readText = async () => 'an older text'; }"))
+    assert _brief(chrome, page) == ""
+    assert _clicked(chrome, page) == []
+    assert _lines(logs, "can't use the clipboard in this browser (the marker did not come back)"), logs
 
 
 MARK = "superresearch-copy-check-0123456789abcdef"

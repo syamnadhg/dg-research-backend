@@ -258,7 +258,8 @@
       : replyMarkdown(root) + (gives === 'cited'
         ? ' ' + String.fromCharCode(0xe200) + 'cite' + String.fromCharCode(0xe202)
           + 'turn0search1' + String.fromCharCode(0xe201) : '');
-    navigator.clipboard.writeText(t);
+    // A clipboard write lands a moment after the click, not with it.
+    setTimeout(() => navigator.clipboard.writeText(t), 150);
   }, true);
 
   const menuOpen = () => !!layer.firstElementChild;
