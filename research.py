@@ -9771,10 +9771,9 @@ def _drain_waiting_runs() -> "list[dict]":
 def _park_instead_of_resuming(job, *, where: str) -> bool:
     """Boot, on a RESTING worker: a run a restart interrupted goes to the front
     of the queue instead of resuming here, and waits for an awake worker. True
-    when it was put there. Blocking (disk + Firestore)."""
+    when it was put there. Blocking (disk + Firestore). (A run that keeps
+    nothing never reaches here: both callers end it first.)"""
     rid = str((job or {}).get("research_id") or "")
-    if _is_incognito_research(rid):
-        return False
     if _park_waiting_run(job, from_worker=WORKER_ID) is None:
         return False
     _update_research_doc(str(job.get("uid") or ""), rid, _waiting_record_patch())
