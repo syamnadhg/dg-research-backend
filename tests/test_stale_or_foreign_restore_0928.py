@@ -1161,3 +1161,82 @@ def test_a_blip_on_who_shares_at_boot_is_asked_again_before_a_record_this_comput
     assert _boot(path, _Q()) == [bobs], f"a job of an account that left was restored: {lines}"
     assert _in_file(path) == [bobs], "the former sharer's entry stays to come back"
     assert len(_said(lines, gone, NOT_OPENABLE)) == 1, lines
+
+
+# ══ 9. the Windows review of 58d705e (2026-09-29) ═══════════════════════════
+# Two of this wave's own reads and writes, measured on the Windows production
+# box's review: the device document read with the client's five-minute retry,
+# once more per entry at boot, and a stood-down job's cleanup written to the
+# account that is gone.
+
+class _OptionsFs:
+    """A device document whose read records the options it was asked with."""
+
+    def __init__(self, doc):
+        self.doc, self.options = doc, []
+
+    def collection(self, _name):
+        return self
+
+    document = collection
+
+    def get(self, **options):
+        self.options.append(options)
+        return _Snap(self.doc)
+
+
+def test_who_shares_this_computer_is_read_once_with_a_deadline(monkeypatch):
+    """⛔ ONE ATTEMPT, BOUNDED. With the client's defaults this read retries for
+    up to five minutes — at boot on the event loop, at the dequeue in a thread
+    the loop's own bound then leaves behind."""
+    fs = _OptionsFs(SHARED)
+    monkeypatch.setattr(research, "_firebase_db", fs)
+    monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
+    monkeypatch.setattr(research, "load_device_id", lambda: DEVICE)
+    assert research._device_members() == {OWNER, SHARER}
+    assert fs.options == [{"retry": None,
+                           "timeout": research._RESTART_RETRY_READ_TIMEOUT_S}]
+
+
+def test_the_boot_restore_reads_who_shares_once_for_every_sharers_entry(
+        monkeypatch, tmp_path):
+    """⛔ ONE READ PER RESTORE, NOT ONE MORE PER ENTRY. The restore read the
+    device document for its foreign check, and the pickup rule read it again for
+    every entry of another account — on the loop, at boot. The answer is the
+    same: the sharer's jobs are restored and the former sharer's is not."""
+    rids = [f"chat_1759000000000_{n}" for n in "wxyz"]
+    fs = _Fs(records={**{(SHARER, r): QUEUED for r in rids[:3]}, (FORMER, rids[3]): QUEUED},
+             device=SHARED)
+    lines = _machine(monkeypatch, tmp_path, fs)
+    path = _snapshot(tmp_path, [_job(SHARER, r, topic=f"T{n}") for n, r in enumerate(rids[:3])]
+                     + [_job(FORMER, rids[3], topic="Gone")])
+
+    assert _boot(path, _Q()) == rids[:3]
+    assert len(fs.device_reads()) == 1, fs.device_reads()
+    assert len(_said(lines, rids[3], NOT_OPENABLE)) == 1, lines
+
+
+@pytest.mark.parametrize("record", RECORDS_LEFT_BEHIND, ids=RECORD_IDS)
+def test_a_job_stood_down_at_the_dequeue_writes_nothing_to_the_account_gone(
+        monkeypatch, tmp_path, record):
+    """⛔ NO CLEANUP WRITE FOR A JOB THAT DID NOT RUN. The account's record refuses
+    this computer, so clearing its queue fields was a doomed write: refused,
+    retried, a force-refresh in the worker's finally, and a step toward the
+    latch that stops force-refreshes for everyone's writes. A member's job
+    still has its fields cleared."""
+    from _run_server_closure import run_worker_once
+    monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
+    _logged(monkeypatch)
+    for uid, runs in ((FORMER, False), (SHARER, True)):
+        rid = f"{LEFTOVER}_{uid[:4]}"
+        writes: list = []
+        db = _Fs(records={(uid, rid): record}, device=SHARED)
+        started = run_worker_once(
+            monkeypatch, tmp_path, _job(uid, rid), flip="error", db=db,
+            update_research=lambda u, r, *a, **k: writes.append((u, r)) or True,
+            device_id=DEVICE)
+        assert (len(started) == 1) is runs, (uid, started)
+        if runs:
+            assert (uid, rid) in writes, "a member's queue fields were not cleared"
+        else:
+            assert (uid, rid) not in writes, f"a doomed write to the gone account: {writes}"

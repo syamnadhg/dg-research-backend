@@ -16983,8 +16983,14 @@ def _is_denied_read(err: BaseException) -> bool:
             or "Missing or insufficient permissions" in s)
 
 
+#: "Not read yet" for the device's members (`_known_not_a_member`): None already
+#: means "read, and can't tell".
+_MEMBERS_UNREAD = object()
+
+
 def _pickup_withdrawn(uid, research_id, where: str, *,
-                      denied_is_answer: bool = False) -> "tuple[str | None, dict | None]":
+                      denied_is_answer: bool = False,
+                      members=_MEMBERS_UNREAD) -> "tuple[str | None, dict | None]":
     """Read the research record before a job is taken: (why it must stand
     down, the record).
 
@@ -17036,7 +17042,8 @@ def _pickup_withdrawn(uid, research_id, where: str, *,
     rid = str(research_id or "").strip()
     if not (_firebase_db and uid and rid):
         return None, None
-    if _known_not_a_member(uid):
+    if (_known_not_a_member(uid) if members is _MEMBERS_UNREAD
+            else _known_not_a_member(uid, members)):
         _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)
         return "denied", None
     try:
@@ -17774,7 +17781,14 @@ def _device_members() -> "set[str] | None":
     if not (paired and device_id and _firebase_db is not None):
         return None
     try:
-        snap = _firebase_db.collection("devices").document(device_id).get()
+        # ⛔ ONE ATTEMPT, WITH A DEADLINE (Windows review of 58d705e, 2026-09-29).
+        # With the client's defaults this read retries for up to 300 s — and the
+        # boot restore calls it ON THE LOOP, once per entry of another account;
+        # the dequeue's `wait_for` freed the loop but left its thread blocked.
+        # `_ask_about_held_entry` bounds its read the same way. A read that runs
+        # out is "can't tell" (None), which takes the job, as any failed read does.
+        snap = (_firebase_db.collection("devices").document(device_id)
+                .get(retry=None, timeout=_RESTART_RETRY_READ_TIMEOUT_S))
         if not snap.exists:
             return None
         doc = snap.to_dict() or {}
@@ -17792,7 +17806,7 @@ def _device_members() -> "set[str] | None":
     return members
 
 
-def _known_not_a_member(uid) -> bool:
+def _known_not_a_member(uid, members=_MEMBERS_UNREAD) -> bool:
     """True only on POSITIVE evidence that `uid` is none of this computer's
     accounts: the device document was read, and names it neither as the owner
     nor among those the computer is shared with. Asked by every pickup before
@@ -17810,7 +17824,10 @@ def _known_not_a_member(uid) -> bool:
     # the route had already told the caller it was queued.
     if not uid or uid == str(load_paired_uid() or "").strip():
         return False
-    members = _device_members()
+    # ⭐ A CALLER THAT HAS JUST READ THEM PASSES THEM (the boot restore): one read
+    # of the device document per restore, not one more per entry.
+    if members is _MEMBERS_UNREAD:
+        members = _device_members()
     return members is not None and uid not in members
 
 
@@ -17949,8 +17966,13 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # until a worker boundary happened to rewrite the file. Only this
         # answer removes an entry; an unreadable record is kept — unless the
         # rules REFUSED the read, which is an answer too (see the docstring).
+        # ⭐ THE MEMBERS THIS RESTORE READ, WHEN THE READ ANSWERED (Windows review of
+        # 58d705e, 2026-09-29): one device read per restore, not one more per
+        # entry. A read that FAILED is not an answer, so the pickup asks again —
+        # a blip at boot must not keep a former sharer's job.
         if _pickup_withdrawn((j or {}).get("uid"), (j or {}).get("research_id"),
-                             "disk-restore", denied_is_answer=True)[0]:
+                             "disk-restore", denied_is_answer=True,
+                             members=_MEMBERS_UNREAD if members is None else members)[0]:
             skipped += 1
             withdrew = True
             continue
@@ -79689,7 +79711,13 @@ async def run_server(port=8000):
                 # chat then wedges QueuedBanner because liveStatus reads
                 # them as still-queued. Idempotent on already-cleared docs.
                 _cuid, _crid = completed.get("uid"), completed.get("research_id")
-                if _firebase_db and _cuid and _crid:
+                # ⛔ NOT FOR A JOB STOOD DOWN AS ANOTHER ACCOUNT'S (Windows review of
+                # 58d705e, 2026-09-29). That account's record refuses this computer,
+                # so the cleanup was a doomed write: refused, retried, a synchronous
+                # token force-refresh in this finally, an "unhealed" WARN — and a
+                # step of `_grpc_heal_consec_fail` toward the STRUCTURAL latch that
+                # stops force-refreshes for everyone's writes, once per such job.
+                if _firebase_db and _cuid and _crid and not _account_gone:
                     from google.cloud.firestore import DELETE_FIELD as _DF
                     _update_research_doc(_cuid, _crid, {
                         "queuePosition": _DF,

@@ -67,7 +67,9 @@ AUTO_RESUME_CLOCK = ("                                    # ⛔ ITS OWN CLOCK: t
                      '                                    "queued_at_ms": int(time.time() * 1000),\n')
 
 # ── anchors: an account that left, on every pickup ─────────────────────────
-PICKUP_ASKS = "    if _known_not_a_member(uid):"
+# ⚠ RE-ANCHORED 2026-09-29 (Windows review): the boot restore passes the members it read.
+PICKUP_ASKS = ("    if (_known_not_a_member(uid) if members is _MEMBERS_UNREAD\n"
+               "            else _known_not_a_member(uid, members)):")
 RULE = "        if _is_denied_read(err) and denied_is_answer:"
 NOT_A_MEMBER = "    return members is not None and uid not in members"
 PAIRED_IS_A_MEMBER = ('    if not uid or uid == str(load_paired_uid() or "").strip():\n'
@@ -228,6 +230,24 @@ def _digest(b: bytes) -> str:
 # every harness in this directory with `spec.loader.exec_module`, which EXECUTES
 # it — an unguarded runner turns a seconds-long check into a full run.
 if __name__ == "__main__":
+    # ⛔ UTF-8 OUT (Windows review, 2026-09-29): a redirected run on Windows has a
+    # cp1252 stdout, and the first "✓ killed" raised UnicodeEncodeError.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    # ⛔⛔ AN IN-FLIGHT MARKER (Windows review, 2026-09-29). Windows ends a process
+    # with TerminateProcess — no SIGTERM handler, no `finally:` — so a killed run
+    # left a mutant in research.py silently. Now it leaves this file naming the
+    # file that holds one, and the next run refuses to start until it is restored.
+    # Run harnesses in a throwaway worktree, never in the live checkout.
+    _INFLIGHT = Path(__file__).with_suffix(".inflight")
+    if _INFLIGHT.exists():
+        print("⛔⛔ A PREVIOUS RUN DIED WITH A MUTANT IN THE SOURCE:\n    "
+              f"{_INFLIGHT.read_text(encoding='utf-8').strip()}\nRestore that file "
+              f"(git checkout -- <file>), then delete\n    {_INFLIGHT}")
+        sys.exit(2)
     files = sorted({m[1] for m in MUTANTS})
     ORIGINALS = {f: (ROOT / f).read_bytes() for f in files}
     DIGESTS = {f: _digest(b) for f, b in ORIGINALS.items()}
@@ -268,6 +288,7 @@ if __name__ == "__main__":
                     compile(mutated, fname, "exec")
                 except SyntaxError as se:
                     raise AssertionError(f"mutant does not compile: {se}")
+            _INFLIGHT.write_text(f"{mid}\t{fname}\n", encoding="utf-8")
             path.write_bytes((mutated.replace("\n", "\r\n") if crlf else mutated)
                              .encode("utf-8"))
             if green(*SUITES[fname]):
@@ -280,6 +301,11 @@ if __name__ == "__main__":
             print(f"  {mid:4} ⛔ HARNESS FAULT — {e}")
         finally:
             path.write_bytes(raw)
+            if _digest(path.read_bytes()) == DIGESTS[fname]:
+                try:
+                    _INFLIGHT.unlink()
+                except FileNotFoundError:
+                    pass
 
     for f in files:
         if _digest((ROOT / f).read_bytes()) != DIGESTS[f]:

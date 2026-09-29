@@ -61,7 +61,9 @@ DENIED_TEST = ('    return (type(err).__name__ == "PermissionDenied" or "403" in
                '            or "PERMISSION_DENIED" in s\n'
                '            or "Missing or insufficient permissions" in s)')
 FUNNEL_DENIED = "                if denied is not None:"
-RESTORE_ASKS = '                             "disk-restore", denied_is_answer=True)[0]:'
+# ⚠ RE-ANCHORED 2026-09-29 (Windows review): the restore passes the members it read.
+RESTORE_ASKS = ('                             "disk-restore", denied_is_answer=True,\n'
+                '                             members=_MEMBERS_UNREAD if members is None else members)[0]:')
 RESTORE_LIST = "                         hold_unreadable=_UNREAD_RESTORES, denied=denied):"
 RESTORE_SHEDS = ("        elif denied:\n"
                  "            # The pickup rule's read answered and this one was refused: the\n"
@@ -76,7 +78,9 @@ MEMBERS_SHARED = "    members.update(s for s in shared if isinstance(s, str) and
 OWNER_FILE = "                    owners.add(o)"
 OWNER_FILE_ABOUT = ('                    and str(meta.get("researchId") or "") in\n'
                     '                    ("", str((job or {}).get("research_id") or ""))):')
-NO_DEVICE_DOC = ('        snap = _firebase_db.collection("devices").document(device_id).get()\n'
+# ⚠ RE-ANCHORED 2026-09-29 (Windows review): the read is one bounded attempt.
+NO_DEVICE_DOC = ('        snap = (_firebase_db.collection("devices").document(device_id)\n'
+                 '                .get(retry=None, timeout=_RESTART_RETRY_READ_TIMEOUT_S))\n'
                  "        if not snap.exists:\n"
                  "            return None")
 DEVICE_BLIP = ('            f"({type(err).__name__}) — the record read decides instead", "DEBUG")\n'
@@ -149,7 +153,8 @@ MUTANTS = [
      [(OWNER_FILE_ABOUT, "                    ):")]),
     ("F4", RESEARCH, "⛔ OVER-REACH: no device document reads as 'shared with "
      "nobody' — every sharer's job is dropped",
-     [(NO_DEVICE_DOC, '        snap = _firebase_db.collection("devices").document(device_id).get()\n'
+     [(NO_DEVICE_DOC, '        snap = (_firebase_db.collection("devices").document(device_id)\n'
+                      '                .get(retry=None, timeout=_RESTART_RETRY_READ_TIMEOUT_S))\n'
                       "        if not snap.exists:\n"
                       "            return set()")]),
     ("F5", RESEARCH, "⛔ OVER-REACH: a device read that blipped reads as 'shared "
@@ -226,6 +231,24 @@ def _digest(b: bytes) -> str:
 # every harness in this directory with `spec.loader.exec_module`, which EXECUTES
 # it — an unguarded runner turns a seconds-long check into a full run.
 if __name__ == "__main__":
+    # ⛔ UTF-8 OUT (Windows review, 2026-09-29): a redirected run on Windows has a
+    # cp1252 stdout, and the first "✓ killed" raised UnicodeEncodeError.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    # ⛔⛔ AN IN-FLIGHT MARKER (Windows review, 2026-09-29). Windows ends a process
+    # with TerminateProcess — no SIGTERM handler, no `finally:` — so a killed run
+    # left a mutant in research.py silently. Now it leaves this file naming the
+    # file that holds one, and the next run refuses to start until it is restored.
+    # Run harnesses in a throwaway worktree, never in the live checkout.
+    _INFLIGHT = Path(__file__).with_suffix(".inflight")
+    if _INFLIGHT.exists():
+        print("⛔⛔ A PREVIOUS RUN DIED WITH A MUTANT IN THE SOURCE:\n    "
+              f"{_INFLIGHT.read_text(encoding='utf-8').strip()}\nRestore that file "
+              f"(git checkout -- <file>), then delete\n    {_INFLIGHT}")
+        sys.exit(2)
     files = sorted({m[1] for m in MUTANTS})
     ORIGINALS = {f: (ROOT / f).read_bytes() for f in files}
     DIGESTS = {f: _digest(b) for f, b in ORIGINALS.items()}
@@ -266,6 +289,7 @@ if __name__ == "__main__":
                     compile(mutated, fname, "exec")
                 except SyntaxError as se:
                     raise AssertionError(f"mutant does not compile: {se}")
+            _INFLIGHT.write_text(f"{mid}\t{fname}\n", encoding="utf-8")
             path.write_bytes((mutated.replace("\n", "\r\n") if crlf else mutated)
                              .encode("utf-8"))
             if green(*SUITES[fname]):
@@ -278,6 +302,11 @@ if __name__ == "__main__":
             print(f"  {mid:4} ⛔ HARNESS FAULT — {e}")
         finally:
             path.write_bytes(raw)
+            if _digest(path.read_bytes()) == DIGESTS[fname]:
+                try:
+                    _INFLIGHT.unlink()
+                except FileNotFoundError:
+                    pass
 
     for f in files:
         if _digest((ROOT / f).read_bytes()) != DIGESTS[f]:
