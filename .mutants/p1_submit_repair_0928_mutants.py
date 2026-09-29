@@ -100,25 +100,26 @@ MUTANTS = [
     ("A11", RESEARCH, "the model is not told its action was refused",
      [("                    {\"type\": \"text\", \"text\": f\"Action '{act}' was NOT carried "
        "out: this task \"\n"
-       "                     f\"may only click, scroll, wait or press Escape. Do not type or "
-       "press Enter.\"},\n", "")]),
+       "                     f\"may only use: {_may}. Do not type or press Enter.\"},\n", "")]),
     ("A12", RESEARCH, "a refused action leaves no line in the log",
-     [("                log(f\"[cua] REFUSED {refused} — this task may only click, scroll, "
-       "wait or \"\n"
-       "                    f\"press Escape; nothing was typed, pressed or sent\", \"WARN\")\n",
+     [("                log(f\"[cua] REFUSED {refused} — this task may only use: {_may}; \"\n"
+       "                    f\"nothing was typed, pressed or sent\", \"WARN\")\n",
        "")]),
 
     # ═══ W — the list is wired where the program owns the typing ════════════
     ("W1", RESEARCH, "⛔⛔ the brief's caret CUA runs without the list — \"test\" is sent",
-     [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY)",
-       "max_iterations=8, verbose=verbose)")]),
+     [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
+       "                never_click=CUA_NEVER_CLICK_SEND)",
+       "max_iterations=8, verbose=verbose,\n"
+       "                never_click=CUA_NEVER_CLICK_SEND)")]),
     ("W2", RESEARCH, "⛔ the follow-up's caret CUA runs without the list",
      [("                    model=CUA_MODEL, max_iterations=8, verbose=verbose,\n"
-       "                    allow=CUA_CLICK_ONLY)",
-       "                    model=CUA_MODEL, max_iterations=8, verbose=verbose)")]),
+       "                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)",
+       "                    model=CUA_MODEL, max_iterations=8, verbose=verbose,\n"
+       "                    never_click=CUA_NEVER_CLICK_SEND)")]),
     ("W3", RESEARCH, "⛔ the gate's diagnosis CUA runs without the list",
-     [("max_iterations=3, verbose=verbose, allow=_cua_allow)",
-       "max_iterations=3, verbose=verbose)")]),
+     [("                    allow=CUA_LOOK_ONLY if _cua_allow is not None else None)",
+       "                    allow=None)")]),
     ("W4", RESEARCH, "⛔⛔ the gate's fix CUA runs without the list — it types and sends",
      [("max_iterations=10, verbose=verbose, allow=_cua_allow)",
        "max_iterations=10, verbose=verbose)")]),
@@ -152,8 +153,8 @@ MUTANTS = [
      [("    if not submitted and cua_client and _p1_submit.get(\"state\") == \"not_sent\":",
        "    if not submitted and cua_client:")]),
     ("P3", RESEARCH, "after the CUA places the caret, the submit ignores it",
-     [("        submitted = await submit_chatgpt_direct(browser, prompt, use_focused=True,\n",
-       "        submitted = await submit_chatgpt_direct(browser, prompt,\n")]),
+     [("            submitted = await submit_chatgpt_direct(browser, prompt, use_focused=True,\n",
+       "            submitted = await submit_chatgpt_direct(browser, prompt,\n")]),
     ("P4", RESEARCH, "the fallback never runs — a box no marker names sends nothing",
      [("    if not submitted and cua_client and _p1_submit.get(\"state\") == \"not_sent\":",
        "    if not submitted and cua_client and _p1_submit.get(\"state\") == \"never\":")]),
@@ -163,12 +164,52 @@ MUTANTS = [
      [("        if not submitted_fu and cua_client and _fu_submit.get(\"state\") == \"not_sent\":",
        "        if not submitted_fu and cua_client:")]),
     ("P7", RESEARCH, "the follow-up's second submit ignores the caret",
-     [("            submitted_fu = await submit_chatgpt_direct(browser, followup, "
+     [("                submitted_fu = await submit_chatgpt_direct(browser, followup, "
        "use_focused=True,\n",
-       "            submitted_fu = await submit_chatgpt_direct(browser, followup,\n")]),
+       "                submitted_fu = await submit_chatgpt_direct(browser, followup,\n")]),
     ("P8", RESEARCH, "the follow-up's fallback never runs",
      [("        if not submitted_fu and cua_client and _fu_submit.get(\"state\") == \"not_sent\":",
        "        if not submitted_fu and cua_client and _fu_submit.get(\"state\") == \"never\":")]),
+
+    # ═══ N — no click sends (09-29 verify) ══════════════════════════════════
+    ("N1", RESEARCH, "⛔⛔ agent_loop ignores never_click — the caret CUA clicks Send "
+     "over a leftover draft",
+     [("            elif (never_click and act == \"left_click\"",
+       "            elif (False and never_click and act == \"left_click\"")]),
+    ("N2", RESEARCH, "⛔ the Send guard never sees Send under a click",
+     [("            \" return !!(e && e.closest(s)); }\", [x, y, sel]))",
+       "            \" return false; }\", [x, y, sel]))")]),
+    ("N3", RESEARCH, "⛔ the brief's caret CUA may click Send",
+     [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
+       "                never_click=CUA_NEVER_CLICK_SEND)",
+       "max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY)")]),
+    ("L1", RESEARCH, "⛔⛔ the diagnosis may click — before the box guard, a click on "
+     "Send sends the leftover",
+     [("                    allow=CUA_LOOK_ONLY if _cua_allow is not None else None)",
+       "                    allow=_cua_allow)")]),
+    ("L2", RESEARCH, "the look-only list lets a click through",
+     [("CUA_LOOK_ONLY = frozenset({\"mouse_move\", \"scroll\", \"wait\"})",
+       "CUA_LOOK_ONLY = frozenset({\"left_click\", \"mouse_move\", \"scroll\", \"wait\"})")]),
+    ("S1", RESEARCH, "⛔⛔ text the box would not give up is handed to the caret CUA — "
+     "one click on Send sends it",
+     [("                out[\"state\"] = \"not_cleared\"\n", "                pass\n")]),
+    ("S2", RESEARCH, "the stuck box is never reported to the submit",
+     [("                if why is not None:\n                    why[\"stuck\"] = True\n", "")]),
+    ("B1", RESEARCH, "⛔⛔ the belt is off on the brief — the prompt is typed after a "
+     "message the program did not send",
+     [("        if _chatgpt_caret_step_sent(_msgs_before, await _chatgpt_user_msg_count(browser.page),",
+       "        if False and _chatgpt_caret_step_sent(_msgs_before, "
+       "await _chatgpt_user_msg_count(browser.page),")]),
+    ("B2", RESEARCH, "⛔ the belt never sees a new message",
+     [("    if before is None or after is None or after <= before:\n        return False",
+       "    if True:\n        return False")]),
+    ("B3", RESEARCH, "⛔ the belt is off on the follow-up",
+     [("            if _chatgpt_caret_step_sent(_fu_msgs_before,",
+       "            if False and _chatgpt_caret_step_sent(_fu_msgs_before,")]),
+    ("B4", RESEARCH, "OVER-REACH: the belt fires on every caret step — a caret placed "
+     "cleanly never gets its prompt",
+     [("    if before is None or after is None or after <= before:\n        return False",
+       "    if before is None or after is None or after < before:\n        return False")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

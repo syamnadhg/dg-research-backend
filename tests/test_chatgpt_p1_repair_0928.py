@@ -365,7 +365,8 @@ def test_live_p1_a_send_that_posts_other_text_is_never_verified(
     assert cua.missions == ["diagnose", "fix"]         # the gate's CUA steps DID run
     assert p1.polls == []
     assert any("not the prompt" in m for _lv, m in logs), logs
-    assert len(_refused(logs)) == 4, _refused(logs)    # two words, two Enters
+    # The diagnosis only looks: its click, word and Enter; the fix's word and Enter.
+    assert len(_refused(logs)) == 5, _refused(logs)
     if mode == "vision-act":
         assert "poll-fix" in vc.asked
         assert any("refused type" in m for _lv, m in logs), logs
@@ -429,7 +430,8 @@ def test_live_p1_a_follow_up_that_posts_other_text_is_not_verified(chrome, page,
     norm = research._norm_prompt_text
     assert _norm_users(chrome, page) == [norm(prompt), norm(followup)[1:]]
     assert any("Follow-up may not have triggered" in m for _lv, m in logs), logs
-    assert len(_refused(logs)) == 4, _refused(logs)
+    # The diagnosis only looks: its click, word and Enter; the fix's word and Enter.
+    assert len(_refused(logs)) == 5, _refused(logs)
 
 
 @pytest.mark.parametrize("mode", ["cua", "vision-act"])
@@ -595,9 +597,129 @@ def test_other_platforms_keep_an_unrestricted_diagnosis_and_fix(monkeypatch):
             _no, pg, "2B", browser=browser, cua_client=object(), max_retries=8, interval=0,
             chatgpt_prompt=prompt))
     assert seen == [("diagnose", None), ("fix", None),
-                    ("diagnose", research.CUA_CLICK_ONLY), ("fix", research.CUA_CLICK_ONLY)]
+                    ("diagnose", research.CUA_LOOK_ONLY), ("fix", research.CUA_CLICK_ONLY)]
 
 
 if __name__ == "__main__":                                   # pragma: no cover
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ═══ 4. No click sends (09-29 verify) ════════════════════════════════════════
+#
+# The allow-list kept a single click, and one click on Send sends whatever the
+# box holds. Four ways that could happen, each driven through run_phase1: the
+# caret CUA clicking Send over a leftover draft, the caret CUA run over text the
+# program could not clear, the look-only diagnosis clicking Send, and — the
+# belt — a step the guards do not see (a Vision click) sending anyway.
+
+SEND_CENTER_JS = """() => {
+    const b = document.querySelector('button[aria-label="Send"]');
+    const r = b.getBoundingClientRect();
+    return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+}"""
+
+#: The box will not empty with select-all + Delete (a page that swallows them).
+BLOCK_CLEAR_JS = """() => {
+    document.querySelector('.ProseMirror').addEventListener('keydown', (e) => {
+        if (e.key === 'Delete' || e.key === 'Backspace') {
+            e.preventDefault(); e.stopImmediatePropagation(); }
+    }, true);
+}"""
+
+
+def _leftover_draft(chrome, page, p1, *, unname=False, stuck=False):
+    """The 09-28 leftover: "est" in the box. Returns Send's centre."""
+    _load_p1(chrome, page, p1, streaming=True)
+    chrome.run(page.click('.ProseMirror'))
+    chrome.run(page.keyboard.insert_text("est"))
+    if stuck:
+        chrome.run(page.evaluate(BLOCK_CLEAR_JS))
+    if unname:
+        chrome.run(page.evaluate(UNNAME_BOX_JS))
+    return chrome.run(page.evaluate(SEND_CENTER_JS))
+
+
+def test_live_p1_the_caret_cua_cannot_click_send(chrome, page, p1, logs):
+    """No marker names the box and it holds a leftover draft; the caret CUA
+    clicks the box, then Send. The click on Send is refused, the program
+    clears the box, types, reads back and sends: only the prompt is sent."""
+    send = _leftover_draft(chrome, page, p1, unname=True)
+    cua = _ScriptedCua({"focus": lambda: [_click_box(p1), ("left_click", {"coordinate": send})]})
+    assert p1.run(cua) == "verified", logs
+    prompt = p1.submits[0][0]
+    assert _users(chrome, page) == [prompt]
+    assert [m for m in _refused(logs) if "click on Send" in m], _refused(logs)
+    assert any("would have clicked Send" in t for t in cua.told), cua.told
+
+
+def test_live_p1_text_the_box_would_not_give_up_is_never_handed_to_a_cua(chrome, page, p1, logs):
+    """The box holds text that will not clear: the program types nothing and
+    sends nothing — and no CUA gets the page, because one allowed click on Send
+    would send that text. The caret CUA would click Send; it never runs."""
+    send = _leftover_draft(chrome, page, p1, stuck=True)
+    cua = _ScriptedCua({"focus": lambda: [("left_click", {"coordinate": send})]})
+    assert p1.run(cua) == "not verified", logs
+    assert _users(chrome, page) == []
+    assert "focus" not in cua.missions, cua.missions
+    assert len(p1.submits) == 1, p1.submits
+
+
+def test_live_p1_the_diagnosis_only_looks(chrome, page, p1, logs):
+    """The gate's diagnosis runs before the box guard; with a ChatGPT prompt in
+    play it may not click at all — a click on Send there sent the leftover."""
+    send = _leftover_draft(chrome, page, p1, stuck=True)
+    cua = _ScriptedCua({"diagnose": lambda: [("left_click", {"coordinate": send})]})
+    assert p1.run(cua) == "not verified", logs
+    assert "diagnose" in cua.missions, cua.missions
+    assert _users(chrome, page) == []
+    assert [m for m in _refused(logs) if "left_click" in m], _refused(logs)
+
+
+def test_live_p1_a_message_sent_during_the_caret_step_stops_the_prompt(
+        chrome, page, p1, logs, monkeypatch, tmp_path):
+    """⛔ THE BELT. A step the guards do not see — here Vision, in act mode,
+    clicking Send over the leftover — sends it. The program sees a message it
+    did not send appear during the caret step and does NOT type the prompt."""
+    send = _leftover_draft(chrome, page, p1, unname=True)
+    vc = _ScriptedVision(p1, {"1a-submit": [
+        ("click", {"x_ratio": send[0] / 1280, "y_ratio": send[1] / 900}),
+        ("declare_success", {})]})
+    _act_mode(monkeypatch, tmp_path, vc)
+    cua = _ScriptedCua({})
+    assert p1.run(cua) == "not verified", logs
+    assert _users(chrome, page) == ["est"]              # Vision's send, and nothing after it
+    prompt = p1.submits[0][0]
+    assert p1.submits == [(prompt, False)], p1.submits   # no second submit
+    assert any(lv == "ERROR" and "while the CUA was only placing the caret" in m
+               for lv, m in logs), logs
+
+
+def test_live_p1_a_message_sent_during_the_follow_ups_caret_step_stops_the_follow_up(
+        chrome, page, p1, logs, monkeypatch, tmp_path):
+    """The belt on the follow-up: after the brief, the box loses its name and
+    holds a leftover; Vision's caret step clicks Send over it. The follow-up
+    is not typed after a message the program did not send."""
+    _load_p1(chrome, page, p1, streaming=True)
+    chrome.run(page.click('.ProseMirror'))
+    chrome.run(page.keyboard.insert_text("x"))
+    send = chrome.run(page.evaluate(SEND_CENTER_JS))    # where Send sits once the box has text
+    chrome.run(page.keyboard.press("Backspace"))
+    p1.extra = "Add the hospice's own records."
+
+    async def _leftover_in_an_unnamed_box():
+        await page.evaluate(UNNAME_BOX_JS)
+        await page.focus('[contenteditable="true"]')
+        await page.keyboard.insert_text("est")
+
+    p1.after_poll = _leftover_in_an_unnamed_box
+    vc = _ScriptedVision(p1, {"1a-submit": [
+        ("click", {"x_ratio": send[0] / 1280, "y_ratio": send[1] / 900}),
+        ("declare_success", {})]})
+    _act_mode(monkeypatch, tmp_path, vc)
+    assert p1.run(_ScriptedCua({})) == "verified", logs     # the brief itself was
+    prompt, followup = p1.submits[0][0], p1.submits[1][0]
+    assert _norm_users(chrome, page) == [research._norm_prompt_text(prompt), "est"]
+    assert p1.submits == [(prompt, False), (followup, False)], p1.submits
+    assert any(lv == "ERROR" and m.startswith("[p1:followup]")
+               and "while the CUA was only placing the caret" in m for lv, m in logs), logs
