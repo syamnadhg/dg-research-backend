@@ -52,9 +52,13 @@ _TEST_TIMEOUT_S = 300
 _ARM = """            const qualifies = (h) => h.named           // ChatGPT's own name for it
                 || (h.animSelf && h.clipSelf)          // a live shimmering text row"""
 _SELF = "                const animSelf = shimmers(el);\n                const clipSelf = clipped(el);"
+# ⛔ RE-AIMED 2026-09-28: the exclusion also names the new page's reply text
+# (`__CG_REPLY_TEXT__`, spliced), since `[class*="markdown"]` is case-sensitive
+# and the new reply root is `MarkdownRoot-…`. Same arm, same defect.
 _PROSE = ("                if (el.closest && el.closest(\n"
           "                        'table, td, th, code, pre, a[href], '\n"
-          "                        + '.markdown, [class*=\"markdown\"], [class*=\"prose\"]')) {\n"
+          "                        + '.markdown, [class*=\"markdown\"], [class*=\"prose\"], '\n"
+          "                        + '__CG_REPLY_TEXT__')) {\n"
           "                    DIAG.structProse++; continue;\n"
           "                }")
 
@@ -128,17 +132,19 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "`conversation-turn` section, so on the page the chips actually render in it "
      "returns null and the caller reads zero chips while eight hostnames are on "
      "screen",
+     # ⛔ RE-AIMED 2026-09-28: the turn and user markers are spliced now
+     # (`__CG_TURN__`, `__CG_USER__` — old page AND new). Same arms.
      [("""    if (!turn) {
         try {
-            const secs = main.querySelectorAll('[data-testid^="conversation-turn"]');""",
+            const secs = main.querySelectorAll('__CG_TURN__');""",
        """    if (false) {
         try {
-            const secs = main.querySelectorAll('[data-testid^="conversation-turn"]');""")],
+            const secs = main.querySelectorAll('__CG_TURN__');""")],
      [T_NEW]),
     ("T2", "over", "⛔ the user's own turn is accepted, so before the assistant's "
      "turn renders the brief WE pasted is read as ChatGPT's sources — a brief "
      "full of hostnames would sail straight in",
-     [("                if (secs[i].querySelector('[data-message-author-role=\"user\"]')) continue;",
+     [("                if (secs[i].querySelector('__CG_USER__')) continue;",
        "                if (false) continue;")],
      [T_NEW]),
     ("T3", "over", "the new arm answers BEFORE `article`, stealing the decision "

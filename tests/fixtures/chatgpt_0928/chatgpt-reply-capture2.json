@@ -1,0 +1,1158 @@
+{
+ "what": "chatgpt-reply-capture2",
+ "when": "2026-09-29T04:02:06.553Z",
+ "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+ "labelCount": 2,
+ "blocks": [
+  {
+   "label": "You said:",
+   "labelEl": {
+    "tag": "H4",
+    "attrs": {
+     "class": "sr-only m-0 select-none"
+    }
+   },
+   "block": {
+    "tag": "DIV",
+    "attrs": {
+     "class": "block-BQZwFn"
+    },
+    "textLen": 15,
+    "label": null,
+    "kids": [
+     {
+      "tag": "H4",
+      "attrs": {
+       "class": "sr-only m-0 select-none"
+      },
+      "textLen": 9,
+      "label": "You said:",
+      "kids": []
+     },
+     {
+      "tag": "DIV",
+      "attrs": {
+       "class": "group/user-message flex flex-col items-end gap-2",
+       "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+       "data-chatgpt-search-message-ids": "<36 chars>"
+      },
+      "textLen": 5,
+      "label": null,
+      "kids": [
+       {
+        "tag": "DIV",
+        "attrs": {
+         "class": "w-full",
+         "data-content-search-unit-key": "fallback-turn-0:0:user"
+        },
+        "textLen": 5,
+        "label": null,
+        "kids": [
+         {
+          "tag": "DIV",
+          "attrs": {
+           "class": "group/user-message flex w-full flex-col items-end justify-end gap-1"
+          },
+          "textLen": 5,
+          "label": null,
+          "kids": [
+           {
+            "tag": "DIV",
+            "attrs": {
+             "data-user-message-bubble": "true",
+             "class": "bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"
+            },
+            "textLen": 5,
+            "label": null,
+            "kids": [
+             {
+              "tag": "DIV",
+              "attrs": {
+               "class": "flex flex-col items-end gap-1"
+              },
+              "textLen": 5,
+              "label": null,
+              "kids": [
+               {
+                "tag": "DIV",
+                "attrs": {
+                 "class": "relative w-full min-w-0 text-size-chat leading-relaxed"
+                },
+                "textLen": 5,
+                "label": null,
+                "kids": [
+                 {
+                  "tag": "DIV",
+                  "attrs": {
+                   "class": "",
+                   "data-search-result-target": ""
+                  },
+                  "textLen": 5,
+                  "label": null,
+                  "kids": [
+                   {
+                    "tag": "DIV",
+                    "attrs": {},
+                    "textLen": 5,
+                    "label": null,
+                    "kids": [
+                     {
+                      "tag": "DIV",
+                      "attrs": {
+                       "class": "text-size-chat whitespace-pre-wrap",
+                       "dir": "auto"
+                      },
+                      "textLen": 5,
+                      "label": null,
+                      "kids": []
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "tag": "DIV",
+            "attrs": {
+             "class": "flex flex-row-reverse items-center gap-1"
+            },
+            "textLen": 0,
+            "label": null,
+            "kids": [
+             {
+              "tag": "DIV",
+              "attrs": {
+               "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+              },
+              "textLen": 0,
+              "label": null,
+              "kids": [
+               {
+                "tag": "DIV",
+                "attrs": {
+                 "class": "flex turn-action-controls items-center gap-0.5 browser:gap-0"
+                },
+                "textLen": 0,
+                "label": null,
+                "kids": [
+                 {
+                  "tag": "SPAN",
+                  "attrs": {
+                   "data-state": "closed",
+                   "class": "contents"
+                  },
+                  "textLen": 0,
+                  "label": null,
+                  "kids": [
+                   {
+                    "tag": "BUTTON",
+                    "attrs": {
+                     "type": "button",
+                     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+                     "aria-label": "Copy message"
+                    },
+                    "textLen": 0,
+                    "label": null,
+                    "kids": [
+                     {
+                      "tag": "svg"
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "tag": "SPAN",
+                  "attrs": {
+                   "data-state": "closed",
+                   "class": "contents"
+                  },
+                  "textLen": 0,
+                  "label": null,
+                  "kids": [
+                   {
+                    "tag": "BUTTON",
+                    "attrs": {
+                     "type": "button",
+                     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+                     "aria-label": "Share prompt"
+                    },
+                    "textLen": 0,
+                    "label": null,
+                    "kids": [
+                     {
+                      "tag": "svg"
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "tag": "SPAN",
+                  "attrs": {
+                   "data-state": "closed",
+                   "class": "contents"
+                  },
+                  "textLen": 0,
+                  "label": null,
+                  "kids": [
+                   {
+                    "tag": "BUTTON",
+                    "attrs": {
+                     "type": "button",
+                     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+                     "aria-label": "Edit message"
+                    },
+                    "textLen": 0,
+                    "label": null,
+                    "kids": [
+                     {
+                      "tag": "svg"
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "ancestors": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col pb-2 pt-2"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5",
+      "data-content-search-turn-key": "fallback-turn-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "0a7dedd7-2642-44ed-9d9c-411d8eb8bf6b"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 py-5 browser:pt-1",
+      "data-thread-find-target": "conversation"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain group-has-[",
+      "role": "presentation"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "h-full min-h-0 min-w-0 flex-1",
+      "data-app-shell-focus-area": "main"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex min-h-0 flex-1 [--thread-content-responsive-max-width:var(--thread-content-e",
+      "data-app-shell-main-content-top-fade": "visible"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "MainContentFrame-sss8BP",
+      "data-app-shell-thread-edge-divider": "false"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "MainContentViewport-OinMfT",
+      "data-app-shell-main-content-layout": "thread-edge-scroll",
+      "data-app-shell-header-edge-scroll": "false",
+      "data-app-shell-right-panel-full-width": "false"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "WorkspaceContent-dnr6uY relative isolate flex min-h-0 flex-1 overflow-hidden"
+     }
+    }
+   ]
+  },
+  {
+   "label": "ChatGPT said:",
+   "labelEl": {
+    "tag": "H4",
+    "attrs": {
+     "class": "sr-only m-0 select-none",
+     "data-conversation-role": "assistant",
+     "tabindex": "-1"
+    }
+   },
+   "block": {
+    "tag": "DIV",
+    "attrs": {
+     "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+     "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+     "data-chatgpt-search-message-ids": "<73 chars>"
+    },
+    "textLen": 53,
+    "label": null,
+    "kids": [
+     {
+      "tag": "H4",
+      "attrs": {
+       "class": "sr-only m-0 select-none",
+       "data-conversation-role": "assistant",
+       "tabindex": "-1"
+      },
+      "textLen": 13,
+      "label": "ChatGPT said:",
+      "kids": []
+     },
+     {
+      "tag": "DIV",
+      "attrs": {
+       "class": "group flex min-w-0 flex-col",
+       "data-chatgpt-selection-conversation-id": "local-chatgpt:a6346be0-5ac1-4d99-a16f-c873cc7bdcff",
+       "data-chatgpt-selection-message-id": "cc4ed835-53a9-46e0-a45d-137d86380974"
+      },
+      "textLen": 38,
+      "label": null,
+      "kids": [
+       {
+        "tag": "DIV",
+        "attrs": {
+         "data-selected-text-overlay-target": "_r_cn_",
+         "dir": "auto",
+         "data-markdown-text-style": "assistant-message",
+         "class": "MarkdownRoot-rZKhxa [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*:last-child]:mb-0 [&>"
+        },
+        "textLen": 38,
+        "label": null,
+        "kids": [
+         {
+          "tag": "P",
+          "attrs": {
+           "class": "Paragraph-kKnbIo",
+           "dir": "auto"
+          },
+          "textLen": 38,
+          "label": null,
+          "kids": [
+           {
+            "tag": "SPAN",
+            "attrs": {},
+            "textLen": 38,
+            "label": null,
+            "kids": []
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "ancestors": [
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-message-ids": "<73 chars>"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col pb-2 pt-2"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5",
+      "data-content-search-turn-key": "fallback-turn-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "0a7dedd7-2642-44ed-9d9c-411d8eb8bf6b"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 py-5 browser:pt-1",
+      "data-thread-find-target": "conversation"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain group-has-[",
+      "role": "presentation"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "h-full min-h-0 min-w-0 flex-1",
+      "data-app-shell-focus-area": "main"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex min-h-0 flex-1 [--thread-content-responsive-max-width:var(--thread-content-e",
+      "data-app-shell-main-content-top-fade": "visible"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "MainContentFrame-sss8BP",
+      "data-app-shell-thread-edge-divider": "false"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "MainContentViewport-OinMfT",
+      "data-app-shell-main-content-layout": "thread-edge-scroll",
+      "data-app-shell-header-edge-scroll": "false",
+      "data-app-shell-right-panel-full-width": "false"
+     }
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "WorkspaceContent-dnr6uY relative isolate flex min-h-0 flex-1 overflow-hidden"
+     }
+    }
+   ]
+  }
+ ],
+ "nodes": 29,
+ "buttons": [
+  {
+   "attrs": {
+    "aria-controls": "app-shell-sidebar",
+    "aria-expanded": "false",
+    "aria-label": "Show sidebar",
+    "class": "pointer-events-auto absolute inset-0 cursor-e-resize outline-none focus-visible:outline fo",
+    "type": "button"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk [--button-ring-offset:0px] [--display-icon-compact:none] [--display-icon-lea",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "lg",
+    "data-suppress-active-style": "",
+    "aria-controls": "app-shell-sidebar",
+    "aria-expanded": "true",
+    "aria-label": "Hide sidebar",
+    "data-app-shell-sidebar-trigger": "true"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-ring focus-visib",
+    "aria-label": "New chat"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-ring focus-visib",
+    "aria-label": "Search"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-ring focus-visib",
+    "aria-label": "Pinned"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-ring focus-visib",
+    "data-sidebar-destination": "builtin:library",
+    "aria-label": "Library"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction has-[[data-ambient-usage-label]]:h-auto ha",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "lg",
+    "aria-label": "Open profile menu",
+    "aria-busy": "true",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk [--button-ring-offset:0px] [--display-icon-compact:none] [--display-icon-lea",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "lg",
+    "aria-label": "Search"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk [--button-ring-offset:0px] [--display-icon-compact:none] [--display-icon-lea",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "lg",
+    "data-suppress-active-style": "",
+    "aria-controls": "app-shell-sidebar",
+    "aria-expanded": "true",
+    "aria-label": "Hide sidebar",
+    "data-app-shell-sidebar-trigger": "true"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-pill": "",
+    "data-uniform": "",
+    "data-size": "3xs",
+    "aria-expanded": "false",
+    "aria-haspopup": "menu",
+    "aria-label": "Chat actions",
+    "id": "<12 chars>",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-pill": "",
+    "data-uniform": "",
+    "data-size": "3xs",
+    "aria-label": "Unpin chat"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-uniform": "",
+    "data-size": "xs",
+    "aria-label": "Project sidebar options",
+    "aria-expanded": "false",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-uniform": "",
+    "data-size": "xs",
+    "aria-label": "Add new project",
+    "data-app-action-sidebar-project-create": ""
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-uniform": "",
+    "data-size": "xs",
+    "aria-label": "Chat sidebar options",
+    "aria-expanded": "false",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-uniform": "",
+    "data-size": "xs",
+    "data-suppress-active-style": "",
+    "aria-label": "Filter chats and work",
+    "aria-pressed": "false",
+    "aria-expanded": "false",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-uniform": "",
+    "data-size": "xs",
+    "aria-label": "New chat"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-pill": "",
+    "data-uniform": "",
+    "data-size": "3xs",
+    "aria-expanded": "false",
+    "aria-haspopup": "menu",
+    "aria-label": "Chat actions",
+    "id": "<12 chars>",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk",
+    "data-color": "secondary",
+    "data-variant": "transparent",
+    "data-pill": "",
+    "data-uniform": "",
+    "data-size": "3xs",
+    "aria-label": "Pin chat"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "class": "absolute inset-0 cursor-interaction outline-none focus-visible:ring-2 focus-visible:ring-r",
+    "aria-label": "Open profile menu",
+    "type": "button",
+    "id": "<34 chars>",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk [--button-ring-offset:0px] [--display-icon-compact:none] [--display-icon-lea",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "lg",
+    "data-suppress-active-style": "",
+    "aria-controls": "browser-sidebar-popover",
+    "aria-expanded": "false",
+    "aria-label": "Show sidebar"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "New chat",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk [--button-ring-offset:0px] [--display-icon-compact:none] [--display-icon-lea",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "lg",
+    "data-suppress-active-style": "",
+    "aria-controls": "browser-sidebar-popover",
+    "aria-expanded": "false",
+    "aria-label": "Show sidebar"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "New chat",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Share",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk Toolbar-TcAqyt no-drag outline-hidden cursor-interaction",
+    "data-color": "primary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xl",
+    "data-icon-size": "sm",
+    "aria-label": "More",
+    "data-state": "closed",
+    "aria-expanded": "false",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Copy message"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Share prompt"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Edit message"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Copy"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Share"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Read aloud",
+    "aria-pressed": "false"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Regenerate response",
+    "data-state": "closed",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "Button-G93JGk outline-hidden cursor-interaction",
+    "data-color": "secondary",
+    "data-variant": "ghost",
+    "data-uniform": "",
+    "data-size": "xs",
+    "data-icon-size": "sm",
+    "aria-label": "More actions",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "class": "group/scroll-to-bottom cursor-interaction absolute z-30 flex h-8 w-8 translate-x-1/2 items",
+    "aria-hidden": "true",
+    "aria-label": "Scroll to bottom",
+    "tabindex": "-1",
+    "type": "button"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Add files and more",
+    "aria-expanded": "false",
+    "data-composer-navigation-target": "add-context",
+    "data-state": "closed"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-label": "Select ChatGPT model",
+    "id": "<12 chars>",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "data-codex-intelligence-trigger": "true",
+    "data-composer-navigation-target": "reasoning",
+    "data-selected-reasoning-effort": "medium"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+    "aria-busy": "false",
+    "aria-label": "Dictate"
+   },
+   "enabled": true
+  },
+  {
+   "attrs": {
+    "type": "button",
+    "class": "cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful",
+    "aria-label": "Start Voice",
+    "data-state": "closed"
+   },
+   "enabled": true
+  }
+ ]
+}

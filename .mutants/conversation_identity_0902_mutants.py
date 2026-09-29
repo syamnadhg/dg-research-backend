@@ -94,7 +94,9 @@ C_RATIO = "    return (hits / len(fingerprint)) >= _BRIEF_MATCH_RATIO"
 C_CONST = "_BRIEF_MATCH_RATIO = 0.6"
 V_NONE = '    if held is None:\n        return "unknown"'
 V_PICK = '    return "ours" if held else "foreign"'
-R_EVAL = '            " return (n && n.innerText || \'\').slice(0, cap); }", cap)) or ""'
+# ⛔ RE-AIMED 2026-09-28: the read is wrapped in `_cg_js(...)` (the user-message
+# marker is spliced — old page AND new), so `}"), cap))`. Same read.
+R_EVAL = '            " return (n && n.innerText || \'\').slice(0, cap); }"), cap)) or ""'
 S_NOFP = ("        if not fingerprint:\n"
           "            continue          # nothing to compare against — see the docstring")
 S_CACHE = ('        cached_url, cached_text = p.get("_ident_read") or ("", "")\n'
@@ -179,7 +181,7 @@ MUTANTS = [
      "this reads the page chrome and the sidebar's list of the person's OTHER "
      "conversations — and the pre-send gate refuses a healthy send on it",
      [(R_EVAL, '            " return ((n && n.innerText) || document.body.innerText '
-               "|| '').slice(0, cap); }\", cap)) or \"\"")]),
+               "|| '').slice(0, cap); }\"), cap)) or \"\"")]),
 
     # ═════════ S — the per-tick sweep ═══════════════════════════════════════
     ("S1", "under",

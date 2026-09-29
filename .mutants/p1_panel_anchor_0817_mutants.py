@@ -109,8 +109,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("P11", "over", "⛔ the composer subtree stops being excluded — its own "
      "shimmering affordance becomes the strip",
+     # ⛔ RE-AIMED 2026-09-28: `#prompt-textarea` → the spliced composer marker.
      [("""                if (el.closest && el.closest(
-                        'form, [data-testid*="composer" i], #prompt-textarea, ' +
+                        'form, [data-testid*="composer" i], __CG_COMPOSER__, ' +
                         'header, [role="toolbar"], nav')) { DIAG.structProse++; continue; }""",
        "                if (false) { DIAG.structProse++; continue; }")],
      [T_NEW]),

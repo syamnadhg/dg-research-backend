@@ -22477,7 +22477,7 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
     # never a literal — the two must not drift on what "the other pill" is.
     _p1["avoid"] = _chatgpt_tier_policy()[2]
     try:
-        res = await page.evaluate("""(P) => {
+        res = await page.evaluate(_cg_js("""(P) => {
             const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
             const vis = el => el.getClientRects().length > 0;
             const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
@@ -22543,8 +22543,8 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
             // same "first match in document order" mistake the scoping is fixing.
             // Ordered candidates: the prompt box's own form, then its nearest
             // form-ish ancestor, then any form at all.
-            const promptBox = document.querySelector(
-                '#prompt-textarea, [contenteditable="true"], textarea');
+            const promptBox = document.querySelector('__CG_COMPOSER__')
+                || document.querySelector('[contenteditable="true"], textarea');
             const composer = (promptBox && promptBox.closest('form'))
                 || (promptBox && promptBox.closest('[data-type="unified-composer"], [class*="composer" i]'))
                 || document.querySelector('form');
@@ -22597,7 +22597,7 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
                      extTag: extMark ? (extMark.tagName || '').toLowerCase() : '',
                      extCls: extMark ? norm((extMark.className && extMark.className.toString)
                          ? extMark.className.toString() : '').slice(0, 80) : '' };
-        }""", _p1)
+        }"""), _p1)
     except Exception as e:
         log(f"[p1:extended_pro_confirm] DOM read failed: {e}", "INFO")
         return "unsure"
@@ -22618,6 +22618,110 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
     return "unsure"
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ChatGPT's page markers — ONE place, and each one accepts the OLD page AND the
+# NEW one (2026-09-28).
+# ─────────────────────────────────────────────────────────────────────────────
+# ⛔⛔ WHY THIS EXISTS. On 2026-09-28 ChatGPT changed its markup while the page
+# LOOKED the same to a person. The message box lost `#prompt-textarea`, both
+# kinds of message lost `data-message-author-role`, and Send and Stop lost their
+# `data-testid`. Each of those strings was typed out by hand wherever it was
+# needed, so every one of them went blind on the same morning:
+#   * Phase 1's submit found no box ("Direct submit: no textarea found");
+#   * the CUA fallback typed "test" into nothing, pressed ctrl+a — which is
+#     "go to line start" on macOS, not select-all — then Delete, leaving "est";
+#   * the "CUA attempting to fix" step clicked Send on "est", and "✓ Verified —
+#     actively generating" accepted it on the Stop button alone;
+#   * the panel census said "no user message on screen" beside "You said: est".
+#
+# Read from the owner's captures of the live page (the fixtures under
+# tests/fixtures/chatgpt_0928/ rebuild them tag for tag):
+#   message box   <div contenteditable="true" role="textbox"
+#                 aria-label="Ask ChatGPT" class="ProseMirror"> — no id, and no
+#                 placeholder on the box itself
+#   user message  div[data-user-message-bubble="true"] — holds the text
+#   reply         div[data-markdown-text-style="assistant-message"] — the reply's
+#                 TEXT element, inside div[data-chatgpt-search-unit-key$=":assistant"]
+#   turn          div[data-turn-key] — ONE turn holds the user block AND the reply
+#   Send / Stop   button[aria-label="Send"] / button[aria-label="Stop"]
+#   model button  button[aria-label="Select ChatGPT model"][aria-haspopup="menu"]
+#
+# ⭐ Every marker is a CSS selector LIST with the old marker first. The old ones
+# stay: a rollback, an A/B cohort or a second account can still be served the old
+# page, and on the old page these lists match exactly what the old strings did.
+# ⚠ A list matches in DOCUMENT order, not list order. That is safe here because
+# no two entries of one list name different elements on the same page.
+# ⛔ Other platforms keep their own markers (Claude's `data-testid="user-message"`
+# is Claude's). These are ChatGPT's only.
+CHATGPT_COMPOSER_SEL = ('#prompt-textarea, '
+                        'div.ProseMirror[contenteditable="true"][role="textbox"], '
+                        '[contenteditable="true"][aria-label="Ask ChatGPT"], '
+                        'textarea[placeholder*="Message"], '
+                        'div[contenteditable="true"][data-placeholder]')
+CHATGPT_USER_MSG_SEL = ('[data-message-author-role="user"], '
+                        '[data-user-message-bubble="true"]')
+#: The reply. On the new page this IS the reply's text element, so a caller that
+#: reads `innerText` off the last match reads the reply on either page.
+CHATGPT_ASSISTANT_MSG_SEL = ('[data-message-author-role="assistant"], '
+                             '[data-markdown-text-style="assistant-message"]')
+#: The reply's rendered TEXT (what an HTML→markdown pass wants): the old page's
+#: `.markdown` inside the reply, the new page's markdown root itself.
+CHATGPT_REPLY_TEXT_SEL = ('[data-message-author-role="assistant"] .markdown, '
+                          '[data-markdown-text-style="assistant-message"]')
+#: Any message at all, either author — "does this thread hold anything yet?"
+CHATGPT_ANY_MSG_SEL = ('[data-message-author-role], '
+                       '[data-user-message-bubble="true"], '
+                       '[data-markdown-text-style="assistant-message"]')
+CHATGPT_TURN_SEL = '[data-testid^="conversation-turn"], [data-turn-key]'
+CHATGPT_SEND_SEL = ('button[data-testid="send-button"], '
+                    'button[aria-label="Send prompt"], '
+                    'button[aria-label="Send"]')
+CHATGPT_STOP_SEL = ('button[data-testid="stop-button"], '
+                    'button[aria-label="Stop"], '
+                    'button[aria-label="Stop streaming"]')
+CHATGPT_MODEL_TRIGGER_SEL = ('[data-testid="model-selector"], '
+                             'button[aria-label="Select ChatGPT model"][aria-haspopup="menu"]')
+
+#: The same markers for page JS. A JS string writes `'__CG_USER__'` — inside
+#: SINGLE quotes — and `_cg_js` splices the list in. Spliced rather than passed
+#: as an argument so that no existing function signature has to change.
+_CG_JS_MARKERS = {
+    "__CG_COMPOSER__": CHATGPT_COMPOSER_SEL,
+    "__CG_USER__": CHATGPT_USER_MSG_SEL,
+    "__CG_ASSISTANT__": CHATGPT_ASSISTANT_MSG_SEL,
+    "__CG_REPLY_TEXT__": CHATGPT_REPLY_TEXT_SEL,
+    "__CG_ANY_MSG__": CHATGPT_ANY_MSG_SEL,
+    "__CG_TURN__": CHATGPT_TURN_SEL,
+    "__CG_SEND__": CHATGPT_SEND_SEL,
+    "__CG_STOP__": CHATGPT_STOP_SEL,
+    "__CG_MODEL__": CHATGPT_MODEL_TRIGGER_SEL,
+}
+# A marker that carried a single quote or a backslash would end the JS string it
+# is spliced into — a SyntaxError on the page, i.e. a probe that silently answers
+# nothing. Refuse at import instead.
+for _cg_k, _cg_v in _CG_JS_MARKERS.items():
+    if "'" in _cg_v or "\\" in _cg_v:
+        raise ValueError(f"ChatGPT marker {_cg_k} cannot be spliced into page JS: {_cg_v!r}")
+
+
+def _cg_js(src: str) -> str:
+    """Splice ChatGPT's page markers into a page-JS string (see above)."""
+    out = src
+    for key, sel in _CG_JS_MARKERS.items():
+        out = out.replace(key, sel)
+    if "__CG_" in out:
+        raise ValueError("unknown ChatGPT marker placeholder in page JS: "
+                         + out[out.index("__CG_"):][:40])
+    return out
+
+
+def _cg_within(sel_list: str, tail: str) -> str:
+    """`tail` inside each member of a marker list: `_cg_within(A, "h2")` is
+    `"<a1> h2, <a2> h2"`. A descendant combinator does not distribute over a
+    selector list, so `"<a1>, <a2> h2"` would mean something else entirely."""
+    return ", ".join(f"{part.strip()} {tail}" for part in sel_list.split(","))
+
+
 # Composer detector shared by the clear + verify legs below. DR-active when a
 # short 'deep research' pill/chip is visible in the composer FORM, or the
 # composer placeholder is the Deep-Research one. NB the DR placeholder is
@@ -22625,7 +22729,7 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
 # 2026-07-08 — so the old placeholder.includes('research') check would MISS it.
 # Scoped to `form` so a 'Deep research' badge on an already-SENT message (which
 # lives OUTSIDE the composer form) can never false-positive.
-_CHATGPT_DR_ACTIVE_JS = r"""() => {
+_CHATGPT_DR_ACTIVE_JS = _cg_js(r"""() => {
     const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const form = document.querySelector('form') || document.body;
     let pillText = '';
@@ -22635,7 +22739,8 @@ _CHATGPT_DR_ACTIVE_JS = r"""() => {
         if (t && t.length <= 30 && t.includes('deep research')) { pillText = t; break; }
     }
     let placeholder = '';
-    const ta = document.querySelector('#prompt-textarea, textarea, [contenteditable="true"]');
+    const ta = document.querySelector('__CG_COMPOSER__')
+            || document.querySelector('textarea, [contenteditable="true"]');
     if (ta) placeholder = norm(ta.getAttribute('placeholder') || ta.getAttribute('data-placeholder'));
     if (!placeholder) {
         const ph = (form.querySelector('[data-placeholder]') || {});
@@ -22643,7 +22748,7 @@ _CHATGPT_DR_ACTIVE_JS = r"""() => {
     }
     const phDR = /detailed report|deep research|research report/.test(placeholder);
     return { active: !!pillText || phDR, pillText, placeholder: placeholder.slice(0, 80) };
-}"""
+}""")
 
 
 # Focus the P1 composer editable and collapse the caret to the very END of any
@@ -22653,8 +22758,8 @@ _CHATGPT_DR_ACTIVE_JS = r"""() => {
 # against ever backspacing over typed prose — the brief is not typed yet so it's
 # 0, and a PDF attachment is a separate card row (never an in-text token), so an
 # in-composer Backspace can only ever delete the tool token, never the file.
-_CHATGPT_FOCUS_COMPOSER_END_JS = r"""() => {
-    const ta = document.querySelector('#prompt-textarea')
+_CHATGPT_FOCUS_COMPOSER_END_JS = _cg_js(r"""() => {
+    const ta = document.querySelector('__CG_COMPOSER__')
             || document.querySelector('div[contenteditable="true"]')
             || document.querySelector('textarea');
     if (!ta) return { ok: false, textLen: 0 };
@@ -22677,7 +22782,7 @@ _CHATGPT_FOCUS_COMPOSER_END_JS = r"""() => {
         }
     } catch (e) {}
     return { ok: true, textLen };
-}"""
+}""")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -24627,10 +24732,9 @@ async def paste_followup(page, text, platform, label="followup"):
         ok = await verified_paste_brief(page, text, platform, label, max_retries=2)
         if not ok:
             return False
-        # Click send button
-        for sel in ['button[data-testid="send-button"]',
-                    'button[aria-label="Send prompt"]',
-                    'button[aria-label="Send"]',
+        # Click send button. ChatGPT's own Send (either page) leads, as its
+        # three strings did before they became the one marker.
+        for sel in [CHATGPT_SEND_SEL,
                     'button[aria-label="Send message"]',
                     'button[aria-label="Submit"]']:
             try:
@@ -24667,7 +24771,7 @@ async def is_agent_generating(page, platform):
     """Cheap DOM check: is the page showing a stop/loading indicator?"""
     try:
         sel_map = {
-            "chatgpt": 'button[data-testid="stop-button"], button[aria-label*="Stop"], [data-testid*="loading"]',
+            "chatgpt": CHATGPT_STOP_SEL + ', button[aria-label*="Stop"], [data-testid*="loading"]',
             # #897b: Gemini's collapsed composer often shows NO stop button
             # mid-run — without the broader new-UI running signals the
             # dispatcher would read a live DR as "finished" and silently
@@ -26221,9 +26325,9 @@ class BriefArtifact:
 
 # JS that finds the longest visible composer-like element and returns its
 # text length. Used for verifying both DOM and CUA-assisted pastes.
-_VERIFY_PASTE_JS = """() => {
+_VERIFY_PASTE_JS = _cg_js("""() => {
     const candidates = [
-        '#prompt-textarea',
+        '__CG_COMPOSER__',
         'rich-textarea div[contenteditable="true"]',
         '.ProseMirror',
         'div[contenteditable="true"][data-placeholder]',
@@ -26248,7 +26352,7 @@ _VERIFY_PASTE_JS = """() => {
         }
     }
     return best;
-}"""
+}""")
 
 # ⭐⭐ 2026-08-06 — THE OTHER HALF OF THE NORMALIZATION, and its absence made a
 # perfect paste unpassable.
@@ -26335,11 +26439,11 @@ _PASTE_SELECTORS = {
                'div[contenteditable="true"][data-placeholder]',
                'div[contenteditable="true"]',
                'textarea', '[aria-label*="prompt"]'],
-    "chatgpt": ['#prompt-textarea', 'textarea',
+    "chatgpt": [CHATGPT_COMPOSER_SEL, 'textarea',
                 'div[contenteditable="true"]', '.ProseMirror'],
     "claude": ['.ProseMirror', 'div[contenteditable="true"]', 'textarea'],
 }
-_PASTE_SELECTORS_GENERIC = ['#prompt-textarea',
+_PASTE_SELECTORS_GENERIC = [CHATGPT_COMPOSER_SEL,
                             'rich-textarea div[contenteditable="true"]',
                             '.ProseMirror',
                             'div[contenteditable="true"][data-placeholder]',
@@ -27391,13 +27495,17 @@ _HOTSPOT_VISION_HINTS = {
         "success_signals": ["the composer placeholder is back to a normal 'Ask anything' prompt",
                              "no 'Deep research' pill in the composer"],
     },
+    # ⛔ 2026-09-28: this act only PLACES THE CARET. It used to send "what is
+    # there", and what was there was "est". The program types the prompt, reads
+    # it back and sends it itself.
     "1a-submit": {
-        "expected_outcome": "the prompt in the composer is submitted and ChatGPT starts generating",
+        "expected_outcome": "the text cursor is in ChatGPT's message box",
         "context_hint": (
-            "The prompt text is already in the composer. Click the Send button to submit it. "
-            "Do NOT retype the prompt — only send what is there."
+            "Close any open menu (Escape), then click once inside ChatGPT's message box so the "
+            "text cursor is in it. Do NOT type — not even a test word — do NOT paste, do NOT "
+            "press Enter and do NOT click Send."
         ),
-        "success_signals": ["a Stop button replaces Send", "a response begins streaming"],
+        "success_signals": ["the message box shows a blinking text cursor"],
     },
     "scrape-artifact": {
         "expected_outcome": "the first tracking artifact's content (URLs/steps/sections) is read out",
@@ -27801,7 +27909,7 @@ async def _shadow_observed_cua(
     context_hint, cua_coro_factory, expected_outcome="",
     mission_prompt="", success_text="", high_stakes=False,
     read_only=False, act_timeout_s=90.0, act_max_steps=0,
-    pre_cua_net_probe=None,
+    pre_cua_net_probe=None, act_allow=None,
 ):
     """The Vision↔CUA dispatch point for every hotspot (name kept for
     grep-stability across logs/memory even though it now covers more than
@@ -27842,6 +27950,9 @@ async def _shadow_observed_cua(
       For non-idempotent hotspots (audio-generate, #778) where a partial Vision
       attempt may have already mutated state (started generating) so re-running
       the full CUA mission would double-act. Off/shadow never invoke it.
+    - act_allow: the allow-list the site's CUA runs under (CUA_CLICK_ONLY). A
+      Vision step outside it is NOT executed — Vision hands over to the CUA,
+      which is held to the same list.
 
     Act success returns {"status": "vision_success", "text": ..., "vision_acted":
     True} — the agent_loop dict shape every caller already parses.
@@ -27888,6 +27999,9 @@ async def _shadow_observed_cua(
     if _mode == "tier2":
         # ── ACT: Vision drives; CUA is the safety net ──
         _final = None
+        _act_kw = {}
+        if act_allow is not None:
+            _act_kw["refuse"] = lambda r: _vision_refusal(r, act_allow)
         try:
             _steps = 1 if read_only else (act_max_steps or _vision.ACT_MAX_STEPS_DEFAULT)
             _final = await asyncio.wait_for(_vision.act_loop(
@@ -27900,6 +28014,7 @@ async def _shadow_observed_cua(
                 max_steps=_steps,
                 read_only=read_only,
                 should_abort=lambda: _controls.is_stop() or _controls.is_pause(),
+                **_act_kw,
             ), timeout=act_timeout_s)
         except Exception as _ae:
             log(f"[act:{hotspot_id}] act path failed "
@@ -32319,7 +32434,7 @@ async def scrape_progress_chatgpt(page):
     from the host page."""
     try:
         # ---- Main-page scrape (host page: title, model, stop button, chat-level DR indicators)
-        result = await page.evaluate("""() => {
+        result = await page.evaluate(_cg_js("""() => {
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
@@ -32327,8 +32442,12 @@ async def scrape_progress_chatgpt(page):
                 dr_active: false, dr_done_text: false, has_stop_btn: false,
                 panel_open: false, searches: 0
             };
+            // A marker list with `tail` inside each member (a descendant
+            // combinator does not distribute over a selector list).
+            const within = (list, tail) => list.split(',')
+                .map(s => s.trim() + ' ' + tail).join(', ');
             // Model info
-            const modelEl = document.querySelector('[data-testid="model-selector"], .model-label');
+            const modelEl = document.querySelector('__CG_MODEL__, .model-label');
             if (modelEl) r.model = modelEl.innerText.substring(0, 50);
             // Conversation title
             const titleEl = document.querySelector('h1, [data-testid="conversation-title"]');
@@ -32336,7 +32455,7 @@ async def scrape_progress_chatgpt(page):
             // Stop-button detection (aria-label + text fallback)
             r.has_stop_btn = !!document.querySelector(
                 'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
-                'button[data-testid="stop-button"], button[data-testid*="stop"]'
+                '__CG_STOP__, button[data-testid*="stop"]'
             );
             if (!r.has_stop_btn) {
                 const btns = document.querySelectorAll('button');
@@ -32396,7 +32515,7 @@ async def scrape_progress_chatgpt(page):
             const srcSet = new Set();
             document.querySelectorAll(
                 '.citation, .source-link, [data-citation], ' +
-                '[data-message-author-role="assistant"] a[href*="http"], ' +
+                within('__CG_ASSISTANT__', 'a[href*="http"]') + ', ' +
                 '[data-testid="canvas"] a[href*="http"], .canvas-container a[href*="http"]'
             ).forEach(s => {
                 const href = s.href || '';
@@ -32406,16 +32525,17 @@ async def scrape_progress_chatgpt(page):
             r.source_urls = Array.from(srcSet).slice(0, 200);
             r.sources = r.source_urls.length;
             // Response sections (host page headings)
-            const headings = document.querySelectorAll('[data-message-author-role="assistant"] h1, [data-message-author-role="assistant"] h2, [data-message-author-role="assistant"] h3');
+            const headings = document.querySelectorAll(
+                ['h1', 'h2', 'h3'].map(h => within('__CG_ASSISTANT__', h)).join(', '));
             r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80));
             // Partial response length (host page)
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+            const msgs = document.querySelectorAll('__CG_ASSISTANT__');
             if (msgs.length > 0) r.partial_text_len = msgs[msgs.length-1].innerText.length;
             // Canvas/artifact content
             const canvas = document.querySelector('[data-testid="canvas"], .canvas-container, .canvas-content');
             if (canvas && canvas.innerText.length > r.partial_text_len) r.partial_text_len = canvas.innerText.length;
             return r;
-        }""")
+        }"""))
 
         # ---- Host-page side-panel scrape (P1 Pro+ET, also catches P2 host-side panel)
         # P1 mode renders the activity panel inline on the host page (no DR
@@ -32978,7 +33098,7 @@ _CHATGPT_SHIMMER_JS_HELPERS = """
 """
 
 
-_CHATGPT_INLINE_ACTIVITY_JS = """() => {
+_CHATGPT_INLINE_ACTIVITY_JS = _cg_js("""() => {
     // Scope: the LAST assistant turn. The status row + drawer render inside
     // the <article> turn wrapper but OUTSIDE [data-message-author-role], so
     // prefer the article; fall back to the role node's parent.
@@ -32986,8 +33106,20 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     const arts = main.querySelectorAll('article');
     let turn = arts.length ? arts[arts.length - 1] : null;
     let scope = turn ? 'article' : '';
+    // ⭐ 2026-09-29 — THE NEW PAGE'S ASSISTANT UNIT. The new page has no
+    // <article>, its reply marker is the reply's TEXT (whose parent is a
+    // `div.group` that leaves out the rest of the reply), and its ONE
+    // `[data-turn-key]` holds the user's bubble too, so the turn arm below
+    // skips it. Before the reply text mounts, that left this walker NULL (the
+    // 08-20 "chips 0->0" shape). The unit is the reply's own container in the
+    // owner's capture. ⚠ UNKNOWN: whether the unit is drawn before any reply
+    // text — no capture of the thinking phase exists.
     if (!turn) {
-        const asst = main.querySelectorAll('[data-message-author-role="assistant"]');
+        const units = main.querySelectorAll('[data-chatgpt-search-unit-key$=":assistant"]');
+        if (units.length) { turn = units[units.length - 1]; scope = 'assistant-unit'; }
+    }
+    if (!turn) {
+        const asst = main.querySelectorAll('__CG_ASSISTANT__');
         turn = asst.length ? (asst[asst.length - 1].parentElement
                               || asst[asst.length - 1]) : null;
         if (turn) scope = 'role-parent';
@@ -33013,9 +33145,9 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     // yet the last match would be the brief we pasted.
     if (!turn) {
         try {
-            const secs = main.querySelectorAll('[data-testid^="conversation-turn"]');
+            const secs = main.querySelectorAll('__CG_TURN__');
             for (let i = secs.length - 1; i >= 0; i--) {
-                if (secs[i].querySelector('[data-message-author-role="user"]')) continue;
+                if (secs[i].querySelector('__CG_USER__')) continue;
                 turn = secs[i];
                 scope = 'turn-testid';
                 break;
@@ -33043,7 +33175,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     // article scope found nothing, which is exactly the case that was dying.
     let lub = -1;
     try {
-        main.querySelectorAll('[data-message-author-role="user"]').forEach(u => {
+        main.querySelectorAll('__CG_USER__').forEach(u => {
             const r = u.getBoundingClientRect();
             if (r.bottom > lub) lub = r.bottom;
         });
@@ -33296,7 +33428,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     const lastStep = out.steps.length ? out.steps[out.steps.length - 1] : '';
     out.progress = out.status_line || lastVerbStep || lastStep;
     return out;
-}"""
+}""")
 
 # Right-hand side panel presence (bool) — evaluated on the host page AND in
 # every frame (the DR iframe's URL no longer matches any fixed substring).
@@ -33312,7 +33444,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
 # Signature A below matches the measured panel directly; the legacy
 # selector sweep keeps a relaxed width gate + the text gate (it has no
 # header anchor, so the text floor still guards against random asides).
-_CHATGPT_SIDE_PANEL_JS = """() => {
+_CHATGPT_SIDE_PANEL_JS = _cg_js("""() => {
     // ⭐⭐ 2026-08-06 (run 2) — THE PANEL THAT WAS NEVER OPENED. This probe is the
     // anti-toggle PRE-CHECK: when it says "open", the poller latches
     // `chatgpt_activity_panel_open` and never calls the opener again for the
@@ -33337,8 +33469,8 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
         // A conversation turn is never the activity panel. Cheap, absolute, and
         // it is the arm that would have refused the observed node.
         try {
-            return !!(n.closest('[data-message-author-role], [data-testid^="conversation-turn"], article')
-                      || n.querySelector('[data-message-author-role]'));
+            return !!(n.closest('__CG_ANY_MSG__, __CG_TURN__, article')
+                      || n.querySelector('__CG_ANY_MSG__'));
         } catch (e) { return false; }
     };
     const ident = (n, why) => ({
@@ -33374,7 +33506,7 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
                 if (r.width >= 200 && r.width <= window.innerWidth * 0.6
                         && r.height >= 150
                         && r.right > window.innerWidth * 0.55) {
-                    if (!node.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')
+                    if (!node.querySelector('__CG_COMPOSER__, form textarea, [data-testid*="composer" i]')
                             && !isTurn(node)) {
                         return ident(node, 'sigA:' + t.slice(0, 30));
                     }
@@ -33399,14 +33531,14 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
                 if (r.right < window.innerWidth * 0.55) continue;
                 const inner = (el.innerText || '').trim();
                 if (inner.length < 50) continue;
-                if (el.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) continue;
+                if (el.querySelector('__CG_COMPOSER__, form textarea, [data-testid*="composer" i]')) continue;
                 if (isTurn(el)) continue;
                 return ident(el, 'sigB:' + sel);
             }
         } catch (e) {}
     }
     return null;
-}"""
+}""")
 
 
 async def _chatgpt_activity_state(page):
@@ -33842,9 +33974,9 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
     a persistent panel-open miss can be root-caused from backend.log alone —
     no live DOM session needed (probing the worker profile out-of-band risks
     the bot score)."""
-    JS = """() => {
+    JS = _cg_js("""() => {
         let lub = -1;
-        document.querySelectorAll('[data-message-author-role="user"]').forEach(u => {
+        document.querySelectorAll('__CG_USER__').forEach(u => {
             const r = u.getBoundingClientRect();
             if (r.bottom > lub) lub = r.bottom;
         });
@@ -33923,11 +34055,11 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
             }
             let inTurn = false, named = false;
             try {
-                inTurn = !!el.closest('[data-testid^="conversation-turn"], '
-                                      + '[data-message-author-role="assistant"]');
+                inTurn = !!el.closest('__CG_TURN__, '
+                                      + '__CG_ASSISTANT__');
             } catch (e) {}
             try {
-                named = !!el.closest('[data-testid^="cot-v"][data-testid*="pinned-row"]');
+                named =!!el.closest('[data-testid^="cot-v"][data-testid*="pinned-row"]');
             } catch (e) {}
             const row = { t: key, tag: el.tagName,
                           ti: (el.getAttribute && el.getAttribute('data-testid')) || '',
@@ -33943,7 +34075,7 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
             rows.push(row);
         }
         return { lub: Math.round(lub), rows, dupes };
-    }"""
+    }""")
     try:
         snap = await page.evaluate(JS)
     except Exception as _se:
@@ -33992,7 +34124,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
     attempts — if PASS 0 keeps picking a host-page element whose click
     never verifies, it would otherwise starve the legacy passes AND the
     frame walk (host found:true short-circuits both) forever."""
-    JS = """(skipStructural) => {
+    JS = _cg_js("""(skipStructural) => {
         // searches | sources | results | citations — covers all observed
         // badge wordings ("citations" added 2026-07-06 #905: the completed
         // strip reads "Research completed in 8m · 17 citations · 96 searches").
@@ -34169,14 +34301,18 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                     // Safe for the dialog pass too: the activity strip has never
                     // rendered inside a form, a header, a toolbar or a nav.
                     if (!inProse && el.closest(
-                            'form, [data-testid*="composer" i], #prompt-textarea, '
+                            'form, [data-testid*="composer" i], __CG_COMPOSER__, '
                             + 'header, [role="toolbar"], nav')) inProse = true;
                     // The rendered response body. Only the two WEAKEST tiers are
                     // refused here — a completed strip or a live ellipsis line
                     // carries evidence prose cannot fake, so if one ever renders
                     // inside the markdown container it still counts.
+                    // ⚠ `[class*="markdown"]` is case-SENSITIVE and the new page's
+                    // reply root is `MarkdownRoot-…`, so the reply-text marker
+                    // names it outright.
                     if (!inProse && !matchesEllipsis && !matchesCount && !matchesCompleted
-                            && el.closest('.markdown, [class*="markdown"], [class*="prose"]')) {
+                            && el.closest('.markdown, [class*="markdown"], [class*="prose"], '
+                                          + '__CG_REPLY_TEXT__')) {
                         inProse = true;
                     }
                 } catch (e) { inProse = false; }
@@ -34250,7 +34386,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // which sits at the BOTTOM of the DR card inside its iframe).
         let lub = -1;
         try {
-            document.querySelectorAll('[data-message-author-role="user"]').forEach(u => {
+            document.querySelectorAll('__CG_USER__').forEach(u => {
                 const r = u.getBoundingClientRect();
                 if (r.bottom > lub) lub = r.bottom;
             });
@@ -34305,7 +34441,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 if (offTop < -8 || offTop > 600) { DIAG.structOffBand++; continue; }
                 DIAG.structInBand++;
                 if (el.closest && el.closest(
-                        'form, [data-testid*="composer" i], #prompt-textarea, ' +
+                        'form, [data-testid*="composer" i], __CG_COMPOSER__, ' +
                         'header, [role="toolbar"], nav')) { DIAG.structProse++; continue; }
                 // ⛔ 2026-08-20 — THE PROSE EXCLUSION BELONGS HERE TOO. Until now
                 // it lived only in `findHitsIn`, and the note there already says
@@ -34318,7 +34454,8 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 // on geometry alone.
                 if (el.closest && el.closest(
                         'table, td, th, code, pre, a[href], '
-                        + '.markdown, [class*="markdown"], [class*="prose"]')) {
+                        + '.markdown, [class*="markdown"], [class*="prose"], '
+                        + '__CG_REPLY_TEXT__')) {
                     DIAG.structProse++; continue;
                 }
                 let inter = false, node = el;
@@ -34396,8 +34533,8 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
                 // every turn.
                 let inTurn = false;
                 try {
-                    inTurn = !!el.closest('[data-testid^="conversation-turn"], '
-                                          + '[data-message-author-role="assistant"]');
+                    inTurn = !!el.closest('__CG_TURN__, '
+                                          + '__CG_ASSISTANT__');
                 } catch (e) {}
                 const wordy = COUNT.test(t) || VERB_ONLY.test(t)
                     || STATUS_LINE.test(t) || ELLIPSIS.test(t) || COMPLETED.test(t);
@@ -34591,7 +34728,7 @@ async def _open_chatgpt_activity_panel(page, skip_structural=False):
         // hitScore; ties broken by lowest-on-page, then shortest text.
         hits.sort((a, b) => (hitScore(b) - hitScore(a)) || (b.top - a.top) || (a.len - b.len));
         return clickAndReturn(hits[0].el, hits.length, 'global');
-    }"""
+    }""")
     # The miss diagnostic, kept across every context we try. Without this the
     # function threw away everything the JS reported and returned a constant,
     # so the caller could only guess why — and guessed wrong on an oversized
@@ -35599,10 +35736,10 @@ _THINKING_TIME_HEADER_SRC = (
 # defect this constant exists to end.
 _THINKING_TIME_HEADER_JS = f"/{_THINKING_TIME_HEADER_SRC}/i"
 
-_CHATGPT_DONE_PROBE_JS = """() => {
+_CHATGPT_DONE_PROBE_JS = _cg_js("""() => {
     let hasStop = !!document.querySelector(
         'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
-        'button[data-testid="stop-button"], button[data-testid*="stop"]'
+        '__CG_STOP__, button[data-testid*="stop"]'
     );
     if (!hasStop) {
         for (const b of document.querySelectorAll('button')) {
@@ -35683,7 +35820,7 @@ _CHATGPT_DONE_PROBE_JS = """() => {
             break;
         }
     }
-    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+    const msgs = document.querySelectorAll('__CG_ASSISTANT__');
     const assistantLen = msgs.length ? msgs[msgs.length - 1].innerText.length : 0;
     // Sources count: external citation links anywhere in THIS document.
     const sources = document.querySelectorAll('a[href^="http"][target="_blank"]').length;
@@ -35693,7 +35830,7 @@ _CHATGPT_DONE_PROBE_JS = """() => {
     ).length;
     return { hasStop, thoughtFor, researchDone, completedChip, docPanelAffordances,
              assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh };
-}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)
+}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
 
 # A non-main context must be a real surface before its download-button scan may
 # call the run finished. The geometry inside a frame is FRAME-relative, so
@@ -39274,20 +39411,10 @@ class Browser:
         await self.page.keyboard.type(text, delay=20)
 
     async def key(self, combo):
-        mapping = {
-            "ctrl": "Control", "alt": "Alt", "shift": "Shift",
-            "meta": "Meta", "super": "Meta", "cmd": "Meta",
-            "return": "Enter", "enter": "Enter",
-            "backspace": "Backspace", "delete": "Delete",
-            "tab": "Tab", "escape": "Escape", "esc": "Escape",
-            "space": " ", "up": "ArrowUp", "down": "ArrowDown",
-            "left": "ArrowLeft", "right": "ArrowRight",
-            "pageup": "PageUp", "pagedown": "PageDown",
-            "home": "Home", "end": "End",
-        }
-        parts = combo.split("+")
-        translated = [mapping.get(p.strip().lower(), p.strip()) for p in parts]
-        await self.page.keyboard.press("+".join(translated))
+        # ⛔ ctrl+a/c/v/x/z become Meta on macOS — see `_cua_key_combo`. On
+        # 2026-09-28 a CUA "ctrl+a, Delete" meant to empty the box instead moved
+        # to the line start and deleted ONE character, and "test" became "est".
+        await self.page.keyboard.press(_cua_key_combo(combo))
 
     async def mouse_move(self, x, y):
         await self.page.mouse.move(x, y)
@@ -39455,6 +39582,39 @@ class Browser:
 
 # ── Action Executor ────────────────────────────────────────────────────────────
 
+#: ⛔⛔ What a CUA may do while the PROGRAM owns the typing: ChatGPT's Phase 1
+#: caret placement, and the verify gate's diagnosis and fix while a ChatGPT
+#: prompt is in play. It may point, click once, scroll, wait and press Escape.
+#: Anything else is refused and logged: a typed word, Enter, a paste,
+#: select-all, a drag, a right-click menu. (A screenshot touches nothing and is
+#: always allowed.) On 2026-09-28 the fallback's CUA typed "test" on its own
+#: initiative, and "do NOT type" in its mission was all that stood in its way.
+CUA_CLICK_ONLY = frozenset({"left_click", "mouse_move", "scroll", "wait", "key:Escape"})
+
+
+def _cua_refusal(action, params, allow) -> str:
+    """'' when `allow` (None: anything) lets a CUA take this action, else the
+    action as the refusal names it. A key is allowed by its mapped name
+    ("key:Escape"), so "esc" and "Escape" are one key, and a combo holding any
+    other key is refused."""
+    if allow is None:
+        return ""
+    if action == "key":
+        p = params or {}
+        combo = _cua_key_combo(p.get("key") or p.get("text", ""))
+        return "" if f"key:{combo}" in allow else f"key {combo!r}"
+    return "" if action in allow else str(action)
+
+
+def _vision_refusal(result, allow) -> str:
+    """`_cua_refusal` for a Vision act step, which names its actions its own
+    way: a Vision "click" is a left_click, and a "key" carries its key."""
+    act = getattr(result, "action", "")
+    if act == "click":
+        act = "left_click"
+    return _cua_refusal(act, {"key": getattr(result, "key", None) or ""}, allow)
+
+
 async def execute_action(browser, action, params):
     """Execute a CUA action. Returns screenshot base64."""
     if action == "screenshot":
@@ -39511,8 +39671,13 @@ async def execute_action(browser, action, params):
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
                      phase=None, agent_name=None, target_page=None,
-                     abort_event=None):
+                     abort_event=None, allow=None):
     """CUA agent loop — proven from original research.py.
+
+    allow (optional): the only actions this mission may take (CUA_CLICK_ONLY).
+    Anything else the model asks for is NOT carried out: it is logged as
+    REFUSED and the model is told so. A mission's "do not type" is otherwise
+    only a request.
 
     target_page (optional): Playwright Page reference. When provided, every
     screenshot re-anchors to this tab via bring_to_front. Prevents the
@@ -39768,6 +39933,15 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 ss = await _anchored_screenshot()
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id,
                     "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}}]})
+            elif refused := _cua_refusal(act, tb.input, allow):
+                log(f"[cua] REFUSED {refused} — this task may only click, scroll, wait or "
+                    f"press Escape; nothing was typed, pressed or sent", "WARN")
+                tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
+                    {"type": "text", "text": f"Action '{act}' was NOT carried out: this task "
+                     f"may only click, scroll, wait or press Escape. Do not type or press Enter."},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                 "data": await _anchored_screenshot()}},
+                ]})
             else:
                 ss = await execute_action(browser, act, tb.input)
                 # Re-anchor after action — execute_action may have navigated,
@@ -39815,12 +39989,11 @@ async def verify_chatgpt_generating(page) -> bool:
             containers.forEach(c => c.scrollTop = c.scrollHeight);
         }""")
         await asyncio.sleep(0.3)
-        host_hit = await page.evaluate("""() => {
-            // Check standard composer stop buttons
+        host_hit = await page.evaluate(_cg_js("""() => {
+            // Check standard composer stop buttons (ChatGPT's own Stop, either
+            // page, is the one marker)
             const stop = document.querySelector('button[aria-label="Stop generating"]')
-                || document.querySelector('button[data-testid="stop-button"]')
-                || document.querySelector('button[aria-label="Stop streaming"]')
-                || document.querySelector('button[aria-label="Stop"]');
+                || document.querySelector('__CG_STOP__');
             if (stop) return true;
             // ChatGPT Deep Research: stop button lives INSIDE the research card/dialog
             // (not in the composer). Look for buttons inside research/canvas containers.
@@ -39922,7 +40095,7 @@ async def verify_chatgpt_generating(page) -> bool:
             // See _THINKING_TIME_HEADER_SRC.
             if (__DONE_BADGE_RE__.test(bl)) return false;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
-        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
+        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)))
         if host_hit:
             return True
 
@@ -40031,11 +40204,9 @@ async def _verify_chatgpt_generating_diag(page) -> str:
     Drift only affects diagnostic accuracy — the real verify path is
     unaffected and the safety-net CUA escalation still works."""
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_cg_js("""() => {
             const stop = document.querySelector('button[aria-label="Stop generating"]')
-                || document.querySelector('button[data-testid="stop-button"]')
-                || document.querySelector('button[aria-label="Stop streaming"]')
-                || document.querySelector('button[aria-label="Stop"]');
+                || document.querySelector('__CG_STOP__');
             if (stop) return "stop_composer:" + (stop.getAttribute('aria-label') || stop.getAttribute('data-testid') || '?');
 
             const cards = document.querySelectorAll(
@@ -40086,7 +40257,7 @@ async def _verify_chatgpt_generating_diag(page) -> str:
 
             if (__DONE_BADGE_RE__.test(bl)) return "";
             return document.querySelector('.result-streaming, [data-is-streaming="true"]') ? "data_streaming_attr" : "";
-        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)) or "no_hit"
+        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))) or "no_hit"
     except Exception as e:
         return f"diag_error:{type(e).__name__}"
 
@@ -40217,14 +40388,27 @@ async def verify_claude_generating(page) -> bool:
 
 
 async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=None,
-                              max_retries=20, interval=3, verbose=False, phase=None):
+                              max_retries=20, interval=3, verbose=False, phase=None,
+                              chatgpt_prompt=None):
     """Smart verification: DOM check first, then CUA diagnosis if failing.
 
     Phase 1 (retries 1-5): Quick DOM checks — maybe it just needs a moment.
     Phase 2 (retry 6): CUA diagnoses what's on screen.
     Phase 3 (retry 7): CUA tries to fix the issue (click buttons, dismiss dialogs).
     Phase 4 (retries 8-20): Continue DOM checks after CUA fix.
+
+    `chatgpt_prompt` (ChatGPT only — the prompt this run typed): "generating"
+    then also requires the LAST user message on screen to start with it, on the
+    DOM path and on the CUA-confirm path alike, and the CUA fix — which may
+    click Send — runs only once the box holds the prompt or nothing. On
+    2026-09-28 the fix sent "est" and the Stop button alone verified it. With a
+    prompt in play the diagnosis and the fix are also held to CUA_CLICK_ONLY:
+    only the program types, so neither may type a word or press Enter.
     """
+    _cua_allow = None
+    if chatgpt_prompt:
+        verify_fn = _chatgpt_sent_prompt_verifier(chatgpt_prompt, label, inner=verify_fn)
+        _cua_allow = CUA_CLICK_ONLY
     for i in range(max_retries):
         if await verify_fn(page):
             log(f"[{label}] ✓ Verified — actively generating")
@@ -40258,7 +40442,7 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                 return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
                     "Look at the BOTTOM of the chat. Is there a Stop button visible? "
                     "Is there a loading animation or spinner? Is the AI actively generating?",
-                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose, allow=_cua_allow)
 
             # #839 act tier (read_only): a Vision verdict must land in the
             # returned text with the same plain-English signals the parser
@@ -40322,6 +40506,12 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                                          "not generating", "isn't generating",
                                          "is not generating", "no longer generating")
             )
+            if (has_stop or has_loading or says_generating) and chatgpt_prompt:
+                _last = await _chatgpt_last_user_text(page)
+                if _last is None or not _chatgpt_text_is_prompt_start(_last, chatgpt_prompt):
+                    log(f"[{label}] CUA says generating, but the last message on screen "
+                        f"is not the prompt — not counting it", "WARN")
+                    has_stop = has_loading = says_generating = False
             if has_stop or has_loading or says_generating:
                 log(f"[{label}] ✓ CUA confirms generating "
                     f"(stop={has_stop} loading={has_loading} says={says_generating})")
@@ -40334,13 +40524,19 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
 
         # Phase 3: CUA fix attempt (once, at retry 7)
         if i == 6 and browser and cua_client:
+            # ⛔ The fix may click Send. With a ChatGPT prompt in play it runs
+            # only when Send can send nothing but that prompt.
+            if chatgpt_prompt and not await _chatgpt_guard_box_before_fix(
+                    page, chatgpt_prompt, label):
+                await asyncio.sleep(interval)
+                continue
             log(f"[{label}] CUA attempting to fix the issue...")
             await browser.switch_to_page(page)
 
             async def _fix_cua():
                 return await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
                     "Fix whatever is blocking the research from starting. Click any needed buttons.",
-                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose, allow=_cua_allow)
 
             # #839 act tier: click-only recovery (the mission forbids typing);
             # success is judged by the Phase-4 DOM re-checks either way.
@@ -40352,7 +40548,8 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                              "(Start/confirm/Send). NEVER type or paste text",
                 expected_outcome="the blocking button is clicked and generation starts",
                 cua_coro_factory=_fix_cua,
-                mission_prompt=PROMPT_FIX_ISSUE)
+                mission_prompt=PROMPT_FIX_ISSUE,
+                act_allow=_cua_allow)
             log(f"[{label}] CUA fix attempt: {(fix or {}).get('text', '')[:200]}")
             await asyncio.sleep(5)
             continue
@@ -40383,7 +40580,8 @@ _last_progress: dict = {}  # Deduplication cache for agent_progress events
 # on just-a-few-more-chars-every-second — the observer handles that slice.
 
 _OBSERVER_SELECTORS = {
-    "chatgpt": ['[data-message-author-role="assistant"]:last-of-type',
+    "chatgpt": [", ".join(f"{_m.strip()}:last-of-type"
+                          for _m in CHATGPT_ASSISTANT_MSG_SEL.split(",")),
                 'main [data-message-id]:last-of-type',
                 'article.text-token-text-primary:last-of-type'],
     "gemini":  ['message-content:last-of-type',
@@ -43491,9 +43689,9 @@ async def _spotlight_latest_response(page, agent_name: str):
     # or <p> chunk so the spotlight still flashes if selectors drift.
     sel_map = {
         "ChatGPT": (
-            '[data-message-author-role="assistant"] .markdown, '
-            '[data-message-author-role="assistant"], '
-            '[data-testid^="conversation-turn"] .markdown, '
+            CHATGPT_REPLY_TEXT_SEL + ', '
+            + CHATGPT_ASSISTANT_MSG_SEL + ', '
+            + _cg_within(CHATGPT_TURN_SEL, '.markdown') + ', '
             'main article'
         ),
         "Gemini": (
@@ -50206,9 +50404,361 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
 
 # ── Direct Playwright Submit (zero CUA cost) ─────────────────────────────────
 
-async def submit_chatgpt_direct(browser, prompt):
-    """Submit prompt to ChatGPT using direct Playwright selectors."""
+# ⛔⛔ 2026-09-28 — WHAT THIS SECTION MUST NEVER DO AGAIN: SEND TEXT NOBODY CHECKED.
+# On the morning ChatGPT's markup changed, the four selectors below this line's
+# predecessor knew all missed the new message box, so nothing was typed; the CUA
+# fallback typed "test" to see whether the box was live, pressed ctrl+a — which
+# on macOS moves to the START OF THE LINE rather than selecting — and Delete, and
+# the fix step later clicked Send on the "est" that was left. Every step after
+# that believed a prompt had gone out.
+#
+# So the submit is now three checks, not one guess:
+#   1. the box is found through the ONE composer marker (old page or new), with
+#      any menu the tier step left open closed first, and FOCUSED BY A CLICK — the
+#      owner's capture shows focus lands on the model button or on BODY when the
+#      model menu closes, never back in the box;
+#   2. what was typed is READ BACK and must equal the prompt before Send is
+#      pressed — on a mismatch the box is cleared (the platform's own select-all)
+#      and the prompt typed once more, and a second mismatch sends NOTHING;
+#   3. "sent" means the LAST user message on screen starts with the prompt — not
+#      that some user message exists, which "est" satisfied.
+
+#: How long the box may take to mount before the submit gives up. One wait for
+#: the whole marker set, not five seconds per dead selector (the old loop spent
+#: 20 s proving four selectors wrong before it said so).
+_CHATGPT_COMPOSER_WAIT_S = 8.0
+#: How much of the prompt's start a sent message must repeat. The whole prompt is
+#: compared in the box; a SENT message is compared on its start because the page
+#: may clamp a long message, and "est" fails at any length.
+_CHATGPT_SENT_MATCH_CHARS = 120
+_PROMPT_NORM_DROP = re.compile("[" + "".join(map(chr, (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF))) + "]")
+_MAC_EDIT_LETTERS = frozenset("acvxz")
+#: Typography a rich-text box may substitute as you type: curly quotes, en/em
+#: dashes, the ellipsis. Folded to ASCII on BOTH sides of a comparison.
+_PROMPT_TYPO_ASCII = str.maketrans({0x2018: "'", 0x2019: "'", 0x201C: '"', 0x201D: '"',
+                                    0x2013: "-", 0x2014: "-", 0x2026: "..."})
+#: A markdown marker at the start of a line — "- ", "1. ", "# ", "> ". A box with
+#: markdown shortcuts turns such a line into a list item / heading / quote, whose
+#: text no longer carries the marker. Dropped on BOTH sides.
+_PROMPT_MD_LINE_MARK = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)]|#{1,6}|>)[ \t]+", re.M)
+
+
+def _norm_prompt_text(s) -> str:
+    """Normalised text for comparing a prompt with what a page shows.
+    An empty ProseMirror box reads "\\n"; a pasted newline may come back as a
+    space; a rich-text box may curl a quote or turn "- item" into a bullet.
+    None of those is a different prompt — while a dropped or extra character
+    ("est" for "test") still is."""
+    t = _PROMPT_NORM_DROP.sub("", str(s or "")).translate(_PROMPT_TYPO_ASCII)
+    return " ".join(_PROMPT_MD_LINE_MARK.sub("", t).split())
+
+
+def _chatgpt_text_is_prompt_start(text, prompt, *, span=None) -> bool:
+    """True when `text` begins with the prompt's first `span` characters
+    (normalised). An empty prompt matches nothing."""
+    want = _norm_prompt_text(prompt)
+    if not want:
+        return False
+    have = _norm_prompt_text(text)
+    n = min(len(want), _CHATGPT_SENT_MATCH_CHARS if span is None else int(span))
+    return len(have) >= n and have[:n] == want[:n]
+
+
+def _platform_select_all() -> str:
+    """The key that SELECTS ALL in an editable on this machine. On macOS Blink
+    maps Control+A to MoveToBeginningOfLine — the keystroke that turned "test"
+    into "est" — so it is Meta there and Control everywhere else."""
+    return "Meta+a" if sys.platform == "darwin" else "Control+a"
+
+
+def _cua_key_combo(combo: str, platform=None) -> str:
+    """A CUA key action (xdotool-style, "ctrl+a") as a Playwright key string.
+
+    ⛔ On macOS the edit shortcuts are Command, not Control: Control+A there is
+    "go to line start", Control+C/V/X/Z do nothing to the selection. The model
+    names them the Linux way whatever machine it drives, so ctrl+a/c/v/x/z are
+    mapped to Meta on macOS. Everything else passes through unchanged."""
+    plat = sys.platform if platform is None else platform
+    mapping = {
+        "ctrl": "Control", "control": "Control", "alt": "Alt", "shift": "Shift",
+        "meta": "Meta", "super": "Meta", "cmd": "Meta",
+        "return": "Enter", "enter": "Enter",
+        "backspace": "Backspace", "delete": "Delete",
+        "tab": "Tab", "escape": "Escape", "esc": "Escape",
+        "space": " ", "up": "ArrowUp", "down": "ArrowDown",
+        "left": "ArrowLeft", "right": "ArrowRight",
+        "pageup": "PageUp", "pagedown": "PageDown",
+        "home": "Home", "end": "End",
+    }
+    parts = [p.strip() for p in str(combo or "").split("+")]
+    keys = [mapping.get(p.lower(), p) for p in parts]
+    if (plat == "darwin" and len(keys) >= 2 and "Control" in keys[:-1]
+            and keys[-1].lower() in _MAC_EDIT_LETTERS):
+        keys = ["Meta" if k == "Control" else k for k in keys[:-1]] + [keys[-1]]
+    return "+".join(keys)
+
+
+#: Open menus: a visible [role=menu], or a menu trigger that says it is expanded.
+_CHATGPT_OPEN_MENUS_JS = r"""() => {
+    const vis = el => el.getClientRects().length > 0;
+    let n = 0;
+    for (const m of document.querySelectorAll('[role="menu"]')) if (vis(m)) n++;
+    for (const b of document.querySelectorAll('[aria-haspopup="menu"][aria-expanded="true"]')) {
+        if (vis(b)) n++;
+    }
+    return n;
+}"""
+
+#: What the box holds: innerText for the contenteditable (ProseMirror) box, the
+#: value for a textarea.
+_CHATGPT_BOX_TEXT_JS = r"""(el) => {
+    if (!el) return null;
+    const ce = el.isContentEditable || el.getAttribute('contenteditable') === 'true';
+    if (ce) return el.innerText || '';
+    return (typeof el.value === 'string') ? el.value : (el.textContent || '');
+}"""
+
+#: The newest user message's OWN text, or null when the thread holds none.
+#: ⛔ Not the whole message. A file the user attached (Phase 1 with sources) is
+#: drawn INSIDE the message, above its text, so the whole message reads
+#: "St_Bernard_notes.pdf PDF Please create…" and a check that it STARTS with the
+#: prompt refused a real send. On both pages the text is the message's LAST
+#: `.whitespace-pre-wrap` block (a file card sits above it); a message with no
+#: such block is read whole.
+_CHATGPT_LAST_USER_TEXT_JS = _cg_js(r"""() => {
+    const all = document.querySelectorAll('__CG_USER__');
+    if (!all.length) return null;
+    const last = all[all.length - 1];
+    const own = last.querySelectorAll('.whitespace-pre-wrap');
+    const el = own.length ? own[own.length - 1] : last;
+    return el.innerText || el.textContent || '';
+}""")
+
+#: The focused element, when it is something a person could type into.
+_CHATGPT_FOCUSED_EDITABLE_JS = r"""() => {
+    const a = document.activeElement;
+    if (!a || a === document.body) return null;
+    const ok = a.isContentEditable || a.tagName === 'TEXTAREA'
+        || (a.tagName === 'INPUT' && (a.type || 'text') === 'text');
+    return ok ? a : null;
+}"""
+
+#: One line that says why a submit could not use the box.
+_CHATGPT_COMPOSER_DIAG_JS = _cg_js(r"""() => {
+    const vis = el => !!el && el.getClientRects().length > 0;
+    const d = (el) => el ? {
+        tag: el.tagName || '', id: el.id || '', role: el.getAttribute('role') || '',
+        aria: (el.getAttribute('aria-label') || '').slice(0, 40),
+        ce: el.getAttribute('contenteditable') || '',
+        cls: String(el.className || '').split(/\s+/)[0].slice(0, 24),
+        vis: vis(el) } : null;
+    const box = document.querySelector('__CG_COMPOSER__');
+    const menus = [...document.querySelectorAll('[role="menu"]')].filter(vis).length;
+    const expanded = [...document.querySelectorAll('[aria-expanded="true"]')].filter(vis)
+        .map(b => (b.getAttribute('aria-label') || b.textContent || '').trim().slice(0, 30))
+        .slice(0, 3);
+    const editables = [...document.querySelectorAll('[contenteditable="true"], textarea')]
+        .filter(vis).length;
+    return { box: d(box), active: d(document.activeElement), menus, expanded, editables };
+}""")
+
+
+def _composer_diag_line(d) -> str:
+    """The diagnostic dict as one readable line (pure — the unit tests read it)."""
+    def _desc(x):
+        if not x:
+            return "none"
+        bits = []
+        for k in ("role", "aria", "ce", "id", "cls"):
+            v = x.get(k)
+            if v:
+                bits.append(f"{k}={v!r}" if k == "aria" else f"{k}={v}")
+        bits.append("visible" if x.get("vis") else "hidden")
+        return f"{x.get('tag') or '?'}[{' '.join(bits)}]"
+    d = d or {}
+    return (f"box={_desc(d.get('box'))} focus={_desc(d.get('active'))} "
+            f"open menus={d.get('menus', '?')} expanded={d.get('expanded') or []} "
+            f"editables={d.get('editables', '?')}")
+
+
+async def _log_chatgpt_composer_diag(page, why, *, tag="[p1:composer]"):
+    try:
+        d = await page.evaluate(_CHATGPT_COMPOSER_DIAG_JS)
+    except Exception as e:
+        log(f"{tag} {why} — the composer diagnostic itself failed: {e}", "WARN")
+        return
+    log(f"{tag} {why} — {_composer_diag_line(d)}", "WARN")
+
+
+async def _chatgpt_close_open_menus(page, *, tag="[p1:composer]", tries=3) -> bool:
+    """Close whatever menu is open — Escape, at most `tries` times, and only
+    while the page says one IS open (a blind Escape is a keystroke aimed at
+    whatever has focus). True when nothing is open at the end."""
+    for i in range(tries + 1):
+        try:
+            n = int(await page.evaluate(_CHATGPT_OPEN_MENUS_JS) or 0)
+        except Exception:
+            return False
+        if n == 0:
+            return True
+        if i == tries:
+            break
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            return False
+        await asyncio.sleep(0.25)
+    log(f"{tag} a menu is STILL open after {tries} Escapes — the box may not take "
+        f"the click", "WARN")
+    return False
+
+
+async def _chatgpt_find_composer(page, timeout_s=None):
+    """The visible message box, looked for through the WHOLE marker set at once
+    until `timeout_s` (default `_CHATGPT_COMPOSER_WAIT_S`) runs out. None when
+    there is none."""
+    if timeout_s is None:
+        timeout_s = _CHATGPT_COMPOSER_WAIT_S
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        try:
+            for h in await page.query_selector_all(CHATGPT_COMPOSER_SEL):
+                try:
+                    if await h.is_visible():
+                        return h
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.25)
+
+
+async def _chatgpt_focused_editable(page):
+    """The element that has focus, when a person could type into it — the box a
+    CUA click put the caret in when no marker names it."""
+    try:
+        h = await page.evaluate_handle(_CHATGPT_FOCUSED_EDITABLE_JS)
+        return h.as_element() if h is not None else None
+    except Exception:
+        return None
+
+
+async def _chatgpt_box_text(box) -> str:
+    try:
+        v = await box.evaluate(_CHATGPT_BOX_TEXT_JS)
+    except Exception:
+        v = None
+    return "" if v is None else str(v)
+
+
+async def _chatgpt_last_user_text(page):
+    """The newest user message's text, or None when the thread holds none."""
+    try:
+        return await page.evaluate(_CHATGPT_LAST_USER_TEXT_JS)
+    except Exception:
+        return None
+
+
+async def _chatgpt_clear_box(page, box) -> bool:
+    """Empty the box with the platform's own select-all + Delete. True only when
+    the box reads empty afterwards."""
+    try:
+        await box.click()
+        await page.keyboard.press(_platform_select_all())
+        await page.keyboard.press("Delete")
+    except Exception:
+        return False
+    await asyncio.sleep(0.2)
+    return _norm_prompt_text(await _chatgpt_box_text(box)) == ""
+
+
+async def _chatgpt_insert_text(page, box, text):
+    # insertText — instant, avoids ChatGPT's clipboard-to-file behaviour.
+    try:
+        await page.keyboard.insert_text(text)
+        return
+    except Exception:
+        pass
+    try:
+        await box.fill(text)
+        return
+    except Exception:
+        pass
+    await page.keyboard.type(text, delay=5)
+
+
+async def _chatgpt_type_prompt_verified(page, box, prompt, *, tag="[p1:submit]") -> bool:
+    """Click the box, type the prompt, READ IT BACK. True only when the box holds
+    exactly the prompt (whitespace-normalised). A mismatch clears the box and
+    types once more; a second mismatch clears it and returns False — the caller
+    then sends nothing."""
+    want = _norm_prompt_text(prompt)
+    if not want:
+        log(f"{tag} empty prompt — nothing to type", "WARN")
+        return False
+    for attempt in (1, 2):
+        try:
+            await box.click()
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+        if _norm_prompt_text(await _chatgpt_box_text(box)):
+            # Something is already in the box — a leftover from an earlier try,
+            # or text a fallback typed. It is not ours to send.
+            if not await _chatgpt_clear_box(page, box):
+                await _log_chatgpt_composer_diag(page, "the box holds text that would not clear",
+                                                 tag=tag)
+                log(f"{tag} ✗ the message box holds text that would not clear — NOT "
+                    f"typing, NOT sending", "ERROR")
+                return False
+        await _chatgpt_insert_text(page, box, prompt)
+        await asyncio.sleep(0.4)
+        have = _norm_prompt_text(await _chatgpt_box_text(box))
+        if have == want:
+            if attempt > 1:
+                log(f"{tag} the prompt read back exactly on the second try ✓")
+            return True
+        log(f"{tag} read-back mismatch (try {attempt}/2): the box holds {len(have)} "
+            f"char(s) starting {have[:60]!r}; the prompt is {len(want)} — clearing it",
+            "WARN")
+        await _chatgpt_clear_box(page, box)
+    await _log_chatgpt_composer_diag(page, "the box would not hold the prompt", tag=tag)
+    log(f"{tag} ✗ the message box did not hold the prompt after two tries — NOT "
+        f"sending anything", "ERROR")
+    return False
+
+
+async def _chatgpt_wait_prompt_sent(page, prompt, timeout_s=10.0) -> bool:
+    """Wait until the LAST user message on screen starts with the prompt."""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        last = await _chatgpt_last_user_text(page)
+        if last is not None and _chatgpt_text_is_prompt_start(last, prompt):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.5)
+
+
+async def submit_chatgpt_direct(browser, prompt, *, use_focused=False, outcome=None):
+    """Type the prompt into ChatGPT's message box, check it, send it, and check
+    it was sent (see the section note above).
+
+    Returns True only when the last user message on screen starts with the
+    prompt. `outcome["state"]` says more for the caller's fallback:
+      * ``not_sent``         — nothing was sent (no box, or it would not hold the
+                               prompt); a fallback may try again;
+      * ``sent_unconfirmed`` — Send WAS pressed but the message was not seen; a
+                               fallback must NOT type the prompt a second time;
+      * ``sent``             — confirmed.
+    `use_focused=True` also accepts the element that has focus when no marker
+    names a box — the CUA fallback's job is to put the caret there."""
     page = browser.page
+    out = outcome if outcome is not None else {}
+    out["state"] = "not_sent"
+    tag = "[p1:submit]"
     try:
         await asyncio.sleep(2)
         # Dismiss overlays
@@ -50219,57 +50769,95 @@ async def submit_chatgpt_direct(browser, prompt):
                 if btn and await btn.is_visible(): await btn.click(); await asyncio.sleep(0.5)
             except Exception: pass
 
-        # Find input
-        textarea = None
-        for sel in ['#prompt-textarea', 'div[contenteditable="true"]#prompt-textarea',
-                    'textarea[placeholder*="Message"]', 'div[contenteditable="true"][data-placeholder]']:
-            try:
-                textarea = await page.wait_for_selector(sel, timeout=5000)
-                if textarea: break
-            except Exception: continue
+        # A menu left open by the tier step sits over the box; close it first.
+        await _chatgpt_close_open_menus(page, tag=tag)
 
-        if not textarea:
-            log("Direct submit: no textarea found", "WARN")
+        box = await _chatgpt_find_composer(page)
+        if box is None and use_focused:
+            box = await _chatgpt_focused_editable(page)
+        if box is None:
+            await _log_chatgpt_composer_diag(page, "no message box found", tag=tag)
+            log("Direct submit: no message box found — nothing typed, nothing sent", "WARN")
             return False
 
-        await textarea.click()
-        await asyncio.sleep(0.3)
+        if not await _chatgpt_type_prompt_verified(page, box, prompt, tag=tag):
+            return False
 
-        # insertText — instant, avoids ChatGPT's clipboard-to-file behavior
-        try:
-            await page.keyboard.insert_text(prompt)
-        except Exception:
-            try:
-                await textarea.fill(prompt)
-            except Exception:
-                await page.keyboard.type(prompt, delay=5)
-
-        await asyncio.sleep(0.5)
-
-        # Send
+        # Send — ChatGPT's Send (either page) appears once the box holds text.
         send_btn = None
-        for sel in ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]', 'button[aria-label="Send"]']:
+        _send_deadline = time.monotonic() + 3.0
+        while send_btn is None:
             try:
-                send_btn = await page.query_selector(sel)
-                if send_btn and await send_btn.is_enabled(): break
-                send_btn = None
-            except Exception: continue
-        if send_btn:
+                for h in await page.query_selector_all(CHATGPT_SEND_SEL):
+                    if await h.is_visible() and await h.is_enabled():
+                        send_btn = h
+                        break
+            except Exception:
+                pass
+            if send_btn is not None or time.monotonic() >= _send_deadline:
+                break
+            await asyncio.sleep(0.25)
+        out["state"] = "sent_unconfirmed"
+        if send_btn is not None:
             await send_btn.click()
         else:
             await page.keyboard.press("Enter")
 
-        await asyncio.sleep(2)
-        sent = await page.evaluate("""() => {
-            const msgs = document.querySelectorAll('[data-message-author-role="user"]');
-            return msgs.length > 0;
-        }""")
-        if sent: log("Direct submit: message sent ✓")
-        return sent
+        if await _chatgpt_wait_prompt_sent(page, prompt):
+            out["state"] = "sent"
+            log("Direct submit: message sent ✓ (the last message on screen is the prompt)")
+            return True
+        last = await _chatgpt_last_user_text(page)
+        seen = "no user message" if last is None else repr(_norm_prompt_text(last)[:60])
+        log(f"Direct submit: Send was pressed but the last message on screen is {seen}, "
+            f"not the prompt — not counting it as sent", "WARN")
+        return False
 
     except Exception as e:
         log(f"Direct submit failed: {e}", "WARN")
         return False
+
+
+def _chatgpt_sent_prompt_verifier(prompt, label, inner=None):
+    """A `wait_until_verified` verify function that says "generating" only when
+    the LAST user message on screen starts with `prompt` AND the page is
+    generating. The Stop button alone accepted "est" on 2026-09-28."""
+    inner = inner or verify_chatgpt_generating
+    said = set()
+
+    async def _verify(page) -> bool:
+        last = await _chatgpt_last_user_text(page)
+        if last is None or not _chatgpt_text_is_prompt_start(last, prompt):
+            seen = "no user message" if last is None else repr(_norm_prompt_text(last)[:60])
+            if seen not in said:
+                said.add(seen)
+                log(f"[{label}] the last message on screen is {seen}, not the prompt — "
+                    f"not counting this as generating", "WARN")
+            return False
+        return await inner(page)
+    return _verify
+
+
+async def _chatgpt_guard_box_before_fix(page, prompt, label) -> bool:
+    """Before a CUA "fix" that may click Send: make sure Send can only ever send
+    the prompt. The box must be readable, and hold the prompt or nothing — any
+    other text is cleared first. False means the fix must not run."""
+    box = await _chatgpt_find_composer(page, timeout_s=2.0)
+    if box is None:
+        await _log_chatgpt_composer_diag(page, "the box cannot be read before the CUA fix",
+                                         tag=f"[{label}]")
+        log(f"[{label}] skipping the CUA fix — it could click Send on text nobody checked",
+            "WARN")
+        return False
+    have = _norm_prompt_text(await _chatgpt_box_text(box))
+    if not have or have == _norm_prompt_text(prompt):
+        return True
+    log(f"[{label}] the message box holds {have[:60]!r}, not the prompt — clearing it "
+        f"before the CUA fix so only the prompt can ever be sent", "WARN")
+    if await _chatgpt_clear_box(page, box):
+        return True
+    log(f"[{label}] the message box would not clear — skipping the CUA fix", "WARN")
+    return False
 
 
 # ── PDF Attachment (Playwright) ──────────────────────────────────────────────
@@ -53073,7 +53661,11 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         '[data-testid*="canvas"] [class*="prose"]',
         '[data-testid*="canvas"] [class*="markdown"]',
         'aside[role="dialog"] [class*="prose"]',
-        '[data-message-author-role="assistant"]:last-of-type .markdown',
+        # The reply's text on either page: the old `.markdown` inside the reply,
+        # the new page's markdown root (`MarkdownRoot-…` — which `.markdown`
+        # below cannot match: a class selector is exact and case-sensitive).
+        # The LAST match is taken, i.e. the newest reply in document order.
+        CHATGPT_REPLY_TEXT_SEL,
         '[data-message-author-role="assistant"]:last-of-type [class*="prose"]',
         # Iframe-side: DR document body markup. These selectors don't
         # exist on chatgpt.com proper (the parent) so they only match
@@ -54203,6 +54795,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     if _p1_tier_ok:
         log(f"[Phase1] Tier confirmed by the DOM rung ({_p1_tier}) — skipping the "
             f"post-select confirm (it re-reads the same trigger)", "INFO")
+    # ⭐ 2026-09-28 — the tier step opens the model menu; leave NOTHING open over
+    # the box. When that menu closes, focus lands on the model button or on BODY
+    # (the owner's capture), so the submit below focuses the box by clicking it.
+    try:
+        await _chatgpt_close_open_menus(browser.page, tag="[Phase1]")
+    except Exception:
+        pass
     if cua_client and _pro_select_claimed:
         try:
             _epc = await _chatgpt_extended_pro_confirm(browser.page)
@@ -54306,32 +54905,46 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     emit_event("agent_progress", phase=1, agent="chatgpt",
                status="submitting",
                progress="Submitting the research-brief prompt…")
-    submitted = await submit_chatgpt_direct(browser, prompt)
-    if not submitted and cua_client:
-        log("Falling back to CUA for submit...")
+    _p1_submit = {}
+    submitted = await submit_chatgpt_direct(browser, prompt, outcome=_p1_submit)
+    # ⛔ The CUA fallback only PUTS THE CARET IN THE BOX. It never types and
+    # never sends: the program types the prompt, reads it back and sends it —
+    # the same checked path as above. A fallback that typed for itself sent
+    # "est" on 2026-09-28. And never after Send was already pressed: that
+    # would put the prompt in the thread twice. CUA_CLICK_ONLY makes "never
+    # types" mechanical — the mission's wording alone is only a request.
+    if not submitted and cua_client and _p1_submit.get("state") == "not_sent":
+        log("Falling back to CUA to put the caret in the message box "
+            "(it types nothing and sends nothing)...")
 
         async def _submit_cua():
             return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
-                f"Submit this prompt to ChatGPT:\n\n{prompt}",
-                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+                "Click inside ChatGPT's message box so the text cursor is in it. "
+                "Do NOT type, paste, press Enter or click Send.",
+                model=CUA_MODEL, max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY)
 
-        # #839 act tier: side-effect-only (result ignored); success is judged
-        # by the wait_until_verified(verify_chatgpt_generating) gate right below.
+        # #839 act tier: side-effect-only (result ignored); what counts is the
+        # checked submit right after it and the verify gate below.
         await _shadow_observed_cua(
             browser.page, hotspot_id="1a-submit", phase=1, platform="chatgpt",
-            current_step="submit_brief_prompt",
-            context_hint="the brief prompt is in the composer — click Send to submit it "
-                         "(the DOM submit already failed once)",
-            expected_outcome="the research-brief prompt is submitted and ChatGPT starts generating",
+            current_step="focus_message_box",
+            context_hint="click inside ChatGPT's message box so the caret is in it — do NOT "
+                         "type, paste, press Enter or click Send (the program types the "
+                         "prompt, reads it back and sends it itself)",
+            expected_outcome="the text cursor is in ChatGPT's message box",
             cua_coro_factory=_submit_cua,
-            mission_prompt=PROMPT_SUBMIT_FALLBACK)
+            mission_prompt=PROMPT_SUBMIT_FALLBACK,
+            act_allow=CUA_CLICK_ONLY)
+        submitted = await submit_chatgpt_direct(browser, prompt, use_focused=True,
+                                                outcome=_p1_submit)
 
-    # VERIFY: confirm ChatGPT is generating
+    # VERIFY: confirm ChatGPT is generating — ON OUR PROMPT (see chatgpt_prompt)
     emit_event("agent_progress", phase=1, agent="chatgpt",
                status="verifying_generation",
                progress="Waiting for ChatGPT Pro + Thinking to start generating…")
     verified = await wait_until_verified(verify_chatgpt_generating, browser.page, "Phase1",
-        browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+        browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose,
+        chatgpt_prompt=prompt)
     if not verified:
         log("Phase 1: Could not verify ChatGPT is generating", "ERROR")
         # No alert: orchestrator's outer retry loop handles re-attempts; if
@@ -54434,26 +55047,35 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             f"the following additional context from the user:\n\n{extra_ctx}\n\n"
             f"Output the complete updated research brief. No preamble."
         )
-        submitted_fu = await submit_chatgpt_direct(browser, followup)
-        if not submitted_fu and cua_client:
+        _fu_submit = {}
+        submitted_fu = await submit_chatgpt_direct(browser, followup, outcome=_fu_submit)
+        # Same rule as the brief's submit: the CUA only places the caret.
+        if not submitted_fu and cua_client and _fu_submit.get("state") == "not_sent":
             async def _submit_fu_cua():
                 return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
-                    f"Submit this follow-up prompt to ChatGPT:\n\n{followup[:500]}",
-                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                    "Click inside ChatGPT's message box so the text cursor is in it. "
+                    "Do NOT type, paste, press Enter or click Send.",
+                    model=CUA_MODEL, max_iterations=8, verbose=verbose,
+                    allow=CUA_CLICK_ONLY)
 
-            # #839 act tier: side-effect-only; the follow-up verify gate below
-            # is the ground truth.
+            # #839 act tier: side-effect-only; the checked submit right after it
+            # and the follow-up verify gate below are the ground truth.
             await _shadow_observed_cua(
                 browser.page, hotspot_id="1a-submit", phase=1, platform="chatgpt",
-                current_step="submit_followup_prompt",
-                context_hint="a follow-up prompt is in the composer — click Send to submit it",
-                expected_outcome="the follow-up prompt is submitted and ChatGPT regenerates",
+                current_step="focus_message_box_followup",
+                context_hint="click inside ChatGPT's message box so the caret is in it — do "
+                             "NOT type, paste, press Enter or click Send",
+                expected_outcome="the text cursor is in ChatGPT's message box",
                 cua_coro_factory=_submit_fu_cua,
-                mission_prompt=PROMPT_SUBMIT_FALLBACK)
+                mission_prompt=PROMPT_SUBMIT_FALLBACK,
+                act_allow=CUA_CLICK_ONLY)
+            submitted_fu = await submit_chatgpt_direct(browser, followup, use_focused=True,
+                                                       outcome=_fu_submit)
         # Wait for the updated response
         await asyncio.sleep(5)
         verified_fu = await wait_until_verified(verify_chatgpt_generating, browser.page, "Phase1-followup",
-            browser=browser, cua_client=cua_client, max_retries=10, interval=3, verbose=verbose)
+            browser=browser, cua_client=cua_client, max_retries=10, interval=3, verbose=verbose,
+            chatgpt_prompt=followup)
         if verified_fu:
             log("Phase 1: Waiting for updated brief...")
             try:
@@ -59555,10 +60177,10 @@ async def read_chatgpt_first_user_message(page, cap: int = 4000) -> str:
     Never raises: an unreadable page returns "" too.
     """
     try:
-        return (await page.evaluate(
+        return (await page.evaluate(_cg_js(
             "(cap) => { const n = document.querySelector("
-            "'[data-message-author-role=\"user\"]');"
-            " return (n && n.innerText || '').slice(0, cap); }", cap)) or ""
+            "'__CG_USER__');"
+            " return (n && n.innerText || '').slice(0, cap); }"), cap)) or ""
     except Exception:
         return ""
 
@@ -59823,13 +60445,13 @@ async def attach_brief_file(browser, page, brief_path, platform, label, extra_fi
         ranked = []
         for i, h in enumerate(handles):
             try:
-                in_composer = await h.evaluate(
+                in_composer = await h.evaluate(_cg_js(
                     """el => {
                         const form = el.closest('form');
                         return !!(form && form.querySelector(
-                            '#prompt-textarea, .ProseMirror, textarea, '
+                            '__CG_COMPOSER__, .ProseMirror, textarea, '
                             + 'div[contenteditable="true"]'));
-                    }""")
+                    }"""))
             except Exception:
                 in_composer = False
             ranked.append((0 if in_composer else 1, i, h))
@@ -60480,25 +61102,30 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
         if any(m in url for m in markers):
             return True, "redirect_to_login_url"
 
-        # DOM markers: visible password field + no active chat UI
-        result = await page.evaluate("""() => {
+        # DOM markers: visible password field + no active chat UI.
+        # ⛔ ChatGPT's own markers join ONLY on ChatGPT: its composer list names
+        # a generic `div[contenteditable][data-placeholder]` (Gemini's editor)
+        # and `button[aria-label="Send"]`, so on Claude or Gemini they would
+        # hide a real sign-in dialog behind a composer that is still drawn.
+        composer_sel = ('[data-testid="send-button"], button[aria-label*="Send prompt"], '
+                        'div[contenteditable="true"]#prompt-textarea, '
+                        'textarea[placeholder*="Message"], [data-test-id="send-button"]')
+        if platform.lower() == "chatgpt":
+            composer_sel = f"{CHATGPT_SEND_SEL}, {CHATGPT_COMPOSER_SEL}, {composer_sel}"
+        result = await page.evaluate("""(composerSel) => {
             const pwInput = document.querySelector('input[type="password"]:not([style*="display: none"])');
             if (!pwInput) return { expired: false };
             // Heuristic: if there's a visible password input AND no chat composer/send button,
             // we're on a login page. Use offsetParent check to filter hidden elements.
             if (pwInput.offsetParent === null) return { expired: false };
-            const hasComposer = document.querySelector(
-                '[data-testid="send-button"], button[aria-label*="Send prompt"], ' +
-                'div[contenteditable="true"]#prompt-textarea, ' +
-                'textarea[placeholder*="Message"], [data-test-id="send-button"]'
-            );
+            const hasComposer = document.querySelector(composerSel);
             if (hasComposer) return { expired: false };
             const text = (document.body.innerText || '').toLowerCase();
             const loginPhrases = ['sign in to', 'log in to', 'please sign in',
                 'welcome back', 'enter your password', 'email address'];
             const hasLoginText = loginPhrases.some(p => text.includes(p));
             return { expired: hasLoginText };
-        }""")
+        }""", composer_sel)
         if isinstance(result, dict) and result.get("expired"):
             return True, "login_form_appeared"
         return False, ""
@@ -61516,6 +62143,17 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
 # send path, before the plan screen exists.
 
 
+#: "Is there a composer, and how many messages does the thread already hold?"
+#: ⛔ 2026-09-28: the count is the ONE marker for any message on either page. It
+#: counted `[data-message-author-role]` alone, and on the new page that is zero on
+#: every thread — a forty-turn conversation would read as a fresh chat.
+_CHATGPT_NEW_CHAT_STATE_JS = _cg_js(
+    "() => ({ composer: !!document.querySelector("
+    "'__CG_COMPOSER__, form [contenteditable=\"true\"], "
+    "[data-testid*=\"composer\"] textarea, form textarea'),"
+    " msgs: document.querySelectorAll('__CG_ANY_MSG__').length })")
+
+
 async def _chatgpt_force_new_chat(page, label) -> bool:
     """Client-side "New chat" on an already-open chatgpt.com tab (2A warm-tab
     reuse, 2026-07-06 bot-score work). Returns True when the tab lands on a
@@ -61544,11 +62182,7 @@ async def _chatgpt_force_new_chat(page, label) -> bool:
         did-it-land probe).
         """
         try:
-            st = await page.evaluate(
-                "() => ({ composer: !!document.querySelector("
-                "'#prompt-textarea, form [contenteditable=\"true\"], "
-                "[data-testid*=\"composer\"] textarea, form textarea'),"
-                " msgs: document.querySelectorAll('[data-message-author-role]').length })")
+            st = await page.evaluate(_CHATGPT_NEW_CHAT_STATE_JS)
         except Exception:
             return False
         st = st or {}
@@ -63070,8 +63704,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                          _pre_send_url, recover=True, why="send"):
         return page, False
 
-    _send_sels = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
-                  'button[aria-label="Send"]', 'button[aria-label="Send message"]',
+    _send_sels = [CHATGPT_SEND_SEL, 'button[aria-label="Send message"]',
                   'button[aria-label="Send Message"]', 'button[aria-label="Submit"]']
     sent = False
     await asyncio.sleep(1)

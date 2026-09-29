@@ -71,6 +71,9 @@ def test_2_send_selectors_unchanged_set():
     # The poll iterates the SAME proven selector set (we only changed WHEN, not
     # WHICH, we click) — guard against an accidental selector drop.
     src = inspect.getsource(research.start_agent_no_gemini_wait)
+    # ⭐ 2026-09-28: ChatGPT's three Send strings are now the ONE Send marker
+    # (old page and new), and the poll set leads with it.
+    assert "_send_sels = [CHATGPT_SEND_SEL," in src, "the poll set lost ChatGPT's Send"
     for sel in ('data-testid="send-button"', 'aria-label="Send prompt"',
                 'aria-label="Send"'):
-        assert sel in src, f"send selector {sel!r} dropped from the poll set"
+        assert sel in research.CHATGPT_SEND_SEL, f"send selector {sel!r} dropped from the poll set"

@@ -1,0 +1,244 @@
+<!doctype html>
+<!--
+  ChatGPT's NEW page (2026-09-28), rebuilt from the owner's captures in this folder:
+    * chatgpt-reply-capture2.json     — the sent user block and ChatGPT's reply
+      block, tag / attribute / class / nesting, and the chain of ancestors above
+      them (class values are cut at ~100 characters by the capture tool and are
+      reproduced exactly as captured, cut included);
+    * chatgpt-composer-capture-trimmed.json — the message box, the model button,
+      the model menu with its "Select model" and "Power" rows and the slider thumb,
+      and where focus goes when the menu closes (the model button — never the box);
+    * chatgpt-thread-capture.json     — the composer's action button: "Start Voice"
+      while the box is empty, "Send" (type=submit) once it holds text, "Stop"
+      while a reply is generating.
+  NOT in any capture, and therefore kept generic on purpose: the heading and the
+  link inside the reply (plain <h2>/<a>), the placeholder paragraph inside the box
+  (the live probe read 'ask chatgpt' from a descendant [data-placeholder]), and
+  where the form sits relative to the transcript.
+
+  The script below only animates what the captures recorded: typing swaps
+  Start Voice for Send, sending appends the user block, shows Stop, then appends
+  the reply; the model button opens and Escape closes the menu, leaving focus on
+  the button. body[data-sr-fixture="thread"] loads a finished exchange with Stop
+  still showing (a reply "generating"). TEST HOOKS, not page behaviour:
+  body[data-mangle="N"] — the next N inserts lose their first character, so the
+  read-back check can be exercised; body[data-richtext] — the box curls
+  apostrophes and turns "- " lines into bullets; body[data-sendmangle] — Send posts the text
+  minus its first character; body[data-menu-closed-by] / [data-sent-via] record
+  how the menu closed (escape / outside) and how the message went (button /
+  enter). body[data-attach] — every user message carries a file card ABOVE its
+  text, inside the bubble's own flex column (NOT captured: no capture holds an
+  attachment, so the card goes where it would hurt most; its name line also
+  carries whitespace-pre-wrap); body[data-streaming] — after a send Stop stays
+  up (the reply is still being written).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ChatGPT</title>
+<style>
+  body { margin: 0; font: 16px/1.5 sans-serif; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+             overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  main { display: block; width: 1000px; margin: 0 auto; }
+  form { margin-top: 24px; padding: 8px; border: 1px solid #ccc; }
+  .ProseMirror { min-height: 26px; outline: none; }
+  button { min-width: 24px; min-height: 24px; }
+  #sr-menu-layer { position: fixed; left: 390px; top: 366px; }
+</style>
+</head>
+<body data-sr-fixture="chat" data-sr-prompt="">
+<main>
+<div class="WorkspaceContent-dnr6uY relative isolate flex min-h-0 flex-1 overflow-hidden">
+<div class="MainContentViewport-OinMfT" data-app-shell-main-content-layout="thread-edge-scroll" data-app-shell-header-edge-scroll="false" data-app-shell-right-panel-full-width="false">
+<div class="MainContentFrame-sss8BP" data-app-shell-thread-edge-divider="false">
+<div class="relative flex min-h-0 flex-1 [--thread-content-responsive-max-width:var(--thread-content-e" data-app-shell-main-content-top-fade="visible">
+<div class="h-full min-h-0 min-w-0 flex-1" data-app-shell-focus-area="main">
+<div class="relative h-full min-h-0">
+<div class="relative h-full min-h-0">
+<div class="relative flex h-full flex-col">
+<div class="flex min-h-0 flex-1 flex-col">
+<div class="relative mx-auto flex min-h-0 w-full flex-1 flex-col">
+<div class="min-h-0 flex-1">
+<div class="flex h-full min-h-0 flex-col">
+<div class="contents">
+<div data-request-input-activity-root="true" class="group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat">
+<div data-app-action-timeline-scroll="" class="thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain group-has-[" role="presentation">
+<div class="[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl">
+<div data-mcp-app-portal-target="true" data-thread-user-message-navigation-content="true" class="relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt">
+<div data-chatgpt-conversation-selection-target="true" class="flex min-h-full flex-1 flex-col gap-1.5 py-5 browser:pt-1" data-thread-find-target="conversation">
+<div class="relative shrink-0">
+<div class="flex flex-col" id="sr-transcript"></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<form>
+<button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Add files and more" aria-expanded="false" data-composer-navigation-target="add-context" data-state="closed"><svg></svg></button>
+<div contenteditable="true" role="textbox" aria-label="Ask ChatGPT" class="ProseMirror"><p data-placeholder="Ask ChatGPT"><br></p></div>
+<button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:cursor-default focus:outline-h" aria-label="Select ChatGPT model" id="radix-_r_4k_" aria-haspopup="menu" aria-expanded="false" data-state="closed" data-codex-intelligence-trigger="true" data-composer-navigation-target="reasoning" data-selected-reasoning-effort="medium">Pro</button>
+<button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-busy="false" aria-label="Dictate"><svg></svg></button>
+<span id="sr-action"><button type="button" class="cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful" aria-label="Start Voice" data-state="closed"><svg></svg></button></span>
+</form>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</main>
+<div id="sr-menu-layer"></div>
+
+<!-- One exchange: the turn wrapper, down to the container both blocks sit in. -->
+<template id="sr-turn"><div class=""><div class="[&amp;_[data-virtualized-turn-content]]:[content-visibility:visible]" data-turn-key="0a7dedd7-2642-44ed-9d9c-411d8eb8bf6b"><div class="flex flex-col gap-1.5" data-content-search-turn-key="fallback-turn-0"><div class="contents"><div class="contents"><div class="group flex flex-col pb-2 pt-2"><div class="flex flex-col gap-3 browser:gap-1"></div></div></div></div></div></div></div></template>
+
+<!-- The user block, exactly as captured (chatgpt-reply-capture2.json blocks[0]). -->
+<template id="sr-user-block"><div class="block-BQZwFn"><h4 class="sr-only m-0 select-none">You said:</h4><div class="group/user-message flex flex-col items-end gap-2" data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="ef145496-bc36-4eb0-a3ff-1321c82efb4a"><div class="w-full" data-content-search-unit-key="fallback-turn-0:0:user"><div class="group/user-message flex w-full flex-col items-end justify-end gap-1"><div data-user-message-bubble="true" class="bg-user-message text-user-message min-w-0 max-w-(--user-chat-width) overflow-hidden break-"><div class="flex flex-col items-end gap-1"><div class="relative w-full min-w-0 text-size-chat leading-relaxed"><div class="" data-search-result-target=""><div><div class="text-size-chat whitespace-pre-wrap" dir="auto"></div></div></div></div></div></div><div class="flex flex-row-reverse items-center gap-1"><div class="me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"><div class="flex turn-action-controls items-center gap-0.5 browser:gap-0"><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Copy message"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Share prompt"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Edit message"><svg></svg></button></span></div></div></div></div></div></div></div></template>
+
+<!-- The reply block, exactly as captured (blocks[1]); its text is filled in below. -->
+<template id="sr-assistant-block"><div class="block-BQZwFn"><div data-content-search-unit-key="fallback-turn-0:2:assistant" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" data-chatgpt-search-message-ids="cc4ed835-53a9-46e0-a45d-137d86380974,5d0e7c21-9a4b-4f63-8e12-3b7c6a9d0f45"><h4 class="sr-only m-0 select-none" data-conversation-role="assistant" tabindex="-1">ChatGPT said:</h4><div class="group flex min-w-0 flex-col" data-chatgpt-selection-conversation-id="local-chatgpt:a6346be0-5ac1-4d99-a16f-c873cc7bdcff" data-chatgpt-selection-message-id="cc4ed835-53a9-46e0-a45d-137d86380974"><div data-selected-text-overlay-target="_r_cn_" dir="auto" data-markdown-text-style="assistant-message" class="MarkdownRoot-rZKhxa [&amp;>*:first-child]:mt-0 [&amp;>*:last-child]:mb-0 [&amp;>*:last-child]:mb-0 [&amp;>"></div></div></div></div></template>
+
+<!-- The reply's text. Paragraphs as captured (p.Paragraph-* > span); the heading
+     and the link are NOT in the capture and are kept generic. -->
+<template id="sr-reply"><h2>Research brief: the St Bernard</h2><p class="Paragraph-kKnbIo" dir="auto"><span>Scope: the breed's history in the Alps, its rescue work at the Great St Bernard Pass, health and temperament, and today's breeding standards. The report should separate what the historical record supports from the legends that grew around the breed in the nineteenth century, and it should say plainly where the two cannot be told apart.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Start from the breed standard at <a href="https://example.org/st-bernard-breed-standard" target="_blank" rel="noopener">the breed standard page</a> and the hospice archives, then work outwards to the kennel club registries, veterinary literature on giant breeds, and first-hand accounts from the monks and travellers who crossed the pass before the tunnel opened.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Questions to answer: when the hospice first kept dogs and for what work; how the rescue reputation formed and which rescues are documented; how the short-haired and long-haired varieties diverged; what the modern standard requires and why it changed; which health problems are most common and what screening breeders use; and how life expectancy compares with other giant breeds.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Method: prefer primary sources and peer-reviewed veterinary studies; quote dates and numbers with their source; where sources disagree, give both and say which is better supported. Keep marketing material and breeder advertising out of the evidence, and flag any figure that appears only in popular articles.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Structure: an executive summary of no more than one page; a history section; a section on working roles past and present; a health and welfare section with a table of conditions, prevalence and screening; a section on the breed standard; and a closing list of open questions the evidence could not settle.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Out of scope: other mastiff-type breeds except where a comparison explains a St Bernard trait; training advice; and product recommendations of any kind. If a source discusses the breed only in passing, cite it only for the point it actually makes, and do not let a single anecdote stand in for a pattern.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Deliverable: a structured report with sections, sources and open questions for the research agent to pursue, written for a reader who knows dogs but not this breed, with every claim traceable to a cited source.</span></p></template>
+
+<!-- The model menu as the composer capture recorded it open: an unnamed wrapper,
+     the [role=menu], its two rows, and the slider thumb under an aria-hidden
+     ancestor (Chrome logged "Blocked aria-hidden … span.ThumbInput"). -->
+<template id="sr-menu"><div><div role="menu" id="radix-_r_4l_" tabindex="-1" class="no-drag z-50 m-px flex select-none flex-col overflow-y-auto bg-surface-elevated-secondary/90 text-default ring-border ri"><div role="menuitem" tabindex="-1" aria-label="Select model">Select model</div><div role="menuitem" tabindex="-1" aria-label="Power" class="no-drag group cursor-interaction SliderKeyboardControl-wao2b_">Power<div aria-hidden="true"><span role="slider" tabindex="0" class="ThumbInput-uGPr52" aria-valuenow="4" aria-valuemin="0" aria-valuemax="4"></span></div></div></div></div></template>
+
+<script>
+(() => {
+  const BTN = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-ful';
+  const EMPTY = '<p data-placeholder="Ask ChatGPT"><br></p>';
+  const box = document.querySelector('div.ProseMirror');
+  const slot = document.getElementById('sr-action');
+  const transcript = document.getElementById('sr-transcript');
+  const modelBtn = document.getElementById('radix-_r_4k_');
+  const layer = document.getElementById('sr-menu-layer');
+  const text = () => (box.innerText || '').split(String.fromCharCode(0x200b)).join('').trim();
+  const clone = (id) => document.getElementById(id).content.cloneNode(true);
+
+  function setAction(kind) {
+    if (kind === 'send') {
+      slot.innerHTML = '<button type="submit" class="' + BTN + '" aria-label="Send"><svg></svg></button>';
+    } else if (kind === 'stop') {
+      slot.innerHTML = '<button type="button" class="' + BTN + '" aria-label="Stop"><svg></svg></button>';
+    } else {
+      slot.innerHTML = '<button type="button" class="' + BTN + '" aria-label="Start Voice" data-state="closed"><svg></svg></button>';
+    }
+  }
+  function fileCard() {
+    const c = document.createElement('div');
+    c.innerHTML = '<div class="truncate font-semibold whitespace-pre-wrap">St_Bernard_notes.pdf</div>'
+      + '<div class="truncate">PDF</div>';
+    return c;
+  }
+  function addExchange(userText, withReply) {
+    const turn = clone('sr-turn');
+    const col = turn.querySelector('div[class="flex flex-col gap-3 browser:gap-1"]');
+    const user = clone('sr-user-block');
+    user.querySelector('div[dir="auto"]').textContent = userText;
+    if (document.body.dataset.attach) {
+      const inBubble = user.querySelector('[data-user-message-bubble="true"] > div');
+      inBubble.insertBefore(fileCard(), inBubble.firstChild);
+    }
+    col.appendChild(user);
+    transcript.appendChild(turn);
+    const addReply = () => {
+      const a = clone('sr-assistant-block');
+      a.querySelector('[data-markdown-text-style]').appendChild(clone('sr-reply'));
+      col.appendChild(a);
+    };
+    if (withReply) addReply();
+    return addReply;
+  }
+  function send(via) {
+    const t = text();
+    if (!t) return;
+    document.body.dataset.sentVia = via;
+    // TEST HOOK: the page posts something other than what the box held.
+    const addReply = addExchange(document.body.dataset.sendmangle ? t.slice(1) : t, false);
+    box.innerHTML = EMPTY;
+    setAction('stop');
+    setTimeout(() => { addReply(); if (!document.body.dataset.streaming) setAction('voice'); }, 400);
+  }
+  box.addEventListener('input', (e) => {
+    if (document.body.dataset.richtext && /^insert/.test(e.inputType || '')) {
+      // TEST HOOK: a box with typography and markdown shortcuts — a straight
+      // apostrophe is curled, a "- " line becomes a bullet (no marker in its text).
+      const parts = (box.innerText || '').split(/\n+/).filter(Boolean);
+      box.replaceChildren();
+      let ul = null;
+      for (const raw of parts) {
+        const line = raw.split("'").join(String.fromCharCode(0x2019));
+        const p = document.createElement('p');
+        if (/^- /.test(line)) {
+          if (!ul) { ul = document.createElement('ul'); box.appendChild(ul); }
+          const li = document.createElement('li');
+          p.textContent = line.slice(2); li.appendChild(p); ul.appendChild(li);
+        } else {
+          ul = null; p.textContent = line; box.appendChild(p);
+        }
+      }
+    }
+    const n = parseInt(document.body.dataset.mangle || '0', 10);
+    if (n > 0 && /^insert/.test(e.inputType || '')) {
+      document.body.dataset.mangle = String(n - 1);
+      const p = document.createElement('p');
+      p.textContent = text().slice(1);
+      box.replaceChildren(p);
+    }
+    setAction(text() ? 'send' : 'voice');
+  });
+  box.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send('enter'); }
+  });
+  slot.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (b && b.getAttribute('aria-label') === 'Send') { e.preventDefault(); send('button'); }
+  });
+  document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());
+
+  const menuOpen = () => !!layer.firstElementChild;
+  function openMenu() {
+    layer.replaceChildren(clone('sr-menu'));
+    modelBtn.setAttribute('aria-expanded', 'true');
+    modelBtn.setAttribute('data-state', 'open');
+    layer.querySelector('[role="menu"]').focus();
+  }
+  function closeMenu() {
+    layer.replaceChildren();
+    modelBtn.setAttribute('aria-expanded', 'false');
+    modelBtn.setAttribute('data-state', 'closed');
+  }
+  modelBtn.addEventListener('click', () => { if (menuOpen()) closeMenu(); else openMenu(); });
+  document.addEventListener('keydown', (e) => {
+    // The capture: Escape closes the menu and focus lands on the model button.
+    if (e.key === 'Escape' && menuOpen()) {
+      closeMenu(); modelBtn.focus(); document.body.dataset.menuClosedBy = 'escape';
+    }
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (menuOpen() && !layer.contains(e.target) && e.target !== modelBtn) {
+      closeMenu(); document.body.dataset.menuClosedBy = 'outside';
+    }
+  }, true);
+
+  if (document.body.dataset.srFixture === 'thread') {
+    addExchange(document.body.dataset.srPrompt || 'hello', true);
+    setAction('stop');
+  }
+})();
+</script>
+</body>
+</html>

@@ -71,8 +71,10 @@ MUTANTS = [
        "            return !!document.querySelector('.result-streaming, [data-is-streaming=\"true\"]');\n"
        '        }""")')]),
     ("U6", "under", "the diagnostic twin ships the raw placeholder",
-     [('        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)) or "no_hit"',
-       '        }""") or "no_hit"')]),
+     # ⛔ RE-AIMED 2026-09-28: the string is now also wrapped in `_cg_js(...)`
+     # (ChatGPT's spliced Stop marker), so one more closing paren. Same defect.
+     [('        }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))) or "no_hit"',
+       '        }""")) or "no_hit"')]),
     ("U7", "under", "the DR-iframe walk ships the raw placeholder",
      [('                        return false;\n'
        '                    }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))',

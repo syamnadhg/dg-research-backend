@@ -54,7 +54,9 @@ def test_focus_js_handles_contenteditable_and_textarea():
     # ChatGPT's composer is a contenteditable in the current UI, but the helper
     # must degrade to a <textarea> value path too.
     assert "isContentEditable" in FOCUS_JS
+    # ⭐ 2026-09-28: the old box's id AND the new box (no id at all).
     assert "#prompt-textarea" in FOCUS_JS
+    assert 'div.ProseMirror[contenteditable="true"][role="textbox"]' in FOCUS_JS
     assert "textarea" in FOCUS_JS
 
 
