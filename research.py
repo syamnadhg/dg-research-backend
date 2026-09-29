@@ -9495,10 +9495,15 @@ def _claim_waiting_run(worker_id) -> "dict | None":
     BLOCKING (disk + Firestore) — call it off the loop.
 
     ⛔ A run a live worker still holds is put back: the worker it was moved off
-    has a few seconds of exit left, and two browsers on one run is the one
-    outcome this must never produce. A research that is gone, archived, not
-    this computer's any more, or that no longer says "queued" (somebody
-    stopped it, or a Resume took it) stops waiting here."""
+    has a few seconds of exit left — and a Resume may have started it on
+    another — and two browsers on one run is the one outcome this must never
+    produce. A research that is gone, archived, not this computer's any more,
+    or that is over or stopped, stops waiting here.
+
+    ⭐ "ONGOING" WITH NOBODY HOLDING IT IS TAKEN, not dropped: it is the record
+    whose "queued" write never landed (a Firestore blip at the move), or that
+    the old worker's last second wrote over. Dropped, the run would be lost —
+    its record saying it runs while nothing runs it."""
     for rec in _waiting_runs():
         d = rec["_dir"]
         uid = str(rec.get("uid") or "")
@@ -9519,7 +9524,7 @@ def _claim_waiting_run(worker_id) -> "dict | None":
             continue
         withdrawn, record = _pickup_withdrawn(uid, rid, "moved-run")
         status = (record or {}).get("status")
-        if withdrawn or (record is not None and status != "queued"):
+        if withdrawn or (record is not None and status not in ("queued", "ongoing")):
             if not withdrawn:
                 log(f"[moved-run] {rid[:8]}… is {status} now — it is no longer "
                     f"waiting in the queue", "INFO")
@@ -77974,6 +77979,7 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                     _update_research_doc(tree_uid, research_id, _waiting_record_patch())
                     log(f"[rehydrate] {research_id[:24]}… is waiting in the queue for "
                         f"a worker — left there", "INFO")
+                    _kick_queue_publish()
                     continue
                 # ⛔⛔ AFTER THE HAND-OFF THE RUN IS THE CLOUD'S, AND THIS SCAN
                 # USED TO TAKE IT BACK (wave 10.9, 542-4). The query is

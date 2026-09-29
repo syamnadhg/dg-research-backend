@@ -34,6 +34,7 @@ import asyncio
 import collections
 import json
 import os
+import threading
 import time
 import types
 from datetime import datetime
@@ -230,7 +231,10 @@ def _machine(monkeypatch, tmp_path, store, *, worker=1, fleet=2):
     monkeypatch.setitem(research._QUEUE_STATE, "recompute_deferred_fn", None)
     monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_lock", None)
     monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_in_progress", False)
-    m = types.SimpleNamespace(writes=[], exits=[], lines=[], store=store)
+    m = types.SimpleNamespace(writes=[], exits=[], lines=[], store=store,
+                              published=threading.Event())
+    # The queue order is re-published on a thread; recorded, not performed.
+    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", m.published.set)
     monkeypatch.setattr(research, "_update_research_doc",
                         lambda u, r, p: m.writes.append((u, r, dict(p))) or True)
     monkeypatch.setattr(research, "_schedule_server_exit",
@@ -454,7 +458,6 @@ def _rescan(monkeypatch, m, *, resting=False, fleet=2):
     monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: resting)
     monkeypatch.setattr(research, "_rest_keepalive_pass", lambda: None)
     monkeypatch.setattr(research, "_try_claim_queue_doc", lambda *a, **k: True)
-    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
     asyncio.run(lift("_rescan_queue_for_unclaimed")())
     return list(jobs._queue)
 
@@ -493,6 +496,7 @@ def test_the_next_awake_worker_takes_the_moved_run_before_anything_deferred(
         "the run was queued here but is still up for grabs")
     ongoing = [p for u, r, p in m.writes if (u, r) == (SHARER, RID)]
     assert ongoing and ongoing[0]["status"] == "ongoing" and ongoing[0]["assignedWorker"] == 1
+    assert m.published.wait(5), "the rest of the queue did not move up"
 
 
 def test_a_resting_worker_never_takes_it_and_an_awake_one_does(monkeypatch, tmp_path):
@@ -529,18 +533,22 @@ def test_a_run_its_old_worker_still_holds_is_put_back_and_keeps_its_place(
     assert m.writes == []
 
 
-@pytest.mark.parametrize("record", ["stopped", "ongoing", None],
-                         ids=["stopped", "a-resume-took-it", "deleted"])
+@pytest.mark.parametrize("record", ["stopped", "completed", "paused_backend_restart", None],
+                         ids=["stopped", "completed", "offered-a-resume", "deleted"])
 def test_a_moved_run_nobody_is_waiting_for_any_more_stops_waiting(monkeypatch, tmp_path, record):
-    """Stopped while it waited, picked up by a Resume, or deleted: it is not
-    run, its marker goes (so it holds no folder for ever), and its record is
-    not written."""
+    """Stopped while it waited, over, or deleted: it is not run, its marker goes
+    (so it holds no folder for ever), and its record is not written. Beside it,
+    a record the move's "queued" write never reached — still "ongoing", nobody
+    holding it — is TAKEN: dropping it would lose the run."""
     m, folder = _waiting(monkeypatch, tmp_path, worker=1, record=record)
     if record is None:
         m.store.records.pop((SHARER, RID))
     assert _rescan(monkeypatch, m) == []
     assert not (folder / MARKER).exists() and not list(folder.glob(f"{MARKER}.w*"))
     assert [w for w in m.writes if w[1] == RID] == []
+
+    m2, _folder2 = _waiting(monkeypatch, tmp_path / "never-landed", worker=1, record="ongoing")
+    assert [j["research_id"] for j in _rescan(monkeypatch, m2)] == [RID]
 
 
 def test_the_run_moved_most_recently_is_first(monkeypatch, tmp_path):
@@ -567,8 +575,8 @@ def test_a_worker_that_died_before_starting_it_puts_it_back_at_boot(monkeypatch,
     _r2, theirs = _run_folder(tmp_path, OTHER_RID, topic="Theirs")
     _moved_marker(mine, SHARER, RID, worker=2)
     _moved_marker(theirs, SHARER, OTHER_RID, worker=3)
-    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
     assert research._release_waiting_claims(2) == 1
+    assert m.published.wait(5), "the queue order was not re-published"
     assert (mine / MARKER).exists() and not (mine / f"{MARKER}.w2").exists()
     assert (theirs / f"{MARKER}.w3").exists() and not (theirs / MARKER).exists()
     assert len(_said(m, "worker 2", "back in the queue")) == 1, m.lines
@@ -678,7 +686,6 @@ def _boot_rehydrate(monkeypatch, tmp_path, *, resting, waiting=False, record="on
     monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", q)
     monkeypatch.setattr(research, "_scan_sibling_locks_for_research", lambda *_a: [])
     monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: resting)
-    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
     counts = asyncio.run(research._rehydrate_ongoing_for_tree(OWNER, OWNER, set()))
     return m, q, folder, counts
 
@@ -693,10 +700,12 @@ def test_a_resting_worker_puts_its_interrupted_run_first_in_the_queue(monkeypatc
     assert (folder / MARKER).exists(), "the run is not waiting in the queue"
     assert _statuses(m, RID) == ["queued"], m.writes
     assert counts == (0, 0)
+    assert m.published.wait(5), "the queue order was not re-published"
 
     m2, q2, folder2, counts2 = _boot_rehydrate(monkeypatch, tmp_path / "awake", resting=False)
     assert [j["research_id"] for j in q2._queue] == [RID] and counts2 == (1, 0)
     assert not (folder2 / MARKER).exists() and _statuses(m2, RID) == []
+    assert not m2.published.is_set()
 
 
 def test_a_run_waiting_in_the_queue_is_left_there_even_by_an_awake_worker(
@@ -709,6 +718,7 @@ def test_a_run_waiting_in_the_queue_is_left_there_even_by_an_awake_worker(
     assert (folder / MARKER).exists()
     assert _statuses(m, RID) == ["queued"], m.writes
     assert _said(m, RID[:24], "waiting in the queue")
+    assert m.published.wait(5), "the queue order was not re-published"
 
 
 # ══ 6. boot: the disk snapshot ════════════════════════════════════════════════
@@ -763,7 +773,6 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
                                 (OWNER, OTHER_RID): {"status": "queued"}})
         m = _machine(monkeypatch, base, store, worker=2)
         monkeypatch.setattr(research, "_worker_is_resting", lambda *a, _r=resting, **k: _r)
-        monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
         run_id, folder = _run_folder(base, RID)
         path = _snapshot(base, _job(SHARER, RID, run_id),
                          [_job(OWNER, OTHER_RID, f"Other_{_stamp()}")])
@@ -772,6 +781,7 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         assert [j["research_id"] for j in q._queue] == expect, (resting, m.lines)
         assert (folder / MARKER).exists() is resting
         assert _statuses(m, RID) == (["queued"] if resting else []), m.writes
+        assert m.published.wait(5) if resting else not m.published.is_set()
 
 
 # ══ 7. a waiting run keeps its folder ═════════════════════════════════════════
@@ -799,14 +809,14 @@ def test_the_startup_sweep_keeps_a_waiting_runs_folder_however_old(monkeypatch, 
     assert not left.exists(), "the sweep stopped sweeping"
 
 
-def _boot_calls(name):
-    """Where `run_server`'s own body (not its nested functions) calls `name`."""
+def _boot_calls(*names):
+    """The lines where `run_server` calls each of `names`, in one parse."""
     from _run_server_closure import _SOURCE
     tree = ast.parse(_SOURCE.read_text(encoding="utf-8"))
     server = next(n for n in tree.body
                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "run_server")
-    return [n.lineno for n in ast.walk(server) if isinstance(n, ast.Call)
-            and getattr(n.func, "id", "") == name]
+    calls = [n for n in ast.walk(server) if isinstance(n, ast.Call)]
+    return [[c.lineno for c in calls if getattr(c.func, "id", "") == name] for name in names]
 
 
 def test_boot_runs_the_sweep_and_puts_taken_runs_back_before_rehydrating():
@@ -815,9 +825,9 @@ def test_boot_runs_the_sweep_and_puts_taken_runs_back_before_rehydrating():
     called, and a worker's taken-but-unstarted runs go back in the queue
     BEFORE rehydration looks — which must see them as waiting, not as this
     worker's to resume."""
-    assert len(_boot_calls("_startup_sweep_stale_runs")) == 1
-    release = _boot_calls("_release_waiting_claims")
-    rehydrate = _boot_calls("_rehydrate_ongoing_for_tree")
+    sweep, release, rehydrate = _boot_calls(
+        "_startup_sweep_stale_runs", "_release_waiting_claims", "_rehydrate_ongoing_for_tree")
+    assert len(sweep) == 1
     assert len(release) == 1 and rehydrate, (release, rehydrate)
     assert release[0] < min(rehydrate), "taken runs are put back after rehydration ran"
 
