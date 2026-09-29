@@ -200,10 +200,12 @@ MUTANTS = [
      [("        if last is None or not _chatgpt_text_is_prompt_start(last, prompt):\n"
        "            seen = ",
        "        if last is None:\n            seen = ")]),
+    # Re-aimed 09-29: the `if chatgpt_prompt:` block also turns the CUA allow-list
+    # on now, so only the verifier wrap is removed — the block must still parse.
     ("S11", RESEARCH, "⛔⛔ wait_until_verified never applies the prompt check",
      [("    if chatgpt_prompt:\n"
        "        verify_fn = _chatgpt_sent_prompt_verifier(chatgpt_prompt, label, inner=verify_fn)\n",
-       "")]),
+       "    if chatgpt_prompt:\n")]),
     ("S12", RESEARCH, "⛔ the CUA's \"still generating\" verifies a wrong send",
      [("            if (has_stop or has_loading or says_generating) and chatgpt_prompt:",
        "            if False:")]),
