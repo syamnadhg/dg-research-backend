@@ -756,6 +756,7 @@ PIN_EDIT_SHARE_JS = """() => {
     edit.style.cssText = 'position: fixed; left: 900px; top: 500px; width: 40px; height: 30px; '
         + 'z-index: 9; display: block; visibility: visible; opacity: 1;';
     const share = document.createElement('button');
+    share.type = 'button';           // as ChatGPT's own; a bare <button> is a submit button
     share.setAttribute('aria-label', 'Share prompt');
     share.style.cssText = 'position: fixed; left: 1000px; top: 300px; width: 40px; height: 30px; z-index: 9;';
     document.body.appendChild(share);
