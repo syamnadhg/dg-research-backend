@@ -70,9 +70,16 @@ AUTO_RESUME_CLOCK = ("                                    # ⛔ ITS OWN CLOCK: t
 PICKUP_ASKS = "    if _known_not_a_member(uid):"
 RULE = "        if _is_denied_read(err) and denied_is_answer:"
 NOT_A_MEMBER = "    return members is not None and uid not in members"
-PAIRED_IS_A_MEMBER = ('    if uid == str(load_paired_uid() or "").strip():\n'
+PAIRED_IS_A_MEMBER = ('    if not uid or uid == str(load_paired_uid() or "").strip():\n'
                       "        return False\n")
-DEQUEUE_ASKS = '            _account_gone = _known_not_a_member(job.get("uid"))'
+DEQUEUE_ASKS = ("                _account_gone = await asyncio.wait_for(\n"
+                '                    asyncio.to_thread(_known_not_a_member, job.get("uid")),\n'
+                "                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)\n")
+DEQUEUE_OFF_LOOP = '                    asyncio.to_thread(_known_not_a_member, job.get("uid")),\n'
+DEQUEUE_TIMEOUT_TAKES = ("                _account_gone = False\n"
+                         '                log(f"[pickup:dequeue]')
+DEQUEUE_BUSY_GATE = "                if _firebase_db and _did_bw and not _account_gone:"
+DEQUEUE_CRUN_GATE = "            if WORKER_ID == 1 and not _account_gone:"
 DEQUEUE_LINE = ("            if _account_gone:\n"
                 '                _log_pickup_not_run("dequeue", job.get("research_id"),\n'
                 "                                    _RESTORE_NOT_OPENABLE)\n")
@@ -85,12 +92,11 @@ DEQUEUE_FALLBACK = ('                    log(f"[flip] the transaction was refuse
                     '                        f"proceeding, as before", "WARN")')
 
 # ── anchors: a refused renumber batch, and the flip ────────────────────────
-BATCH_UID_LOOP = "    for uid_v, _rid_v, _patch in patches:\n"
-BATCH_UID_TEST = "        if uid_v and str(uid_v) != paired:"
-DEFERRED_BATCH_UID = ('what=f"deferred queue-pos batch [{i}:{i+CHUNK}]",\n'
-                      "                                  uid=_batch_heal_uid(chunk))")
-LOCAL_BATCH_UID = ('what=f"queue-pos batch [{i}:{i+CHUNK}]",\n'
-                   "                                      uid=_batch_heal_uid(chunk))")
+BATCH_BY_UID = "        by_uid.setdefault(p[0], []).append(p)"
+DEFERRED_BATCH_UID = ("                _commit_chunk, uid=uid_b,\n"
+                      '                what=f"deferred queue-pos batch')
+LOCAL_BATCH_UID = ("                    _commit_chunk, uid=uid_b,\n"
+                   '                    what=f"queue-pos batch')
 FLIP_UID = '                what=f"flip queued→ongoing {research_id_val[:8]}…", uid=uid_val,'
 
 # ── anchors: a token with no claim is this computer's own pairing ──────────
@@ -123,7 +129,7 @@ MUTANTS = [
      [(NOT_A_MEMBER, "    return members is None or uid not in members")]),
     ("M4", RESEARCH, "⛔⛔ the dequeue never asks — a job whose account left while "
      "it waited, its record still reading 'queued', runs",
-     [(DEQUEUE_ASKS, "            _account_gone = False")]),
+     [(DEQUEUE_ASKS, "                _account_gone = False\n")]),
     ("M5", RESEARCH, "⛔ OVER-REACH: the dequeue refuses on every refused read — a "
      "member's run is not started when the flip and the read are both refused",
      [(DEQUEUE_FALLBACK, "                    should_run = False")]),
@@ -142,8 +148,28 @@ MUTANTS = [
      [(PAIRED_IS_A_MEMBER, "")]),
     ("M10", RESEARCH, "⛔ OVER-REACH: the paired account reads as not a member — "
      "the owner's own jobs are never run",
-     [(PAIRED_IS_A_MEMBER, '    if uid == str(load_paired_uid() or "").strip():\n'
+     [(PAIRED_IS_A_MEMBER, '    if not uid or uid == str(load_paired_uid() or "").strip():\n'
                            "        return True\n")]),
+    ("M12", RESEARCH, "⛔⛔ a job with NO account is asked about — the serve API's own "
+     "Resume reads as 'not a member' and is dropped after the route said queued",
+     [(PAIRED_IS_A_MEMBER, '    if uid == str(load_paired_uid() or "").strip():\n'
+                           "        return False\n")]),
+    ("M13", RESEARCH, "⛔ the dequeue claims its busy slot for a job it then stands down",
+     [(DEQUEUE_BUSY_GATE, "                if _firebase_db and _did_bw:")]),
+    ("M14", RESEARCH, "⛔ the dequeue posts a job it then stands down as the running one",
+     [(DEQUEUE_CRUN_GATE, "            if WORKER_ID == 1:")]),
+    ("M15", RESEARCH, "the membership read runs on the event loop — a slow device read "
+     "freezes the local API and every listener",
+     [(DEQUEUE_OFF_LOOP, '                    asyncio.sleep(0, _known_not_a_member(job.get("uid"))),\n')]),
+    ("M16", RESEARCH, "⛔ a membership read that never answers holds the dequeue until "
+     "it does, and its late 'gone' drops a member's job",
+     [(DEQUEUE_ASKS, "                _account_gone = await asyncio.wait_for(\n"
+                     '                    asyncio.to_thread(_known_not_a_member, job.get("uid")),\n'
+                     "                    timeout=None)\n")]),
+    ("M17", RESEARCH, "⛔ OVER-REACH: a membership read that did not answer drops the job — "
+     "'can't tell' read as 'gone'",
+     [(DEQUEUE_TIMEOUT_TAKES, "                _account_gone = True\n"
+                              '                log(f"[pickup:dequeue]')]),
     ("M11", RESEARCH, "the dequeue flips a job it will not run — the refused "
      "transaction and a 'proceeding' line for a job that never starts",
      [(DEQUEUE_NO_FLIP, '            flip_outcome = _flip_queued_to_ongoing(job.get("uid"), '
@@ -157,19 +183,18 @@ MUTANTS = [
      "says re-pair — the 09-28 line comes back",
      [(OWN_PAIRING, "        own_pairing = True")]),
 
-    # ═══ B — a refused renumber batch names the other account (09-29 verify) ═
-    ("B1", RESEARCH, "⛔ the batch is charged to nobody — a batch refused for a "
-     "removed sharer's record says re-pair again",
-     [(BATCH_UID_LOOP, "    return None\n" + BATCH_UID_LOOP)]),
-    ("B2", RESEARCH, "OVER-REACH: the owner's own record is charged too — a batch "
-     "led by the owner's job says re-pair over another account's refusal",
-     [(BATCH_UID_TEST, "        if uid_v:")]),
-    ("B3", RESEARCH, "the deferred renumber hands the heal no uid",
-     [(DEFERRED_BATCH_UID, 'what=f"deferred queue-pos batch [{i}:{i+CHUNK}]",\n'
-                           "                                  )")]),
-    ("B4", RESEARCH, "the local renumber hands the heal no uid",
-     [(LOCAL_BATCH_UID, 'what=f"queue-pos batch [{i}:{i+CHUNK}]",\n'
-                        "                                      )")]),
+    # ═══ B — the renumber writes one batch per account (09-29 re-verify) ══
+    ("B1", RESEARCH, "⛔⛔ one batch for every account again — a removed sharer's "
+     "record refuses the owner's and every sharer's positions with it",
+     [(BATCH_BY_UID, '        by_uid.setdefault("", []).append(p)')]),
+    ("B2", RESEARCH, "the deferred renumber hands the heal no uid — a refused "
+     "account's batch says re-pair",
+     [(DEFERRED_BATCH_UID, "                _commit_chunk,\n"
+                           '                what=f"deferred queue-pos batch')]),
+    ("B3", RESEARCH, "the local renumber hands the heal no uid — a refused "
+     "account's batch says re-pair",
+     [(LOCAL_BATCH_UID, "                    _commit_chunk,\n"
+                        '                    what=f"queue-pos batch')]),
     # ═══ W — the dequeue's flip names the job's account ═══════════════════
     ("W1", RESEARCH, "⛔ the flip, the 09-28 log's FIRST refused write, hands the "
      "heal no uid — re-pair required for another account's job",

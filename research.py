@@ -7911,9 +7911,7 @@ def _recompute_deferred_queue_positions_locked() -> None:
     if not patches:
         return
 
-    CHUNK = 450
-    for i in range(0, len(patches), CHUNK):
-        chunk = patches[i:i + CHUNK]
+    for uid_b, i, chunk in _queue_pos_batches(patches):
         def _commit_chunk(chunk=chunk):
             batch = _firebase_db.batch()
             for uid_v, rid_v, patch in chunk:
@@ -7924,10 +7922,12 @@ def _recompute_deferred_queue_positions_locked() -> None:
         try:
             # #720: heal a stale-token 403 on the renumber; rebuild the batch
             # inside the op so a retry commits a fresh batch, not a consumed one.
-            _grpc_write_with_heal(_commit_chunk, what=f"deferred queue-pos batch [{i}:{i+CHUNK}]",
-                                  uid=_batch_heal_uid(chunk))
+            _grpc_write_with_heal(
+                _commit_chunk, uid=uid_b,
+                what=f"deferred queue-pos batch {str(uid_b)[:8]}… [{i}:{i + len(chunk)}]")
         except Exception as e:
-            log(f"[deferred-recompute] batch commit failed [{i}:{i+CHUNK}]: {e}", "WARN")
+            log(f"[deferred-recompute] batch commit failed {str(uid_b)[:8]}… "
+                f"[{i}:{i + len(chunk)}]: {e}", "WARN")
 
 
 def _pending_enq_read() -> int:
@@ -8542,21 +8542,25 @@ def _structural_heal_advice(uid, claims: dict, *, own_pairing: bool) -> str:
     return "A force-refresh cannot fix this — re-pair required."
 
 
-def _batch_heal_uid(patches) -> "str | None":
-    """Whose tree a queue-position batch is charged to in the heal's advice:
-    the first account in it that is not this computer's own, else None (the
-    paired owner).
+def _queue_pos_batches(patches, chunk: int = 450):
+    """The queue-position renumber's writes, one batch per ACCOUNT (each cut
+    at `chunk` writes, under Firestore's 500): yields `(uid, i, part)`.
 
-    ⛔ Firestore refuses a WHOLE batch for one record it will not take. A
-    renumber batch updates every waiting job's record, from every account, so
-    one removed sharer's record refuses the owner's updates with it — and with
-    no uid the structural line blamed this computer's pairing and said
-    "re-pair required" (09-29 verify)."""
-    paired = str(load_paired_uid() or "")
-    for uid_v, _rid_v, _patch in patches:
-        if uid_v and str(uid_v) != paired:
-            return str(uid_v)
-    return None
+    ⛔⛔ ONE BATCH FOR EVERY ACCOUNT WAS ONE REFUSAL FOR ALL OF THEM (09-29
+    verify). Firestore refuses a whole batch for one record it will not take,
+    and the renumber updated every waiting job's record — every account's —
+    in one. A job of an account removed while it waited here kept everybody
+    else's position and ETA frozen until it reached the dequeue, and the heal
+    could only guess whose record had been refused. Per account, the refused
+    batch is exactly that account's, and it is named by its own uid.
+    ⭐ Nobody reads another account's records, so the one-frame renumber each
+    person sees (Q4) is still one batch: their own."""
+    by_uid: dict = {}
+    for p in patches:
+        by_uid.setdefault(p[0], []).append(p)
+    for uid_v, mine in by_uid.items():
+        for i in range(0, len(mine), chunk):
+            yield uid_v, i, mine[i:i + chunk]
 
 
 def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None):
@@ -17799,7 +17803,12 @@ def _known_not_a_member(uid) -> bool:
     ⭐ THE PAIRED ACCOUNT IS ONE WITHOUT ASKING. Every job passes here and most
     are the owner's; they cost no read of the device document."""
     uid = str(uid or "").strip()
-    if uid == str(load_paired_uid() or "").strip():
+    # ⛔ NO ACCOUNT IS NOBODY'S TREE — nothing to refuse (09-29 re-verify). The
+    # serve API's own Resume (`POST /api/runs/{id}/resume`, the second half of
+    # the /feedback redo) queues a job with no uid; "" is not the paired account,
+    # so the device read said "not a member" and the dequeue dropped it after
+    # the route had already told the caller it was queued.
+    if not uid or uid == str(load_paired_uid() or "").strip():
         return False
     members = _device_members()
     return members is not None and uid not in members
@@ -78832,9 +78841,7 @@ async def run_server(port=8000):
                     "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 }
             patches.append((uid_v, rid_v, patch))
-        CHUNK = 450
-        for i in range(0, len(patches), CHUNK):
-            chunk = patches[i:i + CHUNK]
+        for uid_b, i, chunk in _queue_pos_batches(patches):
             def _commit_chunk(chunk=chunk):
                 batch = _firebase_db.batch()
                 for uid_v, rid_v, patch in chunk:
@@ -78845,10 +78852,12 @@ async def run_server(port=8000):
             try:
                 # #720: heal a stale-token 403 on the renumber; rebuild the batch
                 # inside the op so a retry commits a fresh batch, not a consumed one.
-                _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]",
-                                      uid=_batch_heal_uid(chunk))
+                _grpc_write_with_heal(
+                    _commit_chunk, uid=uid_b,
+                    what=f"queue-pos batch {str(uid_b)[:8]}… [{i}:{i + len(chunk)}]")
             except Exception as e:
-                log(f"Failed to commit queue-position batch [{i}:{i+CHUNK}]: {e}", "WARN")
+                log(f"Failed to commit queue-position batch {str(uid_b)[:8]}… "
+                    f"[{i}:{i + len(chunk)}]: {e}", "WARN")
         # #890: publish the refreshed queueOwners union (local + deferred).
         _kick_owner_publish()
 
@@ -79329,6 +79338,32 @@ async def run_server(port=8000):
                 job.get("research_id") or "",
                 job.get("run_id") or "",
             )
+            # ⛔⛔ AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — asked before the
+            # flip, of every job (09-29 re-verify). The owner removed it while
+            # its job waited here. Its record still READS "queued": the backend
+            # wrote its queue position meanwhile, and the rules let the device
+            # that stamped a record read it with no membership check. Asked
+            # only when the read after a refused flip was refused too, the job
+            # ran with every write refused, on the owner's ChatGPT and key. See
+            # `_pickup_withdrawn`, whose answer this is.
+            # ⭐ BEFORE THE DEVICE DOCUMENT CALLS THE JOB RUNNING: every member
+            # reads that document, and a job about to be stood down was posted
+            # on it as "busy with <its research>" first. ⭐ OFF THE LOOP AND
+            # BOUNDED: the device read retries for minutes by default, and on
+            # the loop it froze the local API and every listener with it. A
+            # read that does not answer is "can't tell", so the job is taken.
+            try:
+                _account_gone = await asyncio.wait_for(
+                    asyncio.to_thread(_known_not_a_member, job.get("uid")),
+                    timeout=_RESTART_RETRY_READ_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                _account_gone = False
+                log(f"[pickup:dequeue] {str(job.get('research_id') or '')[:24]}… who "
+                    f"this computer is shared with did not answer in "
+                    f"{_RESTART_RETRY_READ_TIMEOUT_S:g}s — taken", "WARN")
+            if _account_gone:
+                _log_pickup_not_run("dequeue", job.get("research_id"),
+                                    _RESTORE_NOT_OPENABLE)
             # 2026-05-28: mark this worker busy in the device-doc
             # `busyWorkerIds` array. Runs for ALL workers (not gated
             # to worker-1) — FE QueuedBanner stall detector reads
@@ -79338,7 +79373,7 @@ async def run_server(port=8000):
             # finally / exit / next-boot. Idempotent via array_union.
             try:
                 _did_bw = load_device_id()
-                if _firebase_db and _did_bw:
+                if _firebase_db and _did_bw and not _account_gone:
                     from google.cloud.firestore import ArrayUnion as _AU
                     # 2026-05-28: also seed this worker's per-sharer usage
                     # entry for the owner's "Shared with" popup. Dotted-path
@@ -79401,7 +79436,7 @@ async def run_server(port=8000):
             # rather than w2's. Acceptable compromise — FE display
             # quirk does not affect actual execution. PR 3 may expand
             # this to a currentRunIds.{workerId} map field.
-            if WORKER_ID == 1:
+            if WORKER_ID == 1 and not _account_gone:
                 try:
                     _did = load_device_id()
                     if _firebase_db and _did:
@@ -79452,19 +79487,8 @@ async def run_server(port=8000):
             # restore both the running job AND remaining queue. Without the
             # current_job param a Phoenix restart would lose this in-flight
             # research.
-            _persist_pending_queue(current_job=job)
-            # ⛔⛔ AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — asked before the
-            # flip, of every job (09-29 re-verify). The owner removed it while
-            # its job waited here. Its record still READS "queued": the backend
-            # wrote its queue position meanwhile, and the rules let the device
-            # that stamped a record read it with no membership check. Asked
-            # only when the read after a refused flip was refused too, the job
-            # ran with every write refused, on the owner's ChatGPT and key. See
-            # `_pickup_withdrawn`, whose answer this is.
-            _account_gone = _known_not_a_member(job.get("uid"))
-            if _account_gone:
-                _log_pickup_not_run("dequeue", job.get("research_id"),
-                                    _RESTORE_NOT_OPENABLE)
+            if not _account_gone:
+                _persist_pending_queue(current_job=job)
             # Flip this run's research doc from queued → ongoing. No-op for
             # the very first start in an idle backend (already ongoing).
             flip_outcome = (None if _account_gone else
