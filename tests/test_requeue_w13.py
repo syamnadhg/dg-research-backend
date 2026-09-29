@@ -1096,6 +1096,15 @@ def test_the_move_takes_the_run_out_of_its_old_workers_snapshot(monkeypatch, tmp
     assert _in_file(path) == [OTHER_RID], "the old worker's snapshot still names the moved run"
     assert (folder / MARKER).exists()
 
+    # Beside it: while Reset Backend is emptying this worker's line, the move
+    # writes nothing back — the reset has already written its clean file.
+    m2, job2, _f2 = _running(monkeypatch, tmp_path / "resetting", worker=2)
+    path2, _line2 = _persisting(monkeypatch, [other])
+    research._write_pending_queue_snapshot(path2, None, [])
+    monkeypatch.setitem(research._QUEUE_STATE, "_hard_reset_in_progress", True)
+    _command(monkeypatch, m2, _requeue(workerId=2))
+    assert _in_file(path2) == [], "the move wrote back a line Reset Backend is clearing"
+
 
 @pytest.mark.parametrize("resting", [True, False], ids=["comes-back-off", "turned-back-on"])
 def test_the_worker_a_run_was_moved_off_does_not_take_it_back_when_it_restarts(
@@ -1260,6 +1269,17 @@ def test_a_waiting_run_out_of_attempts_is_offered_back_to_its_person(monkeypatch
     assert not list(folder.glob(MARKER + "*")), "it still reads as waiting or taken"
     assert m.published.wait(5), "the queue order was not re-published"
 
+    # Beside it: stopped in the moment between the listing and the take — the
+    # stop's own record stands; no Resume card is written over it.
+    m2, folder2 = _waiting(monkeypatch, tmp_path / "stopped-meanwhile", worker=1)
+    m2.store.queue_docs.clear()
+    (folder2 / ".no_auto_retry").write_text("{}", encoding="utf-8")
+    listed = research._waiting_runs()
+    (folder2 / ".stop").touch()
+    monkeypatch.setattr(research, "_waiting_runs", lambda: list(listed))
+    assert _rescan(monkeypatch, m2) == []
+    assert _statuses(m2, RID) == [], "a Resume card was written over a stopped run"
+
 
 # ══ 13. the repair: stopping or cancelling a waiting run ═════════════════════
 
@@ -1365,6 +1385,31 @@ def test_a_job_that_was_only_queued_is_cancelled_as_one_that_never_started(
     assert published.wait(5)
 
 
+def test_a_cancel_of_a_later_start_of_the_same_research_is_the_ordinary_one(
+        monkeypatch, tmp_path):
+    """A research whose moved run was ended earlier (its retired marker still
+    in that old folder) and that has a new start waiting: the cancel names the
+    new start — its document goes, and it is cancelled as a start that never
+    ran, not as the old run."""
+    _r, old = _run_folder(tmp_path, RID, uid=SHARER)
+    _moved_marker(old, SHARER, RID)
+    research._retire_waiting_marker(old / MARKER)
+    (old / ".stop").touch()
+    from _queue_listener import Listener
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER,
+                   queue_docs={"q-new": {"action": "start", "uid": SHARER,
+                                         "submittedBy": SHARER, "researchId": RID,
+                                         "topic": "Again", "timestamp": 1}},
+                   research_docs={(SHARER, RID): {"status": "queued"}},
+                   device_doc={"ownerUid": OWNER, "sharedWith": [SHARER]})
+    monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
+    lis.feed(action="cancel", uid=SHARER, submittedBy=SHARER, researchId=RID)
+    assert "q-new" in lis.deleted_queue_ids
+    assert [_as_written(p) for _u, r, p in lis.writes if r == RID] == [
+        {"status": "stopped", "phase": 0, "summary": "Cancelled while queued",
+         "cancelled": True}]
+
+
 def test_a_run_ended_for_good_is_not_published_and_holds_no_start_back(
         monkeypatch, tmp_path):
     """⛔ A marker left beside a `.stop` (a stop that raced the move) kept the
@@ -1442,6 +1487,29 @@ def test_after_a_move_on_a_one_worker_computer_the_worker_that_is_off_starts_not
             started[0]["user_links"]) == (None, other_id, "the next brief",
                                           [{"url": "https://example.com/a"}])
     assert not list((tmp_path / "queues" / other_id).glob(MARKER + "*"))
+
+
+def test_a_queued_resume_waiting_behind_says_queued_and_a_run_that_keeps_nothing_waits_nowhere(
+        monkeypatch, tmp_path):
+    """Two jobs a worker that is off had only queued, at its restart. A Resume
+    — its record already says "ongoing", written before it was queued — waits
+    behind, and its record now says queued. A run that keeps nothing is never
+    written to this disk to wait: no folder is made for it, and no marker
+    carries its brief."""
+    m = _machine(monkeypatch, tmp_path, _Store(records={
+        (OWNER, OTHER_RID): {"status": "ongoing"},
+        (OWNER, "incog_1759100000002_7"): {"status": "queued"}}), worker=1)
+    monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: True)
+    _r, resumed = _run_folder(tmp_path, OTHER_RID, uid=OWNER, topic="Resumed")
+    incog_id = f"Private_{_stamp()}"
+    path = _snapshot(tmp_path, None, [
+        _job(OWNER, OTHER_RID, resumed.name, resume_dir=str(resumed)),
+        _job(OWNER, "incog_1759100000002_7", incog_id, brief_text="private")])
+    research._restore_pending_queue_snapshot(path, _Q(), set())
+    assert _statuses(m, OTHER_RID) == ["queued"], m.writes
+    assert (resumed / MARKER).exists()
+    assert not (tmp_path / "queues" / incog_id).exists(), (
+        "a run that keeps nothing was written to disk to wait")
 
 
 # ══ 15. the repair: what the lane claimed and nothing measured ════════════════
