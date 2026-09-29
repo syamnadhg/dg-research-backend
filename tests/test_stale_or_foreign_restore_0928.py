@@ -1240,3 +1240,11 @@ def test_a_job_stood_down_at_the_dequeue_writes_nothing_to_the_account_gone(
             assert (uid, rid) in writes, "a member's queue fields were not cleared"
         else:
             assert (uid, rid) not in writes, f"a doomed write to the gone account: {writes}"
+
+def test_each_accounts_batch_is_still_cut_under_firestores_500_writes():
+    """One batch per account, and each still cut at 450 writes (Firestore
+    refuses a batch of more than 500): 451 of one account's records are two
+    batches, and another account's one record is a third."""
+    patches = [(OWNER, f"rid-{i}", {}) for i in range(451)] + [(SHARER, "rid-s", {})]
+    got = [(uid, i, len(part)) for uid, i, part in research._queue_pos_batches(patches)]
+    assert got == [(OWNER, 0, 450), (OWNER, 450, 1), (SHARER, 0, 1)]

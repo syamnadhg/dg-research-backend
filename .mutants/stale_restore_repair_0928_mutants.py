@@ -189,6 +189,11 @@ MUTANTS = [
     ("B1", RESEARCH, "⛔⛔ one batch for every account again — a removed sharer's "
      "record refuses the owner's and every sharer's positions with it",
      [(BATCH_BY_UID, '        by_uid.setdefault("", []).append(p)')]),
+    ("B4", RESEARCH, "⛔ an account's batch is no longer cut — 451 of one person's "
+     "records is one batch Firestore refuses whole",
+     [("        for i in range(0, len(mine), chunk):\n"
+       "            yield uid_v, i, mine[i:i + chunk]",
+       "        yield uid_v, 0, mine")]),
     ("B2", RESEARCH, "the deferred renumber hands the heal no uid — a refused "
      "account's batch says re-pair",
      [(DEFERRED_BATCH_UID, "                _commit_chunk,\n"
