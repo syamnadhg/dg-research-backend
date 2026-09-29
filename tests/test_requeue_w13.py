@@ -435,6 +435,19 @@ def test_a_backend_started_by_hand_does_not_move_the_run(monkeypatch, tmp_path):
     assert len(_said(m, "REQUEUE: ignored", "not running on startup")) == 1, m.lines
 
 
+def test_a_run_with_nothing_saved_yet_is_not_moved(monkeypatch, tmp_path):
+    """A run whose folder does not exist yet has nothing to go on from. No
+    folder is made up for it, it is not put in the queue and the worker does
+    not restart; the line says why."""
+    m, job, folder = _running(monkeypatch, tmp_path)
+    import shutil
+    shutil.rmtree(folder)
+    _command(monkeypatch, m, _requeue())
+    assert not folder.exists(), "a folder was made up for a run that had none"
+    assert m.exits == [] and m.writes == []
+    assert len(_said(m, "REQUEUE: ignored", "nothing saved")) == 1, m.lines
+
+
 def test_a_second_move_of_the_same_run_is_a_no_op(monkeypatch, tmp_path):
     """Idempotent: once the worker is leaving, a repeated press moves nothing
     and restarts nothing again."""
@@ -566,6 +579,50 @@ def test_the_run_moved_most_recently_is_first(monkeypatch, tmp_path):
     assert (earlier / MARKER).exists()
 
 
+def test_a_run_a_sibling_took_first_is_skipped_and_the_next_one_taken(monkeypatch, tmp_path):
+    """⛔ Two idle workers can reach the same run at once. The rename is the
+    arbiter: the one that loses gets nothing for that run and goes on to the
+    next waiting one, instead of giving up."""
+    store = _Store(records={(SHARER, RID): {"status": "queued"},
+                            (OWNER, OTHER_RID): {"status": "queued"}})
+    m = _machine(monkeypatch, tmp_path, store, worker=1)
+    _a, gone = _run_folder(tmp_path, RID, topic="Gone")
+    _b, next_ = _run_folder(tmp_path, OTHER_RID, uid=OWNER, topic="Next")
+    _moved_marker(next_, OWNER, OTHER_RID)
+    real = research._waiting_runs
+    # Listed a moment ago; a sibling has renamed its marker away since.
+    snapshot = [{"uid": SHARER, "research_id": RID, "moved_at_ms": 2, "_dir": gone}] + real()
+    monkeypatch.setattr(research, "_waiting_runs", lambda: list(snapshot))
+    assert [j["research_id"] for j in _rescan(monkeypatch, m)] == [OTHER_RID]
+
+
+def test_a_moved_run_ended_for_good_is_not_taken_and_stops_waiting(monkeypatch, tmp_path):
+    """A run somebody ended for good (`.stop`) while it waited is refused by
+    the queue's own funnel: not run, not left half-taken, and its record is
+    not told it is running."""
+    m, folder = _waiting(monkeypatch, tmp_path, worker=1)
+    (folder / ".stop").touch()
+    assert _rescan(monkeypatch, m) == []
+    assert not (folder / MARKER).exists() and not (folder / f"{MARKER}.w1").exists()
+    assert [w for w in m.writes if w[1] == RID] == []
+
+
+def test_a_damaged_marker_never_stops_the_queue(monkeypatch, tmp_path):
+    """⛔ Every start and every rescan reads these markers. One that is not
+    JSON, not an object, or carries a time that is not a number must not stop
+    the reader — or no start would be taken on this computer again. The good
+    run is still taken; the odd time sorts last."""
+    m, folder = _waiting(monkeypatch, tmp_path, worker=1)
+    for name, body in (("Broken", "{not json"), ("Listy", "[]"),
+                       ("Odd", json.dumps({"uid": SHARER, "research_id": "chat_odd",
+                                           "moved_at_ms": "soon"}))):
+        _r, d = _run_folder(tmp_path, f"chat_{name}", topic=name)
+        (d / MARKER).write_text(body, encoding="utf-8")
+    ranked = [r["research_id"] for r in research._waiting_runs()]
+    assert ranked == [RID, "chat_odd"], ranked
+    assert [j["research_id"] for j in _rescan(monkeypatch, m)] == [RID]
+
+
 def test_a_worker_that_died_before_starting_it_puts_it_back_at_boot(monkeypatch, tmp_path):
     """A taken run is in one worker's memory only. If that worker dies before
     starting it, its next boot puts the run back for any worker — its own
@@ -653,14 +710,22 @@ def test_moved_runs_are_published_first_and_everything_else_moves_down(monkeypat
     assert pos[OTHER_RID]["queuePosition"] == 3
     assert pos[OTHER_RID]["queuedBehindRunId"] == "chat_earlier_move"
     assert pos[OTHER_RID]["queueTotalAhead"] == 2
+    assert (pos[OTHER_RID]["queueAheadFromSelf"], pos[OTHER_RID]["queueAheadFromOthers"]) == (
+        1, 1), "the runs waiting ahead were not counted by whose they are"
+    assert (pos["chat_earlier_move"]["queueAheadFromSelf"],
+            pos["chat_earlier_move"]["queueAheadFromOthers"]) == (0, 1)
     assert all("status" not in p for p in pos.values()), pos
     del m
 
 
-def test_a_moved_run_is_published_when_nothing_else_waits(monkeypatch, tmp_path):
-    """The empty-queue branch publishes too — it is the common case right
+@pytest.mark.parametrize("queue_docs", [{}, {"q-claimed": {
+    "action": "start", "uid": OWNER, "submittedBy": OWNER, "researchId": OTHER_RID,
+    "topic": "Claimed", "timestamp": 1, "assignedWorker": 1}}], ids=["empty", "all-claimed"])
+def test_a_moved_run_is_published_when_nothing_else_waits(monkeypatch, tmp_path, queue_docs):
+    """Both "nothing else waits" branches publish it — no queue documents at
+    all, or only ones a worker already claimed. It is the common case right
     after a move on a computer with nothing else queued."""
-    store = _Store()
+    store = _Store(queue_docs=queue_docs)
     _machine(monkeypatch, tmp_path, store)
     monkeypatch.setattr(research, "_local_pending_owner_entries", lambda: [])
     _r, folder = _run_folder(tmp_path, RID)

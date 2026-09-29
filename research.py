@@ -9462,13 +9462,13 @@ def _waiting_record_patch() -> dict:
 def _park_waiting_run(job, *, from_worker) -> "Path | None":
     """Put `job`'s run at the front of this computer's queue: write its marker,
     naming the whole job, so whichever worker takes it can resume it without
-    asking anyone. The run folder, or None when the job names no person, has
-    no folder yet (nothing to keep — it has not really started), or the write
-    failed."""
+    asking anyone. The run folder, or None when the job names no person, or
+    the write failed — which is also the answer for a run with no folder yet:
+    it has nothing to keep, and a folder is never made up for it here."""
     run_dir = _job_run_dir(job)
     uid = str((job or {}).get("uid") or "").strip()
     rid = str((job or {}).get("research_id") or "").strip()
-    if run_dir is None or not (uid and rid) or not run_dir.is_dir():
+    if run_dir is None or not (uid and rid):
         return None
     rec = {
         "uid": uid, "research_id": rid, "run_id": run_dir.name,
@@ -9530,14 +9530,6 @@ def _claim_waiting_run(worker_id) -> "dict | None":
                     f"waiting in the queue", "INFO")
             _drop_waiting_claim(d, worker_id)
             continue
-        from google.cloud.firestore import DELETE_FIELD as _DF
-        _update_research_doc(uid, rid, {
-            "status": "ongoing", "assignedWorker": int(worker_id),
-            "queuePosition": _DF, "queuedBehindRunId": _DF,
-            "queuedBehindTitle": _DF, "queueTotalAhead": _DF,
-            "queueAheadFromSelf": _DF, "queueAheadFromOthers": _DF,
-            "movedToQueueAt": _DF,
-        })
         log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the front of "
             f"the queue — it goes on from the start of the step it was on", "INFO")
         return {
@@ -9602,15 +9594,29 @@ def _kick_queue_publish() -> None:
 
 async def _offer_waiting_run(job_queue) -> bool:
     """Idle and awake: take the front run of the queue into this worker's line.
-    True when one was queued here."""
+    True when one was queued here.
+
+    ⭐ The record says "running, on this worker" only once the job is really in
+    this worker's line — the funnel can still refuse it (ended for good, gone).
+    The worker's own queued→ongoing flip cannot be relied on for it (the idle
+    rescan writes its pickups the same way), and the worker's number is what
+    a later restart resumes it on."""
     job = await asyncio.to_thread(_claim_waiting_run, WORKER_ID)
     if job is None:
         return False
-    if _safe_enqueue(job_queue, job, source="moved-run", take_unreadable=True):
-        _kick_queue_publish()
-        return True
-    await asyncio.to_thread(_drop_waiting_claim, job.get("resume_dir"), WORKER_ID)
-    return False
+    if not _safe_enqueue(job_queue, job, source="moved-run", take_unreadable=True):
+        await asyncio.to_thread(_drop_waiting_claim, job.get("resume_dir"), WORKER_ID)
+        return False
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    await asyncio.to_thread(_update_research_doc, job["uid"], job["research_id"], {
+        "status": "ongoing", "assignedWorker": WORKER_ID,
+        "queuePosition": _DF, "queuedBehindRunId": _DF,
+        "queuedBehindTitle": _DF, "queueTotalAhead": _DF,
+        "queueAheadFromSelf": _DF, "queueAheadFromOthers": _DF,
+        "movedToQueueAt": _DF,
+    })
+    _kick_queue_publish()
+    return True
 
 
 def _publish_queue_positions_now(timeout_s: float = 10.0) -> None:
@@ -9649,11 +9655,7 @@ def _requeue_target_worker(data) -> int:
     this computer goes to worker 1, which answers it with one line and takes
     the command away — otherwise nobody would."""
     w = (data or {}).get("workerId")
-    n = 0
-    if isinstance(w, int) and not isinstance(w, bool):
-        n = w
-    elif isinstance(w, str) and w.strip().isdigit():
-        n = int(w.strip())
+    n = int(w) if isinstance(w, int) else 0
     try:
         fleet = int(load_worker_count() or 1)
     except Exception:
