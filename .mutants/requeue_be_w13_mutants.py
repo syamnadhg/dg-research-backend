@@ -480,6 +480,9 @@ MUTANTS = [
     ("R39", RESEARCH, "⛔ Clear Local Storage deletes the runs in this worker's own line",
      [('    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref"))) + list(_UNREAD_RESTORES)\n',
        "    jobs = list(_UNREAD_RESTORES)\n")]),
+    ("R41", RESEARCH, "⛔ after a boot that parked several runs, the published order is "
+     "whatever the first background publish saw",
+     [("    if parked:\n        _publish_queue_positions_now()\n", "")]),
     ("R40", RESEARCH, "Clear Local Storage deletes the boot entries still to be checked",
      [('    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref"))) + list(_UNREAD_RESTORES)\n',
        '    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref")))\n')]),

@@ -18755,6 +18755,7 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     skipped = 0
     refused = []
     withdrew = False
+    parked = False
     paired = str(load_paired_uid() or "").strip()
     members: "set[str] | None" = None
     members_read = False
@@ -18846,6 +18847,7 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
                 and (record or {}).get("status") in ("queued", "ongoing")
                 and _park_instead_of_resuming(j, where="pending_queue", behind=j is not cur,
                                               status=(record or {}).get("status"))):
+            parked = True
             skipped += 1
             withdrew = True
             continue
@@ -18872,6 +18874,12 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # The same rewrite, for the same reason: what restored is in the queue
         # and what the funnel refused is kept; only the withdrawn entry goes.
         _forget_pending_queue_snapshot(path, job_queue, refused)
+    # ⛔ ONE PUBLISH AFTER THE LAST PARK, AND IT WAITS ITS TURN (wave 13 repair).
+    # Each park kicks the queue order in the background, and a kick that finds
+    # a publish already running skips — so a restore that parked the run and the
+    # jobs behind it published whatever the first scan happened to see.
+    if parked:
+        _publish_queue_positions_now()
     # ⛔⛔ A HELD ENTRY IS ASKED ABOUT AGAIN, IN THIS PROCESS (wave 10.10
     # leftovers). Kept for the next boot and nothing more, it waited for a
     # restart that might be days away while its person watched a tile that

@@ -872,6 +872,13 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         assert _statuses(m, RID) == (["queued"] if resting else []), m.writes
         assert _statuses(m, OTHER_RID) == [], "a record that says queued was written again"
         assert m.published.wait(5) if resting else not m.published.is_set()
+        # ⛔ One publish after the last park, waiting its turn — the per-park
+        # kicks skip whenever one is already running, and here they are only
+        # recorded: the order everybody sees comes from this one.
+        owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u]
+        assert owners == ([[{"uid": SHARER, "runId": RID, "position": 1},
+                            {"uid": OWNER, "runId": OTHER_RID, "position": 2}]]
+                          if resting else []), owners
         if resting:
             waiting = research._waiting_runs()
             assert [w["research_id"] for w in waiting] == [RID, OTHER_RID], (
@@ -1464,11 +1471,12 @@ def test_after_a_move_on_a_one_worker_computer_the_worker_that_is_off_starts_not
     monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: True)
     line = _Q()
     monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", line)
+    before = len(m.store.device_updates)
     research._restore_pending_queue_snapshot(path, line, set())
     assert list(line._queue) == [], "the worker that is off was given a run to start"
 
-    research._recompute_deferred_queue_positions_locked()
-    published = [u["queueOwners"] for u in m.store.device_updates if "queueOwners" in u][-1]
+    published = [u["queueOwners"] for u in m.store.device_updates[before:]
+                 if "queueOwners" in u][-1]
     assert [(o["runId"], o["position"]) for o in published] == [(RID, 1), (OTHER_RID, 2)]
 
     # Turned back on: the moved run first…
