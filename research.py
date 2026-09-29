@@ -39909,6 +39909,28 @@ class Browser:
 #: always allowed.) On 2026-09-28 the fallback's CUA typed "test" on its own
 #: initiative, and "do NOT type" in its mission was all that stood in its way.
 CUA_CLICK_ONLY = frozenset({"left_click", "mouse_move", "scroll", "wait", "key:Escape"})
+#: ⛔ The verify gate's DIAGNOSIS only looks (09-29 verify). It runs before the
+#: box guard that keeps the fix's clicks away from a box holding other text, so
+#: one click of its own on Send sent that text.
+CUA_LOOK_ONLY = frozenset({"mouse_move", "scroll", "wait"})
+#: ⛔ What a CARET mission may never click (09-29 verify): its one job is to put
+#: the cursor in the box, and a click on Send sends whatever the box holds. The
+#: verify gate's FIX may still click Send — that is a real recovery.
+CUA_NEVER_CLICK_SEND = CHATGPT_SEND_SEL + ', button[type="submit"]'
+
+
+async def _cua_click_lands_on(browser, params, sel) -> bool:
+    """True when a CUA `left_click` at `params["coordinate"]` would land on (or
+    inside) an element matching `sel` — the same viewport point `left_click`
+    clicks. ⚠ Can't tell is True: the caret mission loses one click, and a send
+    cannot be taken back."""
+    try:
+        x, y = (params or {})["coordinate"]
+        return bool(await browser.page.evaluate(
+            "([x, y, s]) => { const e = document.elementFromPoint(x, y);"
+            " return !!(e && e.closest(s)); }", [x, y, sel]))
+    except Exception:
+        return True
 
 
 def _cua_refusal(action, params, allow) -> str:
@@ -39990,13 +40012,16 @@ async def execute_action(browser, action, params):
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
                      phase=None, agent_name=None, target_page=None,
-                     abort_event=None, allow=None):
+                     abort_event=None, allow=None, never_click=None):
     """CUA agent loop — proven from original research.py.
 
     allow (optional): the only actions this mission may take (CUA_CLICK_ONLY).
     Anything else the model asks for is NOT carried out: it is logged as
     REFUSED and the model is told so. A mission's "do not type" is otherwise
     only a request.
+
+    never_click (optional): a selector list a left_click may not land on
+    (CUA_NEVER_CLICK_SEND) — refused the same way.
 
     target_page (optional): Playwright Page reference. When provided, every
     screenshot re-anchors to this tab via bring_to_front. Prevents the
@@ -40253,11 +40278,22 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id,
                     "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}}]})
             elif refused := _cua_refusal(act, tb.input, allow):
-                log(f"[cua] REFUSED {refused} — this task may only click, scroll, wait or "
-                    f"press Escape; nothing was typed, pressed or sent", "WARN")
+                _may = ", ".join(sorted(allow))
+                log(f"[cua] REFUSED {refused} — this task may only use: {_may}; "
+                    f"nothing was typed, pressed or sent", "WARN")
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": f"Action '{act}' was NOT carried out: this task "
-                     f"may only click, scroll, wait or press Escape. Do not type or press Enter."},
+                     f"may only use: {_may}. Do not type or press Enter."},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                 "data": await _anchored_screenshot()}},
+                ]})
+            elif (never_click and act == "left_click"
+                    and await _cua_click_lands_on(browser, tb.input, never_click)):
+                log("[cua] REFUSED a click on Send — this task only puts the cursor in "
+                    "the message box; nothing was clicked or sent", "WARN")
+                tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
+                    {"type": "text", "text": "That click was NOT carried out: it would have "
+                     "clicked Send. Click inside the message box itself, never on Send."},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                                  "data": await _anchored_screenshot()}},
                 ]})
@@ -40761,7 +40797,8 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                 return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
                     "Look at the BOTTOM of the chat. Is there a Stop button visible? "
                     "Is there a loading animation or spinner? Is the AI actively generating?",
-                    model=CUA_MODEL, max_iterations=3, verbose=verbose, allow=_cua_allow)
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose,
+                    allow=CUA_LOOK_ONLY if _cua_allow is not None else None)
 
             # #839 act tier (read_only): a Vision verdict must land in the
             # returned text with the same plain-English signals the parser
@@ -51008,11 +51045,13 @@ async def _chatgpt_insert_text(page, box, text):
     await page.keyboard.type(text, delay=5)
 
 
-async def _chatgpt_type_prompt_verified(page, box, prompt, *, tag="[p1:submit]") -> bool:
+async def _chatgpt_type_prompt_verified(page, box, prompt, *, tag="[p1:submit]",
+                                        why=None) -> bool:
     """Click the box, type the prompt, READ IT BACK. True only when the box holds
     exactly the prompt (whitespace-normalised). A mismatch clears the box and
     types once more; a second mismatch clears it and returns False — the caller
-    then sends nothing."""
+    then sends nothing. `why["stuck"]` is set when the box held text that would
+    not clear: Send is live over that text, so no fallback may touch the page."""
     want = _norm_prompt_text(prompt)
     if not want:
         log(f"{tag} empty prompt — nothing to type", "WARN")
@@ -51031,6 +51070,8 @@ async def _chatgpt_type_prompt_verified(page, box, prompt, *, tag="[p1:submit]")
                                                  tag=tag)
                 log(f"{tag} ✗ the message box holds text that would not clear — NOT "
                     f"typing, NOT sending", "ERROR")
+                if why is not None:
+                    why["stuck"] = True
                 return False
         await _chatgpt_insert_text(page, box, prompt)
         await asyncio.sleep(0.4)
@@ -51061,6 +51102,29 @@ async def _chatgpt_wait_prompt_sent(page, prompt, timeout_s=10.0) -> bool:
         await asyncio.sleep(0.5)
 
 
+async def _chatgpt_user_msg_count(page) -> "int | None":
+    """How many of the person's messages the thread shows; None when unreadable."""
+    try:
+        return int(await page.evaluate("(s) => document.querySelectorAll(s).length",
+                                       CHATGPT_USER_MSG_SEL))
+    except Exception:
+        return None
+
+
+def _chatgpt_caret_step_sent(before, after, tag) -> bool:
+    """⛔ THE BELT (09-29 verify). A message that appeared while a CUA was only
+    placing the caret was SENT by it — whatever the refusals missed: a Vision
+    step, a click the Send guard misjudged. The prompt is then not typed; a
+    thread with a stray message ahead of the brief is not the run's thread, and
+    on Pro the stray message's reply holds Send anyway. Unreadable is False."""
+    if before is None or after is None or after <= before:
+        return False
+    log(f"{tag} ✗ a message was sent while the CUA was only placing the caret "
+        f"({before} → {after} of your messages on screen) — NOT typing the prompt",
+        "ERROR")
+    return True
+
+
 async def submit_chatgpt_direct(browser, prompt, *, use_focused=False, outcome=None):
     """Type the prompt into ChatGPT's message box, check it, send it, and check
     it was sent (see the section note above).
@@ -51069,6 +51133,9 @@ async def submit_chatgpt_direct(browser, prompt, *, use_focused=False, outcome=N
     prompt. `outcome["state"]` says more for the caller's fallback:
       * ``not_sent``         — nothing was sent (no box, or it would not hold the
                                prompt); a fallback may try again;
+      * ``not_cleared``      — nothing was sent, and the box holds text that
+                               would not clear. ⛔ No fallback: Send is live over
+                               that text, and one click on it sends it (09-29);
       * ``sent_unconfirmed`` — Send WAS pressed but the message was not seen; a
                                fallback must NOT type the prompt a second time;
       * ``sent``             — confirmed.
@@ -51099,7 +51166,10 @@ async def submit_chatgpt_direct(browser, prompt, *, use_focused=False, outcome=N
             log("Direct submit: no message box found — nothing typed, nothing sent", "WARN")
             return False
 
-        if not await _chatgpt_type_prompt_verified(page, box, prompt, tag=tag):
+        _why: dict = {}
+        if not await _chatgpt_type_prompt_verified(page, box, prompt, tag=tag, why=_why):
+            if _why.get("stuck"):
+                out["state"] = "not_cleared"
             return False
 
         # Send — ChatGPT's Send (either page) appears once the box holds text.
@@ -55240,10 +55310,12 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
                 "Click inside ChatGPT's message box so the text cursor is in it. "
                 "Do NOT type, paste, press Enter or click Send.",
-                model=CUA_MODEL, max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY)
+                model=CUA_MODEL, max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,
+                never_click=CUA_NEVER_CLICK_SEND)
 
         # #839 act tier: side-effect-only (result ignored); what counts is the
         # checked submit right after it and the verify gate below.
+        _msgs_before = await _chatgpt_user_msg_count(browser.page)
         await _shadow_observed_cua(
             browser.page, hotspot_id="1a-submit", phase=1, platform="chatgpt",
             current_step="focus_message_box",
@@ -55254,8 +55326,12 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             cua_coro_factory=_submit_cua,
             mission_prompt=PROMPT_SUBMIT_FALLBACK,
             act_allow=CUA_CLICK_ONLY)
-        submitted = await submit_chatgpt_direct(browser, prompt, use_focused=True,
-                                                outcome=_p1_submit)
+        if _chatgpt_caret_step_sent(_msgs_before, await _chatgpt_user_msg_count(browser.page),
+                                    "[p1:submit]"):
+            _p1_submit["state"] = "stray_send"
+        else:
+            submitted = await submit_chatgpt_direct(browser, prompt, use_focused=True,
+                                                    outcome=_p1_submit)
 
     # VERIFY: confirm ChatGPT is generating — ON OUR PROMPT (see chatgpt_prompt)
     emit_event("agent_progress", phase=1, agent="chatgpt",
@@ -55375,10 +55451,11 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                     "Click inside ChatGPT's message box so the text cursor is in it. "
                     "Do NOT type, paste, press Enter or click Send.",
                     model=CUA_MODEL, max_iterations=8, verbose=verbose,
-                    allow=CUA_CLICK_ONLY)
+                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)
 
             # #839 act tier: side-effect-only; the checked submit right after it
             # and the follow-up verify gate below are the ground truth.
+            _fu_msgs_before = await _chatgpt_user_msg_count(browser.page)
             await _shadow_observed_cua(
                 browser.page, hotspot_id="1a-submit", phase=1, platform="chatgpt",
                 current_step="focus_message_box_followup",
@@ -55388,8 +55465,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 cua_coro_factory=_submit_fu_cua,
                 mission_prompt=PROMPT_SUBMIT_FALLBACK,
                 act_allow=CUA_CLICK_ONLY)
-            submitted_fu = await submit_chatgpt_direct(browser, followup, use_focused=True,
-                                                       outcome=_fu_submit)
+            if _chatgpt_caret_step_sent(_fu_msgs_before,
+                                        await _chatgpt_user_msg_count(browser.page),
+                                        "[p1:followup]"):
+                _fu_submit["state"] = "stray_send"
+            else:
+                submitted_fu = await submit_chatgpt_direct(browser, followup, use_focused=True,
+                                                           outcome=_fu_submit)
         # Wait for the updated response
         await asyncio.sleep(5)
         verified_fu = await wait_until_verified(verify_chatgpt_generating, browser.page, "Phase1-followup",
