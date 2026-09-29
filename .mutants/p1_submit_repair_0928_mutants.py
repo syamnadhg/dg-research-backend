@@ -177,8 +177,7 @@ MUTANTS = [
      [("            elif (never_click and act == \"left_click\"",
        "            elif (False and never_click and act == \"left_click\"")]),
     ("N2", RESEARCH, "⛔ the Send guard never sees Send under a click",
-     [("            \" return !!(e && e.closest(s)); }\", [x, y, sel]))",
-       "            \" return false; }\", [x, y, sel]))")]),
+     [("        if (n.closest(s)) return true;\n", "        if (false) return true;\n")]),
     ("N3", RESEARCH, "⛔ the brief's caret CUA may click Send",
      [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
        "                never_click=CUA_NEVER_CLICK_SEND)",
@@ -201,15 +200,37 @@ MUTANTS = [
        "        if False and _chatgpt_caret_step_sent(_msgs_before, "
        "await _chatgpt_user_msg_count(browser.page),")]),
     ("B2", RESEARCH, "⛔ the belt never sees a new message",
-     [("    if before is None or after is None or after <= before:\n        return False",
+     [("    if before is None or after is None or after == before:\n        return False",
        "    if True:\n        return False")]),
     ("B3", RESEARCH, "⛔ the belt is off on the follow-up",
      [("            if _chatgpt_caret_step_sent(_fu_msgs_before,",
        "            if False and _chatgpt_caret_step_sent(_fu_msgs_before,")]),
     ("B4", RESEARCH, "OVER-REACH: the belt fires on every caret step — a caret placed "
      "cleanly never gets its prompt",
-     [("    if before is None or after is None or after <= before:\n        return False",
-       "    if before is None or after is None or after < before:\n        return False")]),
+     [("    if before is None or after is None or after == before:\n        return False",
+       "    if before is None or after is None:\n        return False")]),
+
+    # ═══ R — the last review's items (09-29 re-verify) ═════════════════════
+    ("N4", RESEARCH, "⛔ the follow-up's caret CUA may click Send",
+     [("                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)",
+       "                    allow=CUA_CLICK_ONLY)")]),
+    ("N5", RESEARCH, "the Send guard stops at a shadow root's host — the button inside "
+     "is clicked",
+     [("        const inner = e.shadowRoot.elementFromPoint(x, y);\n"
+       "        if (!inner || inner === e) break;\n",
+       "        const inner = null;\n"
+       "        if (!inner || inner === e) break;\n")]),
+    ("N6", RESEARCH, "a click into a frame is judged as not Send",
+     [("    if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return true;\n", "")]),
+    ("N7", RESEARCH, "⛔ a click the guard cannot judge is let through",
+     [("        return bool(await browser.page.evaluate(_CUA_CLICK_TARGET_JS, [x, y, sel]))\n"
+       "    except Exception:\n        return True",
+       "        return bool(await browser.page.evaluate(_CUA_CLICK_TARGET_JS, [x, y, sel]))\n"
+       "    except Exception:\n        return False")]),
+    ("B5", RESEARCH, "⛔ the belt only counts upward — a caret step that opened a new "
+     "chat passes, and the follow-up goes into it",
+     [("    if before is None or after is None or after == before:\n        return False",
+       "    if before is None or after is None or after[0] <= before[0]:\n        return False")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

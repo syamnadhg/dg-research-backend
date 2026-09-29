@@ -723,3 +723,101 @@ def test_live_p1_a_message_sent_during_the_follow_ups_caret_step_stops_the_follo
     assert p1.submits == [(prompt, False), (followup, False)], p1.submits
     assert any(lv == "ERROR" and m.startswith("[p1:followup]")
                and "while the CUA was only placing the caret" in m for lv, m in logs), logs
+
+
+def _send_center_of_an_empty_box(chrome, page):
+    """Where Send sits once the box holds text (it is drawn only then)."""
+    chrome.run(page.click('.ProseMirror'))
+    chrome.run(page.keyboard.insert_text("x"))
+    send = chrome.run(page.evaluate(SEND_CENTER_JS))
+    chrome.run(page.keyboard.press("Backspace"))
+    return send
+
+
+def test_live_p1_the_follow_ups_caret_cua_cannot_click_send(chrome, page, p1, logs):
+    """The follow-up's caret mission is held to the same Send guard as the
+    brief's (09-29 re-verify: only the brief's was pinned)."""
+    _load_p1(chrome, page, p1, streaming=True)
+    send = _send_center_of_an_empty_box(chrome, page)
+    p1.extra = "Add the hospice's own records."
+
+    async def _leftover_in_an_unnamed_box():
+        await page.evaluate(UNNAME_BOX_JS)
+        await page.focus('[contenteditable="true"]')
+        await page.keyboard.insert_text("est")
+
+    p1.after_poll = _leftover_in_an_unnamed_box
+    cua = _ScriptedCua({"focus": lambda: [_click_box(p1), ("left_click", {"coordinate": send})]})
+    assert p1.run(cua) == "verified", logs
+    prompt, followup = p1.submits[0][0], p1.submits[1][0]
+    norm = research._norm_prompt_text
+    assert _norm_users(chrome, page) == [norm(prompt), norm(followup)]
+    assert [m for m in _refused(logs) if "click on Send" in m], _refused(logs)
+
+
+#: A sidebar "New chat", as ChatGPT has: a navigation in the tab that empties
+#: the thread. Returns its centre.
+NEW_CHAT_JS = """() => {
+    const a = document.createElement('a');
+    a.href = '/'; a.textContent = 'New chat';
+    a.style.cssText = 'position:fixed;left:4px;top:4px;width:120px;height:30px;display:block;z-index:9';
+    a.addEventListener('click', (e) => {
+        e.preventDefault();
+        document.getElementById('sr-transcript').replaceChildren();
+        history.pushState({}, '', '#new-chat');
+    });
+    document.body.appendChild(a);
+    const r = a.getBoundingClientRect();
+    return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+}"""
+
+
+def test_live_p1_a_caret_step_that_opens_a_new_chat_stops_the_follow_up(chrome, page, p1, logs):
+    """⛔ The caret CUA misclicks "New chat" (not Send, so allowed): the thread
+    it leaves has FEWER messages, and the follow-up went into an empty chat
+    whose reply was then read as the brief (09-29 re-verify). The thread must
+    be exactly as the step found it."""
+    _load_p1(chrome, page, p1, streaming=True)
+    newchat = chrome.run(page.evaluate(NEW_CHAT_JS))
+    p1.extra = "Add the hospice's own records."
+
+    async def _unnamed_box():
+        await page.evaluate(UNNAME_BOX_JS)
+
+    p1.after_poll = _unnamed_box
+    cua = _ScriptedCua({"focus": lambda: [("left_click", {"coordinate": newchat}),
+                                          _click_box(p1)]})
+    p1.run(cua)
+    prompt, followup = p1.submits[0][0], p1.submits[1][0]
+    assert _norm_users(chrome, page) == [], "the follow-up was sent into the new chat"
+    assert p1.submits == [(prompt, False), (followup, False)], p1.submits
+    assert any(lv == "ERROR" and "the chat changed" in m and "NOT typing" in m
+               for lv, m in logs), logs
+
+
+SHADOW_SEND_HTML = """<body><div id=host style="position:absolute;left:100px;top:100px"></div>
+<script>const r = document.getElementById('host').attachShadow({mode: 'open'});
+r.innerHTML = '<button type=submit aria-label=Send style="width:80px;height:40px">S</button>';
+</script></body>"""
+
+
+def test_live_the_send_guard_sees_send_inside_a_shadow_root_and_refuses_a_frame(chrome, page):
+    chrome.run(page.set_content(SHADOW_SEND_HTML))
+    br = _browser(page)
+    sel = research.CUA_NEVER_CLICK_SEND
+    assert chrome.run(research._cua_click_lands_on(br, {"coordinate": [140, 120]}, sel)) is True
+    assert chrome.run(research._cua_click_lands_on(br, {"coordinate": [600, 500]}, sel)) is False
+    chrome.run(page.set_content('<body><iframe style="position:absolute;left:0;top:0;'
+                                'width:400px;height:300px" srcdoc="<p>x</p>"></iframe></body>'))
+    assert chrome.run(research._cua_click_lands_on(br, {"coordinate": [100, 100]}, sel)) is True
+
+
+def test_a_click_the_guard_cannot_judge_is_refused():
+    """Can't tell (the page threw, no coordinate) is a refusal: the caret step
+    loses one click, and a send cannot be taken back."""
+    async def _boom(*_a, **_k):
+        raise RuntimeError("Target closed")
+    br = SimpleNamespace(page=SimpleNamespace(evaluate=_boom))
+    sel = research.CUA_NEVER_CLICK_SEND
+    assert asyncio.run(research._cua_click_lands_on(br, {"coordinate": [1, 2]}, sel)) is True
+    assert asyncio.run(research._cua_click_lands_on(br, {}, sel)) is True
