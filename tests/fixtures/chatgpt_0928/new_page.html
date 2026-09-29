@@ -26,7 +26,11 @@
   apostrophes and turns "- " lines into bullets; body[data-sendmangle] — Send posts the text
   minus its first character; body[data-menu-closed-by] / [data-sent-via] record
   how the menu closed (escape / outside) and how the message went (button /
-  enter).
+  enter). body[data-attach] — every user message carries a file card ABOVE its
+  text, inside the bubble's own flex column (NOT captured: no capture holds an
+  attachment, so the card goes where it would hurt most; its name line also
+  carries whitespace-pre-wrap); body[data-streaming] — after a send Stop stays
+  up (the reply is still being written).
 -->
 <html lang="en">
 <head>
@@ -133,11 +137,21 @@
       slot.innerHTML = '<button type="button" class="' + BTN + '" aria-label="Start Voice" data-state="closed"><svg></svg></button>';
     }
   }
+  function fileCard() {
+    const c = document.createElement('div');
+    c.innerHTML = '<div class="truncate font-semibold whitespace-pre-wrap">St_Bernard_notes.pdf</div>'
+      + '<div class="truncate">PDF</div>';
+    return c;
+  }
   function addExchange(userText, withReply) {
     const turn = clone('sr-turn');
     const col = turn.querySelector('div[class="flex flex-col gap-3 browser:gap-1"]');
     const user = clone('sr-user-block');
     user.querySelector('div[dir="auto"]').textContent = userText;
+    if (document.body.dataset.attach) {
+      const inBubble = user.querySelector('[data-user-message-bubble="true"] > div');
+      inBubble.insertBefore(fileCard(), inBubble.firstChild);
+    }
     col.appendChild(user);
     transcript.appendChild(turn);
     const addReply = () => {
@@ -156,7 +170,7 @@
     const addReply = addExchange(document.body.dataset.sendmangle ? t.slice(1) : t, false);
     box.innerHTML = EMPTY;
     setAction('stop');
-    setTimeout(() => { addReply(); setAction('voice'); }, 400);
+    setTimeout(() => { addReply(); if (!document.body.dataset.streaming) setAction('voice'); }, 400);
   }
   box.addEventListener('input', (e) => {
     if (document.body.dataset.richtext && /^insert/.test(e.inputType || '')) {

@@ -50447,12 +50447,20 @@ _CHATGPT_BOX_TEXT_JS = r"""(el) => {
     return (typeof el.value === 'string') ? el.value : (el.textContent || '');
 }"""
 
-#: The newest user message's text, or null when the thread holds none.
+#: The newest user message's OWN text, or null when the thread holds none.
+#: ⛔ Not the whole message. A file the user attached (Phase 1 with sources) is
+#: drawn INSIDE the message, above its text, so the whole message reads
+#: "St_Bernard_notes.pdf PDF Please create…" and a check that it STARTS with the
+#: prompt refused a real send. On both pages the text is the message's LAST
+#: `.whitespace-pre-wrap` block (a file card sits above it); a message with no
+#: such block is read whole.
 _CHATGPT_LAST_USER_TEXT_JS = _cg_js(r"""() => {
     const all = document.querySelectorAll('__CG_USER__');
     if (!all.length) return null;
     const last = all[all.length - 1];
-    return last.innerText || last.textContent || '';
+    const own = last.querySelectorAll('.whitespace-pre-wrap');
+    const el = own.length ? own[own.length - 1] : last;
+    return el.innerText || el.textContent || '';
 }""")
 
 #: The focused element, when it is something a person could type into.

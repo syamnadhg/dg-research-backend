@@ -9,6 +9,11 @@
   It exists to prove the old page STILL works after the markers learned the new
   one. Same script contract as new_page.html: body[data-sr-fixture="thread"]
   loads a finished exchange with Stop showing; body[data-mangle] is a test hook.
+  TEST HOOKS shared with new_page.html: body[data-attach] — every user message
+  carries a file card ABOVE its text, inside [data-message-author-role="user"]
+  (where the old page drew an attached source; its name line also carries
+  whitespace-pre-wrap); body[data-streaming] — after a send Stop stays up (the
+  reply is still being written).
 -->
 <html lang="en">
 <head>
@@ -59,9 +64,19 @@
         + (kind === 'send' ? '' : ' disabled') + '><svg></svg></button>';
     }
   }
+  function fileCard() {
+    const c = document.createElement('div');
+    c.innerHTML = '<div class="truncate font-semibold whitespace-pre-wrap">St_Bernard_notes.pdf</div>'
+      + '<div class="truncate">PDF</div>';
+    return c;
+  }
   function addExchange(userText, withReply) {
     const u = clone('sr-user-turn');
     u.querySelector('.whitespace-pre-wrap').textContent = userText;
+    if (document.body.dataset.attach) {
+      const m = u.querySelector('[data-message-author-role="user"]');
+      m.insertBefore(fileCard(), m.firstChild);
+    }
     transcript.appendChild(u);
     const addReply = () => {
       const a = clone('sr-assistant-turn');
@@ -78,7 +93,7 @@
     const addReply = addExchange(t, false);
     box.innerHTML = EMPTY;
     setAction('stop');
-    setTimeout(() => { addReply(); setAction('idle'); }, 400);
+    setTimeout(() => { addReply(); if (!document.body.dataset.streaming) setAction('idle'); }, 400);
   }
   box.addEventListener('input', (e) => {
     const n = parseInt(document.body.dataset.mangle || '0', 10);
