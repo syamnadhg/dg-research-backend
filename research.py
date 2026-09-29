@@ -54373,10 +54373,9 @@ def _cg_letters(s: str) -> str:
 
 
 def _brief_line_probe(line: str) -> str:
-    """The opening of one line of the copy, as the page shows it: an image shows
-    no text, a link shows only its words, and a list's number or bullet is drawn
-    by the page rather than written in its text."""
-    line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+    """The opening of one line of the copy, as the page shows it: a link shows
+    only its words, and a list's number or bullet is drawn by the page rather
+    than written in its text."""
     line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)
     line = re.sub(r"^\s*(?:(?:[-*+>]|\d+[.)])\s+)+", "", line)
     return _cg_letters(line)[:_CG_ON_PAGE_PROBE]

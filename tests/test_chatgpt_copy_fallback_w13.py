@@ -612,11 +612,12 @@ def test_live_p1_the_cuas_copy_overwritten_by_another_worker_is_not_used(
     tasks, wrote = [], asyncio.Event()
 
     class _Look(base._FastAsyncio):
-        """research's sleeps, capped — except the CUA's "wait 7", its next
-        look, which lasts until worker 2 has written."""
+        """research's sleeps, capped — except the CUA's "wait 7.125" (a
+        figure nothing else waits), its next look, which lasts until worker 2
+        has written."""
         @staticmethod
         async def sleep(delay=0, *a, **k):
-            if delay == 7:
+            if delay == 7.125:
                 await asyncio.wait_for(wrote.wait(), 10)
             else:
                 await asyncio.sleep(min(float(delay or 0), 0.05))
@@ -634,7 +635,7 @@ def test_live_p1_the_cuas_copy_overwritten_by_another_worker_is_not_used(
         tasks.append(asyncio.ensure_future(_write_once()))
 
     p1.hooks = [_hook]
-    cua = _CopyCua(lambda: [_click(p1, "copy"), ("wait", {"duration": 7})])
+    cua = _CopyCua(lambda: [_click(p1, "copy"), ("wait", {"duration": 7.125})])
     try:
         out = p1.run(cua)
     finally:
