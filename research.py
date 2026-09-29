@@ -109,6 +109,7 @@ from prompts import (
     PROMPT_CLICK_SEND,
     PROMPT_COPY_ARTIFACT_CHATGPT,
     PROMPT_COPY_ARTIFACT_CLAUDE,
+    PROMPT_COPY_REPLY_CHATGPT,
     PROMPT_DIAGNOSE,
     PROMPT_FIX_ISSUE,
     PROMPT_GEMINI_COPY_CONTENTS,
@@ -23031,6 +23032,16 @@ CHATGPT_STOP_SEL = ('button[data-testid="stop-button"], '
                     'button[aria-label="Stop streaming"]')
 CHATGPT_MODEL_TRIGGER_SEL = ('[data-testid="model-selector"], '
                              'button[aria-label="Select ChatGPT model"][aria-haspopup="menu"]')
+#: The Copy button under a reply (wave 13 — Phase 1's fallback when the page
+#: read comes back empty; see `chatgpt_brief_via_copy`). The owner's capture
+#: (chatgpt-reply-capture2.json "buttons") names it: the reply's is exactly
+#: aria-label "Copy"; the user's own message has "Copy message", which this
+#: marker cannot match. ⚠ WHERE it sits relative to the reply is NOT captured
+#: yet — the lookup takes the last one on the page (see
+#: `_CHATGPT_COPY_BUTTON_JS`). The old page's is the testid. A new capture
+#: edits THIS line only.
+CHATGPT_COPY_REPLY_SEL = ('[data-testid="copy-turn-action-button"], '
+                          'button[aria-label="Copy"]')
 
 #: The same markers for page JS. A JS string writes `'__CG_USER__'` — inside
 #: SINGLE quotes — and `_cg_js` splices the list in. Spliced rather than passed
@@ -23045,6 +23056,7 @@ _CG_JS_MARKERS = {
     "__CG_SEND__": CHATGPT_SEND_SEL,
     "__CG_STOP__": CHATGPT_STOP_SEL,
     "__CG_MODEL__": CHATGPT_MODEL_TRIGGER_SEL,
+    "__CG_COPY__": CHATGPT_COPY_REPLY_SEL,
 }
 # A marker that carried a single quote or a backslash would end the JS string it
 # is spliced into — a SyntaxError on the page, i.e. a probe that silently answers
@@ -39948,6 +39960,19 @@ CUA_LOOK_ONLY = frozenset({"mouse_move", "scroll", "wait"})
 #: the cursor in the box, and a click on Send sends whatever the box holds. The
 #: verify gate's FIX may still click Send — that is a real recovery.
 CUA_NEVER_CLICK_SEND = CHATGPT_SEND_SEL + ', button[type="submit"]'
+#: ⛔ What Phase 1's COPY mission may never click (wave 13): Send, as above, and
+#: Regenerate under the reply — a stray click there would throw the finished
+#: brief away and start writing a new one. (Captured label; it opens a menu.)
+CUA_NEVER_CLICK_COPY = CUA_NEVER_CLICK_SEND + ', button[aria-label="Regenerate response"]'
+#: What agent_loop says when `never_click` refuses a click, per mission: the
+#: button(s) the list names, what the mission is for, and what to click
+#: instead. "caret" (the default) is the wording the caret missions always had.
+_NEVER_CLICK_SAY = {
+    "caret": ("Send", "only puts the cursor in the message box",
+              "Click inside the message box itself, never on Send."),
+    "copy": ("Send or Regenerate", "only clicks the Copy button under ChatGPT's latest reply",
+             "Click only the Copy button directly under ChatGPT's latest reply."),
+}
 
 
 async def _cua_click_lands_on(browser, params, sel) -> bool:
@@ -40062,7 +40087,8 @@ async def execute_action(browser, action, params):
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
                      phase=None, agent_name=None, target_page=None,
-                     abort_event=None, allow=None, never_click=None):
+                     abort_event=None, allow=None, never_click=None,
+                     never_click_say="caret"):
     """CUA agent loop — proven from original research.py.
 
     allow (optional): the only actions this mission may take (CUA_CLICK_ONLY).
@@ -40071,7 +40097,8 @@ async def agent_loop(client, browser, system_prompt, user_message,
     only a request.
 
     never_click (optional): a selector list a left_click may not land on
-    (CUA_NEVER_CLICK_SEND) — refused the same way.
+    (CUA_NEVER_CLICK_SEND, CUA_NEVER_CLICK_COPY) — refused the same way.
+    never_click_say: which `_NEVER_CLICK_SAY` wording the refusal uses.
 
     target_page (optional): Playwright Page reference. When provided, every
     screenshot re-anchors to this tab via bring_to_front. Prevents the
@@ -40339,11 +40366,12 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 ]})
             elif (never_click and act == "left_click"
                     and await _cua_click_lands_on(browser, tb.input, never_click)):
-                log("[cua] REFUSED a click on Send — this task only puts the cursor in "
-                    "the message box; nothing was clicked or sent", "WARN")
+                _nc_btn, _nc_task, _nc_hint = _NEVER_CLICK_SAY[never_click_say]
+                log(f"[cua] REFUSED a click on {_nc_btn} — this task {_nc_task}; "
+                    f"nothing was clicked or sent", "WARN")
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
-                    {"type": "text", "text": "That click was NOT carried out: it would have "
-                     "clicked Send. Click inside the message box itself, never on Send."},
+                    {"type": "text", "text": f"That click was NOT carried out: it would have "
+                     f"clicked {_nc_btn}. {_nc_hint}"},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                                  "data": await _anchored_screenshot()}},
                 ]})
@@ -54045,10 +54073,11 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
               + iframe-aware install). Wayland-safe.
 
     Phase 1 (brief extraction) calls with browser=None / cua_client=None so
-    Tier 1 + Tier 3 gate off — Tier 2 HTML→MD is its SOLE path (the brief is
+    Tier 1 + Tier 3 gate off — Tier 2 HTML→MD is its page read (the brief is
     inline extended-thinking text: no result panel / download button / canvas
-    for a CUA tier to act on, so HTML→MD is both correct and sufficient there;
-    P1's own extraction-fail auto-retry in run_phase1 re-pulls via HTML→MD).
+    for a CUA tier to act on). When that page read comes back EMPTY, Phase 1
+    takes the brief from ChatGPT's own Copy button instead — that is
+    `chatgpt_brief_via_copy`, called by run_phase1, never from here.
 
     ChatGPT Deep Research (P2) outputs a document/artifact card, not regular
     chat text — which is why P2 passes browser+cua to enable Tier 1/3."""
@@ -54212,6 +54241,171 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         pass
     log(f"[{label}] All extraction methods failed (canvas may not have opened)", "WARN")
     return ""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 1's brief from ChatGPT's own Copy button (wave 13)
+# ─────────────────────────────────────────────────────────────────────────────
+# The page read (HTML→markdown of the reply, above) stays the default. When it
+# comes back EMPTY — the owner's run logged "HTML→MD miss: tried=21 sels,
+# matched=0" and then "All extraction methods failed" — the finished brief is
+# still on the screen, under a Copy button that hands out its markdown. So:
+#   1. a marker goes on the clipboard first and is read back; if it does not
+#      come back the clipboard cannot be trusted here, and nothing is clicked;
+#   2. the Copy button under the latest reply is clicked (a real click);
+#   3. no such button (a future rename) → the CUA clicks it — clicks only, and
+#      never on Send or Regenerate;
+#   4. the clipboard is read, and kept only if it is not the marker, is long
+#      enough, is not our own prompt, and reads like a brief.
+# ⛔ The marker is what makes the read mean anything. Without it a click that
+# copied nothing hands back whatever the clipboard held before — an earlier
+# run's brief, say — as this run's.
+
+#: Shortest copy that can be the brief: the "brief looks unusually short" card's
+#: floor. Real briefs measure 46-73 KB (see run_phase1).
+_CG_COPY_MIN_CHARS = 500
+#: How long to wait, after the click, for the clipboard to change.
+_CG_COPY_READ_S = 5.0
+#: The copy mission's cap on the CUA.
+_CG_COPY_CUA_S = 150.0
+
+#: Writes the marker and reads it back: "" when the clipboard works, else why not.
+_CG_COPY_ARM_JS = """async (s) => {
+    try { await navigator.clipboard.writeText(s); }
+    catch (e) { return 'write: ' + ((e && e.message) || e); }
+    try { return (await navigator.clipboard.readText()) === s ? '' : 'the marker did not come back'; }
+    catch (e) { return 'read: ' + ((e && e.message) || e); }
+}"""
+_CG_COPY_READ_JS = """async () => {
+    try { return await navigator.clipboard.readText(); } catch (e) { return null; }
+}"""
+
+#: The Copy button under the LATEST reply, or null. The last Copy button on the
+#: page (the latest reply's row of icons is the last one), never one inside a
+#: code block, never one inside a reply's own text, never one ChatGPT hides;
+#: and while a reply can be found by its marker, only one AFTER the latest reply
+#: — an earlier reply's Copy would hand back an older brief. ⚠ Where the button
+#: sits is ASSUMED (not captured yet): "under the reply" = after it on the page.
+_CHATGPT_COPY_BUTTON_JS = _cg_js("""() => {
+    const replies = document.querySelectorAll('__CG_ASSISTANT__');
+    const latest = replies.length ? replies[replies.length - 1] : null;
+    const texts = [...document.querySelectorAll('__CG_REPLY_TEXT__')];
+    const shown = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const ok = [...document.querySelectorAll('__CG_COPY__')].filter((b) => shown(b)
+        && !b.closest('pre, code')
+        && !texts.some((t) => t.contains(b))
+        && (!latest || !!(latest.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)));
+    return ok.length ? ok[ok.length - 1] : null;
+}""")
+
+#: Characters that crowd a line of code and are rare in prose.
+_CG_CODE_CHARS = frozenset("{}[]()<>=;$\\|`")
+
+
+def _brief_prose_line(line: str) -> bool:
+    """A line of prose: eight words or more, and not crowded with code symbols."""
+    if len(re.findall(r"[^\W\d_]{2,}", line)) < 8:
+        return False
+    return sum(ch in _CG_CODE_CHARS for ch in line) < 0.05 * len(line)
+
+
+def _chatgpt_copy_verdict(text, marker, ours=()) -> str:
+    """"" when what a Copy click left on the clipboard can be Phase 1's brief;
+    otherwise why not, in plain words for the log. `ours`: the prompts we sent."""
+    t = (text or "").strip()
+    if not t or t == marker:
+        return "nothing was copied"
+    if len(t) < _CG_COPY_MIN_CHARS:
+        return f"it was only {len(t)} characters"
+    head = _norm_prompt_text(t)[:400]
+    for p in ours:
+        want = _norm_prompt_text(p)[:60]
+        if want and want in head:
+            return "it was our own prompt, not ChatGPT's reply"
+    if sum(1 for ln in t.splitlines() if _brief_prose_line(ln)) < 3:
+        return "it does not read like a brief"
+    return ""
+
+
+async def _chatgpt_find_copy_button(page):
+    """The Copy button under the latest reply (an element handle), or None."""
+    try:
+        handle = await page.evaluate_handle(_CHATGPT_COPY_BUTTON_JS)
+    except Exception:
+        return None
+    el = handle.as_element()
+    if el is None:
+        with contextlib.suppress(Exception):
+            await handle.dispose()
+    return el
+
+
+async def _chatgpt_read_copied(page, marker) -> str:
+    """The clipboard, once it holds something other than `marker` (or the marker
+    itself when nothing changed within _CG_COPY_READ_S)."""
+    deadline = time.monotonic() + _CG_COPY_READ_S
+    while True:
+        try:
+            got = await page.evaluate(_CG_COPY_READ_JS)
+        except Exception:
+            got = None
+        if got is not None and got != marker:
+            return got
+        if time.monotonic() >= deadline:
+            return marker
+        await asyncio.sleep(0.25)
+
+
+async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=(),
+                                 verbose=False) -> str:
+    """Phase 1's brief from ChatGPT's own Copy button; "" when it cannot be had.
+    run_phase1 calls it ONLY when the page read came back empty (see the note
+    above). `ours`: the prompts we sent, which a copy must not be."""
+    marker = f"superresearch-copy-check-{os.urandom(8).hex()}"
+    try:
+        armed = await page.evaluate(_CG_COPY_ARM_JS, marker)
+    except Exception as e:
+        armed = str(e) or type(e).__name__
+    if armed:
+        log(f"Phase 1: can't use the clipboard in this browser ({str(armed)[:120]}) — "
+            f"the Copy button was not tried", "WARN")
+        return ""
+    how = ""
+    btn = await _chatgpt_find_copy_button(page)
+    if btn is not None:
+        try:
+            await btn.click(timeout=5000)
+            how = "ChatGPT's Copy button"
+        except Exception as e:
+            log(f"Phase 1: the Copy button under ChatGPT's reply could not be clicked "
+                f"({(str(e) or type(e).__name__)[:120]})", "WARN")
+    if not how:
+        if not (browser and cua_client):
+            log("Phase 1: no Copy button found under ChatGPT's reply, and no CUA to click it",
+                "WARN")
+            return ""
+        log("Phase 1: no Copy button found under ChatGPT's reply — asking the CUA to "
+            "click it (it can only click; it cannot type or send)")
+        try:
+            await asyncio.wait_for(agent_loop(
+                cua_client, browser, PROMPT_COPY_REPLY_CHATGPT,
+                "Click the Copy button directly under ChatGPT's latest reply. "
+                "Do NOT type, paste, press Enter or click Send.",
+                model=CUA_MODEL, max_iterations=6, verbose=verbose, target_page=page,
+                allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_COPY,
+                never_click_say="copy"), timeout=_CG_COPY_CUA_S)
+        except Exception as e:
+            log(f"Phase 1: the CUA's Copy click ended early "
+                f"({(str(e) or type(e).__name__)[:120]})", "WARN")
+        how = "ChatGPT's Copy button, clicked by the CUA"
+    text = await _chatgpt_read_copied(page, marker)
+    why = _chatgpt_copy_verdict(text, marker, ours)
+    if why:
+        log(f"Phase 1: what the Copy button gave was not used — {why}", "WARN")
+        return ""
+    text = _strip_chatgpt_citation_tokens(text.strip())
+    log(f"Phase 1: brief taken from {how} ({len(text)} chars)")
+    return text
 
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
@@ -55352,6 +55546,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     if feedback:
         prompt += f'\n\nUSER FEEDBACK (incorporate this): {feedback}'
         log(f"Phase 1: Injecting user feedback: {feedback[:100]}")
+    # Every prompt we send in this phase: a copy of the brief must be none of them.
+    _p1_ours = [prompt]
     emit_event("agent_progress", phase=1, agent="chatgpt",
                status="submitting",
                progress="Submitting the research-brief prompt…")
@@ -55503,6 +55699,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             f"the following additional context from the user:\n\n{extra_ctx}\n\n"
             f"Output the complete updated research brief. No preamble."
         )
+        _p1_ours.append(followup)
         _fu_submit = {}
         submitted_fu = await submit_chatgpt_direct(browser, followup, outcome=_fu_submit)
         # Same rule as the brief's submit: the CUA only places the caret.
@@ -55550,7 +55747,23 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Phase 1: Follow-up may not have triggered generation — using original brief", "WARN")
 
     # Extract
-    brief_text = await extract_chatgpt_response(browser.page)
+    # ⭐ Wave 13 — the page read stays the default. ONLY when it comes back
+    # empty is the brief taken from ChatGPT's own Copy button under the reply
+    # (and, when no Copy button can be found, a CUA that may only click presses
+    # it) — see chatgpt_brief_via_copy. The first read and every re-read below
+    # are this one step, so each says which way the brief came.
+    async def _p1_read_brief():
+        text = await extract_chatgpt_response(browser.page)
+        if len(text or "") >= 100:
+            log(f"Phase 1: brief read from the page ({len(text)} chars)")
+            return text
+        log("Phase 1: the page read came back empty — taking the brief from "
+            "ChatGPT's Copy button under the reply")
+        return (await chatgpt_brief_via_copy(browser.page, browser=browser,
+                                             cua_client=cua_client, ours=_p1_ours,
+                                             verbose=verbose)) or text
+
+    brief_text = await _p1_read_brief()
     chat_url = await browser.current_url()
 
     brief_len = len(brief_text or "")
@@ -55559,11 +55772,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # extended-thinking text — there is NO result panel / download button for it
     # — so the #752 canvas-open re-extract had nothing to act on (it fired 4×
     # in E2E across 05:05/06:31/09:08/09:10 and recovered a brief ZERO times).
-    # Removed. HTML→MD is P1's only sensible extractor.
+    # Removed. HTML→MD is P1's page read — with, since wave 13, ChatGPT's own
+    # Copy button behind it (`_p1_read_brief` above); never the canvas tiers.
     #
     # This handles a DIFFERENT case from a failed brief: the brief GENERATED
-    # fine (completed=True) but the HTML→MD pull came back empty — a transient
-    # DOM-render / selector miss, not a wedge. Re-pull HTML→MD up to
+    # fine (completed=True) but both reads came back empty — a transient
+    # DOM-render / selector miss, not a wedge. Read again (the page, then the
+    # Copy button) up to
     # P1_EXTRACT_RETRY_MAX times, P1_EXTRACT_RETRY_GAP_SEC apart, and STOP the
     # instant real text appears. Strictly gated:
     #   • completed   → only when generation genuinely finished (a FAILED brief
@@ -55582,7 +55797,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             return None
         _extract_attempt += 1
         log(f"Phase 1: brief generated but extraction empty ({brief_len} chars) — "
-            f"re-pulling HTML→MD in {P1_EXTRACT_RETRY_GAP_SEC // 60} min "
+            f"reading it again (the page, then the Copy button) in "
+            f"{P1_EXTRACT_RETRY_GAP_SEC // 60} min "
             f"(attempt {_extract_attempt}/{P1_EXTRACT_RETRY_MAX})", "WARN")
         # Stop-aware wait: poll is_stop every few seconds so a Stop during the
         # 3-min gap is honored promptly (not after the full sleep + another pull).
@@ -55594,7 +55810,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Phase 1: stop requested during extraction-retry wait — aborting")
             return None
         try:
-            _retry_text = await extract_chatgpt_response(browser.page)
+            _retry_text = await _p1_read_brief()
         except Exception as _re_exc:
             log(f"Phase 1: extraction re-pull errored ({_re_exc}) — "
                 f"{'retrying' if _extract_attempt < P1_EXTRACT_RETRY_MAX else 'giving up'}", "WARN")
