@@ -31,6 +31,18 @@
   attachment, so the card goes where it would hurt most; its name line also
   carries whitespace-pre-wrap); body[data-streaming] — after a send Stop stays
   up (the reply is still being written).
+  WAVE 13 HOOKS (Phase 1's Copy fallback): body[data-reply-actions] — every reply
+  gets the row of icons under it: Copy, Share, Read aloud, Regenerate response,
+  More actions. The labels and attributes are the capture's ("buttons" in
+  chatgpt-reply-capture2.json); WHERE the row sits is NOT captured — it is
+  ASSUMED to be inside the reply's .block-BQZwFn, right after the reply unit,
+  the way the user's own row sits inside the user block. Its Copy writes the
+  reply's markdown to the clipboard (body[data-copy-gives]: "nothing" writes
+  nothing, "prompt" writes the last user message, "cited" adds a citation-token
+  run). body[data-reply-renamed] — a future rename: the reply's text root loses
+  every marker, so the page read comes back empty. body[data-clicked] records
+  each click on a button outside the composer, by its data-sr-name or aria-label; body[data-replies] counts
+  the replies drawn.
 -->
 <html lang="en">
 <head>
@@ -111,6 +123,10 @@
      and the link are NOT in the capture and are kept generic. -->
 <template id="sr-reply"><h2>Research brief: the St Bernard</h2><p class="Paragraph-kKnbIo" dir="auto"><span>Scope: the breed's history in the Alps, its rescue work at the Great St Bernard Pass, health and temperament, and today's breeding standards. The report should separate what the historical record supports from the legends that grew around the breed in the nineteenth century, and it should say plainly where the two cannot be told apart.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Start from the breed standard at <a href="https://example.org/st-bernard-breed-standard" target="_blank" rel="noopener">the breed standard page</a> and the hospice archives, then work outwards to the kennel club registries, veterinary literature on giant breeds, and first-hand accounts from the monks and travellers who crossed the pass before the tunnel opened.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Questions to answer: when the hospice first kept dogs and for what work; how the rescue reputation formed and which rescues are documented; how the short-haired and long-haired varieties diverged; what the modern standard requires and why it changed; which health problems are most common and what screening breeders use; and how life expectancy compares with other giant breeds.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Method: prefer primary sources and peer-reviewed veterinary studies; quote dates and numbers with their source; where sources disagree, give both and say which is better supported. Keep marketing material and breeder advertising out of the evidence, and flag any figure that appears only in popular articles.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Structure: an executive summary of no more than one page; a history section; a section on working roles past and present; a health and welfare section with a table of conditions, prevalence and screening; a section on the breed standard; and a closing list of open questions the evidence could not settle.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Out of scope: other mastiff-type breeds except where a comparison explains a St Bernard trait; training advice; and product recommendations of any kind. If a source discusses the breed only in passing, cite it only for the point it actually makes, and do not let a single anecdote stand in for a pattern.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Deliverable: a structured report with sections, sources and open questions for the research agent to pursue, written for a reader who knows dogs but not this breed, with every claim traceable to a cited source.</span></p></template>
 
+<!-- The row of icons under a reply (body[data-reply-actions]): labels and
+     attributes as captured, placement ASSUMED (see the note at the top). -->
+<template id="sr-reply-actions"><div class="flex justify-start" data-sr-reply-actions=""><div class="flex turn-action-controls items-center gap-0.5 browser:gap-0"><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Copy" data-sr-act="copy"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Share" data-state="closed"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Read aloud" aria-pressed="false"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Regenerate response" data-state="closed" aria-haspopup="menu" aria-expanded="false"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="Button-G93JGk outline-hidden cursor-interaction" data-color="secondary" data-variant="ghost" data-uniform="" data-size="xs" data-icon-size="sm" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" data-state="closed"><svg></svg></button></span></div></div></template>
+
 <!-- The model menu as the composer capture recorded it open: an unnamed wrapper,
      the [role=menu], its two rows, and the slider thumb under an aria-hidden
      ancestor (Chrome logged "Blocked aria-hidden … span.ThumbInput"). -->
@@ -156,8 +172,16 @@
     transcript.appendChild(turn);
     const addReply = () => {
       const a = clone('sr-assistant-block');
-      a.querySelector('[data-markdown-text-style]').appendChild(clone('sr-reply'));
+      const root = a.querySelector('[data-markdown-text-style]');
+      root.appendChild(clone('sr-reply'));
+      if (document.body.dataset.replyRenamed) {
+        // TEST HOOK: a future rename — no marker names the reply's text any more.
+        root.removeAttribute('data-markdown-text-style');
+        root.className = 'Answer-x1';
+      }
+      if (document.body.dataset.replyActions) a.firstElementChild.appendChild(clone('sr-reply-actions'));
       col.appendChild(a);
+      document.body.dataset.replies = String(parseInt(document.body.dataset.replies || '0', 10) + 1);
     };
     if (withReply) addReply();
     return addReply;
@@ -208,6 +232,34 @@
     if (b && b.getAttribute('aria-label') === 'Send') { e.preventDefault(); send('button'); }
   });
   document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());
+
+  // The reply's markdown, as a Copy button hands it out: headings, paragraphs,
+  // links, code blocks.
+  function replyMarkdown(root) {
+    const inline = (n) => [...n.childNodes].map((c) => c.nodeType === 3 ? c.textContent
+      : c.tagName === 'A' ? '[' + c.textContent + '](' + c.getAttribute('href') + ')'
+      : c.tagName === 'BUTTON' ? '' : inline(c)).join('');
+    return [...root.children].map((c) => /^H[1-6]$/.test(c.tagName)
+      ? '#'.repeat(parseInt(c.tagName[1], 10)) + ' ' + c.textContent
+      : c.tagName === 'PRE' ? '```\n' + (c.querySelector('code') || c).textContent + '\n```'
+      : inline(c)).join('\n\n');
+  }
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (!b.closest('form')) document.body.dataset.clicked = (document.body.dataset.clicked || '')
+      + (b.dataset.srName || b.getAttribute('aria-label') || '') + '|';
+    if (b.dataset.srAct !== 'copy') return;
+    const root = b.closest('.block-BQZwFn').querySelector('[data-selected-text-overlay-target]');
+    const users = document.querySelectorAll('[data-user-message-bubble="true"]');
+    const gives = document.body.dataset.copyGives || '';
+    if (gives === 'nothing') return;
+    const t = gives === 'prompt' ? users[users.length - 1].innerText
+      : replyMarkdown(root) + (gives === 'cited'
+        ? ' ' + String.fromCharCode(0xe200) + 'cite' + String.fromCharCode(0xe202)
+          + 'turn0search1' + String.fromCharCode(0xe201) : '');
+    navigator.clipboard.writeText(t);
+  }, true);
 
   const menuOpen = () => !!layer.firstElementChild;
   function openMenu() {

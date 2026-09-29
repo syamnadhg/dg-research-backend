@@ -54303,7 +54303,11 @@ _CG_CODE_CHARS = frozenset("{}[]()<>=;$\\|`")
 
 
 def _brief_prose_line(line: str) -> bool:
-    """A line of prose: eight words or more, and not crowded with code symbols."""
+    """A line of prose: eight words or more, not crowded with code symbols, and
+    not a code comment ("#" or "//" first — a long comment reads like prose; a
+    markdown heading is not counted either, and a brief does not need it to be)."""
+    if line.lstrip().startswith(("#", "//")):
+        return False
     if len(re.findall(r"[^\W\d_]{2,}", line)) < 8:
         return False
     return sum(ch in _CG_CODE_CHARS for ch in line) < 0.05 * len(line)
@@ -54403,7 +54407,7 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
     if why:
         log(f"Phase 1: what the Copy button gave was not used — {why}", "WARN")
         return ""
-    text = _strip_chatgpt_citation_tokens(text.strip())
+    text = _strip_chatgpt_citation_tokens(text).strip()
     log(f"Phase 1: brief taken from {how} ({len(text)} chars)")
     return text
 

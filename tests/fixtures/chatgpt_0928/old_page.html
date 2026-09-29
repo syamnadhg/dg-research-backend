@@ -14,6 +14,12 @@
   (where the old page drew an attached source; its name line also carries
   whitespace-pre-wrap); body[data-streaming] — after a send Stop stays up (the
   reply is still being written).
+  WAVE 13 HOOKS, as in new_page.html: body[data-reply-actions] — every reply's
+  article gets a row of icons after the reply, the old page's Copy being
+  button[data-testid="copy-turn-action-button"] (reconstructed from the old
+  marker; placement ASSUMED); body[data-copy-gives], body[data-clicked],
+  body[data-replies] as there. (No rename hook here: the old page's <article>
+  is itself one of the page read's markers.)
 -->
 <html lang="en">
 <head>
@@ -44,6 +50,8 @@
 <template id="sr-user-turn"><article data-testid="conversation-turn-1" data-scroll-anchor="false"><h5 class="sr-only">You said:</h5><div class="flex w-full flex-col gap-1 empty:hidden items-end rtl:items-start"><div data-message-author-role="user" data-message-id="b3a1c2d4-0000-4000-8000-000000000001"><div class="whitespace-pre-wrap"></div></div></div></article></template>
 
 <template id="sr-assistant-turn"><article data-testid="conversation-turn-2" data-scroll-anchor="true"><h6 class="sr-only">ChatGPT said:</h6><div data-message-author-role="assistant" data-message-id="b3a1c2d4-0000-4000-8000-000000000002"><div class="markdown prose w-full break-words dark:prose-invert light"></div></div></article></template>
+
+<template id="sr-reply-actions"><div class="flex justify-start" data-sr-reply-actions=""><div class="flex items-center"><button class="text-token-text-secondary" aria-label="Copy" data-testid="copy-turn-action-button" data-sr-act="copy"><svg></svg></button><button class="text-token-text-secondary" aria-label="Good response" data-testid="good-response-turn-action-button"><svg></svg></button><button class="text-token-text-secondary" aria-label="Bad response" data-testid="bad-response-turn-action-button"><svg></svg></button></div></div></template>
 
 <template id="sr-reply"><h2>Research brief: the St Bernard</h2><p>Scope: the breed's history in the Alps, its rescue work at the Great St Bernard Pass, health and temperament, and today's breeding standards. The report should separate what the historical record supports from the legends that grew around the breed in the nineteenth century, and it should say plainly where the two cannot be told apart.</p><p>Start from the breed standard at <a href="https://example.org/st-bernard-breed-standard" target="_blank" rel="noopener">the breed standard page</a> and the hospice archives, then work outwards to the kennel club registries, veterinary literature on giant breeds, and first-hand accounts from the monks and travellers who crossed the pass before the tunnel opened.</p><p>Questions to answer: when the hospice first kept dogs and for what work; how the rescue reputation formed and which rescues are documented; how the short-haired and long-haired varieties diverged; what the modern standard requires and why it changed; which health problems are most common and what screening breeders use; and how life expectancy compares with other giant breeds.</p><p>Method: prefer primary sources and peer-reviewed veterinary studies; quote dates and numbers with their source; where sources disagree, give both and say which is better supported. Keep marketing material and breeder advertising out of the evidence, and flag any figure that appears only in popular articles.</p><p>Structure: an executive summary of no more than one page; a history section; a section on working roles past and present; a health and welfare section with a table of conditions, prevalence and screening; a section on the breed standard; and a closing list of open questions the evidence could not settle.</p><p>Out of scope: other mastiff-type breeds except where a comparison explains a St Bernard trait; training advice; and product recommendations of any kind. If a source discusses the breed only in passing, cite it only for the point it actually makes, and do not let a single anecdote stand in for a pattern.</p><p>Deliverable: a structured report with sections, sources and open questions for the research agent to pursue, written for a reader who knows dogs but not this breed, with every claim traceable to a cited source.</p></template>
 
@@ -81,7 +89,9 @@
     const addReply = () => {
       const a = clone('sr-assistant-turn');
       a.querySelector('.markdown').appendChild(clone('sr-reply'));
+      if (document.body.dataset.replyActions) a.firstElementChild.appendChild(clone('sr-reply-actions'));
       transcript.appendChild(a);
+      document.body.dataset.replies = String(parseInt(document.body.dataset.replies || '0', 10) + 1);
     };
     if (withReply) addReply();
     return addReply;
@@ -115,6 +125,33 @@
     }
   });
   document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());
+
+  // The reply's markdown, as the Copy button hands it out (see new_page.html).
+  function replyMarkdown(root) {
+    const inline = (n) => [...n.childNodes].map((c) => c.nodeType === 3 ? c.textContent
+      : c.tagName === 'A' ? '[' + c.textContent + '](' + c.getAttribute('href') + ')'
+      : c.tagName === 'BUTTON' ? '' : inline(c)).join('');
+    return [...root.children].map((c) => /^H[1-6]$/.test(c.tagName)
+      ? '#'.repeat(parseInt(c.tagName[1], 10)) + ' ' + c.textContent
+      : c.tagName === 'PRE' ? '```\n' + (c.querySelector('code') || c).textContent + '\n```'
+      : inline(c)).join('\n\n');
+  }
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (!b.closest('form')) document.body.dataset.clicked = (document.body.dataset.clicked || '')
+      + (b.dataset.srName || b.getAttribute('aria-label') || '') + '|';
+    if (b.dataset.srAct !== 'copy') return;
+    const root = b.closest('article').querySelector('[data-message-author-role="assistant"] > div');
+    const users = document.querySelectorAll('[data-message-author-role="user"]');
+    const gives = document.body.dataset.copyGives || '';
+    if (gives === 'nothing') return;
+    const t = gives === 'prompt' ? users[users.length - 1].innerText
+      : replyMarkdown(root) + (gives === 'cited'
+        ? ' ' + String.fromCharCode(0xe200) + 'cite' + String.fromCharCode(0xe202)
+          + 'turn0search1' + String.fromCharCode(0xe201) : '');
+    navigator.clipboard.writeText(t);
+  }, true);
 
   if (document.body.dataset.srFixture === 'thread') {
     addExchange(document.body.dataset.srPrompt || 'hello', true);
