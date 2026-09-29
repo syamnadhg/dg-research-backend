@@ -646,3 +646,102 @@ def test_every_research_writer_names_the_research_owners_account(monkeypatch, wr
     [line] = _structural(lines)
     assert "the job belongs to another account" in line, line
     assert "re-pair required" not in line, line
+
+
+# ══ 6. a refusal for an account that left, on every pickup ═══════════════════
+#
+# ⛔⛔ THE 09-28 RUN, BY THE OTHER DOOR (09-29 verify). The owner removes a
+# sharer while the computer is off; the unshare route takes them out of
+# `sharedWith` but leaves their queue documents. At serve start the start
+# listener is handed one: its record read is refused, the pickup rule took it
+# ("a read that fails is not a deletion"), the funnel "trusted the FE-side queue
+# write", the dequeue's read was refused too — and it ran with every write
+# refused, on the owner's ChatGPT and key. A 403 for an account the device
+# document positively no longer lists is now the answer on every pickup; a
+# member's 403 (the fresh-document race) and a membership nobody could read are
+# still taken.
+
+LEFTOVER = "agent-82bb870dba1140ed"
+
+#: Each pickup's cases: whose job, what the device document says, and whether
+#: the job must be taken.
+PICKUP_CASES = [
+    (FORMER, SHARED, False),
+    (SHARER, SHARED, True),
+    (OWNER, SHARED, True),
+    (FORMER, DEVICE_UNREADABLE, True),
+    (FORMER, None, True),
+]
+PICKUP_IDS = ["former-sharer", "current-sharer", "owner",
+              "device-read-blips", "no-device-document"]
+
+
+def _logged(monkeypatch):
+    lines: list = []
+    monkeypatch.setattr(research, "log",
+                        lambda msg, level="INFO": lines.append((level, str(msg))))
+    return lines
+
+
+@pytest.mark.parametrize("uid, device, taken", PICKUP_CASES, ids=PICKUP_IDS)
+def test_a_start_doc_left_by_an_account_that_left_is_not_run_at_serve_start(
+        monkeypatch, tmp_path, uid, device, taken):
+    from _queue_listener import Listener
+    monkeypatch.setitem(research._QUEUE_STATE, "running", False)
+    lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs=DENIED,
+                   device_doc=device)
+    lines = _logged(monkeypatch)
+    lis.feed(action="start", uid=uid, submittedBy=uid, researchId=LEFTOVER,
+             topic="St Bernard", timestamp=int((time.time() - 600) * 1000))
+
+    if taken:
+        assert [j["research_id"] for j in lis.enqueued] == [LEFTOVER], (
+            f"a job the rules may still let this computer run was refused: {lines}")
+        return
+    assert lis.enqueued == [], f"a job of an account that left was queued to run: {lines}"
+    assert lis.incoming == ["incoming"], "its start doc was left to come back at every start"
+    assert lis.writes == [], "a record this computer cannot open was written to"
+    assert len(_said(lines, LEFTOVER, NOT_OPENABLE)) == 1, lines
+    assert not _said(lines, LEFTOVER, "taking the job"), lines
+
+
+def test_a_resume_left_by_an_account_that_left_is_not_run(monkeypatch, tmp_path):
+    """⛔ THE SAME DOOR FOR A RESUME. Its run is on this disk and says whose it
+    is, so without the answer the Resume was taken on the disk's word. Beside it
+    a current sharer's Resume, refused the same way, is still taken."""
+    from _queue_listener import Listener
+    for uid, taken in ((FORMER, False), (SHARER, True)):
+        rid = f"{LEFTOVER}_{uid[:4]}"
+        run_id, _folder = _old_run_folder(tmp_path, rid, days=1, uid=uid,
+                                          topic=f"Resumed_{uid[:4]}")
+        lis = Listener(monkeypatch, tmp_path, owner=OWNER, research_docs=DENIED,
+                       device_doc=SHARED)
+        lines = _logged(monkeypatch)
+        lis.feed(action="resume", uid=uid, submittedBy=uid, researchId=rid,
+                 backendRunId=run_id, email="", config={})
+        if taken:
+            assert [j["research_id"] for j in lis.enqueued] == [rid], lines
+        else:
+            assert lis.enqueued == [], f"a Resume of an account that left was queued: {lines}"
+            assert lis.incoming == ["incoming"], "its Resume doc was left to come back"
+            assert len(_said(lines, rid, NOT_OPENABLE)) == 1, lines
+
+
+@pytest.mark.parametrize("uid, device, taken", PICKUP_CASES, ids=PICKUP_IDS)
+def test_the_dequeue_does_not_run_a_job_whose_account_left(
+        monkeypatch, tmp_path, uid, device, taken):
+    """⛔ THE LAST PICKUP. A job queued while its account was a member, and the
+    account removed while it waited: the flip is refused and so is the plain
+    read after it — which used to proceed "as before"."""
+    from _run_server_closure import run_worker_once
+    monkeypatch.setattr(research, "load_paired_uid", lambda: OWNER)
+    lines = _logged(monkeypatch)
+    started = run_worker_once(monkeypatch, tmp_path, _job(uid, LEFTOVER), flip="error",
+                              db=_Fs(records={(uid, LEFTOVER): DENIED}, device=device),
+                              update_research=lambda *a, **k: True, device_id=DEVICE)
+
+    if taken:
+        assert len(started) == 1, f"a job the rules may still let run was refused: {lines}"
+        return
+    assert started == [], f"a job of an account that left was run: {lines}"
+    assert len(_said(lines, LEFTOVER, NOT_OPENABLE)) == 1, lines

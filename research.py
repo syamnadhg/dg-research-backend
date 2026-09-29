@@ -16187,9 +16187,11 @@ def start_firestore_start_listener(job_queue, loop):
             # queue doc staleSkipped so it doesn't replay on future
             # listener attaches.
             # ⭐ THE ONE PICKUP RULE (wave 10.10) — deleted or archived stands
-            # down and takes the queue doc with it; an unreadable record is
-            # taken, as this branch always did ("allowing through"). The record
-            # it read is handed on, so the checks below do not read it again.
+            # down and takes the queue doc with it, and so does a refusal for an
+            # account the device document no longer lists (a removed sharer's
+            # leftover doc, 09-29); any other unreadable record is taken, as
+            # this branch always did ("allowing through"). The record it read
+            # is handed on, so the checks below do not read it again.
             _withdrawn, _rd_found = _pickup_withdrawn(uid, research_id, "start")
             if _withdrawn:
                 try:
@@ -16926,8 +16928,8 @@ def _log_pickup_stand_down(where: str, research_id, reason: str) -> None:
             f"standing down, nothing is picked up", "INFO")
 
 
-#: What the boot restore says about a job this computer may no longer run for.
-#: One sentence for both ways of knowing it — the job's owner is not among the
+#: What a pickup says about a job this computer may no longer run for. One
+#: sentence for both ways of knowing it — the job's owner is not among the
 #: computer's accounts, or the rules refused to show the computer its record.
 _RESTORE_NOT_OPENABLE = ("not run: this computer can no longer open that research "
                          "— it belongs to an account it is not paired to or no "
@@ -16982,17 +16984,22 @@ def _pickup_withdrawn(uid, research_id, where: str, *,
     rule written per path is a rule one path forgets, and a Resume that named
     its run was that path: it never read the record at all.
 
-    ⛔⛔ EXCEPT A REFUSAL, FOR THE ONE CALLER WHOSE JOB NOBODY SENT JUST NOW —
-    `denied_is_answer`, which only the boot restore passes (2026-09-28). The
-    rules let this computer read the record of every account it runs for, so a
-    403 is not a blip: it is the rules saying the job's owner is no longer one
-    of them. Every other pickup holds a job a member sent moments ago, where a
-    403 is the fresh-document race the rules file documents, and takes it. The
-    boot restore holds a local copy that can be days old: it took an eight-day-
-    old job of an account this computer was no longer shared with, ran it with
-    every write refused, on the owner's ChatGPT and key, for nobody. With the
-    flag a 403 answers "denied", and the one line that says why is written
-    here."""
+    ⛔⛔ EXCEPT A REFUSAL FOR AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — on
+    every pickup (2026-09-28, widened on the 09-29 verify). The rules let this
+    computer read the record of every account it runs for, so a 403 for an
+    account the device document positively does not list is the rules saying it
+    is not one of them any more. The boot restore took an eight-day-old job of
+    such an account and ran it with every write refused, on the owner's ChatGPT
+    and key, for nobody — and the start listener did the same with a start
+    document a removed sharer left in the queue while the computer was off (the
+    unshare route leaves those behind), because "every pickup holds a job a
+    member sent moments ago" is not true of a document found at serve start.
+    Such a refusal answers "denied", and the one line that says why is written
+    here. A member's 403, and one whose membership cannot be read, is still
+    taken: that is the fresh-document race the rules file documents.
+    ⭐ `denied_is_answer`, which only the boot restore passes, makes EVERY 403
+    the answer: its copy can be days old, and it has asked who the members are
+    before it reads."""
     rid = str(research_id or "").strip()
     if not (_firebase_db and uid and rid):
         return None, None
@@ -17004,7 +17011,7 @@ def _pickup_withdrawn(uid, research_id, where: str, *,
         exists = bool(snap.exists)
         record = (snap.to_dict() or {}) if exists else None
     except Exception as err:
-        if denied_is_answer and _is_denied_read(err):
+        if _is_denied_read(err) and (denied_is_answer or _known_not_a_member(uid)):
             _log_pickup_not_run(where, rid, _RESTORE_NOT_OPENABLE)
             return "denied", None
         with _machine_log_scope():
@@ -17740,6 +17747,16 @@ def _device_members() -> "set[str] | None":
         members.add(doc["ownerUid"])
     members.update(s for s in shared if isinstance(s, str) and s)
     return members
+
+
+def _known_not_a_member(uid) -> bool:
+    """True only on POSITIVE evidence that `uid` is none of this computer's
+    accounts: the device document was read, and names it neither as the owner
+    nor among those the computer is shared with. Asked by a pickup whose read
+    of the job's record was refused — see `_pickup_withdrawn`. "Can't tell" is
+    False, so the job is taken, as it always was."""
+    members = _device_members()
+    return members is not None and str(uid or "").strip() not in members
 
 
 def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int, int]":
@@ -78730,9 +78747,19 @@ async def run_server(port=8000):
                         log("[flip] the transaction was refused and the doc could "
                             "not be read either — proceeding, as before", "WARN")
                 except Exception as _fe:
-                    log(f"[flip] the transaction was refused and the fallback "
-                        f"read also failed ({type(_fe).__name__}) — "
-                        f"proceeding, as before", "WARN")
+                    # ⛔⛔ UNLESS THE RULES REFUSED IT FOR AN ACCOUNT THIS
+                    # COMPUTER NO LONGER RUNS FOR (09-29 verify) — removed while
+                    # its job waited here. Run anyway, it went ahead with every
+                    # write refused, on the owner's ChatGPT and key; see
+                    # `_pickup_withdrawn`, whose answer this is.
+                    if _is_denied_read(_fe) and _known_not_a_member(job.get("uid")):
+                        should_run = False
+                        _log_pickup_not_run("dequeue", job.get("research_id"),
+                                            _RESTORE_NOT_OPENABLE)
+                    else:
+                        log(f"[flip] the transaction was refused and the fallback "
+                            f"read also failed ({type(_fe).__name__}) — "
+                            f"proceeding, as before", "WARN")
             # ⛔⛔ THE LAST PICKUP EVERY JOB PASSES (wave 10.10). "missing" was
             # a WARN and a run: a Resume taken before its research was deleted
             # reached this point, found no record, and ran and emailed anyway.

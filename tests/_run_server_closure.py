@@ -92,13 +92,17 @@ class _Controls:
         pass
 
 
-def run_worker_once(monkeypatch, tmp_path, job, *, flip, db, update_research):
+def run_worker_once(monkeypatch, tmp_path, job, *, flip, db, update_research,
+                    device_id=None):
     """Run `_job_worker` — the real dequeue — over `job`, with the flip answering
     `flip` and `db` answering any plain read. Returns the pipelines it started.
 
     ⭐ The pipeline is replaced by a recorder that hands back an already-finished
     future, so the worker's watchdog loop sees it done at once; everything that
-    decides whether it is started at all is the worker's own code."""
+    decides whether it is started at all is the worker's own code.
+
+    `device_id` is this computer's device id — None (the default) is a computer
+    with none, so who it is shared with cannot be read."""
     started = []
 
     def _pipeline(**kw):
@@ -126,7 +130,7 @@ def run_worker_once(monkeypatch, tmp_path, job, *, flip, db, update_research):
     monkeypatch.setattr(research, "_clear_current_run_id_best_effort", lambda *a, **k: None)
     monkeypatch.setattr(research, "_recompute_deferred_queue_positions", lambda: None)
     monkeypatch.setattr(research, "_pending_enq_dec", lambda: None)
-    monkeypatch.setattr(research, "load_device_id", lambda: None)
+    monkeypatch.setattr(research, "load_device_id", lambda: device_id)
     monkeypatch.setattr(research, "_update_research_doc", update_research)
     monkeypatch.setitem(research._QUEUE_STATE, "running", False)
     monkeypatch.setitem(research._QUEUE_STATE, "current_job", None)
