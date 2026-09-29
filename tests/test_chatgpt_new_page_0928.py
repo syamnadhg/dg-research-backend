@@ -316,6 +316,19 @@ def test_live_after_the_menu_closes_the_box_is_found_and_focused_by_a_click(chro
     assert chrome.run(page.evaluate(
         "() => document.activeElement.getAttribute('aria-label')")) == "Ask ChatGPT"
     assert chrome.run(page.evaluate(BOX_JS)) == PROMPT
+    # Right FIRST time: the click comes before the typing, not after a miss.
+    assert not any("read-back mismatch" in m for _lv, m in logs), logs
+
+
+def test_live_leftover_text_in_the_box_is_cleared_before_typing(chrome, page, fast, logs):
+    """A box that already holds text (a fallback's "est") is emptied BEFORE the
+    prompt goes in, so the prompt is never appended to it."""
+    _load(chrome, page, "new")
+    chrome.run(page.click(NEW_BOX))
+    chrome.run(page.keyboard.insert_text("est"))
+    assert chrome.run(research.submit_chatgpt_direct(_browser(page), PROMPT)) is True
+    assert chrome.run(page.evaluate(USERS_JS)) == [PROMPT]
+    assert not any("read-back mismatch" in m for _lv, m in logs), logs
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)

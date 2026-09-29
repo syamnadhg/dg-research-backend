@@ -50559,7 +50559,7 @@ async def _chatgpt_box_text(box) -> str:
     try:
         v = await box.evaluate(_CHATGPT_BOX_TEXT_JS)
     except Exception:
-        return ""
+        v = None
     return "" if v is None else str(v)
 
 

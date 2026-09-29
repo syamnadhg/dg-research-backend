@@ -165,11 +165,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("M14", "over", "⛔⛔ the global walk sees the whole document again — the "
      "chrome exclusion PASS 0 used to provide is gone and a shimmering banner "
      "above the thread is pressed instead of the strip",
-     [('                    if (!inProse && el.closest(\n                            \'form, [data-testid*="composer" i], #prompt-textarea, \'\n                            + \'header, [role="toolbar"], nav\')) inProse = true;', "")],
+     # ⛔ RE-AIMED 2026-09-28: `#prompt-textarea` became the spliced composer
+     # marker `__CG_COMPOSER__` (old page AND new). Same line, same defect.
+     [('                    if (!inProse && el.closest(\n                            \'form, [data-testid*="composer" i], __CG_COMPOSER__, \'\n                            + \'header, [role="toolbar"], nav\')) inProse = true;', "")],
      [T_DOM]),
     ("M15", "under", "the composer stops being excluded from the global walk, "
      "so its own affordance becomes the strip",
-     [('                    if (!inProse && el.closest(\n                            \'form, [data-testid*="composer" i], #prompt-textarea, \'\n                            + \'header, [role="toolbar"], nav\')) inProse = true;',
+     [('                    if (!inProse && el.closest(\n                            \'form, [data-testid*="composer" i], __CG_COMPOSER__, \'\n                            + \'header, [role="toolbar"], nav\')) inProse = true;',
        """                    if (!inProse && el.closest(
                             'header, [role="toolbar"], nav')) inProse = true;""")],
      [T_DOM]),
