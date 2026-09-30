@@ -1,4 +1,4 @@
-"""The Windows review of wave 13 (2026-09-30): two defects the Mac could not see.
+"""The Windows review of wave 13 (2026-09-30): defects the Mac could not see.
 
 ⛔⛔ 1. MOVE TO QUEUE WAS NEVER OFFERED ON WINDOWS. The machine publishes the
 "requeue" capability — and obeys a requeue — only when `_supervisor_is_my_parent()`
@@ -7,22 +7,34 @@ whose Windows half ran WMIC inside `except Exception: return []`; current
 Windows 11 (the owner's 10.0.26200 box) has no WMIC.exe, so the list was always
 empty: no chip in the app, every requeue refused as "not supervised" — and the
 older users of the same list (`--retire`, `--resurrect`, the daemon-loop's
-pre-flight sweep) saw nothing running either. The list now comes from psutil,
-then PowerShell's CIM, and WMIC last.
+pre-flight sweep) saw nothing running either. The list now comes from psutil
+(the name first; a command line is read only for a python), then PowerShell's
+CIM, and WMIC last.
 
 ⛔ 1b. A VENV'S LAUNCHER STANDS BETWEEN. On a pipx or venv install the
 daemon-loop spawns each worker through `Scripts\\python.exe`, a launcher that
-starts the real interpreter with the very same command line — so the worker's
-direct parent is the launcher, and the daemon-loop is one step up.
+starts the real interpreter with the same arguments — so the worker's direct
+parent is the launcher, the daemon-loop is one step up, and an update must not
+stop the launcher (that ends the worker through the launcher's job).
+
+⛔ 1c. RESET BACKEND ASKED ABOUT ANY SUPERVISOR. With the list now real on
+Windows, "a daemon-loop runs somewhere" would exit a foreground --serve beside
+the fleet for good; it asks about its own parent now, as reconnect does.
 
 ⛔ 2. THE COPY BACKUP'S BRIEF CAME BACK WITH CRLF. Chrome on Windows hands the
 clipboard back with CRLF line ends; brief.md is written in text mode, which
 makes each CR CR LF, and read back every line gains a blank line — a table's
 rows fall apart before the brief reaches the Phase 2 agents.
 
-Sections 1-3 run everywhere (fakes); section 4 runs the real thing on Windows.
+⛔ 3. THE CLIPBOARD HOOKS NEED THE PAGE'S OWN SCRIPT WORLD. patchright 1.62+
+(the new floor) runs `evaluate` isolated; a `writeText` hook installed there
+never sees the page's own Copy. The hooks now run in the page's world.
+
+Sections 1-4 run everywhere (fakes; section 4's browser test needs Chrome);
+section 5 runs the real process table on Windows.
 """
 import asyncio
+import inspect
 import json
 import subprocess
 import sys
@@ -41,13 +53,23 @@ ON_WINDOWS = sys.platform == "win32"
 # ══ 1. where the Windows list comes from ═════════════════════════════════════
 
 class _Proc:
-    def __init__(self, pid, name, cmdline):
-        self.info = {"pid": pid, "name": name, "cmdline": cmdline}
+    """A process as `process_iter(["pid", "name"])` hands it out. Its command
+    line is read only on request, and every read is recorded."""
+
+    def __init__(self, pid, name, cmdline, reads):
+        self.info = {"pid": pid, "name": name}
+        self._cmdline, self._reads = cmdline, reads
+
+    def cmdline(self):
+        self._reads.append(self.info["pid"])
+        if self._cmdline is None:
+            raise PermissionError("access denied")     # psutil.AccessDenied
+        return list(self._cmdline)
 
 
 def _fake_psutil(procs=(), processes=None, me=None):
-    """A psutil with `process_iter` over `procs`, and `Process(pid)` answering
-    from `processes` (pid → (cmdline, ppid, create_time)); `me` is Process()."""
+    """A psutil with `process_iter` over `procs` and `Process(pid)` answering
+    from `processes` (pid → dict of cmd, ppid, ct, name, exe); `me` is Process()."""
     processes = dict(processes or {})
 
     class NoSuchProcess(Exception):
@@ -58,15 +80,22 @@ def _fake_psutil(procs=(), processes=None, me=None):
             self.pid = me if pid is None else pid
             if self.pid not in processes:
                 raise NoSuchProcess(self.pid)
+            self._p = processes[self.pid]
 
         def cmdline(self):
-            return list(processes[self.pid][0])
+            return list(self._p["cmd"])
 
         def ppid(self):
-            return processes[self.pid][1]
+            return self._p["ppid"]
 
         def create_time(self):
-            return processes[self.pid][2]
+            return self._p["ct"]
+
+        def name(self):
+            return self._p["name"]
+
+        def exe(self):
+            return self._p["exe"]
 
     return types.SimpleNamespace(process_iter=lambda attrs=None: iter(list(procs)),
                                  Process=Process, NoSuchProcess=NoSuchProcess)
@@ -84,15 +113,20 @@ def _no_subprocess(monkeypatch):
 
 
 def test_the_windows_list_comes_from_psutil_and_runs_no_program(monkeypatch):
-    """⛔ psutil answers first: WMIC is not asked (it is gone), nor PowerShell."""
+    """⛔ psutil answers first: WMIC is not asked (it is gone), nor PowerShell.
+    And only a python's command line is read — asking every process's costs
+    about a second per protected one (LsaIso, NgcIso …) under an elevated
+    token, about 5 s a scan."""
+    reads = []
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil([
-        _Proc(11, "pythonw.exe", ["C:\\Py\\pythonw.exe", "C:\\sr\\research.py", "--daemon-loop"]),
+        _Proc(11, "pythonw.exe", ["C:\\Py\\pythonw.exe", "C:\\sr\\research.py", "--daemon-loop"], reads),
         _Proc(12, "python.exe", ["C:\\Py\\python.exe", "C:\\sr\\research.py", "--serve",
-                                 "--worker-id", "2"]),
-        _Proc(13, "Python.EXE", ["C:\\Py\\python.exe", "research.py", "a topic"]),
-        _Proc(14, "chrome.exe", ["chrome.exe", "--flag", "research.py", "--serve"]),
-        _Proc(15, "python.exe", ["C:\\Py\\python.exe", "other.py", "--serve"]),
-        _Proc(16, "python.exe", None),                    # refused its command line
+                                 "--worker-id", "2"], reads),
+        _Proc(13, "Python.EXE", ["C:\\Py\\python.exe", "research.py", "a topic"], reads),
+        _Proc(14, "chrome.exe", ["chrome.exe", "--flag", "research.py", "--serve"], reads),
+        _Proc(15, "python.exe", ["C:\\Py\\python.exe", "other.py", "--serve"], reads),
+        _Proc(16, "python.exe", None, reads),                 # refused its command line
+        _Proc(17, "LsaIso.exe", None, reads),                 # protected: never asked
     ]))
     calls = _no_subprocess(monkeypatch)
     got = research._enumerate_research_py_procs_windows()
@@ -100,13 +134,14 @@ def test_the_windows_list_comes_from_psutil_and_runs_no_program(monkeypatch):
         (11, "daemon-loop"), (12, "serve"), (13, "other")]
     assert "research.py" in got[0][1] and "--daemon-loop" in got[0][1]
     assert calls == []
+    assert sorted(reads) == [11, 12, 13, 15, 16], f"a non-python's command line was read: {reads}"
 
 
 def test_a_path_with_a_space_keeps_its_quotes(monkeypatch):
     """The command line is rebuilt the way Windows writes it, as WMIC gave it."""
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil([
         _Proc(21, "python.exe", ["C:\\Program Files\\Py\\python.exe",
-                                 "C:\\My Code\\research.py", "--serve"])]))
+                                 "C:\\My Code\\research.py", "--serve"], [])]))
     _no_subprocess(monkeypatch)
     (pid, cmd, role), = research._enumerate_research_py_procs_windows()
     assert cmd == '"C:\\Program Files\\Py\\python.exe" "C:\\My Code\\research.py" --serve'
@@ -181,65 +216,108 @@ def test_with_no_source_at_all_the_list_is_empty(monkeypatch):
 def test_a_processs_age_comes_from_psutil(monkeypatch):
     """`_proc_age_seconds_windows` read WMIC's CreationDate only — None on a box
     without WMIC, for every process."""
-    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(
-        processes={77: ([], 1, time.time() - 120.0)}))
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(processes={
+        77: {"cmd": [], "ppid": 1, "ct": time.time() - 120.0, "name": "python.exe", "exe": ""}}))
     _no_subprocess(monkeypatch)
     age = research._proc_age_seconds_windows(77)
     assert age is not None and 119.0 <= age <= 125.0
 
 
-# ══ 2. the supervisor above a venv launcher ═══════════════════════════════════
+# ══ 2. the supervisor above a venv launcher, and what an update stops ═════════
 
-DAEMON, LAUNCHER, ME = 500, 600, 700
-WORKER_CMD = ["C:\\venv\\Scripts\\python.exe", "C:\\sr\\research.py", "--serve", "--worker-id", "2"]
+DAEMON, LAUNCHER, ME, SIBLING, ONE_OFF = 500, 600, 700, 800, 900
+BASE = "C:\\Py\\python.exe"
+ARGS = ["C:\\sr\\research.py", "--serve", "--worker-id", "2"]
 
 
-def _world(monkeypatch, *, parent_cmd, platform="Windows", parent_ppid=DAEMON):
+def _world(monkeypatch, tmp_path, *, parent_argv0=None, parent_args=ARGS,
+           parent_name="python.exe", in_venv=True, platform="Windows", my_argv0=None):
+    """This worker (ME) under a parent at LAUNCHER, under the daemon-loop at
+    DAEMON. The parent's exe sits in <tmp>/venv/Scripts — a venv when
+    `in_venv` (its pyvenv.cfg is there). argv[0]s default to the 3.13+ shape
+    (the launcher's own path in both)."""
+    venv = tmp_path / "venv"
+    (venv / "Scripts").mkdir(parents=True, exist_ok=True)
+    if in_venv:
+        (venv / "pyvenv.cfg").write_text("home = C:\\Py\n", encoding="utf-8")
+    launcher = str(venv / "Scripts" / "python.exe")
+    parent_cmd = [parent_argv0 or launcher, *parent_args]
+    my_cmd = [my_argv0 or launcher, *ARGS]
     monkeypatch.setattr(research, "_supervisor_platform", lambda: platform)
     monkeypatch.setattr(research.os, "getppid", lambda: LAUNCHER)
-    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(
-        processes={ME: (WORKER_CMD, LAUNCHER, 0.0),
-                   LAUNCHER: (parent_cmd, parent_ppid, 0.0),
-                   DAEMON: (["pythonw.exe", "research.py", "--daemon-loop"], 4, 0.0)},
-        me=ME))
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(processes={
+        ME: {"cmd": my_cmd, "ppid": LAUNCHER, "ct": 0.0, "name": "python.exe", "exe": BASE},
+        LAUNCHER: {"cmd": parent_cmd, "ppid": DAEMON, "ct": 0.0, "name": parent_name,
+                   "exe": launcher},
+        DAEMON: {"cmd": ["pythonw.exe", "research.py", "--daemon-loop"], "ppid": 4, "ct": 0.0,
+                 "name": "pythonw.exe", "exe": "C:\\Py\\pythonw.exe"},
+    }, me=ME))
     monkeypatch.setattr(research, "_enumerate_research_py_procs", lambda: [
         (DAEMON, "pythonw.exe research.py --daemon-loop", "daemon-loop"),
         (LAUNCHER, " ".join(parent_cmd), "serve" if "--serve" in parent_cmd else "other"),
-        (ME, " ".join(WORKER_CMD), "serve")])
+        (ME, " ".join(my_cmd), "serve"),
+        (SIBLING, "python.exe research.py --serve --worker-id 3", "serve"),
+        (ONE_OFF, "python.exe research.py a topic", "other")])
 
 
-def test_a_worker_started_through_its_venvs_launcher_is_supervised(monkeypatch):
-    """⛔ The launcher's command line is the worker's own, argv[0] included (as
-    measured on the owner's box): the daemon-loop above it is the supervisor."""
-    _world(monkeypatch, parent_cmd=list(WORKER_CMD))
+@pytest.mark.parametrize("shape", ["3.13+", "3.11/3.12"])
+def test_a_worker_started_through_its_venvs_launcher_is_supervised(monkeypatch, tmp_path, shape):
+    """⛔ The launcher carries the worker's arguments (3.13+ keeps argv[0] too —
+    measured on the owner's box; 3.11/3.12 rewrite the child's to the base
+    interpreter): the daemon-loop above it is the supervisor."""
+    _world(monkeypatch, tmp_path, my_argv0=BASE if shape == "3.11/3.12" else None)
     assert research._supervisor_is_my_parent() is True
     assert research._requeue_capability_patch() == {"capabilities": [research.REQUEUE_CAPABILITY]}
 
 
-def test_a_parent_with_another_command_line_is_not_a_launcher(monkeypatch):
-    """A `--serve` parent that is not this worker's launcher (another worker, a
-    foreground session) is not stepped over."""
-    _world(monkeypatch, parent_cmd=["C:\\venv\\Scripts\\python.exe", "C:\\sr\\research.py",
-                                    "--serve", "--worker-id", "3"])
+@pytest.mark.parametrize("case", ["another-worker", "not-a-venv", "another-program", "a-shell"])
+def test_a_parent_that_is_not_this_workers_launcher_is_not_stepped_over(monkeypatch, tmp_path, case):
+    """A sibling worker, a python outside any venv with the same arguments, a
+    different program, a shell: none is this worker's launcher, so the
+    daemon-loop above it is not this worker's supervisor."""
+    kw = {"another-worker": {"parent_args": ["C:\\sr\\research.py", "--serve", "--worker-id", "3"]},
+          "not-a-venv": {"in_venv": False},
+          "another-program": {"parent_name": "py.exe"},
+          "a-shell": {"parent_argv0": "C:\\Windows\\System32\\cmd.exe", "parent_args": []}}[case]
+    _world(monkeypatch, tmp_path, **kw)
     assert research._supervisor_is_my_parent() is False
 
 
-def test_a_foreground_serve_under_a_shell_is_not_supervised(monkeypatch):
-    _world(monkeypatch, parent_cmd=["C:\\Windows\\System32\\cmd.exe"], parent_ppid=DAEMON)
-    assert research._supervisor_is_my_parent() is False
-
-
-def test_the_launcher_step_is_windows_only(monkeypatch):
+def test_the_launcher_step_is_windows_only(monkeypatch, tmp_path):
     """A POSIX venv's python is a symlink: a parent with this worker's command
     line there is a fork, and is never stepped over."""
-    _world(monkeypatch, parent_cmd=list(WORKER_CMD), platform="Darwin")
+    _world(monkeypatch, tmp_path, platform="Darwin")
     assert research._supervisor_is_my_parent() is False
 
 
-def test_a_direct_daemon_loop_parent_is_supervised_as_before(monkeypatch):
-    _world(monkeypatch, parent_cmd=list(WORKER_CMD))
+def test_a_direct_daemon_loop_parent_is_supervised_as_before(monkeypatch, tmp_path):
+    _world(monkeypatch, tmp_path)
     monkeypatch.setattr(research.os, "getppid", lambda: DAEMON)
     assert research._supervisor_is_my_parent() is True
+
+
+def test_an_update_never_stops_this_worker_or_its_own_launcher(monkeypatch, tmp_path):
+    """⛔ The update's "free the venv" list: every daemon-loop and --serve but
+    this worker — and not its own launcher either, whose job would end this
+    worker part-way through the list. A sibling worker and the daemon-loop are
+    stopped; a one-off run is not."""
+    _world(monkeypatch, tmp_path)
+    monkeypatch.setattr(research.os, "getpid", lambda: ME)
+    assert research._backend_procs_holding_the_venv() == [DAEMON, SIBLING]
+
+
+def test_an_update_from_a_worker_with_no_launcher_stops_everything_else(monkeypatch, tmp_path):
+    _world(monkeypatch, tmp_path, in_venv=False)
+    monkeypatch.setattr(research.os, "getpid", lambda: ME)
+    assert research._backend_procs_holding_the_venv() == [DAEMON, LAUNCHER, SIBLING]
+
+
+def test_reset_backend_asks_about_its_own_supervisor():
+    """⛔ HARD_RESET's exit-or-stay asks whether ITS parent is a daemon-loop, as
+    reconnect and relink do — not whether one runs anywhere on the machine."""
+    src = inspect.getsource(research._start_device_command_listener)
+    assert "_supervisor_alive = _supervisor_is_my_parent()" in src
+    assert 'if pid != self_pid and role == "daemon-loop"' not in src
 
 
 # ══ 3. the Copy backup's line ends ════════════════════════════════════════════
@@ -252,7 +330,7 @@ class _ClipPage:
         return self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
 
 
-def test_the_copy_is_read_back_with_lf_line_ends(monkeypatch):
+def test_the_copy_is_read_back_with_lf_line_ends():
     """⛔ Chrome on Windows hands the clipboard back with CRLF. The copy is LF, as
     the page read gives it — so brief.md is not written CR CR LF."""
     got = asyncio.run(research._chatgpt_read_copied(
@@ -276,7 +354,109 @@ def test_a_crlf_brief_written_the_way_phase_1_writes_it_keeps_its_table(tmp_path
     assert p.read_text(encoding="utf-8") == "# Research Brief\n\n| a | b |\n|---|---|\n| 1 | 2 |"
 
 
-# ══ 4. the real thing, on Windows ═════════════════════════════════════════════
+# ══ 4. the clipboard hooks run in the page's own world ════════════════════════
+
+class _PatchrightTarget:
+    def __init__(self):
+        self.worlds = []
+
+    async def evaluate(self, js, arg=None, *, isolated_context=True):
+        self.worlds.append("isolated" if isolated_context else "page")
+        return arg
+
+
+class _PlainTarget:
+    def __init__(self):
+        self.calls = []
+
+    async def evaluate(self, js, *args):
+        self.calls.append(args)
+        return args[0] if args else None
+
+
+def test_a_hook_runs_in_the_pages_world_where_patchright_can_say_so():
+    t = _PatchrightTarget()
+    assert asyncio.run(research._page_world_evaluate(t, "js", {"a": 1})) == {"a": 1}
+    assert asyncio.run(research._page_world_evaluate(t, "js")) is None
+    assert t.worlds == ["page", "page"]
+
+
+def test_a_target_without_worlds_is_called_as_before():
+    """A test double, or plain Playwright: no `isolated_context` to pass."""
+    t = _PlainTarget()
+    assert asyncio.run(research._page_world_evaluate(t, "js", 5)) == 5
+    asyncio.run(research._page_world_evaluate(t, "js"))
+    assert t.calls == [(5,), ()]
+
+
+@pytest.mark.parametrize("fn", ["_copy_via_hijack", "_run_with_clipboard_hijack"])
+def test_every_evaluate_in_the_clipboard_hooks_is_in_the_pages_world(fn):
+    """Install, click, the reads of what was captured, and the unhook: one world,
+    or the reads look at a window the hook never wrote."""
+    src = inspect.getsource(getattr(research, fn))
+    assert "_page_world_evaluate(" in src
+    assert "page.evaluate(" not in src and "tgt.evaluate(" not in src, fn
+
+
+HOOK_URL = "http://127.0.0.1:9/hook"             # the Copy tests' granted origin
+REPLY = " ".join(f"word{n}" for n in range(200))
+
+
+@pytest.fixture
+def hook_page(request):
+    """A page whose own Copy button writes its reply with navigator.clipboard.writeText,
+    in headless Chrome with the clipboard granted (the Copy tests' browser)."""
+    ch = request.getfixturevalue("chrome")
+    page = ch.run(ch.ctx.new_page())
+    body = ("<!doctype html><html><body><div id='t'>" + REPLY + "</div>"
+            "<button id='copy' aria-label='Copy' onclick=\"navigator.clipboard.writeText("
+            "document.getElementById('t').textContent)\">Copy</button></body></html>")
+
+    async def _serve(route):
+        if route.request.url == HOOK_URL:
+            await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
+        else:
+            await route.abort()
+
+    async def _go():
+        await page.route("**/*", _serve)
+        await page.goto(HOOK_URL)
+
+    ch.run(_go())
+    yield ch, page
+    ch.run(page.close())
+
+
+# The Copy tests' module-scoped Chrome, shared here.
+from test_chatgpt_copy_fallback_w13 import chrome  # noqa: E402,F401
+
+
+def test_live_the_copy_hijack_catches_the_pages_own_copy(hook_page, monkeypatch):
+    """⛔⛔ On patchright 1.62+ (the new floor, and every Mac) the hook sat in the
+    isolated world and caught nothing — the Claude chat-mode Copy tier returned
+    "" with no word why."""
+    ch, page = hook_page
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    got = ch.run(research._copy_via_hijack(
+        page, "T", direct_copy_selectors=["#copy"], wait_ms=2000, min_chars=100))
+    assert got == REPLY
+
+
+def test_live_the_tier_3_hijack_catches_the_pages_own_copy(hook_page, monkeypatch):
+    """The CUA-copy tiers' hook: the Copy button the CUA presses writes through
+    the page's own writeText."""
+    ch, page = hook_page
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+
+    async def _press():
+        await page.click("#copy")
+
+    got = ch.run(research._run_with_clipboard_hijack(
+        page, "T", _press, timeout_ms=5000, min_chars=100))
+    assert got == REPLY
+
+
+# ══ 5. the real thing, on Windows ═════════════════════════════════════════════
 
 #: A process shaped like the daemon-loop (its command line names research.py
 #: and --daemon-loop) that starts one child shaped like a worker and prints
@@ -312,7 +492,7 @@ def test_on_windows_a_real_worker_under_a_real_daemon_loop_is_supervised():
 @pytest.mark.skipif(not ON_WINDOWS, reason="a Windows venv's launcher")
 def test_on_windows_a_worker_started_through_a_venv_launcher_is_supervised(tmp_path):
     """⛔ The pipx/venv shape: the child is started by a venv's Scripts\\python.exe,
-    which runs the real interpreter as ITS child with the same command line."""
+    which runs the real interpreter as ITS child with the same arguments."""
     venv = tmp_path / "venv"
     made = subprocess.run([sys.executable, "-m", "venv", "--system-site-packages",
                            "--without-pip", str(venv)], capture_output=True, text=True,
@@ -320,6 +500,10 @@ def test_on_windows_a_worker_started_through_a_venv_launcher_is_supervised(tmp_p
     launcher = venv / "Scripts" / "python.exe"
     if made.returncode != 0 or not launcher.exists():
         pytest.skip(f"could not make a venv here: {made.stderr[-300:]}")
+    probe = subprocess.run([str(launcher), "-c", "import psutil, patchright"],
+                           capture_output=True, text=True, timeout=120)
+    if probe.returncode != 0:
+        pytest.skip("the venv cannot see this interpreter's packages (pytest runs from a venv)")
     assert _as_daemon_loop(str(launcher)) == "SUPERVISED"
 
 

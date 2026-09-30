@@ -2,20 +2,25 @@
 
 ⛔⛔ WHAT THIS CODE DECIDES.
   P* — research.py: where Windows' list of research.py processes comes from
-       (psutil, then PowerShell's CIM, then WMIC — WMIC is gone from current
-       Windows 11), a process's age, and the supervisor one step above a venv's
-       launcher. Move to queue, --retire and --resurrect all read these.
+       (psutil — the name first — then PowerShell's CIM, then WMIC; WMIC is gone
+       from current Windows 11), a process's age, this worker's own venv
+       launcher (the supervisor one step above it; never stopped by an update),
+       and Reset Backend asking about ITS supervisor. Move to queue, --retire,
+       --resurrect and the update all read these.
   C* — research.py: the Copy backup's brief is read back with LF line ends.
+  H* — research.py: the clipboard hooks run in the page's own script world
+       (patchright 1.62+ runs evaluate isolated, where a hook sees nothing).
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every mutated
 Python file must still COMPILE. Both are harness faults, counted OUT.
 ⛔ BYTES BACK, NOT TEXT — a text restore would flip a CRLF checkout's line endings.
 ⛔⛔ AN IN-FLIGHT MARKER, because Windows kills without running `finally:` or a
 SIGTERM handler. Run this in a throwaway worktree, never in the checkout the
-backend runs from. On Windows the suite also runs the real process-table tests.
+backend runs from. On Windows the suite also runs the real process-table tests
+(a pass there takes about a minute — run a few mutants at a time, or on Linux).
 
   python .mutants/windows_review_w13_mutants.py
-  python .mutants/windows_review_w13_mutants.py P6 C1
+  python .mutants/windows_review_w13_mutants.py P6 C1 H1
 """
 import hashlib
 import os
@@ -53,21 +58,45 @@ MUTANTS = [
     ('P6', RESEARCH, '⛔⛔ the venv launcher is not stepped over — pipx installs never supervised',
      [('    above_launcher = _venv_launcher_parent(ppid)\n',
        '    above_launcher = None\n')]),
-    ('P7', RESEARCH, '⛔ the launcher step runs on macOS/Linux too, where a same-command-line parent is a fork',
-     [('    if _supervisor_platform() != "Windows":\n        return None\n    try:\n        import psutil as _ps\n        me = _ps.Process()\n',
-       '    if False:\n        return None\n    try:\n        import psutil as _ps\n        me = _ps.Process()\n')]),
+    ('P7', RESEARCH, '⛔ the launcher step runs on macOS/Linux too, where a same-arguments parent is a fork',
+     [('    if _supervisor_platform() != "Windows":\n        return False\n    try:\n        import psutil as _ps\n        me, parent',
+       '    if False:\n        return False\n    try:\n        import psutil as _ps\n        me, parent')]),
     ('P8', RESEARCH, "⛔⛔ any python parent is taken for a launcher — another worker's supervisor",
-     [('        if parent.cmdline() and parent.cmdline() == me.cmdline():\n',
-       '        if parent.cmdline():\n')]),
+     [('        if not theirs or theirs[1:] != mine[1:]:\n',
+       '        if not theirs:\n')]),
     ('P9', RESEARCH, "⛔ a process's age from WMIC only — None on current Windows 11",
      [('        return max(0.0, time.time() - _ps.Process(int(pid)).create_time())\n',
        '        raise RuntimeError("no psutil age")\n')]),
+    ('P10', RESEARCH, "⛔ every process's command line is read before its name — ~5 s a scan, elevated",
+     [('                info = proc.info\n                if str(info.get("name") or "").lower() not in _WIN_PYTHON_NAMES:\n',
+       '                info = proc.info\n                proc.cmdline()\n                if str(info.get("name") or "").lower() not in _WIN_PYTHON_NAMES:\n')]),
+    ('P11', RESEARCH, '⛔ another program with the same arguments is taken for the launcher',
+     [('        if str(parent.name()).lower() != str(me.name()).lower():\n            return False\n',
+       '        if False:\n            return False\n')]),
+    ('P12', RESEARCH, '⛔ a python outside any venv is taken for a launcher',
+     [('        return (Path(parent.exe()).parent.parent / "pyvenv.cfg").is_file()\n',
+       '        return True\n')]),
+    ('P13', RESEARCH, "⛔⛔ an update stops this worker's own launcher — and with it this worker, mid-list",
+     [('        if _is_my_venv_launcher(os.getppid()):\n            spare.add(os.getppid())\n',
+       '        if False:\n            spare.add(os.getppid())\n')]),
+    ('P14', RESEARCH, '⛔⛔ Reset Backend asks whether ANY daemon-loop runs — a foreground --serve beside the fleet exits for good',
+     [('                    _supervisor_alive = _supervisor_is_my_parent()\n',
+       '                    _supervisor_alive = any(r == "daemon-loop" and p != os.getpid()\n                                            for p, _c, r in _enumerate_research_py_procs())\n')]),
     ('C1', RESEARCH, "⛔⛔ the Copy backup's brief keeps CRLF — brief.md written CR CR LF, tables broken",
      [('            return got.replace("\\r\\n", "\\n").replace("\\r", "\\n")\n',
        '            return got\n')]),
     ('C2', RESEARCH, '⛔ a lone CR is kept',
      [('            return got.replace("\\r\\n", "\\n").replace("\\r", "\\n")\n',
        '            return got.replace("\\r\\n", "\\n")\n')]),
+    ('H1', RESEARCH, '⛔⛔ the one-shot Copy hijack runs isolated — on patchright 1.62+ it catches nothing',
+     [('        result = await _page_world_evaluate(page, r"""(opts) => new Promise(async (resolve) => {\n',
+       '        result = await page.evaluate(r"""(opts) => new Promise(async (resolve) => {\n')]),
+    ('H2', RESEARCH, "⛔⛔ the Tier-3 hook is installed isolated — the page's own Copy is never seen",
+     [('                ok = await _page_world_evaluate(tgt, install_script)\n',
+       '                ok = await tgt.evaluate(install_script)\n')]),
+    ('H3', RESEARCH, "⛔ the page's world is not asked for",
+     [('        return await target.evaluate(js, *args, isolated_context=False)\n',
+       '        return await target.evaluate(js, *args, isolated_context=True)\n')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

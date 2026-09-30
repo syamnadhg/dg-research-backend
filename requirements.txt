@@ -30,12 +30,12 @@ playwright>=1.61
 # and the line now lands in unrelated Firestore-outage code, so the one
 # pointer a reader had led somewhere wrong. A file this long renumbers on
 # every commit; `Browser.start` does not.
-# ⛔⛔ FLOOR 1.62.3 (Windows review of wave 13, 2026-09-30). patchright 1.61.1's
-# Windows wheel ships the stock `playwright-core` driver, and under it
-# `page.evaluate` ran in the PAGE'S OWN script world — the isolated world, and
-# with it the stealth this package exists for, was not there. Measured on the
-# owner's Windows box: 1.61.1 → main world, 1.62.3 and 1.63.0 → isolated
-# (their driver is `patchright-core`).
+# ⛔⛔ FLOOR 1.62.3 (Windows review of wave 13, 2026-09-30). Under patchright
+# 1.61.1 `page.evaluate` ran in the PAGE'S OWN script world — the isolated world,
+# and with it the stealth this package exists for, was not there. Measured on
+# the owner's Windows box: 1.61.1 → the page's world, 1.62.3 and 1.63.0 →
+# isolated. The clipboard hooks, which must run in the page's world, ask for it
+# explicitly (`_page_world_evaluate`).
 patchright>=1.62.3
 
 # Extraction

@@ -13605,16 +13605,17 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # Supervisor detection. If a daemon-loop process is alive,
                 # os._exit lets it respawn us cleanly. If not (foreground
                 # --serve run), os._exit kills the BE permanently — the
-                # user wouldn't see Online come back. Detect via process
-                # enumeration: any python(.exe) with --daemon-loop in its
-                # command line is the supervisor.
+                # user wouldn't see Online come back.
+                # ⛔⛔ OUR SUPERVISOR, NOT ANY (Windows review of wave 13,
+                # 2026-09-30). This asked "is a daemon-loop running anywhere
+                # on this machine?" — true for a foreground --serve beside the
+                # supervised fleet, which then exited for good; that is the
+                # failure `_supervisor_is_my_parent` exists for, and the
+                # reconnect and relink paths already ask it. It went unseen on
+                # Windows only because the process list there was always empty.
                 _supervisor_alive = False
                 try:
-                    self_pid = os.getpid()
-                    for pid, _cmd, role in _enumerate_research_py_procs():
-                        if pid != self_pid and role == "daemon-loop":
-                            _supervisor_alive = True
-                            break
+                    _supervisor_alive = _supervisor_is_my_parent()
                 except Exception as _enum_err:
                     log(f"[device-cmds] HARD_RESET: supervisor detect failed (assuming foreground): {_enum_err}", "DEBUG")
 
@@ -19668,31 +19669,46 @@ def _supervisor_is_my_parent() -> bool:
     return False
 
 
-def _venv_launcher_parent(ppid) -> "int | None":
-    """The pid ABOVE a venv launcher that started this process, or None.
+def _is_my_venv_launcher(ppid) -> bool:
+    """Whether `ppid` is this process's own venv launcher (Windows).
 
     ⛔ ON WINDOWS A VENV'S `Scripts\\python.exe` IS A LAUNCHER (Windows review of
     wave 13, 2026-09-30): it starts the real interpreter as its child with the
-    very same command line and waits. A pipx or venv install's daemon-loop
-    spawns each worker through one, so the worker's direct parent is its own
-    launcher — a `--serve` process — and the daemon-loop is one step further
-    up. Measured on the owner's box: parent and child command lines identical,
-    argv[0] included. Nothing else looks like that: a daemon-loop's own command
-    line is never its worker's, and a foreground `--serve` started from a
-    shell has the shell above it. Needs psutil; None when it can't tell. Only
-    on Windows: a POSIX venv's python is a symlink, not a launcher."""
+    same arguments and waits for it — and ends it if the launcher is killed. A
+    pipx or venv install's daemon-loop spawns each worker through one, so the
+    worker's direct parent is its own launcher, a `--serve` process like itself.
+    Recognised by all three: the same arguments after argv[0] (Python 3.13+
+    keeps argv[0] too, 3.11/3.12 rewrite it to the base interpreter), the same
+    program name, and the venv's pyvenv.cfg beside the launcher's Scripts
+    folder. A daemon-loop's command line is never its worker's, and a shell is
+    not a python. Needs psutil; False when it can't tell. Only on Windows: a
+    POSIX venv's python is a symlink, not a launcher."""
     if _supervisor_platform() != "Windows":
+        return False
+    try:
+        import psutil as _ps
+        me, parent = _ps.Process(), _ps.Process(int(ppid))
+        mine, theirs = me.cmdline(), parent.cmdline()
+        if not theirs or theirs[1:] != mine[1:]:
+            return False
+        if str(parent.name()).lower() != str(me.name()).lower():
+            return False
+        return (Path(parent.exe()).parent.parent / "pyvenv.cfg").is_file()
+    except Exception:
+        return False
+
+
+def _venv_launcher_parent(ppid) -> "int | None":
+    """The pid ABOVE this process's own venv launcher (`_is_my_venv_launcher`),
+    or None — where a pipx or venv install's daemon-loop is."""
+    if not _is_my_venv_launcher(ppid):
         return None
     try:
         import psutil as _ps
-        me = _ps.Process()
-        parent = _ps.Process(int(ppid))
-        if parent.cmdline() and parent.cmdline() == me.cmdline():
-            up = parent.ppid()
-            return up if up and up > 1 else None
+        up = _ps.Process(int(ppid)).ppid()
+        return up if up and up > 1 else None
     except Exception:
-        pass
-    return None
+        return None
 
 
 # Set at boot by run_server. The reconnect loop cannot build this itself: it has
@@ -55025,6 +55041,34 @@ async def _extract_html_to_md_anyframe(page, selectors, label):
     return ""
 
 
+_NO_EVAL_ARG = object()
+
+
+async def _page_world_evaluate(target, js, arg=_NO_EVAL_ARG):
+    """`target.evaluate`, run in the PAGE'S OWN script world.
+
+    ⛔⛔ THE CLIPBOARD HOOKS NEED THE PAGE'S WORLD (Windows review of wave 13,
+    2026-09-30). patchright 1.62+ runs `evaluate` in an isolated world by
+    default — the stealth it exists for. A hook that replaces
+    `navigator.clipboard.writeText` there replaces the ISOLATED world's copy,
+    and the page's own Copy button calls the page's, so nothing was captured:
+    the Copy hijacks were silently empty on every install at 1.62+ (the Mac's,
+    and every fresh one), and worked on Windows only because its patchright
+    1.61.1 ran everything in the page's world. Only these hooks, and the reads
+    of what they captured, run there; everything else stays isolated. A target
+    whose `evaluate` has no `isolated_context` (a test double, plain
+    Playwright) is called as before."""
+    args = () if arg is _NO_EVAL_ARG else (arg,)
+    try:
+        import inspect as _ins
+        page_world = "isolated_context" in _ins.signature(target.evaluate).parameters
+    except (TypeError, ValueError, AttributeError):
+        page_world = False
+    if page_world:
+        return await target.evaluate(js, *args, isolated_context=False)
+    return await target.evaluate(js, *args)
+
+
 async def _copy_via_hijack(
     page,
     label,
@@ -55080,7 +55124,7 @@ async def _copy_via_hijack(
     ]
     excludes = scoping_excludes if scoping_excludes is not None else DEFAULT_EXCLUDES
     try:
-        result = await page.evaluate(r"""(opts) => new Promise(async (resolve) => {
+        result = await _page_world_evaluate(page, r"""(opts) => new Promise(async (resolve) => {
             const {
                 canvas_root_selectors,
                 kebab_selectors,
@@ -55629,7 +55673,7 @@ async def _run_with_clipboard_hijack(
         # ── Step 1: install hook in every target ──
         for tgt in targets:
             try:
-                ok = await tgt.evaluate(install_script)
+                ok = await _page_world_evaluate(tgt, install_script)
                 if ok is not False:
                     installed_targets.append(tgt)
             except Exception as e:
@@ -55658,8 +55702,8 @@ async def _run_with_clipboard_hijack(
         for _ in range(5):
             for tgt in list(installed_targets):
                 try:
-                    v = await tgt.evaluate(
-                        "() => window.__dg_cb_captured_text || ''"
+                    v = await _page_world_evaluate(
+                        tgt, "() => window.__dg_cb_captured_text || ''"
                     )
                 except Exception:
                     # Frame detached mid-poll (canvas closed by CUA's
@@ -55688,8 +55732,8 @@ async def _run_with_clipboard_hijack(
             per_frame_lens = []
             for tgt in installed_targets:
                 try:
-                    _l = await tgt.evaluate(
-                        "() => (window.__dg_cb_captured_text || '').length"
+                    _l = await _page_world_evaluate(
+                        tgt, "() => (window.__dg_cb_captured_text || '').length"
                     )
                     per_frame_lens.append(int(_l))
                 except Exception:
@@ -55705,8 +55749,8 @@ async def _run_with_clipboard_hijack(
         # Restore originals on every frame we installed into.
         for tgt in installed_targets:
             try:
-                await tgt.evaluate(
-                    "() => { try { window.__dg_unhook && window.__dg_unhook(); } catch {} }"
+                await _page_world_evaluate(
+                    tgt, "() => { try { window.__dg_unhook && window.__dg_unhook(); } catch {} }"
                 )
             except Exception:
                 pass
@@ -87125,19 +87169,26 @@ _WIN_PYTHON_NAMES = ("python.exe", "pythonw.exe")
 def _windows_python_procs_psutil() -> "list[tuple[int, str]] | None":
     """[(pid, command line)] of every python.exe / pythonw.exe, via psutil;
     None when psutil cannot be used at all (so the next source is asked). A
-    process that ends or refuses mid-scan is skipped, as WMIC skipped it."""
+    process that ends or refuses mid-scan is skipped, as WMIC skipped it.
+
+    ⛔ THE NAME FIRST, THE COMMAND LINE ONLY FOR A PYTHON (review of this fix,
+    2026-09-30). Asking psutil for every process's command line costs about a
+    second per protected process (LsaIso, NgcIso, vmmemWSL — psutil retries the
+    refused read) when the backend holds SeDebugPrivilege, as one started from
+    an elevated terminal does: about 5 s a scan on the owner's box, and some
+    callers run on the event loop. The name alone costs milliseconds."""
     try:
         import psutil as _ps
     except Exception:
         return None
     rows: list[tuple[int, str]] = []
     try:
-        for proc in _ps.process_iter(["pid", "name", "cmdline"]):
+        for proc in _ps.process_iter(["pid", "name"]):
             try:
                 info = proc.info
                 if str(info.get("name") or "").lower() not in _WIN_PYTHON_NAMES:
                     continue
-                args = info.get("cmdline") or []
+                args = proc.cmdline() or []
                 rows.append((int(info["pid"]), subprocess.list2cmdline([str(a) for a in args])))
             except Exception:
                 continue
@@ -94312,9 +94363,7 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
     free_venv = (not restart_after) or (sys.platform == "win32" and bool(entry))
     if free_venv:
         try:
-            self_pid = os.getpid()
-            victims = [pid for pid, _cmd, role in _enumerate_research_py_procs()
-                       if pid != self_pid and role in ("daemon-loop", "serve")]
+            victims = _backend_procs_holding_the_venv()
             if victims:
                 _kill_pids(victims)
                 print(f"  Stopped {len(victims)} running backend process(es) so the "
@@ -94322,6 +94371,25 @@ def _spawn_detached_lifecycle(action: str, *, restart_after: bool = False,
         except Exception:
             pass
     return waiter_pid
+
+
+def _backend_procs_holding_the_venv() -> "list[int]":
+    """The daemon-loop and --serve processes an update stops so pipx can rebuild
+    the venv (`_spawn_detached_lifecycle`) — never this process.
+
+    ⛔ NOR THIS WORKER'S OWN VENV LAUNCHER (Windows review of wave 13,
+    2026-09-30). It carries this worker's command line, so it is listed as a
+    --serve; killing it ends this worker through the launcher's job, part-way
+    through the list, with its browser left running. It exits by itself the
+    moment this worker does."""
+    spare = {os.getpid()}
+    try:
+        if _is_my_venv_launcher(os.getppid()):
+            spare.add(os.getppid())
+    except Exception:
+        pass
+    return [pid for pid, _cmd, role in _enumerate_research_py_procs()
+            if pid not in spare and role in ("daemon-loop", "serve")]
 
 
 def _perform_self_update(*, force_check: bool = True, restart_after: bool = False) -> dict:
