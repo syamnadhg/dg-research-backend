@@ -75,6 +75,20 @@ class _EventsCol:
         self._db.timeline.append(("event", data.get("type")))
 
 
+class _EnqueueAtOnce:
+    """The run's own loop, except that a job handed to it lands at once — so a
+    timeline shows what reached the outside first, not when the loop got to it."""
+
+    def __init__(self, loop):
+        self._loop = loop
+
+    def create_task(self, *a, **k):
+        return self._loop.create_task(*a, **k)
+
+    def call_soon_threadsafe(self, fn, *a):
+        fn(*a)
+
+
 class _EventsDb(FakeDb):
     """The listener suite's fake Firestore, plus a research's event timeline."""
 
@@ -677,6 +691,13 @@ def test_the_card_comes_down_when_the_run_continues_by_itself(machine, monkeypat
     starting over), BEFORE the job reaches the queue. ⛔ Written to the run's
     own research, not to whichever run this worker's globals name by then."""
     from google.cloud.firestore import DELETE_FIELD
+    real_plan = research._login_auto_resume_plan
+
+    def _observed(*a, **k):
+        plan = real_plan(*a, **k)
+        plan["loop"] = _EnqueueAtOnce(plan["loop"])
+        return plan
+    monkeypatch.setattr(research, "_login_auto_resume_plan", _observed)
 
     async def main():
         research._write_login_marker()

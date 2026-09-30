@@ -10,6 +10,10 @@ itself when the login finishes.
        cleared by any resume.
   C* — the words: the login card, the terminal's warning.
   H* — a human check the login interrupts gives way, and its cards say so.
+  R* — (review 09-30) a Retry after the run continued by itself is refused:
+       the note on disk and its liveness, this worker's waiting jobs, the
+       resumed run spending the note, and the card coming down at the queue.
+  S* — (review 09-30) a login open past 30 minutes keeps the run waiting.
 Driven through the real `run_pipeline` catching a real phase-2 / phase-3 /
 human-check raise, the real login marker helpers, the real resume helper and
 the real start listener (tests/test_login_auto_resume_w13.py).
@@ -45,7 +49,7 @@ MUTANTS = [
        "    if False:\n        _arm_login_auto_resume(_login_resume)\n")], LOGIN_T),
     ("A2", RESEARCH, "⛔ the run goes back on the queue while the login still has "
      "the browser — Chrome relaunches onto the profile being signed into",
-     [("        while _login_interrupt_active():\n",
+     [("        while _login_still_running():\n",
        "        while False:\n")], LOGIN_T),
     ("A3", RESEARCH, "⛔⛔ a second resume path: the job is queued, but the files "
      "and the record are left paused — not what a Retry does",
@@ -121,6 +125,71 @@ MUTANTS = [
      [("            + HV_LOGIN_LINE\n        )", "        )")], LOGIN_T),
     ("H5", RESEARCH, "the non-Cloudflare hands-off card leaves the line off",
      [("if you want it back.\" + HV_LOGIN_LINE,", "if you want it back.\",")], LOGIN_T),
+
+    # ═══ R — review 09-30: a Retry after the run continued by itself ═══════
+    ("R1", RESEARCH, "⛔⛔ the auto-resume leaves no note — a sibling's Retry starts "
+     "the queued run a second time",
+     [("if login_pause and fname == \"delivery.json\":", "if False:")], LOGIN_T),
+    ("R2", RESEARCH, "⛔⛔ a Retry is never refused — the run already queued goes twice",
+     [("if not login_pause and _run_already_queued(queue_dir, job_queue):", "if False:")],
+     LOGIN_T),
+    ("R3", RESEARCH, "⛔ a note left by a worker that is gone holds for ever — the "
+     "run's Retry is refused after a restart",
+     [("return pid > 0 and (psutil.Process(pid).create_time()\n"
+       "                            <= float(note.get(\"at\") or 0) / 1000 + 1)",
+       "return True")], LOGIN_T),
+    ("R4", RESEARCH, "a note holds for any process with its number, even one younger "
+     "than the note",
+     [("return pid > 0 and (psutil.Process(pid).create_time()\n"
+       "                            <= float(note.get(\"at\") or 0) / 1000 + 1)",
+       "return pid > 0 and psutil.pid_exists(pid)")], LOGIN_T),
+    ("R5", RESEARCH, "⛔ this worker's own waiting job is not looked at — a second "
+     "Retry queues the run twice",
+     [("return any(getattr(_job_run_dir(j), \"name\", None) == name for j in waiting)",
+       "return False")], LOGIN_T),
+    ("R6", RESEARCH, "⛔ the run this worker is letting go of counts as queued — a "
+     "Retry in the ten seconds after the pause is refused",
+     [("waiting = list(job_queue._queue)", "waiting = _jobs_held_locally(job_queue)")],
+     LOGIN_T),
+    ("R7", RESEARCH, "⛔ the resumed run never spends the note — a Retry on its "
+     "next card is refused",
+     [("        _spend_login_resume_note(queue_dir)\n        # Set the active-run global",
+       "        # Set the active-run global")], LOGIN_T),
+    ("R8", RESEARCH, "the record keeps the login card — it comes back on a cold open "
+     "over a queued run",
+     [("**({\"pendingDecision\": _DF_RESUME} if login_pause else {})", "**({})")], LOGIN_T),
+    ("R9", RESEARCH, "⛔ the open tab keeps the login card and its Retry until the "
+     "job starts",
+     [("    if login_pause:\n        _send_login_card_down(uid, research_id, queue_dir)\n",
+       "")], LOGIN_T),
+    ("R10", RESEARCH, "⛔⛔ the card's clear is written where the run globals point — "
+     "onto whichever research this worker runs by then",
+     [("lambda d=doc: _firebase_db.collection(\"users\").document(uid)\n"
+       "                    .collection(\"researches\").document(research_id)",
+       "lambda d=doc: _firebase_db.collection(\"users\").document(_fb_uid)\n"
+       "                    .collection(\"researches\").document(_fb_research_id)")],
+     LOGIN_T),
+    ("R11", RESEARCH, "the card's clear goes after the job — it can land after the "
+     "resumed run's own start and reset its phase",
+     [("    if login_pause:\n        _send_login_card_down(uid, research_id, queue_dir)\n",
+       ""),
+      ("    loop.call_soon_threadsafe(_do_resume_enqueue)\n",
+       "    loop.call_soon_threadsafe(_do_resume_enqueue)\n"
+       "    if login_pause:\n        _send_login_card_down(uid, research_id, queue_dir)\n")],
+     LOGIN_T),
+
+    # ═══ S — review 09-30: a login left open a long time ═══════════════════
+    ("S1", RESEARCH, "⛔⛔ a login open past 30 minutes counts as finished — the run "
+     "starts again on the profile the login window has open",
+     [("        while _login_still_running():\n",
+       "        while _login_interrupt_active():\n")], LOGIN_T),
+    ("S2", RESEARCH, "a marker no process vouches for is believed for 12 hours",
+     [("max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S if vouched else 30 * 60)",
+       "max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S)")], LOGIN_T),
+    ("S3", RESEARCH, "a live login is believed for ever — a reused number keeps the "
+     "run waiting for good",
+     [("LOGIN_RESUME_LIVE_LOGIN_CAP_S = 12 * 3600", "LOGIN_RESUME_LIVE_LOGIN_CAP_S = 10 ** 9")],
+     LOGIN_T),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

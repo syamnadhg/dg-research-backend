@@ -768,10 +768,11 @@ MUTANTS = [
      "stale-field defect on the field that replaced it, and the card now prefers "
      "it for all four recovery statuses",
      # ⭐ Re-aimed 2026-09-30 (wave 13): the success write moved into
-     # `_resume_from_checkpoint`, which the login auto-resume shares.
+     # `_resume_from_checkpoint`, which the login auto-resume shares. Again the
+     # same day: the write gained the login card's clear after these two lines.
      [("                          \"resumeDropReason\": _DF_RESUME,\n"
-       "                          \"resumeDropAt\": _DF_RESUME})",
-       "                          })")]),
+       "                          \"resumeDropAt\": _DF_RESUME,\n",
+       "")]),
 ]
 
 
