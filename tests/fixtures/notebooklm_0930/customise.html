@@ -39,6 +39,9 @@
     data-start-format  the format chosen when the window opens (default Deep dive)
     data-length-stuck  a Length option that ignores presses
     data-generate-dead "1": Generate now does nothing
+    data-generate-slow milliseconds: Generate now takes, but the window closes
+                       and "Generating Audio Overview…" shows only after this
+                       long (ASSUMED: a slow server reply)
   <body data-log> records every press, as JSON (a page script's globals are
   out of reach of patchright's isolated evaluate; the DOM is shared).
 -->
@@ -289,9 +292,13 @@
     pressNow.addEventListener('click', () => {
       log.push('generate-now:' + state.format + '|' + (state.length || '-'));
       if (document.body.dataset.generateDead === '1') return;
-      shut();
-      document.getElementById('library').append(h('div', { class: 'artifact-placeholder' }, [
-        h('span', {}, ['Generating Audio Overview…']), ' ', h('span', {}, ['Come back in a few minutes'])]));
+      const started = () => {
+        shut();
+        document.getElementById('library').append(h('div', { class: 'artifact-placeholder' }, [
+          h('span', {}, ['Generating Audio Overview…']), ' ', h('span', {}, ['Come back in a few minutes'])]));
+      };
+      const slow = Number(document.body.dataset.generateSlow || 0);
+      if (slow) setTimeout(started, slow); else started();
     });
     // Any later press inside the window puts the lagging class back.
     dlg.addEventListener('click', () => {

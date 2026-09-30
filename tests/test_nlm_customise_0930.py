@@ -57,7 +57,7 @@ def chrome():
     loop.close()
 
 
-def _fixture_html(start="Deep dive", stuck="", dead=False) -> str:
+def _fixture_html(start="Deep dive", stuck="", dead=False, slow_ms=0) -> str:
     src = (FIX / "customise.html").read_text(encoding="utf-8")
     body = 'data-start-format="Deep dive"'
     assert src.count(body) == 1, "the fixture's <body> switches moved"
@@ -66,6 +66,8 @@ def _fixture_html(start="Deep dive", stuck="", dead=False) -> str:
         extra += f' data-length-stuck="{stuck}"'
     if dead:
         extra += ' data-generate-dead="1"'
+    if slow_ms:
+        extra += f' data-generate-slow="{int(slow_ms)}"'
     return src.replace(body, extra)
 
 
@@ -199,13 +201,35 @@ def test_a_length_that_does_not_read_back_is_never_generated_by_the_page(chrome,
                "choosing Long)" in m for m in lines), lines
 
 
-def test_a_generate_now_that_leaves_the_window_open_is_not_counted(chrome, monkeypatch):
-    """ASSUMED: a Generate now that took closes the window. One that leaves it
-    open with nothing generating did not take, so computer use gets the open
-    window — once."""
+# ═════════════════════════════════════════════════════════════════════════════
+# "Generate now" is pressed once, ever: a press that landed is never repeated
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_a_generate_now_that_leaves_the_window_open_is_never_pressed_again(chrome, monkeypatch):
+    """The press landed but the window stays open and nothing shows as
+    generating. The page cannot tell a press that failed from a slow one that
+    took, and a second press on one that took makes a second audio that cannot
+    be deleted. So computer use is not handed a Generate mission: the step goes
+    on to the checks and the poll, which watch for the audio."""
+    monkeypatch.setattr(research, "_NLM_GENERATE_WATCH_S", 1.0, raising=False)
     presses, cua, lines = _run_audio(chrome, monkeypatch, "long", dead=True)
     assert presses == ["tile", "length:Long", "generate-now:Deep dive|Long"], (presses, lines)
-    _one_panel_open_handover(cua)
+    assert cua == [], ("computer use was handed the window after the page's own "
+                       f"Generate now: {[c.get('current_step') for c in cua]}")
+    assert any('"Generate now" was pressed once' in m and "not pressing it again" in m
+               for m in lines), lines
+    assert any("Post-generate inventory" in m for m in lines), lines
+
+
+def test_a_slow_server_reply_is_waited_for_not_handed_on(chrome, monkeypatch):
+    """ASSUMED timing: Generate now takes, but the window closes and "Generating
+    Audio Overview…" shows only after 9 s. The page is still watching then, so
+    it reads as started by the page."""
+    presses, cua, lines = _run_audio(chrome, monkeypatch, "long", slow_ms=9000)
+    assert presses == ["tile", "length:Long", "generate-now:Deep dive|Long"], (presses, lines)
+    assert cua == [], [c.get("current_step") for c in cua]
+    assert any('Audio started by the page: Deep dive + Long read back as chosen, '
+               'then "Generate now" pressed' in m for m in lines), lines
 
 
 # ═════════════════════════════════════════════════════════════════════════════

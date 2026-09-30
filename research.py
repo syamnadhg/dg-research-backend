@@ -71611,8 +71611,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # "Generate now" is pressed once. Computer use runs only when the
             # page could not finish — with the window already open when the
             # page got that far (panel_already_open=True), so it never opens a
-            # second one; and never after the page's own Generate took. All
-            # calls here are exception-safe, but keeping them inside the try
+            # second one; and never once the page's press on "Generate now"
+            # landed, even when nothing has shown yet. All calls here are
+            # exception-safe, but keeping them inside the try
             # means the narration ticker's finally always stops it.
             _panel_opened = await _open_nlm_audio_customize(browser.page)
             _dom_gen = {}
@@ -71635,6 +71636,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                                                       _dom_gen.get("length")) if x)
                     log(f"[Phase3] Audio started by the page: {_chosen} read back as "
                         f"chosen, then \"Generate now\" pressed — no computer use")
+                elif _dom_gen.get("pressed"):
+                    log(f"[Phase3] \"Generate now\" was pressed once, but "
+                        f"{_dom_gen.get('reason') or 'nothing showed yet'} — not pressing "
+                        f"it again (a second press can make a second audio that cannot "
+                        f"be deleted); the checks below keep watching for it", "WARN")
                 else:
                     log(f"[Phase3] The page could not finish Customise "
                         f"({_dom_gen.get('reason') or 'no reason given'}) — computer "
@@ -71702,9 +71708,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                     log(f"[Phase3] act-net guard probe errored ({_pge}) — allowing CUA net", "WARN")
                 return None
 
-            if _dom_gen.get("generated"):
-                # The page's own "Generate now" took — a computer-use pass here
-                # could only press Generate a second time.
+            if _dom_gen.get("pressed"):
+                # The page's own press on "Generate now" landed. Whether or not
+                # the audio has shown yet, a computer-use pass here could only
+                # press Generate a second time (#778). The verify, the
+                # post-generate inventory and the poll below watch for it.
                 _ag_result = {"text": "generating"}
             else:
                 _ag_result = await _shadow_observed_cua(
@@ -73013,15 +73021,23 @@ async def _nlm_customise_choose(page, op: str, want: str, wait_s: float = 4.0) -
         await asyncio.sleep(0.2)
 
 
+#: How long the page watches for its own "Generate now" to show — the window
+#: closing, or the audio generating. A slow server reply can take longer than a
+#: few seconds. Only the log line depends on it: once the press landed, nothing
+#: presses Generate a second time either way.
+_NLM_GENERATE_WATCH_S = 30.0
+
+
 async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dict:
     """In the open Customise window: choose the configured Format, then Length,
     read both back, and press "Generate now" — never "Generate later".
 
-    Returns {"generated", "pressed", "format", "length", "reason"}. "generated"
-    is True once "Generate now" was pressed and the window closed or the page
-    shows the audio generating. Nothing is pressed when a choice does not read
-    back as chosen, so computer use can take over the same open window without
-    a second Generate.
+    Returns {"generated", "pressed", "format", "length", "reason"}. "pressed"
+    is True once the press on "Generate now" landed; "generated" once, within
+    `_NLM_GENERATE_WATCH_S`, the window closed or the page shows the audio
+    generating. Nothing is pressed when a choice does not read back as chosen,
+    so computer use can take over the same open window without a second
+    Generate. After a landed press the caller must never ask for another.
     """
     fmt, length = _nlm_audio_choice(podcast_length)
     res = {"generated": False, "pressed": False, "format": fmt, "length": length,
@@ -73044,15 +73060,15 @@ async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dic
         res["reason"] = "the press on Generate now did not land"
         return res
     res["pressed"] = True
-    deadline = time.monotonic() + 8.0
+    deadline = time.monotonic() + _NLM_GENERATE_WATCH_S
     while True:
         if (not (await _nlm_customise_read(page, "probe")).get("dialog")
                 or await _check_audio_generating(page)):
             res["generated"] = True
             return res
         if time.monotonic() >= deadline:
-            res["reason"] = ("Generate now was pressed, but the window stayed open "
-                             "and nothing started")
+            res["reason"] = (f"in {_NLM_GENERATE_WATCH_S:.0f} s the window stayed open "
+                             f"and nothing showed as generating")
             return res
         await asyncio.sleep(0.25)
 
