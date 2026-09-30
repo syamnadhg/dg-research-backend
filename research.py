@@ -7957,11 +7957,12 @@ def _waiting_position_patches(front) -> "list[tuple[str, str, dict]]":
 
 def _commit_queue_position_patches(patches) -> None:
     """Commit `(uid, research id, patch)` renumber writes, one batch per
-    account, each through the heal."""
+    account, each through the heal — except an account this computer is no
+    longer shared with (`_renumber_batches`)."""
     if not patches:
         return
 
-    for uid_b, i, chunk in _queue_pos_batches(patches):
+    for uid_b, i, chunk in _renumber_batches(patches):
         def _commit_chunk(chunk=chunk):
             batch = _firebase_db.batch()
             for uid_v, rid_v, patch in chunk:
@@ -8613,6 +8614,40 @@ def _queue_pos_batches(patches, chunk: int = 450):
             yield uid_v, i, mine[i:i + chunk]
 
 
+def _renumber_batches(patches):
+    """`_queue_pos_batches`, less every batch of an account this computer is
+    POSITIVELY no longer shared with — both renumbers commit what this yields.
+
+    ⛔⛔ THAT ACCOUNT'S BATCH SPENT EVERYBODY'S SAFETY NET (w13 integrated
+    review, 09-29). A removed sharer's run waiting in the queue, or a start
+    document they left behind, is in every renumber — at each phase start,
+    claim, finish, park and move. The rules refuse its records for good
+    (`deviceOwnership`), and each refusal went through the full heal: the
+    re-mint and its 30-second cooldown, which are one per process, and a step
+    toward the latch. So the owner's own "queued at #1" write after a move, or
+    boot's first write after the put-back, found no re-mint left and was
+    dropped; three such renumbers latched STRUCTURAL for every account.
+    ⭐ Skipped, not written with `heal=False`: the same device document the
+    rules read says they are not a member, so the write can only be refused.
+    ⭐ "CAN'T TELL" IS AS TODAY. A device read that fails is no evidence
+    (`_device_members`), so the batch is written through the heal as before.
+    ⭐ The paired account's batches cost no read; the device document is read
+    once per renumber, and only when another account's run is in it."""
+    paired = str(load_paired_uid() or "").strip()
+    members = _MEMBERS_UNREAD
+    for uid_b, i, chunk in _queue_pos_batches(patches):
+        uid_s = str(uid_b or "").strip()
+        if uid_s and uid_s != paired:
+            if members is _MEMBERS_UNREAD:
+                members = _device_members()
+            if _known_not_a_member(uid_s, members):
+                log(f"[queue-pos] not renumbering {len(chunk)} queued run(s) of "
+                    f"{uid_s[:8]}…: that account is no longer shared on this "
+                    f"computer, so its records refuse this computer's writes", "DEBUG")
+                continue
+        yield uid_b, i, chunk
+
+
 def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
                           heal: bool = True):
     """Run a gRPC user-tree write `op` (a zero-arg callable). On a synth-user
@@ -8640,8 +8675,10 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
     older logs, and once on worker 2 a minute after it started. Such a write
     gets the free same-token retry below and nothing else: no force-refresh, no
     cooldown stamp, no count toward the latch, no line blaming the pairing.
-    (A success still clears the latch, as every successful write does — the
-    heartbeat among them; landing proves the credential works.)"""
+    (A success still clears the latch, as every write that lands THROUGH THIS
+    FUNCTION does; landing proves the credential works. ⛔ The heartbeat does
+    not: it writes the device document directly, so a latch stays set until a
+    research write through here lands.)"""
     global _grpc_heal_last_ts, _grpc_heal_consec_fail, _grpc_heal_structural
     try:
         result = op()
@@ -80705,7 +80742,9 @@ async def run_server(port=8000):
                     "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 }
             patches.append((uid_v, rid_v, patch))
-        for uid_b, i, chunk in _queue_pos_batches(patches):
+        # ⛔ Not an account this computer is no longer shared with: its batch
+        # can only be refused, and the heal would spend everybody's re-mint.
+        for uid_b, i, chunk in _renumber_batches(patches):
             def _commit_chunk(chunk=chunk):
                 batch = _firebase_db.batch()
                 for uid_v, rid_v, patch in chunk:
