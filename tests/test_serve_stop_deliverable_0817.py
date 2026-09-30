@@ -452,8 +452,13 @@ def test_the_real_signal_module_delivers_a_pending_signal_on_unblock():
     try:
         signal.signal(signal.SIGUSR1, lambda *_a: got.append(1))
         signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGUSR1])
-        import os
-        os.kill(os.getpid(), signal.SIGUSR1)
+        # ⛔ TO THIS THREAD, NOT THE PROCESS (Windows review of wave 13, 2026-09-30).
+        # The mask above is this thread's; `os.kill(pid)` may be delivered to ANY
+        # thread that does not block it, so with another test's thread still alive
+        # the signal skipped the pending set and this failed in full Linux runs
+        # (78 of 300 tries with four idle threads; 0 of 300 thread-directed).
+        import threading
+        signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
         assert signal.SIGUSR1 in signal.sigpending(), "held, not dropped"
         assert got == [], "and not delivered while blocked"
         signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGUSR1])

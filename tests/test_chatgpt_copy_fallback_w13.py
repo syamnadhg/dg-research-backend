@@ -36,6 +36,7 @@ button, CUA, the re-read. Section 2 is the button lookup, section 3 the
 clipboard marker and the verdict.
 """
 import asyncio
+import sys
 import html as _html
 from types import SimpleNamespace
 
@@ -1427,11 +1428,14 @@ def test_live_a_chatgpt_tab_behind_another_tab_still_gets_its_brief(chrome, page
         # ⚠ WHERE THE CASE CAN BE STAGED (Windows review of wave 13, 2026-09-30).
         # Linux's headless Chrome answers the tab behind every time, and
         # Windows' does once earlier tests in this file have typed into a tab —
-        # there is then no tab-behind case to bring forward, and asserting it
-        # failed the suite on the setup, not on the product.
-        if chrome.run(page.evaluate(_READ_JS)) != "":
-            pytest.skip("this headless Chrome answers a tab behind too — no tab-behind "
-                        "case to stage here")
+        # asserting it everywhere failed the suite on the setup, not on the
+        # product. It is asserted where it holds (macOS); elsewhere the brief is
+        # still taken with another tab in front. Never a skip: the Copy
+        # harness refuses a skipped baseline, rightly — a skip there means the
+        # browser tests did not run.
+        staged = chrome.run(page.evaluate(_READ_JS)) == ""
+        if sys.platform == "darwin":
+            assert staged, "the ChatGPT tab is not behind"
         got = _brief(chrome, page)
     finally:
         chrome.run(other.close())
