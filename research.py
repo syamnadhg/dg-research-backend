@@ -51608,6 +51608,33 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     }
                     continue
 
+            # ⭐⭐ 2026-09-30 — WHILE STOP SHOWS, CHATGPT AND CLAUDE ARE STILL
+            # WORKING, AND NO SCREENSHOT IS NEEDED TO SAY SO. The owner: "the
+            # Stop button is a good determination point". Every ChatGPT and
+            # Claude computer-use completion check on record ran right after
+            # the page read above had logged `stop_btn_present`, and every one
+            # answered "still generating" (69 of 69 for Claude) — the page had
+            # already said it. The comment below promised this check ran "only
+            # if Playwright was not confident"; nothing enforced that until now.
+            # ⭐ THE CLOCK MOVES FORWARD, it is not merely skipped: the first
+            # computer-use look comes a full interval after the last poll that
+            # saw Stop, so a Stop that blinks out for one read is not a reason
+            # to look. A stall WITH Stop showing is the stuck arbiter's job above
+            # (15 minutes flat), which this does not touch.
+            # ⛔ GEMINI STAYS AS IT WAS: its detector has hidden-Stop and
+            # weak-signal cases, and its visible Stop has not been measured the
+            # way these two have.
+            if (detect_fn is not None and name in ("ChatGPT", "Claude")
+                    and str(dom_reason or "").startswith("stop_btn_present")):
+                p["last_cua_check"] = time.time()
+                if not p.get("stop_skips_cua_logged"):
+                    p["stop_skips_cua_logged"] = True
+                    log(f"[{name}] The page shows the Stop button, so {name} is still "
+                        "working — no computer-use completion check while it does "
+                        "(one runs 5 minutes after Stop goes, if the page cannot "
+                        "tell by then)")
+                continue
+
             # Check completion — CUA-primary fallback (only if Playwright was
             # not confident within the MIN_WAIT + budget window). CUA checks
             # every 5 min per agent (cost-effective, actually works).
