@@ -7652,11 +7652,11 @@ def _local_pending_owner_entries() -> "list[dict]":
         # ⛔ NO `title` — 7.7E. This list is published into the device document's
         # `queueOwners` array, which every member of the machine reads. See the
         # note at the append in `_recompute_deferred_queue_positions`.
-        out.append({
-            "uid": uid_v,
-            "runId": rid_v,
-            "position": len(out) + 1,
-        })
+        # ⭐ WAVE 13: a run with work done this worker took from the queue and
+        # has not started yet is still one waiting after a move — `moved: true`,
+        # so the owner's long-press stops it and keeps the work.
+        out.append(_waiting_owner_entry(uid_v, rid_v, len(out) + 1,
+                                        kept_work=bool(job.get("kept_work"))))
     return out
 
 
@@ -7727,10 +7727,14 @@ def _recompute_deferred_queue_positions_locked() -> None:
     # to #1, and everything already waiting moves down one — local claims and
     # deferred documents alike. They wait on this disk (`_waiting_runs`), which
     # the subcollection scan below cannot see.
+    # ⭐ A run with work done carries `moved: true` — the owner's long-press on
+    # its pill stops it and keeps the work, where an ordinary queued run's
+    # cancels it (see `_waiting_owner_entry`).
     _front = _waiting_runs()
-    _front_owners = [{"uid": str(w.get("uid") or ""),
-                      "runId": str(w.get("research_id") or ""),
-                      "position": i + 1} for i, w in enumerate(_front)]
+    _front_owners = [_waiting_owner_entry(str(w.get("uid") or ""),
+                                          str(w.get("research_id") or ""), i + 1,
+                                          kept_work=_waiting_kept_work(w))
+                     for i, w in enumerate(_front)]
     _front_patches = _waiting_position_patches(_front)
     # #890: locally-claimed queued jobs (single-worker busy claims) lead the
     # published queueOwners union — the subcollection scan below can't see
@@ -8797,7 +8801,7 @@ _heartbeat_failures = 0
 _last_published_version_fields: "dict | None" = None
 _version_publish_next_ms = 0
 # Wave 13: the "Move to queue" capability, published in its own write — see
-# `_REQUEUE_RUNS_CAPABILITY`.
+# `REQUEUE_CAPABILITY`.
 _last_published_requeue_patch: "dict | None" = None
 # One-shot latch: the waiter's update outcome is published exactly once per serve.
 #
@@ -9373,11 +9377,17 @@ REQUEUE_ACTION = "requeue"
 #: ⭐ WHAT THIS CODE CAN DO, published so the app shows "Move to queue" only
 #: where it works: an older build ignores the command, and a backend that is
 #: not running under its startup supervisor cannot restart the worker the run
-#: was on. The KEY carries the meaning; `1` is what the rules admit (an int).
+#: was on. The name this computer lists in the device document's
+#: `capabilities` — the list the app reads, and the key the rules admit.
 #: Written in its OWN update, never inside the version patch — `hasOnly`
 #: refuses a whole update over one unadmitted key, and a lagging rules deploy
 #: must cost the chip, not the About row's update signal.
-_REQUEUE_RUNS_CAPABILITY = 1
+#:
+#: ⛔⛔ NOT UNDER A KEY OF ITS OWN. The first build announced it under one while
+#: the app read `capabilities`; the rules refused the write and the chip showed
+#: on no computer, with both sides' tests green. The web pins this list against
+#: this file (`moveToQueueWire.test.ts`).
+REQUEUE_CAPABILITY = "requeue"
 
 
 def _requeue_capability_patch() -> dict:
@@ -9386,8 +9396,8 @@ def _requeue_capability_patch() -> dict:
     restarts the worker, and nothing restarts a backend started by hand). Off
     that, the field is cleared, and the app shows no chip."""
     if _supervisor_is_my_parent():
-        return {"requeueRuns": _REQUEUE_RUNS_CAPABILITY}
-    return {"requeueRuns": _crun_delete_field()}
+        return {"capabilities": [REQUEUE_CAPABILITY]}
+    return {"capabilities": _crun_delete_field()}
 
 
 def _waiting_taken_name(worker_id) -> str:
@@ -9451,6 +9461,26 @@ def _waiting_runs() -> "list[dict]":
         out.append(rec)
     out.sort(key=lambda r: (-r["moved_at_ms"], r["_dir"].name))
     return out
+
+
+def _waiting_kept_work(rec) -> bool:
+    """Did this waiting run have work done — the run a worker was RUNNING, which
+    the owner moved to the queue or a resting worker's restart put back? Its
+    amber pill carries `moved: true`, and the owner's long-press offers Stop,
+    which keeps the work, instead of Cancel. A job a resting worker had only
+    queued (`queued_job`) waits as the ordinary queued run it was."""
+    return not isinstance((rec or {}).get("queued_job"), dict)
+
+
+def _waiting_owner_entry(uid, run_id, position, *, kept_work: bool) -> dict:
+    """One `queueOwners` entry. ⭐ `moved: true` only on a run with work done
+    waiting for a worker (see `_waiting_kept_work`); an ordinary queued run
+    carries no `moved` key at all. On the device document, because the owner
+    cannot read a sharer's research record."""
+    entry = {"uid": uid, "runId": run_id, "position": position}
+    if kept_work:
+        entry["moved"] = True
+    return entry
 
 
 def _waiting_record_patch() -> dict:
@@ -9662,6 +9692,8 @@ def _claim_waiting_run(worker_id) -> "dict | None":
             "submitted_by": str(rec.get("submitted_by") or ""),
             "queued_at_ms": int(time.time() * 1000),
             "moved_run": True,
+            # It was running: until it starts here its pill says so (`moved`).
+            "kept_work": True,
         }
     return None
 

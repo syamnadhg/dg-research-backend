@@ -339,8 +339,10 @@ def test_move_to_queue_keeps_the_run_puts_it_first_and_restarts_the_worker(
     rests = [u["restingWorkerIds"] for u in m.store.device_updates if "restingWorkerIds" in u]
     assert rests and list(rests[0].values) == [2], "the worker was not kept off"
     owners = [u["queueOwners"] for u in m.store.device_updates if "queueOwners" in u]
-    assert owners and owners[-1] == [{"uid": SHARER, "runId": RID, "position": 1},
-                                     {"uid": OWNER, "runId": OTHER_RID, "position": 2}], (
+    # Both were running when they were moved: both pills say so (`moved`).
+    assert owners and owners[-1] == [
+        {"uid": SHARER, "runId": RID, "position": 1, "moved": True},
+        {"uid": OWNER, "runId": OTHER_RID, "position": 2, "moved": True}], (
         "the moved run is not #1 with what already waited moved down one")
     assert fate == ["deleted"], "the command was not taken away by the worker it named"
     assert len(_said(m, "REQUEUE", RID[:8], "moved to the front of the queue")) == 1, m.lines
@@ -710,6 +712,9 @@ def test_moved_runs_are_published_first_and_everything_else_moves_down(monkeypat
     assert [(o["runId"], o["position"]) for o in owners] == [
         (RID, 1), ("chat_earlier_move", 2), (OTHER_RID, 3)], owners
     assert owners[0]["uid"] == SHARER
+    # Moved runs are marked; the deferred start is an ordinary queued run.
+    assert [o.get("moved") for o in owners[:2]] == [True, True], owners
+    assert "moved" not in owners[2], owners
     pos = {parts[3]: p for parts, p in store.batched}
     assert pos[RID]["queuePosition"] == 1 and pos["chat_earlier_move"]["queuePosition"] == 2
     assert pos["chat_earlier_move"]["queuedBehindRunId"] == RID
@@ -739,8 +744,37 @@ def test_a_moved_run_is_published_when_nothing_else_waits(monkeypatch, tmp_path,
     _moved_marker(folder, SHARER, RID)
     research._recompute_deferred_queue_positions_locked()
     owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u]
-    assert owners == [[{"uid": SHARER, "runId": RID, "position": 1}]], owners
+    assert owners == [[{"uid": SHARER, "runId": RID, "position": 1, "moved": True}]], owners
     assert [(parts[3], p["queuePosition"]) for parts, p in store.batched] == [(RID, 1)]
+
+
+def test_one_workers_line_marks_the_moved_run_it_took_and_nothing_else(monkeypatch, tmp_path):
+    """⭐ One worker takes runs into its own line (#890), and that line is
+    published too. A run with work done it took from the queue and has not
+    started yet is still one waiting after a move: `moved`, so the owner's
+    long-press stops it and keeps the work. Beside it in the same line, a run
+    sent while the worker was busy and a job a worker that is off had only
+    queued are ordinary queued runs: no `moved` key. Both jobs taken come from
+    the REAL idle rescan, and the queued one was parked by the real park."""
+    m, _folder = _waiting(monkeypatch, tmp_path, worker=1, fleet=1)
+    m.store.queue_docs.clear()
+    queued = _job(OWNER, OTHER_RID, f"Queued_{_stamp()}", brief_text="as sent")
+    assert research._park_waiting_run(queued, from_worker=2, behind=True) is not None
+    first = _rescan(monkeypatch, m, fleet=1)
+    second = _rescan(monkeypatch, m, fleet=1)
+    assert [j["research_id"] for j in first + second] == [RID, OTHER_RID]
+    line = _Q()
+    for j in (first[0], _job(SHARER, "chat_sent_while_busy", f"Sent_{_stamp()}"), second[0]):
+        line.put_nowait(j)
+    monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", line)
+
+    research._recompute_deferred_queue_positions_locked()
+
+    owners = [u["queueOwners"] for u in m.store.device_updates if "queueOwners" in u][-1]
+    assert owners == [
+        {"uid": SHARER, "runId": RID, "position": 1, "moved": True},
+        {"uid": SHARER, "runId": "chat_sent_while_busy", "position": 2},
+        {"uid": OWNER, "runId": OTHER_RID, "position": 3}], owners
 
 
 # ══ 5. boot: a resting worker does not resume its interrupted run ════════════
@@ -875,8 +909,11 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         # ⛔ One publish after the last park, waiting its turn — the per-park
         # kicks skip whenever one is already running, and here they are only
         # recorded: the order everybody sees comes from this one.
+        # ⭐ The run it was RUNNING has work done — its pill says `moved`, and
+        # the owner's long-press stops it and keeps the work. The job it had
+        # only queued is the ordinary queued run it was: no `moved` key.
         owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u]
-        assert owners == ([[{"uid": SHARER, "runId": RID, "position": 1},
+        assert owners == ([[{"uid": SHARER, "runId": RID, "position": 1, "moved": True},
                             {"uid": OWNER, "runId": OTHER_RID, "position": 2}]]
                           if resting else []), owners
         if resting:
@@ -1038,24 +1075,32 @@ def _one_heartbeat(monkeypatch, tmp_path, *, supervised):
     monkeypatch.setattr(research.asyncio, "sleep", _stop)
     with pytest.raises(_Tick):
         asyncio.run(research._heartbeat_loop())
-    return m, [u for u in store.device_updates if "requeueRuns" in u]
+    return m, [u for u in store.device_updates if "capabilities" in u]
 
 
 def test_the_heartbeat_tells_the_app_move_to_queue_works_here(monkeypatch, tmp_path):
-    """⭐ The app shows "Move to queue" only where this key is on the device
-    document: this build, running under its startup supervisor. Its OWN write
+    """⭐ The app shows "Move to queue" only where the device document's
+    `capabilities` lists "requeue" — the one field it reads and the rules
+    admit: this build, running under its startup supervisor. Its OWN write
     — a rules deploy that has not admitted it must cost the chip, never the
-    version row. Beside it, a backend started by hand clears the key."""
+    version row. Beside it, a backend started by hand clears the field.
+
+    ⛔⛔ The first build wrote a key of its own the app never read, the rules
+    refused it, and the chip showed nowhere. Every device write of this tick
+    is checked for it."""
     m, sent = _one_heartbeat(monkeypatch, tmp_path, supervised=True)
-    assert sent == [{"requeueRuns": 1}], sent
+    assert sent == [{"capabilities": ["requeue"]}], sent
     assert [u for u in m.store.device_updates if "version" in u] == [
         {"version": "9.9.9", "servingVersion": "9.9.9"}], (
         "the version patch changed — or the capability joined it, where one "
         "unadmitted key refuses both")
 
-    _m2, sent2 = _one_heartbeat(monkeypatch, tmp_path / "by-hand", supervised=False)
+    m2, sent2 = _one_heartbeat(monkeypatch, tmp_path / "by-hand", supervised=False)
     from google.cloud.firestore import DELETE_FIELD
-    assert sent2 == [{"requeueRuns": DELETE_FIELD}], sent2
+    assert sent2 == [{"capabilities": DELETE_FIELD}], sent2
+    stray = [k for u in m.store.device_updates + m2.store.device_updates for k in u
+             if "requeue" in k.lower()]
+    assert stray == [], f"a key of its own the app never reads: {stray}"
 
 
 # ══ 11. the repair: the worker it was moved off comes back ══════════════════════
@@ -1477,7 +1522,9 @@ def test_after_a_move_on_a_one_worker_computer_the_worker_that_is_off_starts_not
 
     published = [u["queueOwners"] for u in m.store.device_updates[before:]
                  if "queueOwners" in u][-1]
-    assert [(o["runId"], o["position"]) for o in published] == [(RID, 1), (OTHER_RID, 2)]
+    assert published == [{"uid": SHARER, "runId": RID, "position": 1, "moved": True},
+                         {"uid": OWNER, "runId": OTHER_RID, "position": 2}], (
+        "the moved run is not marked, or the run it had only queued is")
 
     # Turned back on: the moved run first…
     first = _rescan(monkeypatch, m, fleet=1)
