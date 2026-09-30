@@ -838,6 +838,15 @@ def test_a_run_waiting_in_the_queue_is_left_there_even_by_an_awake_worker(
 
 # ══ 6. boot: the disk snapshot ════════════════════════════════════════════════
 
+def _boot_publish_done():
+    """Wait for the boot restore's one publish after the last park. It runs on
+    its own thread (w13 integrated review): boot calls the restore on the event
+    loop, and the publish is a whole renumber."""
+    for t in threading.enumerate():
+        if t.name == "queueowners-boot-park":
+            t.join(15)
+
+
 def _snapshot(tmp_path, current, pending=()):
     path = tmp_path / "queues" / "_pending_queue.json"
     path.write_text(json.dumps({"ts_ms": 1, "current": current, "pending": list(pending)}),
@@ -904,6 +913,7 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         path = _snapshot(base, _job(SHARER, RID, run_id), [other])
         q = _Q()
         research._restore_pending_queue_snapshot(path, q, set())
+        _boot_publish_done()
         assert [j["research_id"] for j in q._queue] == expect, (resting, m.lines)
         assert (folder / MARKER).exists() is resting
         assert (other_folder / MARKER).exists() is resting, "the queued job is not behind it"
@@ -1577,6 +1587,7 @@ def test_after_a_move_on_a_one_worker_computer_the_worker_that_is_off_starts_not
     monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", line)
     before = len(m.store.device_updates)
     research._restore_pending_queue_snapshot(path, line, set())
+    _boot_publish_done()
     assert list(line._queue) == [], "the worker that is off was given a run to start"
 
     published = [u["queueOwners"] for u in m.store.device_updates[before:]
@@ -1723,6 +1734,7 @@ def test_a_queued_resume_a_resting_worker_puts_back_is_marked_moved_and_stops_wi
         _job(OWNER, NEW_RID, new_id, brief_text="a new run")])
 
     research._restore_pending_queue_snapshot(path, _Q(), set())
+    _boot_publish_done()
 
     owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u][-1]
     assert owners == [

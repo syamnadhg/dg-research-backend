@@ -19100,8 +19100,17 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     # Each park kicks the queue order in the background, and a kick that finds
     # a publish already running skips — so a restore that parked the run and the
     # jobs behind it published whatever the first scan happened to see.
+    # ⛔ ON ITS OWN THREAD (w13 integrated review): boot calls this restore on
+    # the event loop, before the server listens, and the publish is a whole
+    # renumber — a queue scan, a device read and a batch per account through
+    # the heal, after waiting up to 10 s for the park's own kick. A slow
+    # Firestore at boot froze the loop for all of it.
     if parked:
-        _publish_queue_positions_now()
+        try:
+            _threading.Thread(target=_publish_queue_positions_now, daemon=True,
+                              name="queueowners-boot-park").start()
+        except Exception as e:
+            log(f"[pending_queue] queue publish launch failed (non-fatal): {e}", "DEBUG")
     # ⛔⛔ A HELD ENTRY IS ASKED ABOUT AGAIN, IN THIS PROCESS (wave 10.10
     # leftovers). Kept for the next boot and nothing more, it waited for a
     # restart that might be days away while its person watched a tile that

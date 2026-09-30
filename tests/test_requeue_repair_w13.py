@@ -25,6 +25,7 @@ re-mint. Each defect case sits beside a control that must not change.
 
 Run:  pytest tests/test_requeue_repair_w13.py -v
 """
+import asyncio
 import base64
 import collections
 import json
@@ -529,3 +530,63 @@ def test_a_drop_before_a_take_publishes_once_the_taken_run_is_in_the_line(
     assert [j["research_id"] for j in T._rescan(monkeypatch, m)] == [T.RID]
     assert not list(gone.glob(f"{T.MARKER}*")), "the removed sharer's run was not dropped"
     assert kicks == [(1, 1)], kicks
+
+
+# ══ 4. the boot restore's publish never holds the event loop ═════════════════
+
+@pytest.mark.parametrize("resting", [True, False], ids=["resting-parks", "awake-restores"])
+def test_the_boot_restores_publish_never_holds_the_event_loop(machine, monkeypatch, resting):
+    """⛔ Boot calls the snapshot restore ON THE EVENT LOOP, before the server
+    listens. A resting worker parks its interrupted run and then publishes the
+    queue order once — a whole renumber: a queue scan, a device read, a batch
+    per account through the heal, after waiting up to 10 s for the park's own
+    publish. It ran inline, so a slow Firestore at boot froze the loop for up to
+    two renumbers. It runs on its own thread now, and still publishes."""
+    m = machine(shared=[SHARER], worker=2)
+    monkeypatch.setattr(research, "_threading", threading)       # real threads here
+    monkeypatch.setattr(research, "time", _real_time)
+    monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: resting)
+    slow = 1.0
+    real_stream = Node.stream
+
+    def _slow_scan(self):
+        _real_time.sleep(slow)                                  # a slow queue scan
+        return real_stream(self)
+    monkeypatch.setattr(Node, "stream", _slow_scan)
+    rid = "chat_1759200000010_mine"
+    run = m.root / "Mine_20260929_140000"
+    (run / "documents").mkdir(parents=True)
+    (run / "checkpoint.json").write_text("{}", encoding="utf-8")
+    m.fs.records[(OWNER, rid)] = {"status": "ongoing"}
+    snap = m.root / "_pending_queue_2.json"
+    job = {"uid": OWNER, "research_id": rid, "run_id": run.name, "topic": "t",
+           "email": "", "config": {}}
+    snap.write_text(json.dumps({"ts_ms": 1, "current": job, "pending": []}), encoding="utf-8")
+    monkeypatch.setattr(research, "_safe_enqueue", lambda q, j, **k: q.put_nowait(j) or True)
+    gaps: list = []
+
+    async def _boot():
+        last = [_real_time.monotonic()]
+
+        async def _ticker():
+            while True:
+                now = _real_time.monotonic()
+                gaps.append(now - last[0])
+                last[0] = now
+                await asyncio.sleep(0.02)
+        ticking = asyncio.create_task(_ticker())
+        await asyncio.sleep(0.1)
+        research._restore_pending_queue_snapshot(snap, T._Q(), set())
+        await asyncio.sleep(0.1)
+        ticking.cancel()
+    asyncio.run(_boot())
+    assert max(gaps) < slow, f"the event loop stood still for {max(gaps):.2f}s"
+
+    T._boot_publish_done()
+    owners = [u["queueOwners"] for u in m.fs.device_updates if "queueOwners" in u]
+    if resting:
+        assert (run / T.MARKER).exists(), "precondition: the resting worker parked its run"
+        assert owners and owners[-1] == [
+            {"uid": OWNER, "runId": rid, "position": 1, "moved": True}], owners
+    else:
+        assert not (run / T.MARKER).exists() and owners == []
