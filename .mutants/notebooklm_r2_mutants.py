@@ -9,10 +9,11 @@
        (the row's class lags the click), and the Length row is waited for.
   L* — the length is chosen and read back by aria-checked; a length that does
        not read back is never generated.
-  G* — "Generate now", never "Generate later"; a press counts only when the
-       window closes or the audio shows as generating; computer use never runs
-       after the page's own Generate took, and gets the SAME open window when
-       the page could not finish.
+  G* — "Generate now", never "Generate later"; a press reads as started only
+       when the window closes or the audio shows as generating within 30 s;
+       once the page's press landed, computer use is never handed a Generate
+       mission (a second press can make an audio that cannot be deleted); when
+       the page could not finish, computer use gets the SAME open window.
   P* — the computer-use prompt and the vision hints open Customise from the tile.
 
 ⛔ The browser tests need patchright and Chrome; where they SKIP the baseline is
@@ -100,17 +101,17 @@ MUTANTS = [
      "\"Generate later\"",
      [("        const b = btns.find((x) => said(x) === 'generate now')",
        "        const b = btns.find((x) => said(x).startsWith('generate'))")]),
-    ("G2", RESEARCH, "⛔ a press counts as generated whether or not it took — a "
-     "window left open is never handed on",
-     [('    res["pressed"] = True\n    deadline = time.monotonic() + 8.0',
+    ("G2", RESEARCH, "a press reads as started whether or not anything showed — "
+     "the log says the audio started when nothing did",
+     [('    res["pressed"] = True\n    deadline = time.monotonic() + _NLM_GENERATE_WATCH_S',
        '    res["pressed"] = True\n    res["generated"] = True\n    return res\n'
-       '    deadline = time.monotonic() + 8.0')]),
+       '    deadline = time.monotonic() + _NLM_GENERATE_WATCH_S')]),
     ("G3", RESEARCH, "⛔⛔ computer use runs after the page's own Generate took — "
      "the one way to a second Generate",
-     [('            if _dom_gen.get("generated"):\n'
-       '                # The page\'s own "Generate now" took',
+     [('            if _dom_gen.get("pressed"):\n'
+       '                # The page\'s own press on "Generate now" landed',
        '            if False:\n'
-       '                # The page\'s own "Generate now" took')]),
+       '                # The page\'s own press on "Generate now" landed')]),
     ("G4", RESEARCH, "the page never does Customise at all — only computer use",
      [("                _dom_gen = await _nlm_customise_and_generate(browser.page, podcast_length)",
        "                _dom_gen = {}")]),
@@ -120,6 +121,17 @@ MUTANTS = [
        "                                                 panel_already_open=_panel_opened)",
        "            _prompt = make_prompt_audio_generate(podcast_length,\n"
        "                                                 panel_already_open=False)")]),
+
+    ("G6", RESEARCH, "⛔⛔ a press that landed but showed nothing yet is handed to "
+     "computer use with 'click Generate now ONCE' — a second audio that cannot be "
+     "deleted",
+     [('            if _dom_gen.get("pressed"):\n'
+       '                # The page\'s own press on "Generate now" landed',
+       '            if _dom_gen.get("generated"):\n'
+       '                # The page\'s own press on "Generate now" landed')]),
+    ("G7", RESEARCH, "the page stops watching after 8 s — a slow server reply "
+     "reads as nothing started",
+     [("_NLM_GENERATE_WATCH_S = 30.0", "_NLM_GENERATE_WATCH_S = 8.0")]),
 
     # ═══ P — the computer-use prompt and vision hints open it from the tile ══
     ("P1", PROMPTS, "⛔ the fallback may click only the gear that is gone",
