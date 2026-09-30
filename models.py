@@ -157,7 +157,16 @@ P2_MODEL_POLICY = {
         # research.py gates Step 1D on it and skips the advisory that would
         # otherwise report thinking as permanently unconfirmed.
         "family": "opus", "pick": "highest",
-        "effort": "max", "thinking": False, "tool": "research",
+        # ⭐⭐ (2026-09-30) EXTRA HIGH, NOT MAX — the owner: Max uses about six
+        # times the usage. The word is the one the Effort menu labels that rung
+        # with ("Low / Medium / High / Extra / Max", the 08-06 and 08-17
+        # captures), which is the vocabulary every reader compares against: the
+        # model button's tier read, the Effort row read and the option test id
+        # (`effort-option-xhigh`). A person reads it as `effort_label` gives it.
+        # ⚠ Setting it by the page is round 2 (the Effort submenu has never been
+        # captured on the new page); until then the run says plainly, before
+        # Send, when Claude is on another tier.
+        "effort": "extra", "thinking": False, "tool": "research",
         # ⭐ (2026-08-14) The family to use when the account's plan does not
         # include `family` at all. On a non-pro Claude account every Opus row in
         # the model menu is a sales chip, so the picker correctly refuses all of
@@ -1494,10 +1503,36 @@ def free_family_note(excluded: str, use_instead: str) -> str:
     )
 
 
+#: How a person reads an effort word. Only the rungs whose menu word is not
+#: what people call them are listed; every other word is shown capitalised.
+_EFFORT_LABELS = {"extra": "Extra high"}
+
+
+def effort_label(word) -> str:
+    """The effort tier as a person reads it: 'extra' → 'Extra high', 'max' → 'Max'.
+
+    For captions and progress lines only. Never compared with the page — the
+    readers compare the policy word itself."""
+    w = str(word or "").strip().lower()
+    return _EFFORT_LABELS.get(w, w.capitalize())
+
+
+#: ⭐⭐ 2026-09-30 — THE EFFORT IS NOT A COMPUTER-USE JOB. Every Claude mission
+#: carries this sentence instead of an effort target. The Effort submenu is a
+#: hover menu that closes between a screenshot and the next click: on 09-30 the
+#: computer-use passes pressed the Effort row four times and never opened it,
+#: then the validator gave up quoting its own prompt — while Claude researched
+#: at Low and nothing said so. The run now reads the tier on the model button
+#: right before Send and says plainly when it is not the one wanted.
+EFFORT_HANDS_OFF = ("Leave the Effort setting exactly as it is — do NOT open the "
+                    "Effort submenu; the run reads and reports the effort itself.")
+
+
 def p2_claude_setup_directive(family: str = "") -> str:
-    """The CUA user-instruction that drives Claude's P2 setup (model + effort +
-    Research tool). Single source replacing the byte-identical literal
-    previously duplicated at two research.py call sites.
+    """The CUA user-instruction that drives Claude's P2 setup (model + Research
+    tool — never the effort, see `EFFORT_HANDS_OFF`). Single source replacing
+    the byte-identical literal previously duplicated at two research.py call
+    sites.
 
     ⭐ FAMILY ONLY — there is no version in this string and there must never be
     one again. Naming a version and asking the agent to "select" it made a HIGHER
@@ -1521,7 +1556,6 @@ def p2_claude_setup_directive(family: str = "") -> str:
     pol = p2_labels("claude")
     primary = str(pol.get("family", "opus"))
     fam = (str(family) or primary).capitalize()                # "Opus" / "Sonnet"
-    effort = str(pol.get("effort", "max")).capitalize()        # "Max"
     tool = str(pol.get("tool", "research")).capitalize()       # "Research"
     # ⭐ HOW TO READ "HIGHEST" (the sentence after "close the menu") is
     # VERSION_ORDER_RULE, in words and with NO DIGITS. The plan asked for the
@@ -1535,7 +1569,8 @@ def p2_claude_setup_directive(family: str = "") -> str:
     swapped = "" if fam.lower() == primary.lower() else \
         f"{free_family_note(primary.capitalize(), fam)} "
     return (
-        f"{swapped}Ensure the model is {fam} with {effort} effort and the {tool} tool ON. "
+        f"{swapped}Ensure the model is {fam} and the {tool} tool is ON. "
+        f"{EFFORT_HANDS_OFF} "
         f"Model rule: the model must be {fam} — the VERSION NUMBER DOES NOT MATTER "
         f"and a higher one is always correct. Open the model menu ONCE and select "
         f"the HIGHEST {fam} it offers; if the highest {fam} is already the selected "
@@ -1547,7 +1582,25 @@ def p2_claude_setup_directive(family: str = "") -> str:
     )
 
 
-def p2_claude_validate_directive(family: str = "", effort_ok: bool = True) -> str:
+def p2_claude_research_only_directive() -> str:
+    """The CUA user-instruction when the page already CONFIRMED the model and
+    only the Research tool is left.
+
+    ⭐ 2026-09-30. On that run the DOM had read Opus 5.5 off the model button
+    and only the Research switch was missed; the computer-use pass was still
+    handed the full setup mission and spent three of its eight steps reopening
+    the model menu to look for a higher Opus. Here there is nothing to do but
+    one switch, so the mission says exactly that."""
+    tool = str(p2_labels("claude").get("tool", "research")).capitalize()
+    return (
+        f"The model is already correct — do NOT open the model menu. Open the '+' "
+        f"(tools) menu next to the message box and switch '{tool}' ON; if it is "
+        f"already on, leave it. {EFFORT_HANDS_OFF} Press Escape to close the menu, "
+        f"click the message box, and say 'ready for paste'. Do NOT type."
+    )
+
+
+def p2_claude_validate_directive(family: str = "") -> str:
     """The CUA user-instruction for the POST-SETUP validation pass on Claude.
 
     ⚠ The mirror image of p2_claude_setup_directive, and the difference is
@@ -1574,24 +1627,16 @@ def p2_claude_validate_directive(family: str = "", effort_ok: bool = True) -> st
     pol = p2_labels("claude")
     primary = str(pol.get("family", "opus"))
     fam = (str(family) or primary).capitalize()
-    effort = str(pol.get("effort", "max")).capitalize()
     tool = str(pol.get("tool", "research")).capitalize()
     swapped = "" if fam.lower() == primary.lower() else \
         f"{free_family_note(primary.capitalize(), fam)} "
-    # ⭐ Matches the system prompt's `effort_ok`. The two strings go to ONE CUA
-    # call, so a permission granted in one and withheld in the other leaves the
-    # agent holding instructions that disagree — the same failure the family word
-    # was moved here to prevent.
-    if not effort_ok:
-        return (
-            f"{swapped}Claude is on {fam} with the {tool} tool, but the effort is "
-            f"NOT {effort} and the automated pass could not set it. Open the model "
-            f"popover, open the Effort submenu, choose {effort}, and close both. "
-            f"Leave the model alone — it is already correct. If the submenu will "
-            f"not open on the first try, say so and stop rather than retrying. "
-            f"Do not type.")
+    # ⛔ 2026-09-30 — no effort branch any more. It told this pass to open the
+    # Effort submenu when setup had not confirmed the tier; the submenu closes
+    # before a computer-use click lands, and on 09-30 that cost four steps for
+    # nothing. See `EFFORT_HANDS_OFF`.
     return (
-        f"{swapped}Verify Claude is on {fam} with {effort} effort and the {tool} tool ON. "
+        f"{swapped}Verify Claude is on {fam} with the {tool} tool ON. "
+        f"{EFFORT_HANDS_OFF} "
         f"THE VERSION NUMBER DOES NOT MATTER: if the model button reads {fam} "
         f"followed by any number — or by no number at all — the model is correct, "
         f"so leave it alone and do NOT open the model menu. Only touch the model "

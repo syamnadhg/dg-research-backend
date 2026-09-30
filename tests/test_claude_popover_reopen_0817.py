@@ -25,6 +25,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -274,39 +276,37 @@ class TestEffortVerdict:
         assert self._v(pressed=False, checked=True) is False
 
 
-class TestValidatorPermission:
-    """Whether the validator may repair the effort tier, and when."""
+class TestNoEffortJobForComputerUse:
+    """⛔⛔ 2026-09-30 — the owner took effort OUT of the computer-use missions.
 
-    def test_an_unrecorded_platform_gets_the_cheap_read_only_pass(self):
-        # ⭐ Defaulting the other way would send the validator into the model
-        # popover on every run of every platform to buy nothing.
-        assert research._claude_validator_effort_ok(None) is True
-        assert research._claude_validator_effort_ok({}) is True
+    From 08-17 the validator was granted permission to open the Effort submenu
+    whenever setup had not confirmed the tier. That hover submenu closes between
+    a screenshot and the next click: on 09-30 it was pressed four times across
+    setup and validation, never opened, and the validator gave up while Claude
+    researched at Low. So no Claude mission names a tier to choose; every one
+    carries the hands-off sentence, and the run reads the tier right before Send.
+    Asserted on the RENDERED strings — the text the agent actually receives."""
 
-    def test_a_confirmed_effort_keeps_the_submenu_ban(self):
-        assert research._claude_validator_effort_ok({"effort": True}) is True
-
-    def test_an_UNCONFIRMED_effort_is_what_grants_permission(self):
-        # ⛔ The polarity. Inverted, the validator is told to go fixing on exactly
-        # the runs that are already correct, and to stand down on the ones that
-        # are not — which is worse than either behaviour applied uniformly.
-        assert research._claude_validator_effort_ok({"effort": False}) is False
-
-    def test_the_validator_asks_the_run_rather_than_assuming(self):
-        # Pinning the CONSUMER: a correct decision nothing consults is not a fix.
-        import inspect
-        src = inspect.getsource(research.validate_setup_with_cua)
-        assert "_claude_validator_effort_ok(_P2_THINKING_STATE.get(\"claude\"))" in src
-
-    def test_both_CUA_strings_carry_the_same_permission(self):
-        # They go to ONE call. A system prompt that forbids the submenu beside a
-        # user message that demands it leaves the agent to pick one arbitrarily.
+    def _missions(self, fam):
         import models
         import prompts
-        for ok in (True, False):
-            sysp = prompts.claude_validate_setup_prompt("Opus", effort_ok=ok)
-            user = models.p2_claude_validate_directive("Opus", effort_ok=ok)
-            bans = "DO NOT try to expand" in sysp
-            assert bans is ok, (ok, "system prompt disagrees with the permission")
-            asks = "Effort submenu" in user and "choose" in user
-            assert asks is (not ok), (ok, "user message disagrees with the permission")
+        return {
+            "setup system": prompts.claude_deep_research_prompt(fam),
+            "setup user": models.p2_claude_setup_directive(fam),
+            "validate system": prompts.claude_validate_setup_prompt(fam),
+            "validate user": models.p2_claude_validate_directive(fam),
+            "research-only system": prompts.claude_research_only_prompt(),
+            "research-only user": models.p2_claude_research_only_directive(),
+        }
+
+    @pytest.mark.parametrize("fam", ["", "sonnet"])
+    def test_no_mission_asks_for_a_tier(self, fam):
+        import models
+        words = {models.effort_label(w).lower() for w in
+                 ("low", "medium", "high", "extra", "max")}
+        for name, text in self._missions(fam).items():
+            low = text.lower()
+            assert models.EFFORT_HANDS_OFF in text, (name, "the hands-off sentence is missing")
+            for w in words:
+                assert f'choose "{w}"' not in low and f"choose {w}" not in low, (name, w)
+            assert "open the effort submenu, choose" not in low, name

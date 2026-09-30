@@ -141,6 +141,7 @@ from prompts import (
     PROMPT_VALIDATE_CHATGPT_SETUP,
     PROMPT_VALIDATE_GEMINI_SETUP,
     claude_deep_research_prompt,
+    claude_research_only_prompt,
     claude_validate_setup_prompt,
     make_prompt_audio_check,
     make_prompt_audio_download,
@@ -172,8 +173,10 @@ from models import (
     p2_free_family,
     p2_known_good,
     p2_labels,
+    p2_claude_research_only_directive,
     p2_claude_setup_directive,
     p2_claude_validate_directive,
+    effort_label,
     parse_family_version,
     reject_terms,
     upsell_nouns as _models_upsell_nouns,
@@ -6724,6 +6727,30 @@ def _dom_note(intent: str, outcome: str, *, phase: int = 0, via: str = "",
         bits.append(f"— {rec['detail']}")
     log(" ".join(bits), "INFO" if outcome in _DOM_OK else "WARN")
     return outcome
+
+
+def _dom_restate(intent: str, outcome: str, *, phase: int = 0, via: str = "",
+                 detail: str = "") -> str:
+    """Restate an intent's LATEST ledger entry when a later read disagrees.
+
+    The ledger holds one answer per attempt. When the run learns more after the
+    attempt — Claude's effort, read again right before Send — the entry for that
+    intent is corrected in place rather than joined by a second one, so the
+    end-of-run summary shows one line per intent and that line is the latest
+    fact. A later read that AGREES with the entry changes nothing. With no entry
+    for the intent, this records one."""
+    for rec in reversed(_DOM_ATTEMPTS):
+        if rec.get("intent") != intent:
+            continue
+        if (rec.get("outcome") in _DOM_OK) == (outcome in _DOM_OK):
+            return rec.get("outcome")
+        rec.update(outcome=outcome, via=via or "", press="", ms=None,
+                   detail=(detail or "")[:400])
+        log(f"[dom] p{rec['phase']} {intent}: {outcome} (restated)"
+            f"{(' via=' + via) if via else ''}{(' — ' + rec['detail']) if detail else ''}",
+            "INFO" if outcome in _DOM_OK else "WARN")
+        return outcome
+    return _dom_note(intent, outcome, phase=phase, via=via, detail=detail)
 
 
 def _claude_effort_outcome(confirmed: bool, via: str) -> str:
@@ -58630,8 +58657,14 @@ async def setup_chatgpt_dr(page, allow_model_pick=False, *,
         except Exception:
             _seen_rows = []
 
+        # ⭐ 2026-09-30 — the 09-28 page's "+" has no test id any more; its
+        # durable marker is `data-composer-navigation-target="add-context"`
+        # (tests/fixtures/chatgpt_0928/new_page.html, captured). It goes right
+        # after the old id, ahead of the label patterns, so a reworded or
+        # translated label cannot send Step 1 to another button.
         menu_sel = None
         for sel in ['button[data-testid="composer-plus-btn"]',
+                    'button[data-composer-navigation-target="add-context"]',
                     'button[aria-label*="Add files" i]',
                     'button[aria-label*="Use a tool" i]',
                     'button[aria-label*="Attach" i]',
@@ -60178,7 +60211,8 @@ def _claude_effort_row_confirms(row_shows, wanted) -> bool:
     return bool(w) and str(row_shows or "").strip().lower() == w
 
 
-def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict:
+def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool,
+                               shown=None) -> dict:
     """What the post-setup telemetry line says about Claude's effort, once the
     computer-use pass has run.
 
@@ -60187,10 +60221,19 @@ def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict
     effect ('low') and recorded it, and even when the computer-use pass had since
     set it. It is written just before the brief is sent, so it can say both:
 
+      * `shown`                 — ⭐⭐ 2026-09-30: the tier the model button
+                                  showed in the LAST read before Send. When it
+                                  names a tier that is not the one wanted, that
+                                  is the answer, whatever setup read earlier:
+                                  on 09-30 setup read Max off the button, the
+                                  tier was Low by Send, and this returned early
+                                  on setup's flag — Claude researched at Low and
+                                  the run said nothing.
       * `state["effort"]`       — setup confirmed the wanted tier: nothing to add.
-      * `button_shows_wanted`   — the pre-send read of the model button (taken
-                                  AFTER the computer-use pass) shows the wanted
-                                  tier: it was set after setup. A note, no miss.
+      * `button_shows_wanted`   — the pre-send read of the model button shows
+                                  the wanted tier though setup did not confirm
+                                  it: it was set after setup's read. A note, no
+                                  miss.
       * `state["effort_got"]`   — the tier last READ and not the one wanted: named.
                                   The caller passes the tier the pre-send read
                                   saw on the model button when it saw one, and
@@ -60205,18 +60248,51 @@ def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict
     """
     w = str(wanted or "").strip().lower()
     st = state if isinstance(state, dict) else {}
-    if not w or st.get("effort"):
+    if not w:
+        return {"missing": None, "note": None}
+    s = str(shown or "").strip().lower()
+    if s and s != w:
+        return {"missing": f"effort is '{s}', not the '{w}' wanted", "note": None}
+    if st.get("effort"):
         return {"missing": None, "note": None}
     if button_shows_wanted:
         return {"missing": None,
                 "note": (f"effort '{w}' now shows on the model button — set after "
-                         f"setup, by the computer-use pass")}
+                         f"setup's read")}
     got = str(st.get("effort_got") or "").strip().lower()
     if got == w:
         return {"missing": None, "note": None}
     if got:
         return {"missing": f"effort is '{got}', not the '{w}' wanted", "note": None}
     return {"missing": f"{w} effort", "note": None}
+
+
+def _claude_effort_ledger_at_send(wanted, shown, *, label: str = "") -> None:
+    """Restate the run's effort entry from the LAST read before Send.
+
+    ⭐⭐ 2026-09-30. The ledger entry was written once, in setup: "already
+    via=trigger" when the button read Max at 05:09:54. The tier was Low by
+    05:11:18, Claude researched at Low, and the end-of-run summary still said
+    "✓ p2 claude.select_effort_tier: already". When the pre-send read shows a
+    tier, the entry now says what that read saw — a miss named plainly, or a
+    confirmation — and when it shows none, setup's entry stands."""
+    w = str(wanted or "").strip().lower()
+    s = str(shown or "").strip().lower()
+    if not w or not s:
+        return
+    if s == w:
+        _dom_restate("claude.select_effort_tier", "verified", phase=2,
+                     via="read before Send",
+                     detail=f"the model button reads '{s}' right before Send")
+        return
+    _dom_restate("claude.select_effort_tier", "missed", phase=2,
+                 via="read before Send",
+                 detail=(f"the model button read '{s}' right before Send, not the "
+                         f"'{w}' wanted — the research runs at {effort_label(s)} "
+                         f"effort"))
+    log(f"[{label}] Claude's effort right before Send is {effort_label(s)}, not the "
+        f"{effort_label(w)} wanted — the research runs at {effort_label(s)} effort",
+        "WARN")
 
 
 def _claude_effort_report(wanted, got) -> dict:
@@ -60249,24 +60325,8 @@ def _claude_effort_report(wanted, got) -> dict:
             "level": "WARN",
             "detail": (f"tier is '{g}', not the '{w}' wanted — the answer may be "
                        f"weaker than the run reports"),
-            "notice": (f"Claude is researching at {g.capitalize()} effort — "
-                       f"{w.capitalize()} could not be set")}
-
-
-def _claude_validator_effort_ok(thinking_state) -> bool:
-    """Should the CUA validator be told the effort tier is already set?
-
-    Extracted from its call site so the POLARITY is testable. Inline it sat in a
-    900-line async function nothing in the suite executes, which is the shape
-    that has repeatedly let an inverted gate ship green.
-
-    ⭐ DEFAULTS TO TRUE — "assume it is fine". A platform that records nothing,
-    or a validate call arriving before any setup ran, then gets today's cheap
-    read-only pass. Defaulting the other way would send the validator into the
-    model popover on every run of every platform to buy nothing, and reopen the
-    "the model selector opens twice" report.
-    """
-    return bool((thinking_state or {}).get("effort", True))
+            "notice": (f"Claude is researching at {effort_label(g)} effort — "
+                       f"{effort_label(w)} could not be set")}
 
 
 # Re-open the model popover with a REAL press on the test-id'd trigger, and
@@ -62703,7 +62763,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         _eff_report = _claude_effort_report(_claude_effort, _effort_got)
         log(f"[setup_claude_dr] {_eff_report['log']}", _eff_report["level"])
         _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed,
-                                        "effort_got": _effort_got}
+                                        "effort_got": _effort_got,
+                                        # ⭐ 2026-09-30 — did the page confirm the
+                                        # MODEL? Then a computer-use setup pass has
+                                        # only the Research switch left to do —
+                                        # see `_claude_cua_setup_mission`.
+                                        "model": bool(opus_selected)}
         # ⭐⭐ 2026-08-06 — Claude's effort tier had NO entry in the run's DOM-intent
         # ledger while ChatGPT's model pill did, so when the Effort submenu failed
         # to mount the run carried on with whatever tier was already set and the
@@ -62847,8 +62912,18 @@ async def _dr_outcome_state(page, platform: str) -> str:
             #
             # Direction is safe either way: a False adds `unknown`, never `off`,
             # so the worst case is a rung that runs when it need not have.
-            return ("on" if (st.get("hasExtended") and st.get("researchOn")
-                             and st.get("effortOk")) else "unknown")
+            #
+            # ⛔⛔ 2026-09-30 — AND EFFORT IS OUT AGAIN, because nothing below can
+            # set it. Both rungs this reading can skip are computer-use passes,
+            # and effort was taken out of their missions (the Effort submenu
+            # closes before their click lands — 09-30: four presses, never open).
+            # Keeping the term would send a run whose only miss is the tier down
+            # two rungs that are now told to leave the tier alone: the cost with
+            # no repair that the note above warns about, from the other side.
+            # The tier is read on the model button right before Send and said
+            # plainly there (`_claude_effort_after_setup`).
+            return ("on" if (st.get("hasExtended") and st.get("researchOn"))
+                    else "unknown")
     except Exception as e:
         log(f"[ladder] outcome probe for {p} failed ({e})", "INFO")
     return "unknown"
@@ -62952,16 +63027,11 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
                     an ambiguous or errored validation (ok=True, confirmed=False)
                     must NOT be treated as proof Deep Research is on, or a real
                     chat-mode degradation could slip through silently (#709)."""
-    # ⭐⭐ 2026-08-17 — DID THE DOM LAYER CONFIRM THE EFFORT TIER? This is what
-    # decides whether the validator is permitted to go and set it. Defaults to
-    # True — "assume it is fine" — so a platform that records nothing, or a call
-    # that arrives before the setup ran, gets today's cheap read-only pass rather
-    # than a speculative trip into the model popover on every run.
-    #
-    # ⛔ The permission has to be granted in BOTH strings or neither: they are
-    # sent to one CUA call, and an agent holding a system prompt that forbids the
-    # submenu and a user message that demands it will do something arbitrary.
-    _claude_effort_ok = _claude_validator_effort_ok(_P2_THINKING_STATE.get("claude"))
+    # ⛔⛔ 2026-09-30 — NO EFFORT PERMISSION ANY MORE. From 08-17 this pass was
+    # told to open the Effort submenu whenever setup had not confirmed the tier.
+    # That hover submenu closes before a computer-use click lands (09-30: four
+    # presses, never open), so the permission bought steps and no tier. The
+    # effort is read on the model button right before Send and reported there.
     validator_map = {
         "chatgpt": PROMPT_VALIDATE_CHATGPT_SETUP,
         "gemini": PROMPT_VALIDATE_GEMINI_SETUP,
@@ -62973,8 +63043,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # validator into the menu whose only primary-family rows are the sales
         # chips the DOM layer just refused — the pass whose job is to confirm
         # the model would be the pass that undoes it.
-        "claude": claude_validate_setup_prompt(_p2_active_family("claude"),
-                                               effort_ok=_claude_effort_ok),
+        "claude": claude_validate_setup_prompt(_p2_active_family("claude")),
     }
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
@@ -62989,8 +63058,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # Same family, same reason — this string and the system prompt above go
         # to ONE CUA call, so a family that reaches only one of them leaves the
         # agent holding two instructions that disagree about the model.
-        "claude": p2_claude_validate_directive(_p2_active_family("claude"),
-                                               effort_ok=_claude_effort_ok),
+        "claude": p2_claude_validate_directive(_p2_active_family("claude")),
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -64254,7 +64322,8 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             # Positive branch logged too — see the ChatGPT note above.
             log(f"[{label}] Claude DR pre-send check: active={ok} reactivate={reactivate}"
                 f" extended={bool(state.get('hasExtended'))}"
-                f" research={bool(state.get('researchOn'))}", "DEBUG")
+                f" research={bool(state.get('researchOn'))}"
+                f" effort={state.get('effortShown') or 'not shown'}", "DEBUG")
             # `effortOk` is REPORTED, never gated on (see the detector): it is the
             # only read of the effort taken AFTER the computer-use pass, and the
             # post-setup telemetry line uses it to say what that pass left.
@@ -65493,6 +65562,11 @@ _CHATGPT_NEW_CHAT_STATE_JS = _cg_js(
     " msgs: document.querySelectorAll('__CG_ANY_MSG__').length })")
 
 
+#: How long `_chatgpt_force_new_chat` waits, after pressing New chat, for the
+#: old conversation to leave the page before calling the new chat a miss.
+_CHATGPT_NEW_CHAT_SETTLE_S = 5.0
+
+
 async def _chatgpt_force_new_chat(page, label) -> bool:
     """Client-side "New chat" on an already-open chatgpt.com tab (2A warm-tab
     reuse, 2026-07-06 bot-score work). Returns True when the tab lands on a
@@ -65533,6 +65607,14 @@ async def _chatgpt_force_new_chat(page, label) -> bool:
                 f"holds {st.get('msgs')} message(s) — NOT a fresh chat", "WARN")
             return False
         return True
+
+    async def _thread_cleared() -> bool:
+        """The same read as `_composer_present`, asked quietly while waiting."""
+        try:
+            st = await page.evaluate(_CHATGPT_NEW_CHAT_STATE_JS) or {}
+        except Exception:
+            return False
+        return bool(st.get("composer")) and int(st.get("msgs") or 0) == 0
 
     try:
         cur = (page.url or "").lower()
@@ -65592,8 +65674,20 @@ async def _chatgpt_force_new_chat(page, label) -> bool:
         if not how:
             return False
         log(f"[{label}] New-chat pressed via {how} (matched {marked})", "INFO")
-        await asyncio.sleep(2)
-        cur2 = (page.url or "").lower()
+        # ⭐⭐ 2026-09-30 — WAIT FOR THE OLD THREAD TO CLEAR, up to about
+        # `_CHATGPT_NEW_CHAT_SETTLE_S`. This read the page ONCE, 2 s after the
+        # press. On the 09-28 page the address had already moved to
+        # chatgpt.com/ by then but the old question and reply were still on
+        # screen, so a new chat that DID land read "the thread already holds 2
+        # message(s) — NOT a fresh chat" and the run reloaded the tab (05:08:42,
+        # 17 s lost). Now: look every half second until the address has left
+        # the conversation and the thread is empty, and only then decide.
+        cur2 = ""
+        for _ in range(int(_CHATGPT_NEW_CHAT_SETTLE_S / 0.5)):
+            await asyncio.sleep(0.5)
+            cur2 = (page.url or "").lower()
+            if "/c/" not in cur2 and await _thread_cleared():
+                break
         log(f"[{label}] New-chat check: url after press={cur2}", "INFO")
         if "/c/" in cur2:
             return False  # SPA never left the conversation
@@ -66226,6 +66320,26 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
     return page, False
 
 
+def _claude_cua_setup_mission(platform_l: str, prompt_system: str, prompt_user: str,
+                              *, label: str = "") -> tuple:
+    """The (system prompt, user message) the computer-use setup pass gets.
+
+    ⭐⭐ 2026-09-30. On Claude, when the page already confirmed the model, only
+    the Research switch is left, so the pass gets a Research-only mission. On
+    that run the DOM had read Opus 5.5 off the model button and missed only the
+    Research row, and the full mission sent the agent back into the model menu
+    for three of its eight steps. Effort is in neither mission (see
+    `models.EFFORT_HANDS_OFF`), so a model that is right leaves nothing in that
+    menu for the pass to do. Every other case keeps the strings it was given."""
+    if platform_l != "claude":
+        return prompt_system, prompt_user
+    if not (_P2_THINKING_STATE.get("claude") or {}).get("model"):
+        return prompt_system, prompt_user
+    log(f"[{label}] the page already confirmed the model — computer use only "
+        f"switches Research on")
+    return claude_research_only_prompt(), p2_claude_research_only_directive()
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
                                      brief_path=None, source_paths=None,
@@ -66500,9 +66614,14 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     async def _rung_cua_setup():
         # Playwright failed — try original CUA setup as a first fallback (tight iterations)
         log(f"[{label}] Playwright setup failed — CUA fallback setup (tight)...")
+        # ⭐ 2026-09-30 — what is LEFT to do, not the whole setup again. Chosen
+        # here, after the DOM setup ran, because only now is it known what the
+        # page confirmed.
+        _sys_p, _user_p = _claude_cua_setup_mission(platform_l, prompt_system, prompt_user,
+                                                    label=label)
 
         async def _setup_fallback_cua():
-            return await agent_loop(cua_client, browser, prompt_system, prompt_user,
+            return await agent_loop(cua_client, browser, _sys_p, _user_p,
                 model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
         # #839 act tier: side-effect-only setup (result ignored — the ladder's
@@ -66515,7 +66634,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                       "want to research?' (chat mode = 'Ask Gemini'); a visible DR chip "
                       "alone is NOT proof — don't toggle a pill that's already active.",
             "chatgpt": "enable Deep Research mode; do NOT type — set up and focus the input.",
-            "claude": "enable Research + the right model/effort; do NOT type.",
+            "claude": "enable Research (and the model, if it is not already right); "
+                      "leave the effort alone; do NOT type.",
         }.get(platform_l, "enable Deep Research mode; do NOT type.")
         await _shadow_observed_cua(
             page, hotspot_id="setup-dr", phase=2, platform=platform_l,
@@ -66524,7 +66644,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                          + _setup_placeholder_hint,
             expected_outcome="Deep Research mode is active and the input is focused (not typed)",
             cua_coro_factory=_setup_fallback_cua,
-            mission_prompt=f"{prompt_system}\n\nTASK: {prompt_user}",
+            mission_prompt=f"{_sys_p}\n\nTASK: {_user_p}",
             act_timeout_s=120.0)
 
     async def _rung_cua_validate():
@@ -66877,13 +66997,24 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # and the tile cannot name two different tiers.
                 _eff_now = ((mode_state or {}).get("effortShown")
                             or _tstate.get("effort_got"))
+                # ⭐⭐ 2026-09-30 — `shown`: the tier the model button showed in
+                # the LAST read before Send. It decides over setup's flag — on
+                # 09-30 setup read Max, the tier was Low by Send, and nothing
+                # said so (the flag returned early). See the helper.
                 _eff_after = _claude_effort_after_setup(
                     _pol.get("effort"), {**_tstate, "effort_got": _eff_now},
-                    bool((mode_state or {}).get("effortOk")))
+                    bool((mode_state or {}).get("effortOk")),
+                    shown=(mode_state or {}).get("effortShown"))
                 if _eff_after["note"]:
                     log(f"[{label}] Phoenix: {_eff_after['note']}", "INFO")
                 if _eff_after["missing"]:
                     _missing.append(_eff_after["missing"])
+                # The same last read restates the run's ledger entry, so the
+                # end-of-run summary cannot say "✓ already" about a run that
+                # went out at another tier (09-30 did exactly that).
+                _claude_effort_ledger_at_send(_pol.get("effort"),
+                                              (mode_state or {}).get("effortShown"),
+                                              label=label)
                 # ⭐ The tile caption goes up HERE, not in setup: the computer-use
                 # pass has now had its turn at the tier and the button has been
                 # read again, so "Low — Max could not be set" is still true when
@@ -68050,7 +68181,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         emit_event("agent_progress", phase=2, agent="claude", status="starting",
                    progress=f"Opening Claude with the latest "
                             f"{(p2_family('claude') or 'Opus').capitalize()} "
-                            f"({str(p2_labels('claude').get('effort', 'max')).capitalize()} "
+                            f"({effort_label(p2_labels('claude').get('effort'))} "
                             f"effort) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
@@ -69639,6 +69770,34 @@ async def _nlm_click_first(page, patterns, *, expect_chooser=False):
     return label
 
 
+# ⭐⭐ 2026-09-30 — THE AUDIO CARD'S ICON NAME, ONE LIST FOR EVERY READER.
+# NotebookLM renamed the Material icon on its audio cards from
+# `audio_magic_eraser` to `audio_spark`. The 09-30 run's own dump shows it: the
+# finished card read "audio_sparkUnread Golden Retriever Science Versus
+# Marketing…", and the Studio tile "audio_spark Audio Overview chevron_forward".
+# Five readers each carried the old name as a literal — the done check, the
+# card count, the Deep Dive count, the download picker and the ⋮-menu scope —
+# so that run never saw its finished audio by reading the page: 12 computer-use
+# checks over 17 minutes, "0 total" after cleanup, and a picker with no card.
+# The old name stays in the list: it costs nothing, and a page still serving it
+# must not go blind the other way. Page JS reaches this list through `_nlm_js`.
+_NLM_AUDIO_ICONS = ("audio_magic_eraser", "audio_spark")
+_NLM_AUDIO_ICON_RE_JS = "/(?:" + "|".join(re.escape(i) for i in _NLM_AUDIO_ICONS) + ")/"
+
+
+def _nlm_js(src: str) -> str:
+    """Splice the audio-icon test into a NotebookLM page-JS string.
+
+    `__NLM_AUDIO_ICON__` becomes a regex literal matching any name in
+    `_NLM_AUDIO_ICONS`, so `__NLM_AUDIO_ICON__.test(text)` in the page asks
+    "does this text carry an audio card's icon?" the same way everywhere."""
+    out = src.replace("__NLM_AUDIO_ICON__", _NLM_AUDIO_ICON_RE_JS)
+    if "__NLM_" in out:
+        raise ValueError("unknown NotebookLM placeholder in page JS: "
+                         + out[out.index("__NLM_"):][:40])
+    return out
+
+
 # ── The audio card's ⋮ menu — scoped, never document-wide ──────────────
 #
 # ⛔ THE BUG THIS EXISTS TO KILL: the audio-share step opened a menu with a
@@ -69657,14 +69816,14 @@ async def _nlm_click_first(page, patterns, *, expect_chooser=False):
 #
 # The first scope is the same population `_count_nlm_audio_cards` and
 # `_pick_nlm_audio_card` already count — a visible <artifact-library-item>
-# carrying the `audio_magic_eraser` ligature — so all three agree on what an
-# audio card is. WHICH audio card does not matter here: NotebookLM emits one
+# carrying one of the `_NLM_AUDIO_ICONS` ligatures — so all three agree on what
+# an audio card is. WHICH audio card does not matter here: NotebookLM emits one
 # `/notebook/{id}` link for the notebook however you reach the share dialog, so
 # a duplicate changes nothing about the URL, only about whose menu opens.
 _NLM_AUDIO_MENU_SCOPES = [
-    {"name": "audio-card", "sel": "artifact-library-item", "needs": "audio_magic_eraser"},
-    {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": ""},
-    {"name": "studio-panel", "sel": "studio-panel", "needs": ""},
+    {"name": "audio-card", "sel": "artifact-library-item", "needs": list(_NLM_AUDIO_ICONS)},
+    {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": []},
+    {"name": "studio-panel", "sel": "studio-panel", "needs": []},
 ]
 
 # Ordered hooks within the scope. Exact label first so a rename to "More
@@ -69690,9 +69849,10 @@ _NLM_FIND_AUDIO_TRIGGER_JS = r"""
     const findTrigger = (P) => {
         for (const g of (P.scopes || [])) {
             for (const scope of document.querySelectorAll(g.sel)) {
-                if (g.needs) {
+                // `needs`: the card must carry ANY of these icon names.
+                if (g.needs && g.needs.length) {
                     const st = (scope.innerText || scope.textContent || '');
-                    if (st.indexOf(g.needs) === -1) continue;
+                    if (!g.needs.some(n => st.indexOf(n) !== -1)) continue;
                 }
                 for (const sel of (P.triggers || [])) {
                     for (const btn of scope.querySelectorAll(sel)) {
@@ -69932,6 +70092,34 @@ async def _nlm_census_settled(page, expected_names, attempts=4, interval=3.0):
     return present, row_count
 
 
+#: How long the DOM upload waits for NotebookLM's Add-sources dialog to show an
+#: upload control after "New notebook" (or "Add source"). The 09-30 dialog
+#: mounted a few seconds after the old 3 s give-up. See `_nlm_dom_add_files`.
+_NLM_UPLOAD_CONTROL_WAIT_S = 15
+
+#: The labels of NotebookLM's upload control inside the Add-sources dialog —
+#: ONE list for the look (`_nlm_upload_control_on_screen`) and the press (the
+#: chooser path in `_nlm_dom_add_files`), so the two cannot disagree about what
+#: an upload control is.
+_NLM_UPLOAD_CONTROL_PATTERNS = (r"upload file", r"choose file", r"select file",
+                                r"\bbrowse\b", r"\bupload\b")
+
+
+async def _nlm_upload_control_on_screen(page) -> bool:
+    """Is an upload control on screen right now? A LOOK, never a press: the
+    same matcher the press uses (`_NLM_CLICK_JS`) finds it, and the mark that
+    matcher leaves is removed at once so nothing later aims at it."""
+    try:
+        picked = await page.evaluate(_NLM_CLICK_JS, list(_NLM_UPLOAD_CONTROL_PATTERNS))
+    except Exception:
+        return False
+    try:
+        await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+    except Exception:
+        pass
+    return bool(isinstance(picked, dict) and picked.get("label"))
+
+
 async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
     """Add files to the CURRENT notebook via NotebookLM's own DOM. Opens the
     Add-sources dialog if needed, then feeds every path in ONE go through the
@@ -69942,22 +70130,43 @@ async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
     try:
         # The Add-sources dialog auto-opens on a fresh notebook; otherwise
         # open it ("Add source" / "+" in the sources panel).
+        #
+        # ⭐⭐ 2026-09-30 — WAIT FOR THE UPLOAD CONTROL, up to
+        # `_NLM_UPLOAD_CONTROL_WAIT_S`. This gave up about 3 s after "New
+        # notebook": two looks, no "Add source" to press, done. On 09-19 the
+        # create label was slower to press and two 4 s click timeouts happened
+        # to give the dialog time to mount; the faster 09-30 "New notebook" flow
+        # took that accident away, and the dialog mounted a few seconds after
+        # we had handed both files to computer use (3 + 3 steps, 05:32:53). So
+        # the wait is now on purpose: poll until the hidden file input or an
+        # upload control is on screen. "Add source" is pressed only while
+        # neither is there, and at most every few seconds, so a dialog that is
+        # still opening is not pressed over.
         inp = None
-        for attempt in range(3):
+        _add_pressed_at = None
+        _waited = 0.0
+        while True:
             try:
                 inp = await page.query_selector('input[type="file"]')
             except Exception:
                 inp = None
             if inp:
                 break
-            # (review r2) no bare '^add' pattern — mat-icon ligatures make
-            # every '+' button's textContent start with 'add', and a stray
-            # match creates notes / opens the wrong dialog.
-            clicked = await _nlm_click_first(page, (
-                r"^add source", r"\badd sources?\b", r"upload sources?"))
-            if attempt and not clicked:
+            if await _nlm_upload_control_on_screen(page):
+                break      # the chooser path below presses it
+            if _waited >= _NLM_UPLOAD_CONTROL_WAIT_S:
+                log(f"[{label}] DOM upload: no upload control after "
+                    f"{int(_waited)}s", "INFO")
                 break
-            await asyncio.sleep(2)
+            if _add_pressed_at is None or _waited - _add_pressed_at >= 4:
+                # (review r2) no bare '^add' pattern — mat-icon ligatures make
+                # every '+' button's textContent start with 'add', and a stray
+                # match creates notes / opens the wrong dialog.
+                if await _nlm_click_first(page, (
+                        r"^add source", r"\badd sources?\b", r"upload sources?")):
+                    _add_pressed_at = _waited
+            await asyncio.sleep(1)
+            _waited += 1
         if inp:
             try:
                 await inp.set_input_files(paths)
@@ -70001,9 +70210,8 @@ async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
             # global handler below can only answer a chooser that opened; this is
             # what makes "it opened" an observation rather than an inference, and
             # a synthetic in-page click could never have produced one at all.
-            clicked = await _nlm_click_first(page, (
-                r"upload file", r"choose file", r"select file", r"\bbrowse\b",
-                r"\bupload\b"), expect_chooser=True)
+            clicked = await _nlm_click_first(page, _NLM_UPLOAD_CONTROL_PATTERNS,
+                                             expect_chooser=True)
             if clicked.endswith("|chooser"):
                 clicked = clicked[: -len("|chooser")]
                 log(f"[{label}] DOM upload: file chooser opened from "
@@ -70269,6 +70477,17 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
                     browser.clear_upload_file()
                 await asyncio.sleep(3)
             continue  # next round re-censuses
+        # ⭐⭐ 2026-09-30 — EVERY FILE IS LISTED: NO COMPUTER-USE LOOK. The census
+        # found each filename in the Sources panel's own rows, which is the
+        # question this step asks. On 09-30 the computer-use check then spent
+        # two steps to say "all sources OK" about the same list. It still runs
+        # when the census could only read the page's text (no source rows
+        # matched), where a filename seen is weaker evidence.
+        if _rows > 0:
+            log(f"[NotebookLM] source census (round {_round}): all "
+                f"{len(expected)} files are listed in the Sources panel — no "
+                f"computer-use check needed")
+            return set()
         if not cua_client:
             log(f"[NotebookLM] source census (round {_round}): all "
                 f"{len(expected)} present (no CUA for red-state check)")
@@ -71746,34 +71965,46 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             audio_done = True
             break
 
-        # CUA fallback — strict: only "audio complete" counts.
-        # 2026-05-14: prompt is length-aware so CUA looks at the SAME
-        # card the generate step produced (not a hardcoded Long + Deep
-        # Dive that doesn't exist for short/default runs).
-        _audio_check_mission = make_prompt_audio_check(podcast_length)
+        # ⭐⭐ 2026-09-30 — NO COMPUTER-USE LOOK WHILE THE PAGE SAYS "GENERATING".
+        # When the Studio panel itself shows the "Generating Audio Overview…"
+        # placeholder, the answer is already on the page: still going. On the
+        # 09-30 run the computer-use check ran 11 times in 17 minutes and said
+        # "still generating" every time, reading that same placeholder off a
+        # screenshot. It still runs on a poll where the page is not that clear.
+        _gen_now = await _count_nlm_audio_generating(browser.page)
+        if _gen_now > 0:
+            log(f"[Phase3] the page shows {_gen_now} audio overview(s) still being "
+                f"made — no computer-use check this round")
+            diag_text = ""
+        else:
+            # CUA fallback — strict: only "audio complete" counts.
+            # 2026-05-14: prompt is length-aware so CUA looks at the SAME
+            # card the generate step produced (not a hardcoded Long + Deep
+            # Dive that doesn't exist for short/default runs).
+            _audio_check_mission = make_prompt_audio_check(podcast_length)
 
-        async def _audio_check_cua():
-            return await agent_loop(cua_client, browser, _audio_check_mission,
-                "Check: Has audio generation FINISHED? Is there a completed audio player "
-                "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
-                model=CUA_MODEL, max_iterations=3, verbose=verbose)
+            async def _audio_check_cua():
+                return await agent_loop(cua_client, browser, _audio_check_mission,
+                    "Check: Has audio generation FINISHED? Is there a completed audio player "
+                    "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
 
-        # #839 act tier — STRICTLY READ_ONLY (#778): a single click on any audio
-        # card here fires the DEFAULT-audio duplicate, so Vision may only READ
-        # and return a verdict; any proposed action defers to CUA unexecuted.
-        # The 'audio complete' marker is parsed from the returned text below in
-        # every mode; DOM (_check_audio_complete_dom) above is authoritative.
-        diag = await _shadow_observed_cua(
-            browser.page, hotspot_id="audio-check", phase=3, platform="notebooklm",
-            current_step="poll_audio_complete",
-            context_hint="READ ONLY — do not click anything. Is there a COMPLETED audio "
-                         "player with NO progress indicator/spinner? Say 'audio complete' "
-                         "only if fully done, otherwise say it is still generating.",
-            expected_outcome="an honest 'audio complete' verdict only when fully done",
-            cua_coro_factory=_audio_check_cua,
-            mission_prompt=_audio_check_mission,
-            read_only=True) or {}
-        diag_text = (diag.get("text") or "").lower()
+            # #839 act tier — STRICTLY READ_ONLY (#778): a single click on any audio
+            # card here fires the DEFAULT-audio duplicate, so Vision may only READ
+            # and return a verdict; any proposed action defers to CUA unexecuted.
+            # The 'audio complete' marker is parsed from the returned text below in
+            # every mode; DOM (_check_audio_complete_dom) above is authoritative.
+            diag = await _shadow_observed_cua(
+                browser.page, hotspot_id="audio-check", phase=3, platform="notebooklm",
+                current_step="poll_audio_complete",
+                context_hint="READ ONLY — do not click anything. Is there a COMPLETED audio "
+                             "player with NO progress indicator/spinner? Say 'audio complete' "
+                             "only if fully done, otherwise say it is still generating.",
+                expected_outcome="an honest 'audio complete' verdict only when fully done",
+                cua_coro_factory=_audio_check_cua,
+                mission_prompt=_audio_check_mission,
+                read_only=True) or {}
+            diag_text = (diag.get("text") or "").lower()
 
         if "audio complete" in diag_text:
             if not dom_complete:
@@ -72238,7 +72469,7 @@ async def _check_audio_complete_dom(page) -> bool:
     "audio_magic_eraser" icon ligature + the real title once done.
     """
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_nlm_js("""() => {
             // Still generating → the placeholder is present and no audio card
             // has materialized. Cross-checks _check_audio_generating's
             // body-wide read but scoped to the artifact container.
@@ -72250,10 +72481,10 @@ async def _check_audio_complete_dom(page) -> bool:
             const items = document.querySelectorAll('artifact-library-item');
             for (const el of items) {
                 if (el.offsetParent === null) continue;
-                if ((el.innerText || el.textContent || '').includes('audio_magic_eraser')) return true;
+                if (__NLM_AUDIO_ICON__.test(el.innerText || el.textContent || '')) return true;
             }
             return false;
-        }""") or False
+        }""")) or False
     except Exception:
         return False
 
@@ -72394,14 +72625,15 @@ def _nlm_notebook_id(url: str) -> str:
 #
 # _count_nlm_audio_cards / _count_nlm_deep_dive_cards / _check_audio_complete_dom
 # all count the SAME population — visible <artifact-library-item> elements
-# whose text carries the "audio_magic_eraser" Material-icon ligature — pinned
+# whose text carries an audio icon ligature (`_NLM_AUDIO_ICONS`: the 06-03
+# "audio_magic_eraser", renamed "audio_spark" by 09-30) — pinned
 # from the #757-B dom-dump (2026-06-03). The OLD guessed selectors
 # ([role=article]/[class*=audio-card]/[data-testid*=audio] + an <audio> element +
 # [role=progressbar]) matched NOTHING in the live Studio panel, so every count
 # read 0 and every dup-guard was a dead no-op. If NotebookLM ships a Studio
-# redesign that drops the artifact-library-item tag or the audio_magic_eraser
-# ligature (e.g. re-renders the icon as an SVG / CSS ::before, where the literal
-# string leaves both innerText AND textContent), all three break together and
+# redesign that drops the artifact-library-item tag or renames the icon again
+# (it did on 09-30), or re-renders the icon as an SVG / CSS ::before (where the
+# literal string leaves both innerText AND textContent), all three break together and
 # revert to 0 — fail-OPEN (healthy runs proceed, dups slip) — and the read-only
 # _dump_nlm_audio_dom on the zero-path is the canary to re-pin them.
 #
@@ -72426,7 +72658,7 @@ async def _count_nlm_audio_cards(page) -> int:
     clicks anything. Returns 0 on any DOM exception.
     """
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_nlm_js("""() => {
             // Real NLM Studio markup (pinned from the #757-B dom-dump,
             // 2026-06-03): a generated audio is an <artifact-library-item>
             // whose text carries the "audio_magic_eraser" Material-icon
@@ -72454,10 +72686,10 @@ async def _count_nlm_audio_cards(page) -> int:
                 // duplicate WARN, from the very fix that exists to stop the
                 // count disagreeing with the screen.
                 if (/generating audio overview/i.test(t)) return;
-                if (t.includes('audio_magic_eraser')) count++;
+                if (__NLM_AUDIO_ICON__.test(t)) count++;
             });
             return count;
-        }""") or 0
+        }""")) or 0
     except Exception:
         return 0
 
@@ -72520,16 +72752,16 @@ async def _count_nlm_deep_dive_cards(page) -> int:
     it (Format + Length are enforced upstream by make_prompt_audio_generate).
     """
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_nlm_js("""() => {
             const items = document.querySelectorAll('artifact-library-item');
             let count = 0;
             items.forEach((el) => {
                 if (el.offsetParent === null) return;
                 const t = (el.innerText || el.textContent || '');
-                if (t.includes('audio_magic_eraser') && /deep dive/i.test(t)) count++;
+                if (__NLM_AUDIO_ICON__.test(t) && /deep dive/i.test(t)) count++;
             });
             return count;
-        }""") or 0
+        }""")) or 0
     except Exception:
         return 0
 
@@ -72618,10 +72850,10 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     download) — Part A prevention is the real guarantee; this is the safety net.
     """
     try:
-        info = await page.evaluate(r"""() => {
+        info = await page.evaluate(_nlm_js(r"""() => {
             const items = Array.from(document.querySelectorAll('artifact-library-item'))
                 .filter((el) => el.offsetParent !== null
-                    && ((el.innerText || el.textContent || '').includes('audio_magic_eraser')));
+                    && __NLM_AUDIO_ICON__.test(el.innerText || el.textContent || ''));
             const cards = items.map((el, i) => {
                 const t = (el.innerText || el.textContent || '');
                 const low = t.toLowerCase();
@@ -72636,7 +72868,7 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
                 };
             });
             return { count: cards.length, cards };
-        }""")
+        }"""))
     except Exception as _e:
         return {"count": 0, "target_ordinal": 1, "complete": False,
                 "ambiguous": False, "reason": f"evaluate_failed:{type(_e).__name__}",

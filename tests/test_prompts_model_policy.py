@@ -127,25 +127,23 @@ def test_validate_user_msg_comes_from_the_policy_module():
     # family, and sends the validator into a menu whose only primary-family rows
     # are the sales chips the DOM layer just refused. Both the system prompt and
     # the user message go to ONE call, so both have to learn the family.
-    # ⚠ RE-ANCHORED 2026-08-17: both calls now also carry `effort_ok`, so they
-    # wrap across lines. Anchored on the call plus its family argument within a
-    # window, rather than on one unbroken source string — a pin a line wrap can
-    # break is a pin that eventually gets deleted instead of fixed.
+    # Anchored on the call plus its family argument within a window, rather
+    # than on one unbroken source string — a pin a line wrap can break is a pin
+    # that eventually gets deleted instead of fixed.
     for call in ("p2_claude_validate_directive(", "claude_validate_setup_prompt("):
         at = src.find(call)
         assert at != -1, f"the validate CUA call must render from policy: {call}"
         assert '_p2_active_family("claude")' in src[at:at + 140], (
             f"the validate CUA call must be family-scoped: {call}")
-        # ⭐ And BOTH must carry the same effort permission. They go to ONE CUA
-        # call: a system prompt that forbids the Effort submenu beside a user
-        # message that demands it leaves the agent to pick one arbitrarily.
-        assert "effort_ok=" in src[at:at + 200], (
-            f"the validate CUA call must pass the effort permission: {call}")
+        # ⛔ 2026-09-30 — and NO effort permission: the owner took effort out of
+        # the computer-use missions (the Effort submenu closes before their
+        # click lands). Both strings carry the hands-off sentence instead.
+        assert "effort_ok" not in src[at:at + 200], (
+            f"the validate CUA call must not hand the pass an effort job: {call}")
     assert "p2_claude_ver" not in src, "the version renderer is gone"
     d = models.p2_claude_validate_directive()
     fam = models.p2_family("claude").capitalize()
-    effort = str(models.p2_labels("claude").get("effort")).capitalize()
-    assert fam in d and f"{effort} effort" in d
+    assert fam in d and models.EFFORT_HANDS_OFF in d
 
 
 def test_validate_directive_says_the_version_is_irrelevant():
@@ -238,11 +236,11 @@ def test_the_claude_system_prompt_reads_highest_as_its_directive_does(family):
     assert models.VERSION_ORDER_RULE in models.p2_claude_setup_directive(family)
 
 
-@pytest.mark.parametrize("effort_ok", [True, False])
-def test_the_validator_reads_highest_the_same_way(effort_ok):
+@pytest.mark.parametrize("family", ["", "sonnet"])
+def test_the_validator_reads_highest_the_same_way(family):
     """It picks the highest only when the button names no family at all — rare,
     and exactly when a wrong reading would pick an older model."""
-    p = prompts.claude_validate_setup_prompt("", effort_ok=effort_ok)
+    p = prompts.claude_validate_setup_prompt(family)
     step = p[p.index("1. MODEL:"):p.index("\n2. ")]
     assert models.VERSION_ORDER_RULE in step
 

@@ -248,15 +248,20 @@ def test_a_button_with_no_tier_names_none_whatever_else_the_page_says():
 
 
 def test_the_effort_term_is_reported_not_self_gated():
-    """One detector, two policies. The PRE-SEND check must not gate on effort —
-    doing so re-runs the whole Claude setup, model popover and all, seconds
-    before the brief is submitted — while the setup LADDER must. So the script
-    reports the term and each caller decides."""
+    """The detector REPORTS effort and no gate requires it. The PRE-SEND check
+    must not — doing so re-runs the whole Claude setup, model popover and all,
+    seconds before the brief is submitted. And since 2026-09-30 the setup
+    LADDER must not either: both rungs it can descend to are computer-use
+    passes, and effort was taken out of their missions (the Effort submenu
+    closes before their click lands), so an effort term would buy two rungs
+    that are told to leave the tier alone. The tier is read right before Send
+    and reported there."""
     import inspect
     src = inspect.getsource(research)
     ladder = src[src.index("async def _dr_outcome_state"):]
     ladder = ladder[:ladder.index("async def _run_intent_ladder")]
-    assert 'st.get("effortOk")' in ladder, "the ladder must require the effort term"
+    assert 'st.get("effortOk")' not in ladder, (
+        "the ladder must not descend on effort — no rung below it can set it")
 
     presend = src.index("Claude mode regressed before send")
     window = src[presend - 1200:presend]

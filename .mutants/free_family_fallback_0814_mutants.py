@@ -193,17 +193,16 @@ MUTANTS = [
      "⛔⛔ the validate CUA mission freezes to the policy family again — its "
      "'only touch the model if it is not <fam>' clause then fires on the "
      "CORRECT model and sends the agent back into the chip menu",
-     # RE-ANCHORED 08-23: the call gained `effort_ok=`, so it wraps two lines.
-     [('        "claude": p2_claude_validate_directive(_p2_active_family("claude"),\n'
-       '                                               effort_ok=_claude_effort_ok),',
-       '        "claude": p2_claude_validate_directive(effort_ok=_claude_effort_ok),')]),
+     # RE-ANCHORED 09-30: `effort_ok=` is gone again (effort left the
+     # computer-use missions), so the call is one line once more.
+     [('        "claude": p2_claude_validate_directive(_p2_active_family("claude")),',
+       '        "claude": p2_claude_validate_directive(),')]),
     ("C7", "research.py", "under",
      "the validate SYSTEM prompt freezes while its user message does not — one "
      "CUA call holding two instructions that disagree about the model",
-     # RE-ANCHORED 08-23: same shape as C6.
-     [('        "claude": claude_validate_setup_prompt(_p2_active_family("claude"),\n'
-       '                                               effort_ok=_claude_effort_ok),',
-       '        "claude": claude_validate_setup_prompt(effort_ok=_claude_effort_ok),')]),
+     # RE-ANCHORED 09-30: same shape as C6.
+     [('        "claude": claude_validate_setup_prompt(_p2_active_family("claude")),',
+       '        "claude": claude_validate_setup_prompt(),')]),
     ("C8", "research.py", "under",
      "the retry's CUA setup mission freezes, so the pass that follows a proved "
      "plan limit is sent hunting for the excluded family again",
@@ -252,13 +251,13 @@ MUTANTS = [
      # assignments and the return, so the tail of the old anchor no longer
      # follows its head. Stops at `swapped`, which is still what carries the
      # family into BOTH returns.
+     # ⛔ RE-ANCHORED 09-30: the `effort =` line went with the effort branch
+     # (effort left the computer-use missions).
      [('    fam = (str(family) or primary).capitalize()\n'
-       '    effort = str(pol.get("effort", "max")).capitalize()\n'
        '    tool = str(pol.get("tool", "research")).capitalize()\n'
        '    swapped = "" if fam.lower() == primary.lower() else \\\n'
        '        f"{free_family_note(primary.capitalize(), fam)} "\n',
        '    fam = primary.capitalize()\n'
-       '    effort = str(pol.get("effort", "max")).capitalize()\n'
        '    tool = str(pol.get("tool", "research")).capitalize()\n'
        '    swapped = ""\n')]),
     ("M3", "models.py", "over",

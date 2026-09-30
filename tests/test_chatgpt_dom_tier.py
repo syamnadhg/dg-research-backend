@@ -1055,12 +1055,13 @@ def test_gemini_keys_on_the_placeholder_not_the_pill():
     assert _probe("gemini", {"pillVisible": True, "pressed": True}) == "unknown"
 
 
-def test_claude_needs_ALL_THREE_halves_of_the_intent_and_never_reads_off():
+def test_claude_needs_BOTH_halves_of_the_intent_and_never_reads_off():
     """⛔ Two rules at once.
 
     EVERY half: the rung this reading can skip is the CUA validator, which checks
-    the model, the Research tool AND the effort tier. Answering `on` from fewer
-    would silently drop one of the jobs that surface was doing.
+    the model and the Research tool. Answering `on` from fewer would silently
+    drop one of the jobs that surface was doing. (Effort was the third half from
+    08-17 to 09-30; it left when effort left the computer-use missions — below.)
 
     And never `off`: claude.ai renders the Research pill without the attributes
     the detector keys on, so a TRUE state reads false — a False is the absence of
@@ -1076,8 +1077,12 @@ def test_claude_needs_ALL_THREE_halves_of_the_intent_and_never_reads_off():
     assert _probe("claude", ok) == "on"
     assert _probe("claude", {**ok, "researchOn": False}) == "unknown"
     assert _probe("claude", {**ok, "hasExtended": False}) == "unknown"
-    # ⭐ The new one. Model right, tool on, tier unverified → descend.
-    assert _probe("claude", {**ok, "effortOk": False}) == "unknown"
+    # ⛔ 2026-09-30 — the effort term is OUT again. Every rung below is a
+    # computer-use pass, and effort was taken out of their missions (the
+    # submenu closes before their click lands), so a run whose only miss is
+    # the tier must not descend: it would pay two rungs told to leave the tier
+    # alone. The tier is read right before Send and reported there.
+    assert _probe("claude", {**ok, "effortOk": False}) == "on"
     assert _probe("claude", {}) == "unknown"
 
 

@@ -445,6 +445,12 @@ class DomPage:
 def _isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "_MODEL_REFRESH_OVERLAY_PATH", tmp_path / "mr.json")
     monkeypatch.setenv("DG_MODEL_REFRESH_ENABLED", "1")
+    # ⚠ 2026-09-30 — the policy moved to Extra high. Every test here reads the
+    # 09-23 capture, whose button and Effort row show MAX, and measures the
+    # read-and-report mechanism against a wanted 'max'; it is pinned to that
+    # word so they keep measuring the mechanism rather than the policy.
+    # The new policy word is driven end to end in test_e2e0930_p2_p3.py.
+    monkeypatch.setitem(models.P2_MODEL_POLICY["claude"], "effort", "max")
 
     async def _instant(_secs):
         return None
@@ -622,8 +628,10 @@ def test_e2e_a_step_back_below_5_5_never_lands_on_fable(said):
     ({"effort": True, "effort_got": None}, False, None, None),
     ({"effort": False, "effort_got": "low"}, False, "effort is 'low', not the 'max' wanted", None),
     ({"effort": False, "effort_got": None}, False, "max effort", None),
+    # ⚠ 2026-09-30: the note no longer credits the computer-use pass — effort
+    # was taken out of its missions, so whoever set the tier, it was not that.
     ({"effort": False, "effort_got": "low"}, True, None,
-     "effort 'max' now shows on the model button — set after setup, by the computer-use pass"),
+     "effort 'max' now shows on the model button — set after setup's read"),
     ({"effort": False, "effort_got": "max"}, False, None, None),
     ({}, False, "max effort", None),
     (None, False, "max effort", None),

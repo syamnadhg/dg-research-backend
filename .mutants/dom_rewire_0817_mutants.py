@@ -248,13 +248,11 @@ MUTANTS = [
        "                        if (!already) pick.click();")]),
 
     # ── L: the ladder and the validator, which interlock ────────────────────
-    ("L1", "research.py", "under",
-     "⭐⭐ the ladder drops the effort term, so a missed tier still reads as a "
-     "satisfied outcome and vision_cua + cua_validate are both skipped",
-     [('            return ("on" if (st.get("hasExtended") and st.get("researchOn")\n'
-       '                             and st.get("effortOk")) else "unknown")',
-       '            return ("on" if (st.get("hasExtended") and st.get("researchOn")\n'
-       '                             ) else "unknown")')]),
+    # ⛔ L1 RETIRED 2026-09-30, and its rule REVERSED by the owner. It killed a
+    # ladder that dropped the effort term; since effort left the computer-use
+    # missions (the Effort submenu closes before their click lands), no rung
+    # below the ladder can set it, so the term is gone ON PURPOSE. The mirror
+    # mutant — the term coming BACK — is p2p3_e2e0930_mutants.py E7.
 
     ("L2", "research.py", "over",
      "⛔⛔ the PRE-SEND check gates on effort too — re-running the entire Claude "
@@ -287,30 +285,12 @@ MUTANTS = [
      [("        if (!famRe.test(t) || upsellRe.test(t)) trigger = null;",
        "        if (false) trigger = null;")]),
 
-    ("L4", "research.py", "over",
-     "⛔ the validator is told the tier is fine on EVERY run, so the rung the "
-     "ladder now descends to is once again forbidden to repair it",
-     [("    return bool((thinking_state or {}).get(\"effort\", True))",
-       "    return True")]),
+    # ⛔ L4 + L5 RETIRED 2026-09-30: `_claude_validator_effort_ok` is gone. The
+    # validator is never given an effort job now, whatever setup read; the
+    # mutant that hands it one back is p2p3_e2e0930_mutants.py E11.
 
-    ("L5", "research.py", "under",
-     "⛔ the polarity is inverted: the validator goes fixing on the runs that "
-     "were already correct and stands down on the ones that were not",
-     [("    return bool((thinking_state or {}).get(\"effort\", True))",
-       "    return not bool((thinking_state or {}).get(\"effort\", True))")]),
-
-    ("L6", "prompts.py", "under",
-     "⛔ the system prompt keeps its blanket ban, so the permission the run "
-     "computed never reaches the agent",
-     [("        if effort_ok else\n"
-       "        f'That button ALSO shows the effort right on it, and on THIS run it does '",
-       "        if True else\n"
-       "        f'That button ALSO shows the effort right on it, and on THIS run it does '")]),
-
-    ("L7", "models.py", "under",
-     "⛔ the USER message keeps saying 'verify' while the system prompt says "
-     "'fix' — one CUA call holding two instructions that disagree",
-     [("    if not effort_ok:", "    if False:")]),
+    # ⛔ L6 + L7 RETIRED 2026-09-30: the `effort_ok` branches in both validate
+    # strings are gone (see L4). Their mirrors are p2p3_e2e0930 E11 and E12.
 ]
 
 
