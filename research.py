@@ -8736,7 +8736,27 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
             if not _is_synth_permission_denied(_plain_e, ignore=exc):
                 raise
         if not heal:
-            raise  # the original denial — the free retry is all this write gets
+            # ⭐ ONE EXCEPTION (wave 13): a token that visibly lacks its deviceId
+            # claim — the known stale shape, which a re-mint CLEARS — gets ONE
+            # re-mint and one retry, so this computer's own stale credential
+            # does not drop a receipt for good. Still no cooldown stamp, no
+            # count toward the latch and no latch cleared: the research writes'
+            # net is left exactly as it was. A token that carries the claim (all
+            # 1,314 refused receipts in the owner's 0.1.13 logs) gets nothing more.
+            creds = getattr(_firebase_db, "_credentials", None)
+            if creds is None or _grpc_token_claims().get("deviceId"):
+                raise  # the original denial — the free retry is all this write gets
+            try:
+                creds.refresh(None)
+                reminted = True
+            except Exception as ref_e:
+                log(f"[grpc-heal] {what}: re-mint failed: {ref_e}", "DEBUG")
+                reminted = False
+            if not reminted:
+                raise  # the original denial
+            log(f"[grpc-heal] {what}: the token had no deviceId claim — re-minted "
+                f"once and retrying", "INFO")
+            return op()
         # Throttle + structural latch under the lock so concurrent worker
         # threads can't all slip past the cooldown and fire simultaneous heals.
         with _grpc_heal_lock:
