@@ -46,9 +46,8 @@ MUTANTS = [
     # ═══ H — the research writes' safety net ════════════════════════════════
     ("H1", RESEARCH, "⛔⛔ a refused receipt goes on to the re-mint — spends the "
      "cooldown, counts toward the latch, prints re-pair required",
-     [("        if not heal:\n"
-       "            raise  # the original denial — the free retry is all this write gets\n",
-       "")]),
+     [("        if not heal:\n            # ⭐ ONE EXCEPTION (wave 13)",
+       "        if False:\n            # ⭐ ONE EXCEPTION (wave 13)")]),
     ("H2", RESEARCH, "⛔⛔ the receipt writer asks for the full heal",
      [("                what=\"log_bundle_status\", heal=False)",
        "                what=\"log_bundle_status\")")]),

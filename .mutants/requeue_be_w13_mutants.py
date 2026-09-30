@@ -182,11 +182,12 @@ MUTANTS = [
     ("H9", RESEARCH, "⛔⛔ the record is never told it is queued — the person sees it running",
      [(RECORD, "    _keep_worker_resting(WORKER_ID)")]),
     ("H10", RESEARCH, "the worker is not kept off — a lost app write brings it back to "
-     "take its own run", [("    _keep_worker_resting(WORKER_ID)\n    _publish_queue_positions_now()",
-                           "    _publish_queue_positions_now()")]),
+     "take its own run", [("    _keep_worker_resting(WORKER_ID)\n    _note_requeue_refusal(rid, None)",
+                           "    _note_requeue_refusal(rid, None)")]),
     ("H11", RESEARCH, "the order is not published before the exit — no amber pill",
-     [("    _keep_worker_resting(WORKER_ID)\n    _publish_queue_positions_now()",
-       "    _keep_worker_resting(WORKER_ID)")]),
+     [("    _note_requeue_refusal(rid, None)   # a refusal shown earlier no longer holds\n"
+       "    _publish_queue_positions_now()",
+       "    _note_requeue_refusal(rid, None)   # a refusal shown earlier no longer holds")]),
     ("H12", RESEARCH, "⛔⛔ the worker never lets the run go — it keeps running while queued",
      [(EXIT, "    pass")]),
     ("H13", RESEARCH, "OVER-REACH: a stop is requested — \"stopped\" is written over the run",
