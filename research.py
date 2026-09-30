@@ -55874,13 +55874,17 @@ _CG_COPY_WRITE_JS = "async (s) => { await navigator.clipboard.writeText(s); }"
 #: while the latest reply's is not drawn yet (wave 13 review). A reply no turn
 #: marker holds (a rename of the turn) → none, and the CUA presses it. Never
 #: one ChatGPT hides.
-_CHATGPT_COPY_BUTTON_JS = _cg_js("""() => {
+#: `skip`: how many of the person's newest messages got no reply (a follow-up
+#: ChatGPT never answered) — "the person's newest message" is then the one
+#: before them, whose reply is the latest one (wave 13).
+_CHATGPT_COPY_BUTTON_JS = _cg_js("""(skip) => {
     const replies = document.querySelectorAll('__CG_ASSISTANT__');
     const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;
     if (!scope) return null;
     const shown = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     const users = document.querySelectorAll('__CG_USER__');
-    const mine = users.length ? users[users.length - 1] : null;
+    const k = skip || 0;
+    const mine = users.length > k ? users[users.length - 1 - k] : null;
     const latest = (b) => replies.length > 0 || !mine
         || (mine.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     const ok = [...scope.querySelectorAll('__CG_COPY__')].filter(shown).filter(latest);
@@ -55939,13 +55943,15 @@ _CG_ON_PAGE_PROBE = 60
 #: Where a copy must be found, as a person sees it: [the LATEST reply's text —
 #: the last reply its marker names, the one the page read reads — , null]; with
 #: no reply marker (a future rename), [the whole page's text, the person's newest
-#: message in it], to be cut there (`_cg_latest_reply_letters`).
-_CG_PAGE_TEXT_JS = _cg_js("""() => {
+#: message in it], to be cut there (`_cg_latest_reply_letters`). `skip`: as in
+#: `_CHATGPT_COPY_BUTTON_JS` — the newest messages that got no reply are passed.
+_CG_PAGE_TEXT_JS = _cg_js("""(skip) => {
     const replies = document.querySelectorAll('__CG_ASSISTANT__');
     if (replies.length) return [replies[replies.length - 1].innerText || '', null];
     const users = document.querySelectorAll('__CG_USER__');
+    const k = skip || 0;
     return [(document.body && document.body.innerText) || '',
-            users.length ? (users[users.length - 1].innerText || '') : null];
+            users.length > k ? (users[users.length - 1 - k].innerText || '') : null];
 }""")
 
 
@@ -55975,28 +55981,33 @@ def _cg_latest_reply_letters(shown, mine) -> str:
     return page_letters[at + len(own):] if at >= 0 else page_letters
 
 
-async def _chatgpt_copy_on_page(page, text) -> bool:
+async def _chatgpt_copy_on_page(page, text, unanswered=0) -> bool:
     """True when the copy is text of THIS ChatGPT page's latest reply: at least
-    two of its first three lines of prose open with words that reply shows, in
-    the same order. Another program's brief on the shared clipboard (another
+    two-thirds of its lines of prose (and at least two) open with words that
+    reply shows. Another program's brief on the shared clipboard (another
     worker's paste, the owner's own copy) is not on this page; an earlier
     reply's (the first draft, before a follow-up) is not the latest (wave 13
-    review). One line may miss: a source chip ChatGPT draws inside a sentence is
-    on the page and not in the copy."""
+    review). A line may miss: a source chip ChatGPT draws inside a sentence is
+    on the page and not in the copy. `unanswered`: see `_CHATGPT_COPY_BUTTON_JS`.
+
+    ⛔ Wave 13: EVERY line, not the first three. A follow-up's updated brief
+    usually opens with the first draft's lines, so a copy of the first draft
+    passed on its opening alone and the person's added context was dropped."""
     probes = [p for p in (_brief_line_probe(ln) for ln in text.splitlines()
-                          if _brief_prose_line(ln)) if p][:3]
+                          if _brief_prose_line(ln)) if p]
     try:
-        shown, mine = await page.evaluate(_CG_PAGE_TEXT_JS)
+        shown, mine = await page.evaluate(_CG_PAGE_TEXT_JS, unanswered)
     except Exception:
         shown, mine = "", None
     shown = _cg_latest_reply_letters(shown, mine)
-    return bool(probes) and sum(p in shown for p in probes) >= min(2, len(probes))
+    hits = sum(p in shown for p in probes)
+    return bool(probes) and hits >= max(min(2, len(probes)), -(-2 * len(probes) // 3))
 
 
-async def _chatgpt_find_copy_button(page):
+async def _chatgpt_find_copy_button(page, unanswered=0):
     """The Copy button under the latest reply (an element handle), or None."""
     try:
-        handle = await page.evaluate_handle(_CHATGPT_COPY_BUTTON_JS)
+        handle = await page.evaluate_handle(_CHATGPT_COPY_BUTTON_JS, unanswered)
     except Exception:
         return None
     el = handle.as_element()
@@ -56033,7 +56044,7 @@ async def _cg_put_back_clipboard(page, held) -> None:
 
 
 async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=(),
-                                 verbose=False) -> str:
+                                 verbose=False, unanswered=0) -> str:
     """Phase 1's brief from ChatGPT's own Copy button; "" when it cannot be had.
     run_phase1 calls it ONLY when the page read came back empty (see the note
     above). `ours`: the prompts we sent, which a copy must not be. Whatever
@@ -56048,12 +56059,13 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
         held = None
     try:
         return await _chatgpt_copy_reply(page, browser=browser, cua_client=cua_client,
-                                         ours=ours, verbose=verbose)
+                                         ours=ours, verbose=verbose, unanswered=unanswered)
     finally:
         await _cg_put_back_clipboard(page, held)
 
 
-async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose) -> str:
+async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose,
+                              unanswered=0) -> str:
     """Steps 1-5 of the note above: the brief, or "" (and one line why)."""
     marker = f"superresearch-copy-check-{os.urandom(8).hex()}"
     # ⛔ The chat as the fallback found it — checked again before the read.
@@ -56067,7 +56079,7 @@ async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose) -> st
             f"the Copy button was not tried", "WARN")
         return ""
     how = ""
-    btn = await _chatgpt_find_copy_button(page)
+    btn = await _chatgpt_find_copy_button(page, unanswered)
     if btn is not None:
         try:
             await btn.click(timeout=_CG_COPY_CLICK_MS)
@@ -56104,7 +56116,7 @@ async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose) -> st
         log(f"Phase 1: what the Copy button gave was not used — {why}", "WARN")
         return ""
     text = _strip_chatgpt_citation_tokens(text).strip()
-    if not await _chatgpt_copy_on_page(page, text):
+    if not await _chatgpt_copy_on_page(page, text, unanswered):
         log("Phase 1: what the Copy button gave was not used — it is not text of the "
             "latest reply on this ChatGPT page (an earlier reply's, or something else "
             "changed the clipboard)", "WARN")
@@ -57393,6 +57405,10 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # Only pop the buffer if we're going to use it — otherwise leave it for
     # Phase 2 / NotebookLM to consume (pop is destructive, so peek first).
     extra_ctx = None
+    # How many of the person's newest messages got no reply: a follow-up that
+    # ChatGPT never answered. The Copy fallback then reads the reply before it —
+    # the original brief the log says is used (wave 13).
+    _p1_unanswered = 0
     if completed and _controls.peek_extra_context():
         extra_ctx = _controls.pop_extra_context()
     if extra_ctx and completed:
@@ -57450,6 +57466,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 log(f"Phase 1 followup stalled — using pre-followup brief: {_bs_fu}", "WARN")
         else:
             log("Phase 1: Follow-up may not have triggered generation — using original brief", "WARN")
+            if submitted_fu:
+                _p1_unanswered = 1
 
     # Extract
     # ⭐ Wave 13 — the page read stays the default. ONLY when it comes back
@@ -57478,7 +57496,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             "ChatGPT's Copy button under the reply")
         return (await chatgpt_brief_via_copy(browser.page, browser=browser,
                                              cua_client=cua_client, ours=_p1_ours,
-                                             verbose=verbose)) or text
+                                             verbose=verbose,
+                                             unanswered=_p1_unanswered)) or text
 
     brief_text = await _p1_read_brief()
     chat_url = await browser.current_url()

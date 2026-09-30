@@ -1058,6 +1058,85 @@ def test_live_p1_after_a_follow_up_the_cuas_copy_of_the_first_draft_is_refused(
                             "ChatGPT page")) == 1, logs
 
 
+#: A first draft that OPENS like the updated brief — its first three paragraphs
+#: are the same, the rest were rewritten by the follow-up: the poll hook after
+#: the first reply.
+def _same_opening_first_draft_hook(page):
+    async def _rewrite_the_rest():
+        await page.evaluate(
+            "() => [...document.querySelectorAll('[data-selected-text-overlay-target] p > span')]"
+            ".slice(3).forEach((s) => { s.textContent = 'In the first draft of this brief: '"
+            " + s.textContent; })")
+    return _rewrite_the_rest
+
+
+def test_live_p1_after_a_follow_up_a_first_draft_that_opens_the_same_is_refused(
+        chrome, page, p1, logs):
+    """⛔ Wave 13: as above, the CUA presses the FIRST reply's Copy — but this
+    first draft opens with the same three paragraphs as the updated brief, and
+    only its later ones differ. Checked on its opening alone it passed, and the
+    person's added context was dropped. Every line is compared now: refused, and
+    the re-read's press on the latest reply's Copy is the brief."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+    p1.extra = EXTRA
+
+    async def _pin_both_copies():
+        await page.evaluate("""() => {
+            const all = [...document.querySelectorAll('[data-sr-act="copy"]')];
+            all.forEach((b, i) => {
+                b.setAttribute('aria-label', 'Copy response');
+                b.dataset.srName = i === 0 ? 'first copy' : 'latest copy';
+                b.style.cssText = `position:fixed;left:${600 + 100 * i}px;top:400px;width:40px;`
+                    + 'height:30px;z-index:20;overflow:hidden';
+            });
+        }""")
+
+    p1.hooks = [_same_opening_first_draft_hook(page), _pin_both_copies]
+    presses = iter([[("left_click", {"coordinate": [620, 415]})]]
+                   + [[("left_click", {"coordinate": [720, 415]})]] * 2)
+    cua = _CopyCua(lambda: next(presses))
+    out = p1.run(cua)
+    first = chrome.run(page.evaluate(
+        "() => document.querySelector('[data-selected-text-overlay-target]').innerText"))
+    assert first.count("In the first draft of this brief: ") == 4
+    assert out["text"] == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["first copy", "latest copy"]
+    assert len(_lines(logs, "was not used — it is not text of the latest reply on this "
+                            "ChatGPT page")) == 1, logs
+
+
+def test_live_p1_with_no_reply_marker_a_follow_up_with_no_reply_keeps_the_brief(
+        chrome, page, p1, logs, monkeypatch):
+    """⛔ Wave 13: the person added context, the follow-up was sent, and ChatGPT
+    never answered it ("using original brief", says the log). With no reply
+    marker (a future rename) the Copy fallback looked only AFTER the person's
+    newest message — the unanswered follow-up — found nothing, and the original
+    brief was lost. The follow-up is passed over now, and the original brief's
+    own Copy gives it."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+    p1.extra = EXTRA
+    real_verify = research.wait_until_verified
+
+    async def _verify(fn, pg, label, *a, **k):
+        if label == "Phase1-followup":
+            return False                           # the follow-up got no reply
+        return await real_verify(fn, pg, label, *a, **k)
+
+    monkeypatch.setattr(research, "wait_until_verified", _verify)
+
+    async def _no_more_replies():
+        await page.evaluate("() => document.getElementById('sr-assistant-block').remove()")
+
+    p1.hooks = [_no_more_replies]
+    out = p1.run()
+    assert p1.polls == ["Phase1"]
+    assert len(_users(chrome, page)) == 2          # the follow-up was sent
+    assert chrome.run(page.evaluate("() => document.body.dataset.replies")) == "1"
+    assert _lines(logs, "Follow-up may not have triggered generation — using original brief")
+    assert out["text"] == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["Copy"]
+
+
 # ═══ 2. Which button ═══════════════════════════════════════════════════════
 #
 # chatgpt_brief_via_copy on a finished exchange (thread=True), no CUA.
