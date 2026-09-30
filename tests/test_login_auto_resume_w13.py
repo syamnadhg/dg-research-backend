@@ -397,8 +397,19 @@ def test_a_waiter_does_not_take_a_later_pause_that_is_not_its_own(machine, monke
     """⛔⛔ THE TOKEN. On a machine with two workers the Retry can be taken by
     the OTHER worker, and if the login closes that attempt's browser too, the
     run pauses again — with that worker's waiter. The first waiter then finds
-    the run paused; without the token it resumes it a second time."""
+    the run paused; without the token it resumes it a second time.
+
+    ⭐ THE ORDER IS FIXED, not left to two pollers: worker 1's waiter checks
+    first, alone, and worker 2's waiter is started after it (from the plan its
+    pause made — the real `_login_auto_resume_plan`, observed, not replaced)."""
     jobs_2 = _Jobs()
+    plans = []
+    real_plan = research._login_auto_resume_plan
+
+    def _observed(*a, **k):
+        plans.append(real_plan(*a, **k))
+        return plans[-1]
+    monkeypatch.setattr(research, "_login_auto_resume_plan", _observed)
 
     async def main():
         research._write_login_marker()
@@ -414,11 +425,16 @@ def test_a_waiter_does_not_take_a_later_pause_that_is_not_its_own(machine, monke
         monkeypatch.setattr(research, "WORKER_ID", 2)
         monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", jobs_2)
         await machine.run_until_interrupted(_p3_site_raise)
-        w2 = machine.waiter()
+        research._LOGIN_RESUME_WAITERS.pop(RUN).cancel()   # started again below
         research._clear_login_marker()
-        return await asyncio.wait_for(asyncio.gather(w1, w2), 5)
-    verdicts = asyncio.run(main())
-    assert verdicts == ["moved_on", "resumed"]
+        v1 = await asyncio.wait_for(w1, 5)
+        await _settle()
+        assert machine.jobs.put == [] and len(jobs_2.put) == 1, (
+            "worker 1's waiter resumed a pause that was worker 2's")
+        v2 = await asyncio.wait_for(research._arm_login_auto_resume(plans[-1]), 5)
+        await _settle()
+        return v1, v2
+    assert asyncio.run(main()) == ("moved_on", "resumed")
     assert machine.jobs.put == []
     assert len(jobs_2.put) == 2      # the Retry, then the resume after the login
 

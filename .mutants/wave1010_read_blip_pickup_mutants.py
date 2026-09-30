@@ -120,7 +120,9 @@ TAKEN_ONGOING = '    if (record or {}).get("status") == "ongoing":'
 TAKEN_OWNER = "        if owner != WORKER_ID and 1 <= owner <= fleet:"
 TAKEN_STAMP = ("        if not isinstance(stamp, int) and not unstamped_is_worker_1:\n"
                "            return None")
-RESUME_RECORDS = "                _RESUMED_HERE.add((target_uid, target_rid))"
+# ⭐ Re-aimed 2026-09-30 (wave 13): the Resume branch's tail moved into
+# `_resume_from_checkpoint`, which the login auto-resume shares.
+RESUME_RECORDS = "    _RESUMED_HERE.add((uid, research_id))"
 
 # ── anchors: the carry ──────────────────────────────────────────────────────
 WRITER_CARRY = ("    pending_jobs = (list(pending_jobs or [])\n"
@@ -346,7 +348,7 @@ MUTANTS = [
      RESEARCH, PICKUP),
     ("R3", "over", "⛔⛔ the Resume branch stops recording what it started — the "
      "retries cannot see a Resume whose job has not reached the queue yet",
-     [(RESUME_RECORDS, "                pass")],
+     [(RESUME_RECORDS, "    pass")],
      RESEARCH, PICKUP),
 
     # ══ 4. every rewrite carries a held entry, once, and never a private one ═
