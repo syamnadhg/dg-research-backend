@@ -295,7 +295,9 @@ SCRIPT = r"""
       if (cfg.reply === 'absent') stash.parent.appendChild(stash.reply);
       for (const k of stash.kids) stash.root.appendChild(k);
     }
-    setVoice();
+    // streamMs: the thinking is over but the reply is still being written —
+    // the Stop button stays that long.
+    if (cfg.streamMs) setTimeout(setVoice, cfg.streamMs); else setVoice();
     return true;
   };
   // Test hooks across worlds (patchright evaluates in an isolated world).

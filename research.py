@@ -44279,7 +44279,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # drawer auto-collapses on some UI transitions. Bounded
                 # re-open (3 max) instead of the old fire-and-forget.
                 if (label in ("Phase1", "Phase1-followup") and _panel_open_done
-                        and not _panel_by_page_shape and not _p1_quiet):
+                        and not _panel_by_page_shape):
                     try:
                         _st_now = await _chatgpt_activity_state(page)
                         # ⛔⛔ 2026-08-19 — THIS LINE UN-LATCHED AN OPEN DRAWER. At

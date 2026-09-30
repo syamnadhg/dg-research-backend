@@ -156,6 +156,54 @@ def test_the_brief_is_read_within_seconds_of_the_finish(chrome, page, logs, stil
     assert lag < 3000, f"the brief was read {lag / 1000:.1f} s after ChatGPT finished"
 
 
+def _poll_on_thinking_page(chrome, page, after_finish_js, *, timeout=60):
+    """The real poll on the thinking page (at an http address), the reply
+    finishing at once and `after_finish_js` run right after. Returns (the poll's
+    answer or "still polling", when it returned in ms)."""
+    tl._load_at_url(chrome, page, thread=True, place="column", header="pair")
+    chrome.run(page.evaluate("() => document.dispatchEvent(new CustomEvent('sr-think'))"))
+    chrome.run(page.evaluate("() => document.dispatchEvent(new CustomEvent('sr-finish'))"))
+    chrome.run(page.evaluate(after_finish_js))
+    try:
+        done = chrome.run(asyncio.wait_for(research.poll_until_done(
+            page, research.verify_chatgpt_p1_generating, "Phase1", 10, 60, phase=1),
+            timeout=timeout))
+    except asyncio.TimeoutError:
+        done = "still polling"
+    return done, time.time() * 1000
+
+
+def test_a_reply_still_being_written_is_not_read_yet(chrome, page, logs, still):
+    """⛔ The steady re-read is a re-READ: with the Stop gone and the header up
+    but the reply still growing, the brief is not taken half-written."""
+    done, at = _poll_on_thinking_page(chrome, page, """() => {
+        const reply = document.querySelector('[data-markdown-text-style="assistant-message"]');
+        let n = 0;
+        const t = setInterval(() => {
+            const p = document.createElement('p');
+            p.textContent = 'A further paragraph of the brief, number ' + (++n) + '.';
+            reply.appendChild(p);
+            if (n >= 12) { clearInterval(t); document.body.dataset.srGrowEnd = String(Date.now()); }
+        }, 250);
+    }""")
+    assert done is True
+    grown = float(chrome.run(page.evaluate("() => document.body.dataset.srGrowEnd")) or "inf")
+    assert at >= grown, f"read {(grown - at) / 1000:.1f} s before the reply stopped growing"
+
+
+def test_the_pages_own_working_check_can_still_say_not_yet(chrome, page, logs, still):
+    """⛔ Both signs up, but the page's own "still working?" check sees work
+    running (a live animation, its long-standing sign): the finish waits."""
+    done, _at = _poll_on_thinking_page(chrome, page, """() => {
+        const s = document.createElement('span');
+        s.className = 'animate-pulse';
+        s.style.cssText = 'display:inline-block;width:12px;height:12px;'
+                        + 'animation: srSweep 1s linear infinite';
+        document.getElementById('sr-transcript').appendChild(s);
+    }""", timeout=4)
+    assert done == "still polling"
+
+
 def test_the_finish_is_read_in_the_latest_exchange_only(chrome, page, logs):
     """The header of an earlier exchange never answers for this one, and a
     brief that writes "worked for 5 hours" in its own text is not the header."""
@@ -227,6 +275,28 @@ def test_phase1_never_presses_the_new_pages_line(p1run, shape):
     assert out.while_thinking == [], out.while_thinking
     assert any("shows by default on this page" in m for m in out.lines), (
         [m for m in out.lines if "activity" in m or "step list" in m][:10])
+
+
+def test_the_new_pages_line_is_left_alone_after_it_reads_worked_for(p1run, chrome, page,
+                                                                    monkeypatch):
+    """The thinking is over ("Worked for 7m 23s", the list gone) and the reply
+    is still being written, Stop showing. On the new page the line is never
+    pressed — not while it thinks, and not once it reads "Worked for …" either.
+    Before: the list's going read as "collapsed" and the opener went looking
+    for the line again."""
+    real_open = research._open_chatgpt_activity_panel
+    opened = []
+
+    async def _open(pg, *a, **k):
+        opened.append(time.time() * 1000)
+        return await real_open(pg, *a, **k)
+
+    monkeypatch.setattr(research, "_open_chatgpt_activity_panel", _open)
+    out = p1run(place="column", reply="empty", finishMs=5000, streamMs=4000, header="pair")
+    assert HEADING in out.text, out.text[:200]
+    assert any("activity already open (shape=steps" in m for m in out.lines)
+    assert opened == [], f"the opener went looking for the line {len(opened)} time(s)"
+    assert out.presses == 0 and out.cua.missions == [], (out.presses, out.cua.missions)
 
 
 def test_a_line_drawn_once_is_not_the_new_pages_line(chrome, page, logs):
