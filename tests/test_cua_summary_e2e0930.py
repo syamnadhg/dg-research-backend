@@ -195,3 +195,47 @@ def test_a_vision_step_that_acts_is_counted_too(run, monkeypatch):
     research._dom_summary()
     assert _summary(run.lines)[1:] == [
         "[cua-summary]   p1 chatgpt · open activity panel p1: 1 vision read"]
+
+
+class _Verdicts:
+    """A vision model that answers one word per call, in order."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = 0
+        self.messages = SimpleNamespace(create=self.create)
+
+    def create(self, **kw):
+        self.calls += 1
+        return SimpleNamespace(content=[SimpleNamespace(type="text",
+                                                        text=self.answers.pop(0))])
+
+
+def test_phase0_sign_in_and_tier_screen_checks_are_counted(run, monkeypatch):
+    """⛔ Phase 0's sign-in check and subscription-tier check each send a
+    screenshot to the vision model, and neither was counted: on a run where
+    the DOM handled everything else, the summary said "no computer use and no
+    vision-model screen reads this run" after five of them. Driven through the
+    REAL `verify_login_cua` (NO, then YES on the heavy re-check) and the REAL
+    `_cua_pro_tier_call` (ChatGPT reads straight on the heavy model; Gemini's
+    unclear light answer earns a heavy re-read)."""
+    monkeypatch.setattr(research._runtime, "phase", 0, raising=False)
+    signin = _Verdicts("NO", "YES")
+    assert asyncio.run(research.verify_login_cua(run.page, "claude", signin)) is True
+    assert signin.calls == 2
+    assert asyncio.run(research._cua_pro_tier_call(
+        run.page, "chatgpt", _Verdicts("Pro"))) == "pro"
+    tier = _Verdicts("Hmm", "Pro")
+    assert asyncio.run(research._cua_pro_tier_call(run.page, "gemini", tier)) == "pro"
+    assert tier.calls == 2
+    research._dom_note("chatgpt.select_model", "verified", phase=1)
+    run.lines.clear()
+    research._dom_summary("run complete")
+    assert _summary(run.lines) == [
+        "[cua-summary] run complete computer use ran 0 times (0 steps in all), plus 5 "
+        "vision-model screen reads — the DOM line above counts only the setup steps "
+        "it tracks",
+        "[cua-summary] run complete   p0 chatgpt · check subscription tier: 1 vision read",
+        "[cua-summary] run complete   p0 claude · check sign-in: 2 vision reads",
+        "[cua-summary] run complete   p0 gemini · check subscription tier: 2 vision reads",
+    ], _summary(run.lines)

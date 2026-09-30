@@ -10,7 +10,8 @@
        says what the page shows about Gemini, and the landing line names the chat
        and the seconds after Send.
   C* — the end-of-run summary counts every computer-use session and vision read
-       by phase, platform and purpose.
+       by phase, platform and purpose — Phase 0's sign-in and subscription-tier
+       screen checks included.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every mutated
 Python file must still COMPILE. Both are harness faults, counted OUT.
@@ -132,6 +133,12 @@ MUTANTS = [
        '')]),
     ("C8", RESEARCH, "⛔ a vision step that acts is not counted",
      [('            _cua_open("vision", phase=phase, platform=platform, purpose=current_step)\n',
+       '')]),
+    ("C9", RESEARCH, "⛔ Phase 0's sign-in screen checks are not counted",
+     [('    _cua_open("vision", phase=0, platform=platform, purpose="check sign-in")\n',
+       '')]),
+    ("C10", RESEARCH, "⛔ Phase 0's subscription-tier screen checks are not counted",
+     [('    _cua_open("vision", phase=0, platform=platform, purpose="check subscription tier")\n',
        '')]),
 ]
 

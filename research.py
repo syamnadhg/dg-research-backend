@@ -23852,6 +23852,9 @@ async def _cua_login_call(page, platform: str, cua_client, heavy: bool = False) 
         f"YES in those cases.\n\n"
         f"Reply with ONLY one word: YES or NO."
     )
+    # Counted for the end-of-run summary: each pass sends a screenshot to the
+    # vision model (the second pass is a second read).
+    _cua_open("vision", phase=0, platform=platform, purpose="check sign-in")
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
@@ -26281,6 +26284,9 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
     except Exception as e:
         log(f"[pro_tier:{pname}] screenshot failed: {e}", "WARN")
         return "unsure"
+    # Counted for the end-of-run summary: one screenshot to the vision model
+    # (the heavy re-read after an unclear answer is counted as its own read).
+    _cua_open("vision", phase=0, platform=platform, purpose="check subscription tier")
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
