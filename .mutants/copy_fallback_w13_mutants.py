@@ -35,6 +35,21 @@ button when the page read comes back empty.
   N* — on this page: two of the first three lines of prose open (their first
        sixty letters and digits) with words the page shows; a link shows only
        its words, a list's number is drawn by the page.
+  T*, R* — the same chat (wave 13 review): the chat is marked (address and the
+       number of the person's messages) before anything is pressed and the
+       clipboard is not read when it changed — another address (a sidebar
+       conversation) or another count (a suggested reply sent) — and a chat
+       that cannot be read is not taken; run_phase1 marks the chat before the
+       first read and reads nothing from another one, while a mark that cannot
+       be read leaves the page read as it was.
+  S* — the LATEST reply (wave 13 review): a copy must be text of the last reply
+       its marker names; with no reply marker, of what follows the person's
+       newest message; with no marker on that message either, of the page. With
+       no reply marker, a Copy row before the person's newest message is never
+       pressed; with one, the latest reply's own turn decides, as before.
+  Z* — the clipboard given back (wave 13 review): what it held is read before
+       the marker goes on and written back whatever happened; unreadable →
+       emptied, never left holding the marker.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 real headless Chrome against the rebuilt pages (served at a routed local
@@ -145,9 +160,9 @@ MUTANTS = [
     ("C16", RESEARCH, "the ChatGPT tab is not brought to the front — behind another tab "
      "the clipboard reads back empty and the brief is lost",
      [("        await page.bring_to_front()\n    try:\n"
-       "        armed = await page.evaluate(_CG_COPY_ARM_JS, marker)",
+       "        held = await page.evaluate(_CG_COPY_READ_JS)",
        "        pass\n    try:\n"
-       "        armed = await page.evaluate(_CG_COPY_ARM_JS, marker)")]),
+       "        held = await page.evaluate(_CG_COPY_READ_JS)")]),
     ("C17", RESEARCH, "a Copy button that cannot be clicked ends the fallback — the CUA "
      "never gets to press it",
      [("could not be clicked \"\n"
@@ -307,6 +322,78 @@ MUTANTS += [
      "that line",
      [("    return _cg_letters(line)[:_CG_ON_PAGE_PROBE]",
        "    return _cg_letters(line)")]),
+]
+
+MUTANTS += [
+    # ═══ T — the same chat, in the Copy fallback ═══════════════════════════
+    ("T1", RESEARCH, "⛔⛔ the chat is not checked before the clipboard is read — one CUA "
+     "click on a sidebar conversation and another run's brief is this run's",
+     [("    if moved := _chatgpt_chat_moved(chat, await _chatgpt_user_msg_count(page)):",
+       "    if False and (moved := _chatgpt_chat_moved(chat, "
+       "await _chatgpt_user_msg_count(page))):")]),
+    ("T2", RESEARCH, "⛔ only the number of messages is compared — another address with "
+     "as many messages (a sidebar conversation) passes",
+     [("    if before is not None and after == before:\n        return \"\"",
+       "    if before is not None and after is not None and after[0] == before[0]:\n"
+       "        return \"\"")]),
+    ("T3", RESEARCH, "⛔ only the address is compared — a suggested reply sent and answered "
+     "at the same address passes",
+     [("    if before is not None and after == before:\n        return \"\"",
+       "    if before is not None and after is not None and after[1] == before[1]:\n"
+       "        return \"\"")]),
+    ("T4", RESEARCH, "a chat that cannot be read counts as the same chat — the Copy "
+     "fallback takes a brief it cannot place",
+     [("    if before is not None and after == before:\n        return \"\"",
+       "    if after == before:\n        return \"\"")]),
+
+    # ═══ R — the same chat, in run_phase1's reads ═══════════════════════════
+    ("R1", RESEARCH, "⛔⛔ the re-reads read whatever chat the tab shows — three minutes "
+     "after a CUA misclick, another run's brief is read from the page",
+     [("        if _p1_chat is not None and (moved := _chatgpt_chat_moved(",
+       "        if False and _p1_chat is not None and (moved := _chatgpt_chat_moved(")]),
+    ("R2", RESEARCH, "OVER-REACH: a mark that could not be taken refuses every read — "
+     "the page read, which clicks nothing, loses the brief",
+     [("        if _p1_chat is not None and (moved := _chatgpt_chat_moved(",
+       "        if (moved := _chatgpt_chat_moved(")]),
+
+    # ═══ S — the latest reply ═══════════════════════════════════════════════
+    ("S1", RESEARCH, "OVER-REACH: the latest reply its marker names is not used — after a "
+     "follow-up with no reply yet, the latest reply's own copy is refused",
+     [("    if (replies.length) return [replies[replies.length - 1].innerText || '', null];\n",
+       "")]),
+    ("S2", RESEARCH, "⛔⛔ with no reply marker the whole page counts — after a follow-up, "
+     "the CUA's press on the first draft's Copy passes and the user's added context "
+     "is dropped",
+     [("            users.length ? (users[users.length - 1].innerText || '') : null];",
+       "            null];")]),
+    ("S3", RESEARCH, "OVER-REACH: a person's message with no marker makes every copy "
+     "fail — a second rename costs the brief",
+     [("    return page_letters[at + len(own):] if at >= 0 else page_letters",
+       "    return page_letters[at + len(own):] if at >= 0 else \"\"")]),
+    ("S4", RESEARCH, "⛔ with no reply marker the last Copy row on the page is pressed "
+     "even before the person's newest message — an earlier reply's",
+     [(".filter(shown).filter(latest)", ".filter(shown)")]),
+    ("S5", RESEARCH, "OVER-REACH: with a reply marker too, rows before the newest message "
+     "are passed over — after a follow-up with no reply yet, no Copy is found",
+     [("    const latest = (b) => replies.length > 0 || !mine",
+       "    const latest = (b) => !mine")]),
+    ("S6", RESEARCH, "the rows BEFORE the person's newest message are the ones kept",
+     [("& Node.DOCUMENT_POSITION_FOLLOWING) !== 0;",
+       "& Node.DOCUMENT_POSITION_FOLLOWING) === 0;")]),
+
+    # ═══ Z — the clipboard given back ═══════════════════════════════════════
+    ("Z1", RESEARCH, "⛔ the clipboard is never given back — the marker, or the whole "
+     "brief, stays on the clipboard every worker and the owner share",
+     [("        await _cg_put_back_clipboard(page, held)", "        pass")]),
+    ("Z2", RESEARCH, "a clipboard that could not be read is \"given back\" as the word "
+     "null",
+     [("_CG_COPY_WRITE_JS, \"\" if held is None else held)",
+       "_CG_COPY_WRITE_JS, held)")]),
+    ("Z3", RESEARCH, "what the clipboard held is never read — it is emptied, and the "
+     "owner's own clipboard is lost",
+     [("        held = await page.evaluate(_CG_COPY_READ_JS)\n    except Exception:\n"
+       "        held = None",
+       "        held = None\n    except Exception:\n        held = None")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

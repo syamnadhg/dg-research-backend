@@ -14,6 +14,10 @@
        placements (brief, follow-up), the gate's diagnosis and fix while a
        ChatGPT prompt is in play — for the CUA and the Vision act step alike —
        and nowhere else.
+  K* — the caret missions (brief and follow-up) never click what the copy
+       mission never clicks: Regenerate, Share, Edit message and the rest, not
+       only Send — the follow-up's caret step runs on the finished brief's page
+       (wave 13 review). The refusal says so.
   P* — Phase 1's own wiring, killed by run_phase1 EXECUTED against the page
        (the lane harness's S16-S18 used to die only on a source-count pin):
        verify with the prompt, the fallback only when nothing was sent, the
@@ -109,14 +113,14 @@ MUTANTS = [
     # ═══ W — the list is wired where the program owns the typing ════════════
     ("W1", RESEARCH, "⛔⛔ the brief's caret CUA runs without the list — \"test\" is sent",
      [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
-       "                never_click=CUA_NEVER_CLICK_SEND)",
+       "                never_click=CUA_NEVER_CLICK_CARET)",
        "max_iterations=8, verbose=verbose,\n"
-       "                never_click=CUA_NEVER_CLICK_SEND)")]),
+       "                never_click=CUA_NEVER_CLICK_CARET)")]),
     ("W2", RESEARCH, "⛔ the follow-up's caret CUA runs without the list",
      [("                    model=CUA_MODEL, max_iterations=8, verbose=verbose,\n"
-       "                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)",
+       "                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_CARET)",
        "                    model=CUA_MODEL, max_iterations=8, verbose=verbose,\n"
-       "                    never_click=CUA_NEVER_CLICK_SEND)")]),
+       "                    never_click=CUA_NEVER_CLICK_CARET)")]),
     ("W3", RESEARCH, "⛔ the gate's diagnosis CUA runs without the list",
      [("                    allow=CUA_LOOK_ONLY if _cua_allow is not None else None)",
        "                    allow=None)")]),
@@ -180,7 +184,7 @@ MUTANTS = [
      [("        if (n.closest(s)) return true;\n", "        if (false) return true;\n")]),
     ("N3", RESEARCH, "⛔ the brief's caret CUA may click Send",
      [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
-       "                never_click=CUA_NEVER_CLICK_SEND)",
+       "                never_click=CUA_NEVER_CLICK_CARET)",
        "max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY)")]),
     ("L1", RESEARCH, "⛔⛔ the diagnosis may click — before the box guard, a click on "
      "Send sends the leftover",
@@ -212,7 +216,7 @@ MUTANTS = [
 
     # ═══ R — the last review's items (09-29 re-verify) ═════════════════════
     ("N4", RESEARCH, "⛔ the follow-up's caret CUA may click Send",
-     [("                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)",
+     [("                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_CARET)",
        "                    allow=CUA_CLICK_ONLY)")]),
     ("N5", RESEARCH, "the Send guard stops at a shadow root's host — the button inside "
      "is clicked",
@@ -231,6 +235,27 @@ MUTANTS = [
      "chat passes, and the follow-up goes into it",
      [("    if before is None or after is None or after == before:\n        return False",
        "    if before is None or after is None or after[0] <= before[0]:\n        return False")]),
+]
+
+MUTANTS += [
+    # ═══ K — the caret missions' never-click list (wave 13 review) ══════════
+    ("K1", RESEARCH, "⛔⛔ the caret missions are held off Send alone — on the finished "
+     "brief's page a stray click on Regenerate or Edit message throws it away",
+     [("CUA_NEVER_CLICK_CARET = CUA_NEVER_CLICK_COPY",
+       "CUA_NEVER_CLICK_CARET = CUA_NEVER_CLICK_SEND")]),
+    ("K2", RESEARCH, "⛔ the brief's caret CUA is held off Send alone",
+     [("max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
+       "                never_click=CUA_NEVER_CLICK_CARET)",
+       "max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,\n"
+       "                never_click=CUA_NEVER_CLICK_SEND)")]),
+    ("K3", RESEARCH, "⛔ the follow-up's caret CUA is held off Send alone — the one that "
+     "runs beside the finished brief's buttons",
+     [("                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_CARET)",
+       "                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)")]),
+    ("K4", RESEARCH, "a caret refusal names only Send — the log and the model are told "
+     "the wrong button",
+     [("    \"caret\": (\"Send, Regenerate, Share, Edit, Copy message or a table's own button\",",
+       "    \"caret\": (\"Send\",")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

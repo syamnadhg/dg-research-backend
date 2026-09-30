@@ -988,6 +988,28 @@ def test_live_p1_a_cua_click_that_changes_the_chat_never_gives_its_brief(
         assert chrome.run(page.evaluate("() => location.href")).endswith("/c/another-chat")
 
 
+@pytest.mark.parametrize("renamed", [False, True], ids=["page-read", "copy-button"])
+def test_live_p1_a_chat_that_cannot_be_read(chrome, page, p1, logs, monkeypatch, renamed):
+    """The chat's mark cannot be read (the page does not answer). The page
+    read, which clicks nothing, reads as it always did (a control); the Copy
+    fallback, whose CUA can leave the chat, cannot tell whether it has, and
+    takes nothing."""
+    async def _unreadable(_page):
+        return None
+
+    monkeypatch.setattr(research, "_chatgpt_user_msg_count", _unreadable)
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=renamed, streaming=True)
+    out = p1.run()
+    if not renamed:
+        assert HEADING in out["text"] and LINK in out["text"], logs
+        assert _lines(logs, "Phase 1: brief read from the page ("), logs
+        return
+    assert out["text"] == "", logs
+    assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]
+    assert len(_lines(logs, "the clipboard was not read — the ChatGPT tab no longer shows "
+                            "this run's chat (the page could not be read)")) == 3, logs
+
+
 #: A first draft whose every paragraph opens differently from the updated brief
 #: (a follow-up rewrote it): the poll hook after the first reply.
 def _rewritten_first_draft_hook(page):
