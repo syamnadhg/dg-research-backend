@@ -43877,25 +43877,44 @@ async def _chatgpt_p1_finish_signs(page) -> dict:
 async def _chatgpt_p1_finish_holds(page, verify_fn, first) -> bool:
     """ONE steady re-read, in place of the 5 s + 3 s double-check: a second
     later both signs still hold, the reply is the same length, and the page's
-    own "still working?" check agrees it is not."""
+    own "still working?" check agrees it is not.
+
+    When the signs held and the reply stayed put but that check still said
+    working, it marks `first["held_back"]`, for the wait after this cycle (see
+    `_chatgpt_p1_wait_for_finish`)."""
     await asyncio.sleep(_P1_FINISH_STEADY_S)
     again = await _chatgpt_p1_finish_signs(page)
     if not again["done"] or again["reply_len"] != first.get("reply_len"):
         return False
     try:
-        return not await verify_fn(page)
+        working = await verify_fn(page)
     except Exception:
         return False
+    if not working:
+        return True
+    first["held_back"] = True
+    return False
 
 
-async def _chatgpt_p1_wait_for_finish(page, seconds) -> None:
+async def _chatgpt_p1_wait_for_finish(page, seconds, held_back=False) -> None:
     """Wait up to `seconds` between Phase 1 polls, looking for the finish once a
-    second, and come back as soon as it shows (or a Stop was asked for)."""
+    second, and come back as soon as it shows (or a Stop was asked for).
+
+    ⛔ 2026-09-30 — `held_back`: this cycle found the finish up and steady, and
+    the page's own "still working?" check said working anyway (a running
+    animation left on the page: the Salaar/Kalki briefs read "generating" for
+    27 minutes after they finished). That same finish is still showing a second
+    later, so coming back for it ran the whole poll every ~2 s — the scrape, the
+    activity walk, two page checks and a "Still generating" line — five times
+    the normal rate until the safety net. So a finish held back waits the whole
+    poll, as before this lane (a Stop still ends it). A reply still growing is
+    not held back: it keeps the fast return, so the brief is read as soon as it
+    settles."""
     for _ in range(max(1, int(round(float(seconds) / _P1_FINISH_TICK_S)))):
         await asyncio.sleep(_P1_FINISH_TICK_S)
         if _controls.is_stop():
             return
-        if (await _chatgpt_p1_finish_signs(page))["done"]:
+        if not held_back and (await _chatgpt_p1_finish_signs(page))["done"]:
             return
 
 
@@ -45387,7 +45406,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             # ⭐ 2026-09-30: the wait between polls looks for the finish once a
             # second, so the brief is read within about a second of ChatGPT
             # finishing instead of up to a whole poll later.
-            await _chatgpt_p1_wait_for_finish(page, poll_interval)
+            await _chatgpt_p1_wait_for_finish(page, poll_interval,
+                                              held_back=bool(_fin.get("held_back")))
         else:
             await asyncio.sleep(poll_interval)
 

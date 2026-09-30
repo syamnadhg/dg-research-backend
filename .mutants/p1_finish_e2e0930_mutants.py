@@ -9,6 +9,8 @@
   F3  the wait between polls looks for that finish once a second;
   F4a the steady re-read refuses a reply that is still growing;
   F4b …and a page whose own "still working?" check says it is;
+  H1  …and then the wait between polls does not come straight back for that
+      same finish (it waits the poll), so the poll does not run every ~2 s;
   F5  the new page's line (its label drawn twice) is latched open, never pressed;
   F6  …for the rest of the poll, also once it reads "Worked for …";
   F7  a vision step's "already open" is only undone by a DOM that saw it open;
@@ -62,15 +64,26 @@ MUTANTS = [
        "            if False and await _chatgpt_p1_finish_holds(page, verify_fn, _fin):")]),
     ("F3", RESEARCH, "⛔ the wait between polls is one blind sleep again — the finish is "
      "seen up to a whole poll late",
-     [("            await _chatgpt_p1_wait_for_finish(page, poll_interval)",
+     [("            await _chatgpt_p1_wait_for_finish(page, poll_interval,\n"
+       "                                              held_back=bool(_fin.get(\"held_back\")))",
        "            await asyncio.sleep(poll_interval)")]),
     ("F4a", RESEARCH, "⛔ the steady re-read ignores a growing reply — a half-written "
      "brief is read",
      [("    if not again[\"done\"] or again[\"reply_len\"] != first.get(\"reply_len\"):",
        "    if not again[\"done\"]:")]),
     ("F4b", RESEARCH, "the steady re-read ignores the page's own still-working check",
-     [("        return not await verify_fn(page)\n",
-       "        return True\n")]),
+     [("        working = await verify_fn(page)\n",
+       "        working = False\n")]),
+    ("H1", RESEARCH, "⛔⛔ the wait comes straight back for a finish the page's own check "
+     "held back — the whole poll every ~2 s",
+     [("        if not held_back and (await _chatgpt_p1_finish_signs(page))[\"done\"]:",
+       "        if (await _chatgpt_p1_finish_signs(page))[\"done\"]:")]),
+    ("H1b", RESEARCH, "the poll never tells the wait the finish was held back",
+     [("                                              held_back=bool(_fin.get(\"held_back\")))",
+       "                                              held_back=False)")]),
+    ("H1c", RESEARCH, "the steady re-read never marks a finish it held back",
+     [("    first[\"held_back\"] = True\n",
+       "    pass\n")]),
     ("F5", RESEARCH, "⛔⛔ the new page's line is pressed again — the list flaps shut and "
      "open every poll",
      [("                        elif _line:\n",

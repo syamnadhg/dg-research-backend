@@ -195,7 +195,13 @@ def test_the_pages_own_working_check_can_still_say_not_yet(chrome, page, logs, s
                                                          monkeypatch):
     """⛔ Both signs up, but the page's own "still working?" check sees work
     running (a live animation, its long-standing sign): the finish waits — and
-    while it does, the page looks finished, so the activity line is left alone."""
+    while it does, the page looks finished, so the activity line is left alone.
+
+    ⛔ …and it waits at the poll's own pace. The finish it held back is still
+    showing a second later, and the wait between polls came straight back for
+    it: the whole poll ran every ~2 s (ten "Still generating" rounds in 21 s at
+    a 10 s poll, against two on the base). Two rounds here also take the poll
+    past the second one, where the activity line would first be looked for."""
     opened = []
 
     async def _open(pg, *a, **k):
@@ -209,8 +215,10 @@ def test_the_pages_own_working_check_can_still_say_not_yet(chrome, page, logs, s
         s.style.cssText = 'display:inline-block;width:12px;height:12px;'
                         + 'animation: srSweep 1s linear infinite';
         document.getElementById('sr-transcript').appendChild(s);
-    }""", timeout=6)
+    }""", timeout=20)
     assert done == "still polling"
+    rounds = [m for _lvl, m in logs if "Still generating" in m]
+    assert 2 <= len(rounds) <= 3, f"{len(rounds)} poll rounds in 20 s at a 10 s poll"
     assert opened == [], f"the activity line was looked for {len(opened)} time(s)"
 
 
