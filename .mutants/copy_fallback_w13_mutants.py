@@ -10,7 +10,8 @@ button when the page read comes back empty.
        before anything is pressed; the CUA is held to clicks, never Send or
        Regenerate, told the copy mission's words, given the copy mission's
        prompt; no CUA → no click; citation tokens dropped; the clipboard is
-       waited for after the click; never Share, Share prompt or Edit message;
+       waited for after the click; never Share, Share prompt or Edit message,
+       never a table's Copy table or Expand table, never Copy message;
        the ChatGPT tab brought to the front first; a Copy button that cannot be
        clicked is left to the CUA; a copy that is not on this page is refused.
   L* — which button (aimed at the owner's capture, 2026-09-29): a Copy in a
@@ -19,15 +20,18 @@ button when the page read comes back empty.
        the turn that holds the latest reply — never an earlier reply's, never a
        later turn's with no reply in it, never the latest turn when that holds
        only our follow-up; with no reply marker, the last such row on the page;
-       never a hidden one.
+       a reply no turn marker holds gets none (the CUA presses it); never a
+       hidden one.
   H* — the page read of a long brief (HTML→markdown, on the capture's shapes):
        a source chip's site icon dropped (only a chip's), inline code written
-       as a marked span comes out as code, from its own unescaped letters.
+       as a marked span comes out as code, from its own unescaped letters and
+       fenced as markdown fences code; every other span keeps its spacing.
   V* — what counts as the brief: not the marker, MORE than 2000 characters of
        prose (the page read's own floor; an image's address does not count),
        not our prompt (anywhere near its start), three lines of prose — a code
-       comment and a line crowded with code symbols are not prose; a line in a
-       script written without spaces counts by its letters (twenty or more).
+       comment, a markdown table's row and a line crowded with code symbols are
+       not prose; a line in a script written without spaces counts by its
+       letters (twenty or more).
   N* — on this page: two of the first three lines of prose open (their first
        sixty letters and digits) with words the page shows; a link shows only
        its words, a list's number is drawn by the page.
@@ -136,8 +140,8 @@ MUTANTS = [
        "', button[aria-label=\"Share\"]'")]),
     ("C15", RESEARCH, "⛔ Edit message is off the never-click list — its Send re-submits "
      "the prompt and throws the brief away",
-     [("\n                        ', button[aria-label=\"Edit message\"]')",
-       ")")]),
+     [("\n                        ', button[aria-label=\"Edit message\"]'",
+       "")]),
     ("C16", RESEARCH, "the ChatGPT tab is not brought to the front — behind another tab "
      "the clipboard reads back empty and the brief is lost",
      [("        await page.bring_to_front()\n    try:\n"
@@ -155,6 +159,17 @@ MUTANTS = [
      "brief on the shared clipboard becomes this run's",
      [("    if not await _chatgpt_copy_on_page(page, text):",
        "    if False:")]),
+    ("C19", RESEARCH, "⛔⛔ Copy table is off the never-click list — the CUA copies one table "
+     "and it becomes Phase 1's whole brief",
+     [("\n                        ', button[aria-label=\"Copy table\"]'",
+       "")]),
+    ("C20", RESEARCH, "Expand table is off the never-click list",
+     [("\n                        ', button[aria-label=\"Expand table\"]'",
+       "")]),
+    ("C21", RESEARCH, "Copy message is off the never-click list — the CUA copies our own "
+     "prompt",
+     [("\n                        ', button[aria-label=\"Copy message\"]')",
+       ")")]),
 
     # ═══ L — which button ══════════════════════════════════════════════════
     ("L1", RESEARCH, "⛔⛔ the marker drops the turn's row — a code block's own Copy, or a "
@@ -184,6 +199,11 @@ MUTANTS = [
      "all — the fallback's own case finds nothing",
      [("const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;",
        "const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : null;")]),
+    ("L8", RESEARCH, "⛔ a reply no turn marker holds is searched for across the whole page — "
+     "where the Copy found could be an earlier reply's",
+     [("const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;",
+       "const scope = replies.length ? (replies[replies.length - 1].closest('__CG_TURN__') "
+       "|| document) : document;")]),
 
     # ═══ V — what counts as the brief ══════════════════════════════════════
     ("V1", RESEARCH, "the marker coming back is not recognised as \"nothing was copied\"",
@@ -229,6 +249,10 @@ MUTANTS = [
     ("V8", RESEARCH, "a single word is a line of prose",
      [("    if (len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 8\n",
        "    if (len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 1\n")]),
+    ("V14", RESEARCH, "⛔ a markdown table's rows count as prose — one table, copied under "
+     "some other label, passes as the brief",
+     [("    if line.lstrip().startswith(\"|\"):\n        return False\n",
+       "")]),
 ]
 
 MUTANTS += [
@@ -251,6 +275,14 @@ MUTANTS += [
      "chart behind a link is lost",
      [("el.find_parent(\"a\", attrs={\"data-testid\": \"chatgpt-citation\"})",
        "el.find_parent(\"a\", attrs={})")]),
+    ("H5", RESEARCH, "a plain span's edge spaces are dropped — words run together at a bold "
+     "run or a chip (`pass.**Paintings`)",
+     [("                return text\n        cls = _doc_img_converter_classes[base]",
+       "                return text.strip()\n        cls = _doc_img_converter_classes[base]")]),
+    ("H6", RESEARCH, "inline code is fenced by hand — a backtick inside it breaks the fence, "
+     "and its edge spaces go inside it",
+     [("                    return self.convert_code(el, el.get_text(), parent_tags)",
+       "                    return \"`\" + el.get_text() + \"`\"")]),
 ]
 
 MUTANTS += [
