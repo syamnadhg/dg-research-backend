@@ -41536,9 +41536,17 @@ async def execute_action(browser, action, params):
             x, y = params["coordinate"]; log_action("mouse_move", f"({x}, {y})"); await browser.mouse_move(x, y)
         elif action == "scroll":
             x, y = params.get("coordinate", (640, 400))
-            d = params.get("direction", "down")
-            a = params.get("amount", 3)
-            log_action("scroll", f"({x},{y}) {d}"); await browser.scroll(x, y, d, a)
+            # ⛔⛔ 2026-09-30 — EVERY SCROLL WENT DOWN. The computer tool this loop
+            # declares (`computer_20251124`) names its scroll inputs
+            # `scroll_direction` and `scroll_amount`; this read `direction` and
+            # `amount`, found neither, and fell back to "down, 3" every time. All
+            # 71 scrolls ever logged on the Mac said "down", including the 09-30
+            # Phase 1 escalation where the model asked three times to scroll UP,
+            # was scrolled down each time, and gave up. The old names stay as a
+            # fallback only.
+            d = params.get("scroll_direction") or params.get("direction") or "down"
+            a = params.get("scroll_amount") or params.get("amount") or 3
+            log_action("scroll", f"({x},{y}) {d} {a}"); await browser.scroll(x, y, d, a)
         elif action == "left_click_drag":
             sx, sy = params.get("start_coordinate", (0, 0))
             ex, ey = params.get("end_coordinate", (0, 0))
