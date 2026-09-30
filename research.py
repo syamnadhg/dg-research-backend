@@ -90,6 +90,19 @@ from urllib.parse import urlparse, urlsplit
 # problem can still export `GRPC_VERBOSITY=DEBUG` and be obeyed.
 # ⚠ ERROR, not NONE: a genuine gRPC failure must still reach the log.
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+# ⛔ AND gRPC'S FORK SUPPORT IS OFF (wave 13), read at the same moment. grpcio
+# ships it ON, so every `subprocess` fork re-starts gRPC's poller INSIDE THE
+# CHILD, in the moment before the child execs its program. Measured on this
+# Mac (grpcio 1.84, Python 3.13): 2,656 of 3,000 plain `sh -c 'exit 0'` children
+# of a process holding a Firestore-style stream printed ev_poll_posix.cc lines
+# from that moment. The same file's line 659 is the owner's
+# "F… ev_poll_posix.cc:659] Check failed: wakeup_fd_->ConsumeWakeup().ok()"
+# (08-25, 09-16, 09-29 — the last two at the second the browser was launched):
+# that poller racing the exec and aborting the half-born child. Fork support
+# is only for a child that goes on USING gRPC after a fork, and nothing here
+# does — every fork here is subprocess's fork-then-exec. Off, no child runs any
+# gRPC code (0 of 3,000) and the parent's calls are unchanged.
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
 # Explicit, NOT `from prompts import *` (DGOPS-9508). A star import blinds ruff to
 # undefined names in this whole file: it cannot resolve the import, so it downgrades
 # every unresolved global from `F821 undefined-name` to the far weaker
