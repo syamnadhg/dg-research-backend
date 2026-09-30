@@ -13,9 +13,16 @@ button when the page read comes back empty.
        waited for after the click; never Share, Share prompt or Edit message;
        the ChatGPT tab brought to the front first; a Copy button that cannot be
        clicked is left to the CUA; a copy that is not on this page is refused.
-  L* — which button: the last Copy on the page, never a code block's, never one
-       inside a reply's text, never one before the latest reply, never a hidden
-       one, never the user's "Copy message".
+  L* — which button (aimed at the owner's capture, 2026-09-29): a Copy in a
+       turn's own row (turn-action-controls), labelled exactly "Copy" — never a
+       code block's or a side panel's, never the user's "Copy message"; inside
+       the turn that holds the latest reply — never an earlier reply's, never a
+       later turn's with no reply in it, never the latest turn when that holds
+       only our follow-up; with no reply marker, the last such row on the page;
+       never a hidden one.
+  H* — the page read of a long brief (HTML→markdown, on the capture's shapes):
+       a source chip's site icon dropped (only a chip's), inline code written
+       as a marked span comes out as code, from its own unescaped letters.
   V* — what counts as the brief: not the marker, MORE than 2000 characters of
        prose (the page read's own floor; an image's address does not count),
        not our prompt (anywhere near its start), three lines of prose — a code
@@ -50,7 +57,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 RESEARCH = "research.py"
 
-TESTS = ["tests/test_chatgpt_copy_fallback_w13.py"]
+TESTS = ["tests/test_chatgpt_copy_fallback_w13.py", "tests/test_chatgpt_long_brief_w13.py"]
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 MUTANTS = [
@@ -150,27 +157,33 @@ MUTANTS = [
        "    if False:")]),
 
     # ═══ L — which button ══════════════════════════════════════════════════
-    ("L1", RESEARCH, "⛔⛔ a code block's Copy is pressed",
-     [("        && !b.closest('pre, code')\n",
-       "")]),
-    ("L2", RESEARCH, "⛔ a Copy inside the reply's own text is pressed",
-     [("        && !texts.some((t) => t.contains(b))\n",
-       "")]),
-    ("L3", RESEARCH, "⛔⛔ an earlier reply's Copy is pressed — an older brief comes back "
-     "as the latest",
-     [("(!latest || !!(latest.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING))",
-       "true")]),
-    ("L4", RESEARCH, "⛔ the FIRST Copy on the page is pressed — after a follow-up, the "
+    ("L1", RESEARCH, "⛔⛔ the marker drops the turn's row — a code block's own Copy, or a "
+     "side panel's, is pressed",
+     [("'.turn-action-controls button[aria-label=\"Copy\"]')",
+       "'button[aria-label=\"Copy\"]')")]),
+    ("L2", RESEARCH, "⛔⛔ the whole page, not the latest reply's turn — an earlier reply's "
+     "Copy, or a later turn's, is pressed",
+     [("const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;",
+       "const scope = document;")]),
+    ("L3", RESEARCH, "⛔ the latest TURN, not the latest reply's — after a follow-up with "
+     "no reply yet, no Copy is found and the brief is lost",
+     [("const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;",
+       "const scope = replies.length ? [...document.querySelectorAll('__CG_TURN__')].pop() : document;")]),
+    ("L4", RESEARCH, "⛔ the FIRST Copy row on the page is pressed — after a follow-up, the "
      "first draft",
      [("    return ok.length ? ok[ok.length - 1] : null;",
        "    return ok.length ? ok[0] : null;")]),
     ("L5", RESEARCH, "a hidden Copy is pressed — the click times out and the brief is lost",
-     [(".filter((b) => shown(b)",
-       ".filter((b) => true")]),
+     [("[...scope.querySelectorAll('__CG_COPY__')].filter(shown)",
+       "[...scope.querySelectorAll('__CG_COPY__')].filter(() => true)")]),
     ("L6", RESEARCH, "⛔ the marker matches \"Copy message\" — the user's own message is "
      "copied",
-     [("                          'button[aria-label=\"Copy\"]')",
-       "                          'button[aria-label^=\"Copy\"]')")]),
+     [("'.turn-action-controls button[aria-label=\"Copy\"]')",
+       "'.turn-action-controls button[aria-label^=\"Copy\"]')")]),
+    ("L7", RESEARCH, "⛔⛔ with no reply marker (the owner's run) no Copy is looked for at "
+     "all — the fallback's own case finds nothing",
+     [("const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;",
+       "const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : null;")]),
 
     # ═══ V — what counts as the brief ══════════════════════════════════════
     ("V1", RESEARCH, "the marker coming back is not recognised as \"nothing was copied\"",
@@ -216,6 +229,28 @@ MUTANTS = [
     ("V8", RESEARCH, "a single word is a line of prose",
      [("    if (len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 8\n",
        "    if (len(re.findall(r\"[^\\W\\d_]{2,}\", line)) < 1\n")]),
+]
+
+MUTANTS += [
+    # ═══ H — the page read of a long brief ═══════════════════════════════════
+    ("H1", RESEARCH, "⛔ a source chip's site icon stays — every chip is a link around an "
+     "image the document funnel fetches",
+     [("                if el.find_parent(\"a\", attrs={\"data-testid\": \"chatgpt-citation\"}) is not None:\n"
+       "                    _doc_img_note_decorative()\n"
+       "                    return \"\"\n"
+       "                out = _doc_img_markdown_for_tag(dict(el.attrs))",
+       "                out = _doc_img_markdown_for_tag(dict(el.attrs))")]),
+    ("H2", RESEARCH, "inline code written as a span comes out as prose",
+     [("                if el.get(\"data-markdown-copy\") == \"inline-code\":",
+       "                if False:")]),
+    ("H3", RESEARCH, "inline code is written from the prose-escaped text — its underscores "
+     "come out as \\_",
+     [("self.convert_code(el, el.get_text(), parent_tags)",
+       "self.convert_code(el, text, parent_tags)")]),
+    ("H4", RESEARCH, "⛔ every image inside any link is dropped, not only a chip's icon — a "
+     "chart behind a link is lost",
+     [("el.find_parent(\"a\", attrs={\"data-testid\": \"chatgpt-citation\"})",
+       "el.find_parent(\"a\", attrs={})")]),
 ]
 
 MUTANTS += [
