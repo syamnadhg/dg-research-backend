@@ -191,17 +191,27 @@ def test_a_reply_still_being_written_is_not_read_yet(chrome, page, logs, still):
     assert at >= grown, f"read {(grown - at) / 1000:.1f} s before the reply stopped growing"
 
 
-def test_the_pages_own_working_check_can_still_say_not_yet(chrome, page, logs, still):
+def test_the_pages_own_working_check_can_still_say_not_yet(chrome, page, logs, still,
+                                                         monkeypatch):
     """⛔ Both signs up, but the page's own "still working?" check sees work
-    running (a live animation, its long-standing sign): the finish waits."""
+    running (a live animation, its long-standing sign): the finish waits — and
+    while it does, the page looks finished, so the activity line is left alone."""
+    opened = []
+
+    async def _open(pg, *a, **k):
+        opened.append(1)
+        return {"found": False}
+
+    monkeypatch.setattr(research, "_open_chatgpt_activity_panel", _open)
     done, _at = _poll_on_thinking_page(chrome, page, """() => {
         const s = document.createElement('span');
         s.className = 'animate-pulse';
         s.style.cssText = 'display:inline-block;width:12px;height:12px;'
                         + 'animation: srSweep 1s linear infinite';
         document.getElementById('sr-transcript').appendChild(s);
-    }""", timeout=4)
+    }""", timeout=6)
     assert done == "still polling"
+    assert opened == [], f"the activity line was looked for {len(opened)} time(s)"
 
 
 def test_the_finish_is_read_in_the_latest_exchange_only(chrome, page, logs):
