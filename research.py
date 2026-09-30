@@ -41302,12 +41302,21 @@ CUA_NEVER_CLICK_COPY = (CUA_NEVER_CLICK_SEND + ', button[aria-label="Regenerate 
                         ', button[aria-label="Copy table"]'
                         ', button[aria-label="Expand table"]'
                         ', button[aria-label="Copy message"]')
+#: ⛔ What Phase 1's CARET missions may never click (wave 13 review): the copy
+#: mission's whole list, not Send alone. The follow-up's caret step runs on the
+#: finished brief's page, beside the same buttons: a stray click on Regenerate
+#: or Edit message throws the brief away, and Share makes a public link to the
+#: chat. The belt (`_chatgpt_caret_step_sent`) sees none of it — an open editor,
+#: menu or dialog changes neither the address nor the number of messages.
+CUA_NEVER_CLICK_CARET = CUA_NEVER_CLICK_COPY
 #: What agent_loop says when `never_click` refuses a click, per mission: the
 #: button(s) the list names, what the mission is for, and what to click
-#: instead. "caret" (the default) is the wording the caret missions always had.
+#: instead. "caret" (the default) is the caret missions' wording.
 _NEVER_CLICK_SAY = {
-    "caret": ("Send", "only puts the cursor in the message box",
-              "Click inside the message box itself, never on Send."),
+    "caret": ("Send, Regenerate, Share, Edit, Copy message or a table's own button",
+              "only puts the cursor in the message box",
+              "Click inside the message box itself, never on Send or a button under a "
+              "message."),
     "copy": ("Send, Regenerate, Share, Edit, Copy message or a table's own button",
              "only clicks the Copy button under ChatGPT's latest reply",
              "Click only the Copy button directly under ChatGPT's latest reply."),
@@ -52667,6 +52676,22 @@ def _chatgpt_caret_step_sent(before, after, tag) -> bool:
     return True
 
 
+def _chatgpt_chat_moved(before, after) -> str:
+    """"" when the tab still shows the chat it showed before — the belt's mark
+    (`_chatgpt_user_msg_count`): the same address and the same number of the
+    person's messages. Otherwise what changed, in plain words: a click on a
+    conversation in the sidebar is another address, one on "New chat" or a
+    suggested reply another count (wave 13 review). A page that cannot be read
+    has changed as far as anyone can tell."""
+    if before is not None and after == before:
+        return ""
+    if before is None or after is None:
+        return "the page could not be read"
+    (n0, href0), (n1, href1) = before, after
+    what = [f"{n0} → {n1} of your messages on screen"] if n1 != n0 else []
+    return ", ".join(what + (["another page"] if href1 != href0 else []))
+
+
 async def submit_chatgpt_direct(browser, prompt, *, use_focused=False, outcome=None):
     """Type the prompt into ChatGPT's message box, check it, send it, and check
     it was sent (see the section note above).
@@ -55728,9 +55753,12 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 #      CHATGPT_COPY_REPLY_SEL);
 #   3. no such button (a future rename) → the CUA clicks it — clicks only, and
 #      never on Send, Regenerate, Share or Edit;
-#   4. the clipboard is read, and kept only if it is not the marker, is as long
+#   4. the tab must still show the same chat — the same address, the same
+#      number of the person's messages — or the clipboard is not read;
+#   5. the clipboard is read, and kept only if it is not the marker, is as long
 #      as the page read requires, is not our own prompt, reads like a brief,
-#      and is text THIS ChatGPT page shows.
+#      and is text of ChatGPT's LATEST reply on this page;
+#   6. whatever came of it, the clipboard is given back what it held before.
 # ⛔ The marker is what makes the read mean anything. Without it a click that
 # copied nothing hands back whatever the clipboard held before — an earlier
 # run's brief, say — as this run's.
@@ -55738,7 +55766,12 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 # Copy button did. Fleet workers on one computer each run their own Chrome but
 # share ONE clipboard, and another worker's Phase 2 paste (or its own Copy)
 # writes a whole brief there — so a copy is kept only when its opening lines of
-# prose are on this page (`_chatgpt_copy_on_page`).
+# prose are in this page's latest reply (`_chatgpt_copy_on_page`).
+# ⛔ The CUA can leave the chat (wave 13 review). One misclick on a conversation
+# in the sidebar is a move inside chatgpt.com; the Copy under THAT chat's reply
+# hands out another run's brief, and it is text of the page the tab now shows.
+# So the chat is marked before anything is pressed and checked before the
+# clipboard is read (step 4), and run_phase1 checks it before every read.
 
 #: Shortest copy that can be the brief: the page read's own floor (T2 in
 #: extract_chatgpt_response keeps only MORE than this many characters of prose;
@@ -55765,21 +55798,28 @@ _CG_COPY_ARM_JS = """async (s) => {
 _CG_COPY_READ_JS = """async () => {
     try { return await navigator.clipboard.readText(); } catch (e) { return null; }
 }"""
+_CG_COPY_WRITE_JS = "async (s) => { await navigator.clipboard.writeText(s); }"
 
 #: The Copy button of the reply the page read reads — the LATEST one — or null.
 #: The capture puts a reply's Copy in its own turn's row (CHATGPT_COPY_REPLY_SEL),
 #: so it is looked for inside the turn that holds the latest reply: never an
 #: earlier reply's (an older brief), never a later turn's that holds no reply
 #: the page read would read. With no reply found by its marker (a future
-#: rename), the last Copy row on the page: the latest turn that has one. A reply
-#: no turn marker holds (a rename of the turn) → none, and the CUA presses it.
-#: Never one ChatGPT hides.
+#: rename), the last Copy row on the page AFTER the person's newest message:
+#: the latest exchange's — never an earlier reply's, whose row is the last one
+#: while the latest reply's is not drawn yet (wave 13 review). A reply no turn
+#: marker holds (a rename of the turn) → none, and the CUA presses it. Never
+#: one ChatGPT hides.
 _CHATGPT_COPY_BUTTON_JS = _cg_js("""() => {
     const replies = document.querySelectorAll('__CG_ASSISTANT__');
     const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;
     if (!scope) return null;
     const shown = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-    const ok = [...scope.querySelectorAll('__CG_COPY__')].filter(shown);
+    const users = document.querySelectorAll('__CG_USER__');
+    const mine = users.length ? users[users.length - 1] : null;
+    const latest = (b) => replies.length > 0 || !mine
+        || (mine.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    const ok = [...scope.querySelectorAll('__CG_COPY__')].filter(shown).filter(latest);
     return ok.length ? ok[ok.length - 1] : null;
 }""")
 
@@ -55832,8 +55872,17 @@ def _chatgpt_copy_verdict(text, marker, ours=()) -> str:
 #: How much of a line's start is looked for on the page: its first this-many
 #: letters and digits (about a dozen English words).
 _CG_ON_PAGE_PROBE = 60
-#: The page's text, as a person sees it.
-_CG_PAGE_TEXT_JS = "() => (document.body && document.body.innerText) || ''"
+#: Where a copy must be found, as a person sees it: [the LATEST reply's text —
+#: the last reply its marker names, the one the page read reads — , null]; with
+#: no reply marker (a future rename), [the whole page's text, the person's newest
+#: message in it], to be cut there (`_cg_latest_reply_letters`).
+_CG_PAGE_TEXT_JS = _cg_js("""() => {
+    const replies = document.querySelectorAll('__CG_ASSISTANT__');
+    if (replies.length) return [replies[replies.length - 1].innerText || '', null];
+    const users = document.querySelectorAll('__CG_USER__');
+    return [(document.body && document.body.innerText) || '',
+            users.length ? (users[users.length - 1].innerText || '') : null];
+}""")
 
 
 def _cg_letters(s: str) -> str:
@@ -55851,19 +55900,32 @@ def _brief_line_probe(line: str) -> str:
     return _cg_letters(line)[:_CG_ON_PAGE_PROBE]
 
 
+def _cg_latest_reply_letters(shown, mine) -> str:
+    """The letters and digits of the latest reply (`_CG_PAGE_TEXT_JS`): `shown`
+    itself, or — when `shown` is the whole page and `mine` the person's newest
+    message — what follows that message. With no message of theirs marked, or
+    its words not found in the page's text, the whole page."""
+    page_letters = _cg_letters(shown or "")
+    own = _cg_letters(mine or "")
+    at = page_letters.rfind(own) if own else -1
+    return page_letters[at + len(own):] if at >= 0 else page_letters
+
+
 async def _chatgpt_copy_on_page(page, text) -> bool:
-    """True when the copy is text THIS ChatGPT page shows: at least two of its
-    first three lines of prose open with words the page shows, in the same
-    order. Another program's brief on the shared clipboard (another worker's
-    paste, the owner's own copy) is not on this page. One line may miss: a
-    source chip ChatGPT draws inside a sentence is on the page and not in the
-    copy."""
+    """True when the copy is text of THIS ChatGPT page's latest reply: at least
+    two of its first three lines of prose open with words that reply shows, in
+    the same order. Another program's brief on the shared clipboard (another
+    worker's paste, the owner's own copy) is not on this page; an earlier
+    reply's (the first draft, before a follow-up) is not the latest (wave 13
+    review). One line may miss: a source chip ChatGPT draws inside a sentence is
+    on the page and not in the copy."""
     probes = [p for p in (_brief_line_probe(ln) for ln in text.splitlines()
                           if _brief_prose_line(ln)) if p][:3]
     try:
-        shown = _cg_letters(await page.evaluate(_CG_PAGE_TEXT_JS) or "")
+        shown, mine = await page.evaluate(_CG_PAGE_TEXT_JS)
     except Exception:
-        shown = ""
+        shown, mine = "", None
+    shown = _cg_latest_reply_letters(shown, mine)
     return bool(probes) and sum(p in shown for p in probes) >= min(2, len(probes))
 
 
@@ -55896,16 +55958,42 @@ async def _chatgpt_read_copied(page, marker) -> str:
         await asyncio.sleep(0.25)
 
 
+async def _cg_put_back_clipboard(page, held) -> None:
+    """Give the clipboard back what it held before the Copy fallback (`held`),
+    so neither the marker nor the brief outlives the read: fleet workers and
+    the owner share one clipboard, and a clipboard history keeps a 60 KB brief.
+    When it could not be read beforehand (None), it is emptied — never left
+    holding the marker."""
+    with contextlib.suppress(Exception):
+        await page.evaluate(_CG_COPY_WRITE_JS, "" if held is None else held)
+
+
 async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=(),
                                  verbose=False) -> str:
     """Phase 1's brief from ChatGPT's own Copy button; "" when it cannot be had.
     run_phase1 calls it ONLY when the page read came back empty (see the note
-    above). `ours`: the prompts we sent, which a copy must not be."""
-    marker = f"superresearch-copy-check-{os.urandom(8).hex()}"
+    above). `ours`: the prompts we sent, which a copy must not be. Whatever
+    comes of it, the clipboard is left holding what it held before."""
     # The clipboard answers only the tab in front (verified_paste_brief does the
     # same): a ChatGPT tab behind another tab reads it back empty.
     with contextlib.suppress(Exception):
         await page.bring_to_front()
+    try:
+        held = await page.evaluate(_CG_COPY_READ_JS)
+    except Exception:
+        held = None
+    try:
+        return await _chatgpt_copy_reply(page, browser=browser, cua_client=cua_client,
+                                         ours=ours, verbose=verbose)
+    finally:
+        await _cg_put_back_clipboard(page, held)
+
+
+async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose) -> str:
+    """Steps 1-5 of the note above: the brief, or "" (and one line why)."""
+    marker = f"superresearch-copy-check-{os.urandom(8).hex()}"
+    # ⛔ The chat as the fallback found it — checked again before the read.
+    chat = await _chatgpt_user_msg_count(page)
     try:
         armed = await page.evaluate(_CG_COPY_ARM_JS, marker)
     except Exception as e:
@@ -55942,6 +56030,10 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
             log(f"Phase 1: the CUA's Copy click ended early "
                 f"({(str(e) or type(e).__name__)[:120]})", "WARN")
         how = "ChatGPT's Copy button, clicked by the CUA"
+    if moved := _chatgpt_chat_moved(chat, await _chatgpt_user_msg_count(page)):
+        log(f"Phase 1: the clipboard was not read — the ChatGPT tab no longer shows "
+            f"this run's chat ({moved})", "WARN")
+        return ""
     text = await _chatgpt_read_copied(page, marker)
     why = _chatgpt_copy_verdict(text, marker, ours)
     if why:
@@ -55949,8 +56041,9 @@ async def chatgpt_brief_via_copy(page, *, browser=None, cua_client=None, ours=()
         return ""
     text = _strip_chatgpt_citation_tokens(text).strip()
     if not await _chatgpt_copy_on_page(page, text):
-        log("Phase 1: what the Copy button gave was not used — it is not text on this "
-            "ChatGPT page (something else changed the clipboard)", "WARN")
+        log("Phase 1: what the Copy button gave was not used — it is not text of the "
+            "latest reply on this ChatGPT page (an earlier reply's, or something else "
+            "changed the clipboard)", "WARN")
         return ""
     log(f"Phase 1: brief taken from {how} ({len(text)} chars)")
     return text
@@ -57116,7 +57209,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 "Click inside ChatGPT's message box so the text cursor is in it. "
                 "Do NOT type, paste, press Enter or click Send.",
                 model=CUA_MODEL, max_iterations=8, verbose=verbose, allow=CUA_CLICK_ONLY,
-                never_click=CUA_NEVER_CLICK_SEND)
+                never_click=CUA_NEVER_CLICK_CARET)
 
         # #839 act tier: side-effect-only (result ignored); what counts is the
         # checked submit right after it and the verify gate below.
@@ -57257,7 +57350,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                     "Click inside ChatGPT's message box so the text cursor is in it. "
                     "Do NOT type, paste, press Enter or click Send.",
                     model=CUA_MODEL, max_iterations=8, verbose=verbose,
-                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_SEND)
+                    allow=CUA_CLICK_ONLY, never_click=CUA_NEVER_CLICK_CARET)
 
             # #839 act tier: side-effect-only; the checked submit right after it
             # and the follow-up verify gate below are the ground truth.
@@ -57300,7 +57393,19 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # (and, when no Copy button can be found, a CUA that may only click presses
     # it) — see chatgpt_brief_via_copy. The first read and every re-read below
     # are this one step, so each says which way the brief came.
+    # ⛔ Only from the chat the brief was written in (wave 13 review): a CUA
+    # misclick on a conversation in the sidebar leaves the tab showing another
+    # run's brief, and the re-read three minutes later would read THAT. The
+    # chat is marked now (the belt's mark); unreadable now → not checked, as
+    # before.
+    _p1_chat = await _chatgpt_user_msg_count(browser.page)
+
     async def _p1_read_brief():
+        if _p1_chat is not None and (moved := _chatgpt_chat_moved(
+                _p1_chat, await _chatgpt_user_msg_count(browser.page))):
+            log(f"Phase 1: the brief was not read — the ChatGPT tab no longer shows the "
+                f"chat it was written in ({moved})", "WARN")
+            return ""
         text = await extract_chatgpt_response(browser.page)
         if len(text or "") >= 100:
             log(f"Phase 1: brief read from the page ({len(text)} chars)")

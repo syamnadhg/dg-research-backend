@@ -795,7 +795,114 @@ def test_live_p1_a_caret_step_that_opens_a_new_chat_stops_the_follow_up(chrome, 
                for lv, m in logs), logs
 
 
-SHADOW_SEND_HTML = """<body><div id=host style="position:absolute;left:100px;top:100px"></div>
+# ═══ 5. The caret missions never click the brief's own buttons (wave 13 review) ══
+#
+# The follow-up's caret step runs on the finished brief's page, beside the
+# reply's Regenerate and Share and the user's Edit message. A stray click on
+# Regenerate or Edit message throws the brief away; Share makes a public link to
+# the chat; the belt sees none of it (an open menu, dialog or editor changes
+# neither the address nor the number of messages). Only Send was refused there;
+# the copy mission refused them all. The caret missions now use its list.
+
+#: The latest reply's row of icons pinned where a scripted click reaches it, and
+#: the user's own Edit message beside it, clear of the pinned composer. Returns
+#: each one's centre and the label of what a click there lands on.
+PIN_BUTTONS_JS = """() => {
+    const row = [...document.querySelectorAll('[data-sr-reply-actions]')].pop();
+    row.dataset.srPinned = '';
+    row.style.cssText = 'position: fixed; left: 200px; top: 120px; z-index: 5; background: #fff;';
+    const edit = [...document.querySelectorAll('[aria-label="Edit message"]')].pop();
+    edit.dataset.srPinned = '';
+    document.body.appendChild(edit);
+    edit.style.cssText = 'position: fixed; left: 900px; top: 300px; width: 40px; height: 30px; '
+        + 'z-index: 9; display: block;';
+    const out = {};
+    for (const [k, s] of [['regen', '[data-sr-pinned] [aria-label="Regenerate response"]'],
+                          ['share', '[data-sr-pinned] [aria-label="Share"]'],
+                          ['edit', '[data-sr-pinned][aria-label="Edit message"]']]) {
+        const r = document.querySelector(s).getBoundingClientRect();
+        const xy = [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+        out[k] = xy;
+        out[k + ' lands on'] = document.elementFromPoint(xy[0], xy[1])
+            .closest('button').getAttribute('aria-label');
+    }
+    return out;
+}"""
+
+#: agent_loop's line for a caret mission's refused click.
+CARET_REFUSED = ("[cua] REFUSED a click on Send, Regenerate, Share, Edit, Copy message or a "
+                 "table's own button — this task only puts the cursor in the message box")
+
+
+def _clicked(chrome, page):
+    """Every button clicked outside the composer (the page records them)."""
+    return [x for x in chrome.run(page.evaluate("() => document.body.dataset.clicked || ''"))
+            .split("|") if x]
+
+
+def _stray_clicks_then_the_box(p1, at):
+    return lambda: ([("left_click", {"coordinate": at[k]}) for k in ("regen", "share", "edit")]
+                    + [_click_box(p1)])
+
+
+def _assert_held_off(chrome, page, logs, at):
+    assert [at[f"{k} lands on"] for k in ("regen", "share", "edit")] == [
+        "Regenerate response", "Share", "Edit message"]         # each click aimed at it
+    assert _clicked(chrome, page) == []
+    assert len([m for m in _refused(logs) if m.startswith(CARET_REFUSED)]) == 3, _refused(logs)
+
+
+def test_live_p1_the_follow_ups_caret_cua_never_clicks_regenerate_share_or_edit(
+        chrome, page, p1, logs):
+    """⛔ The follow-up's box has no marker (a rename), so the caret CUA runs on
+    the finished brief's page. It tries Regenerate, Share and Edit message
+    before the box: all three are refused; its box click still places the
+    caret, and the follow-up is sent after the brief."""
+    _load_p1(chrome, page, p1, streaming=True, **{"reply-actions": True})
+    p1.extra = "Add the hospice's own records."
+    at = {}
+
+    async def _the_finished_brief():
+        await page.wait_for_function(
+            "() => parseInt(document.body.dataset.replies || '0', 10) >= 1", timeout=10000)
+        await page.evaluate(UNNAME_BOX_JS)
+        at.update(await page.evaluate(PIN_BUTTONS_JS))
+
+    p1.after_poll = _the_finished_brief
+    cua = _ScriptedCua({"focus": _stray_clicks_then_the_box(p1, at)})
+    assert p1.run(cua) == "verified", logs
+    prompt, followup = p1.submits[0][0], p1.submits[1][0]
+    norm = research._norm_prompt_text
+    assert _norm_users(chrome, page) == [norm(prompt), norm(followup)]
+    assert p1.submits == [(prompt, False), (followup, False), (followup, True)]
+    assert cua.missions == ["focus"]
+    _assert_held_off(chrome, page, logs, at)
+
+
+def test_live_p1_the_briefs_caret_cua_never_clicks_regenerate_share_or_edit(
+        chrome, page, p1, logs):
+    """The brief's own caret step is held to the same list. Here the chat
+    already shows an earlier exchange, with its reply's row of icons, when the
+    box turns out to have no marker."""
+    _load_p1(chrome, page, p1, **{"reply-actions": True})
+    chrome.run(page.click('.ProseMirror'))
+    chrome.run(page.keyboard.insert_text("An earlier question."))
+    chrome.run(page.keyboard.press("Enter"))
+    chrome.run(page.wait_for_function(
+        "() => parseInt(document.body.dataset.replies || '0', 10) >= 1", timeout=10000))
+    chrome.run(page.evaluate("() => { document.body.dataset.streaming = '1'; }"))
+    chrome.run(page.evaluate(UNNAME_BOX_JS))
+    at = chrome.run(page.evaluate(PIN_BUTTONS_JS))
+    cua = _ScriptedCua({"focus": _stray_clicks_then_the_box(p1, at)})
+    assert p1.run(cua) == "verified", logs
+    prompt = p1.submits[0][0]
+    assert _norm_users(chrome, page) == ["An earlier question.", research._norm_prompt_text(prompt)]
+    assert p1.submits == [(prompt, False), (prompt, True)]
+    assert cua.missions == ["focus"]
+    _assert_held_off(chrome, page, logs, at)
+
+
+SHADOW_SEND_HTML ="""<body><div id=host style="position:absolute;left:100px;top:100px"></div>
 <script>const r = document.getElementById('host').attachShadow({mode: 'open'});
 r.innerHTML = '<button type=submit aria-label=Send style="width:80px;height:40px">S</button>';
 </script></body>"""

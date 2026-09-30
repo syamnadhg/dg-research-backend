@@ -215,6 +215,17 @@ def _html_for(layout, *, thread=False, prompt=PROMPT, long_brief=False, **hooks)
                               f'data-sr-prompt="{_html.escape(prompt, quote=True)}"{extra}>'))
 
 
+#: Every clipboard write the PAGE's own code makes — its Copy buttons — kept on
+#: <html data-sr-copied>. The program's own writes (the marker, and putting back
+#: what the clipboard held) run in its own script world and are not seen here;
+#: since the fallback gives the clipboard back after every read, this is how a
+#: test sees what a Copy handed out.
+RECORD_COPIES_JS = """(() => {
+    const c = navigator.clipboard, write = c.writeText.bind(c);
+    c.writeText = (t) => { document.documentElement.dataset.srCopied = t; return write(t); };
+})();"""
+
+
 def _open(chrome, page, layout="new", **kw):
     """Serve the fixture at URL from memory; every other request is refused."""
     body = _html_for(layout, **kw)
@@ -229,8 +240,14 @@ def _open(chrome, page, layout="new", **kw):
         await page.unroute("**/*")
         await page.route("**/*", _serve)
         await page.goto(URL)
+        await page.add_script_tag(content=RECORD_COPIES_JS)
 
     chrome.run(_go())
+
+
+def _copied(chrome, page):
+    """What the page's own Copy last handed out (RECORD_COPIES_JS), or None."""
+    return chrome.run(page.evaluate("() => document.documentElement.dataset.srCopied ?? null"))
 
 
 def _clip(chrome, page):
@@ -454,7 +471,7 @@ def test_live_p1_a_copy_of_our_own_prompt_is_refused(chrome, page, p1, logs):
     _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True,
           copy_gives="prompt")
     out = p1.run(feedback=FEEDBACK)
-    copied = _clip(chrome, page)
+    copied = _copied(chrome, page)
     assert FEEDBACK.split("\n")[0] in copied and len(copied) > 2000
     assert out["text"] == "", logs
     assert _lines(logs, "was not used — it was our own prompt"), logs
@@ -480,7 +497,7 @@ def test_live_p1_a_copy_of_the_follow_up_is_refused(chrome, page, p1, logs):
           copy_gives="prompt")
     p1.extra = EXTRA
     out = p1.run()
-    copied = _clip(chrome, page)
+    copied = _copied(chrome, page)
     assert EXTRA.split("\n")[0] in copied and len(copied) > 2000
     assert out["text"] == "", logs
     assert _lines(logs, "was not used — it was our own prompt"), logs
@@ -517,7 +534,7 @@ def test_live_p1_a_short_reply_is_never_taken_as_the_brief(chrome, page, p1, log
     out = p1.run()
     assert out["text"] == "", logs
     assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]       # the read + 2 re-reads
-    assert QUESTION[0] in _clip(chrome, page)                        # it WAS copied
+    assert QUESTION[0] in _copied(chrome, page)                      # it WAS copied
     assert len(_lines(logs, "was not used — it was only")) == 3, logs
 
 
@@ -616,7 +633,7 @@ def test_live_p1_another_workers_brief_is_never_taken_as_this_runs(
         _finish(chrome, other, tasks)
     assert research._chatgpt_copy_verdict(OTHER, "m", (PROMPT,)) == ""   # it WOULD pass
     assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]
-    assert len(_lines(logs, "was not used — it is not text on this ChatGPT page")) == 3, logs
+    assert len(_lines(logs, "was not used — it is not text of the latest reply on this ChatGPT page")) == 3, logs
     assert not _lines(logs, "brief taken from"), logs
 
 
@@ -662,7 +679,7 @@ def test_live_p1_the_cuas_copy_overwritten_by_another_worker_is_not_used(
     assert wrote.is_set()
     assert out["text"] == _fixture_markdown(), logs
     assert cua.missions == ["copy", "copy"]
-    assert len(_lines(logs, "was not used — it is not text on this ChatGPT page")) == 1, logs
+    assert len(_lines(logs, "was not used — it is not text of the latest reply on this ChatGPT page")) == 1, logs
     assert _lines(logs, "brief taken from ChatGPT's Copy button, clicked by the CUA ("), logs
 
 
@@ -871,6 +888,176 @@ def test_live_p1_without_a_cua_no_copy_button_means_no_brief(chrome, page, p1, l
     assert _lines(logs, "no Copy button found under ChatGPT's reply, and no CUA"), logs
 
 
+# ── the CUA leaves the chat (wave 13 review) ────────────────────────────────
+
+#: Another chat put on the screen by one click, as ChatGPT does it — inside
+#: chatgpt.com, the tab never reloads. mode "sidebar": a conversation in the
+#: sidebar; its click moves the tab to that chat's address and draws that
+#: chat's thread instead of this one. mode "suggestion": a suggested reply under
+#: the brief; its click SENDS it (one more message of the person's, at the same
+#: address) and ChatGPT answers it. Either way the chat now on the screen holds
+#: another brief (`paras`), named by the reply's marker, with its row of icons
+#: and its Copy pinned where a click reaches it — every check but "is it the
+#: same chat" keeps what that Copy hands out. The page's click listener records
+#: the chip as "suggestion"; a link is not a button, so it records nothing.
+CHAT_CHANGER_JS = """([mode, paras]) => {
+    const draw = () => {
+        const turn = document.getElementById('sr-turn').content.cloneNode(true);
+        const col = turn.querySelector('div[class="flex flex-col gap-3 browser:gap-1"]');
+        const user = document.getElementById('sr-user-block').content.cloneNode(true);
+        user.querySelector('div[dir="auto"]').textContent =
+            mode === 'sidebar' ? 'Please write a research brief on the Newfoundland.'
+                               : 'Make it about the Newfoundland instead.';
+        col.appendChild(user);
+        const blk = document.getElementById('sr-assistant-block').content.cloneNode(true);
+        blk.querySelector('[data-markdown-text-style]').innerHTML = paras.map((p, i) => i === 0
+            ? '<h2>' + p.replace(/^## /, '') + '</h2>' : '<p><span>' + p + '</span></p>').join('');
+        col.appendChild(blk);
+        const row = document.getElementById('sr-reply-actions').content.cloneNode(true);
+        const copy = row.querySelector('[data-sr-act="copy"]');
+        copy.dataset.srName = 'other copy';
+        copy.style.cssText = 'position:fixed;left:600px;top:400px;width:40px;height:30px;'
+            + 'z-index:20;overflow:hidden';
+        col.parentElement.appendChild(row);
+        return turn;
+    };
+    const t = document.getElementById('sr-transcript');
+    const el = document.createElement(mode === 'sidebar' ? 'a' : 'button');
+    el.textContent = mode === 'sidebar' ? 'St Bernard brief (yesterday)' : 'Make it about the Newfoundland';
+    el.dataset.srName = mode;
+    el.style.cssText = 'position:fixed;left:4px;top:300px;width:160px;height:30px;display:block;'
+        + 'z-index:30;background:#eee';
+    if (mode === 'sidebar') el.href = '/c/another-chat';
+    el.addEventListener('click', (e) => {
+        e.preventDefault();
+        if (mode === 'sidebar') {
+            t.replaceChildren(draw());
+            history.pushState({}, '', '/c/another-chat');
+        } else {
+            t.appendChild(draw());
+        }
+    });
+    document.body.appendChild(el);
+}"""
+
+
+def _chat_changer_page(chrome, page, p1, mode):
+    """No Copy button by its marker (a future rename), and a click that puts
+    another chat holding OLD_BRIEF on the screen (CHAT_CHANGER_JS)."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+
+    async def _hook():
+        await page.evaluate("() => document.querySelector('[data-sr-act=\"copy\"]')"
+                            ".setAttribute('aria-label', 'Copy response')")
+        await page.evaluate(CHAT_CHANGER_JS, [mode, OLD_BRIEF.split("\n\n")])
+        p1.at = {"changer": await page.evaluate(CENTER_JS, f'[data-sr-name="{mode}"]'),
+                 "other copy": [620, 415]}
+
+    p1.hooks = [_hook]
+
+
+@pytest.mark.parametrize("mode,moved", [
+    ("sidebar", "(another page)"),
+    ("suggestion", "(1 → 2 of your messages on screen)")])
+def test_live_p1_a_cua_click_that_changes_the_chat_never_gives_its_brief(
+        chrome, page, p1, logs, mode, moved):
+    """⛔ The copy CUA's first click puts another chat on the screen — a
+    conversation in the sidebar (another address, the same number of messages)
+    or a suggested reply that is sent and answered (the same address, one more
+    message) — and its next click is its own job: the Copy under the latest
+    reply, which is now another brief. That copy is long enough, prose, not our
+    prompt and the latest reply's text — only the chat has changed. The
+    clipboard is not read; and the re-reads, three minutes later, read nothing
+    from a tab that no longer shows the chat the brief was written in."""
+    _chat_changer_page(chrome, page, p1, mode)
+    cua = _CopyCua(lambda: [_click(p1, "changer"), _click(p1, "other copy")])
+    out = p1.run(cua)
+    assert _copied(chrome, page) == OLD_BRIEF                 # it WAS copied — another brief
+    assert "Newfoundland" not in out["text"] and out["text"] == "", logs
+    assert cua.missions == ["copy"]
+    assert _lines(logs, "Phase 1: the clipboard was not read — the ChatGPT tab no longer "
+                        f"shows this run's chat {moved}"), logs
+    assert len(_lines(logs, "Phase 1: the brief was not read — the ChatGPT tab no longer "
+                            f"shows the chat it was written in {moved}")) == 2, logs
+    assert not _lines(logs, "brief taken from"), logs
+    if mode == "suggestion":
+        assert _clicked(chrome, page) == ["suggestion", "other copy"]
+        assert len(chrome.run(page.evaluate(base.USERS_JS))) == 2
+    else:
+        assert _clicked(chrome, page) == ["other copy"]
+        assert chrome.run(page.evaluate("() => location.href")).endswith("/c/another-chat")
+
+
+@pytest.mark.parametrize("renamed", [False, True], ids=["page-read", "copy-button"])
+def test_live_p1_a_chat_that_cannot_be_read(chrome, page, p1, logs, monkeypatch, renamed):
+    """The chat's mark cannot be read (the page does not answer). The page
+    read, which clicks nothing, reads as it always did (a control); the Copy
+    fallback, whose CUA can leave the chat, cannot tell whether it has, and
+    takes nothing."""
+    async def _unreadable(_page):
+        return None
+
+    monkeypatch.setattr(research, "_chatgpt_user_msg_count", _unreadable)
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=renamed, streaming=True)
+    out = p1.run()
+    if not renamed:
+        assert HEADING in out["text"] and LINK in out["text"], logs
+        assert _lines(logs, "Phase 1: brief read from the page ("), logs
+        return
+    assert out["text"] == "", logs
+    assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]
+    assert len(_lines(logs, "the clipboard was not read — the ChatGPT tab no longer shows "
+                            "this run's chat (the page could not be read)")) == 3, logs
+
+
+#: A first draft whose every paragraph opens differently from the updated brief
+#: (a follow-up rewrote it): the poll hook after the first reply.
+def _rewritten_first_draft_hook(page):
+    async def _rewrite():
+        await page.evaluate(
+            "() => document.querySelectorAll('[data-selected-text-overlay-target] p > span')"
+            ".forEach((s) => { s.textContent = 'In the first draft of this brief: ' + s.textContent; })")
+    return _rewrite
+
+
+def test_live_p1_after_a_follow_up_the_cuas_copy_of_the_first_draft_is_refused(
+        chrome, page, p1, logs):
+    """⛔ The user added context mid-brief: two replies, each with its own Copy,
+    and no Copy found by its marker (a future rename). The CUA presses the FIRST
+    reply's Copy: the first draft — long enough, prose, not our prompt, and on
+    this page — is not the latest reply's text, so it is refused, and the user's
+    added context is not dropped. The re-read's CUA presses the latest reply's
+    Copy and that is the brief."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
+    p1.extra = EXTRA
+
+    async def _pin_both_copies():
+        await page.evaluate("""() => {
+            const all = [...document.querySelectorAll('[data-sr-act="copy"]')];
+            all.forEach((b, i) => {
+                b.setAttribute('aria-label', 'Copy response');
+                b.dataset.srName = i === 0 ? 'first copy' : 'latest copy';
+                b.style.cssText = `position:fixed;left:${600 + 100 * i}px;top:400px;width:40px;`
+                    + 'height:30px;z-index:20;overflow:hidden';
+            });
+        }""")
+
+    p1.hooks = [_rewritten_first_draft_hook(page), _pin_both_copies]
+    presses = iter([[("left_click", {"coordinate": [620, 415]})]]
+                   + [[("left_click", {"coordinate": [720, 415]})]] * 2)
+    cua = _CopyCua(lambda: next(presses))
+    out = p1.run(cua)
+    assert p1.polls == ["Phase1", "Phase1-followup"]
+    first = chrome.run(page.evaluate(      # the first draft IS on the page
+        "() => document.querySelector('[data-selected-text-overlay-target]').innerText"))
+    assert first.count("In the first draft of this brief: ") == 7
+    assert out["text"] == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["first copy", "latest copy"]
+    assert cua.missions == ["copy", "copy"]
+    assert len(_lines(logs, "was not used — it is not text of the latest reply on this "
+                            "ChatGPT page")) == 1, logs
+
+
 # ═══ 2. Which button ═══════════════════════════════════════════════════════
 #
 # chatgpt_brief_via_copy on a finished exchange (thread=True), no CUA.
@@ -952,6 +1139,39 @@ def test_live_an_earlier_replys_copy_is_never_used(chrome, page, quick, logs):
         "() => [...document.querySelectorAll('[data-sr-reply-actions]')].pop().remove()"))
     assert _brief(chrome, page) == ""
     assert _clicked(chrome, page) == []
+
+
+def test_live_with_no_reply_marker_a_row_before_the_newest_message_is_never_pressed(
+        chrome, page, quick, logs):
+    """⛔ No marker names the replies (a future rename), and the latest reply's
+    row of icons is not drawn yet. The last Copy row on the page is then the
+    EARLIER reply's, before the person's newest message — an older brief. It is
+    not pressed; the CUA is asked instead (here there is none)."""
+    _open(chrome, page, "new", thread=True, reply_renamed=True, reply_actions=True)
+    _second_exchange(chrome, page)
+    chrome.run(page.evaluate(
+        "() => [...document.querySelectorAll('[data-sr-reply-actions]')].pop().remove()"))
+    assert chrome.run(page.evaluate(       # one Copy row left: the earlier reply's
+        "(s) => document.querySelectorAll(s).length", research.CHATGPT_COPY_REPLY_SEL)) == 1
+    assert _brief(chrome, page) == ""
+    assert _clicked(chrome, page) == []
+    assert _lines(logs, "no Copy button found under ChatGPT's reply, and no CUA to click it"), logs
+
+
+def test_live_with_no_marker_on_the_persons_message_the_whole_page_is_looked_at(
+        chrome, page, quick, logs):
+    """A rename of the person's own message too: where the latest exchange
+    begins cannot be told, so the Copy row and the copy's text are looked for
+    across the page, as before — the brief is not lost for it. (A control: it
+    passes before the latest-reply check too, and fails if that check refuses
+    what it cannot place.)"""
+    _open(chrome, page, "new", thread=True, reply_renamed=True, reply_actions=True)
+    chrome.run(page.evaluate("() => document.querySelector('[data-user-message-bubble]')"
+                             ".removeAttribute('data-user-message-bubble')"))
+    assert chrome.run(page.evaluate(
+        "(s) => document.querySelectorAll(s).length", research.CHATGPT_USER_MSG_SEL)) == 0
+    assert _brief(chrome, page) == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["Copy"]
 
 
 #: A second row of icons in the reply's turn, after the one shown, that ChatGPT
@@ -1117,6 +1337,44 @@ def test_live_a_clipboard_that_does_not_keep_the_marker_is_never_used(chrome, pa
     assert _brief(chrome, page) == ""
     assert _clicked(chrome, page) == []
     assert _lines(logs, "can't use the clipboard in this browser (the marker did not come back)"), logs
+
+
+@pytest.mark.parametrize("gives", ["", "nothing"], ids=["the-brief", "nothing"])
+def test_live_p1_the_clipboard_is_given_back_after_the_copy(chrome, page, p1, logs, gives):
+    """⛔ Fleet workers and the owner share ONE clipboard. Whatever the Copy
+    gave — the whole brief, or nothing (the marker would stay) — the clipboard
+    holds what it held before once the fallback is done."""
+    _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True,
+          copy_gives=gives)
+    _set_clip(chrome, page, "the owner's own clipboard")
+    out = p1.run()
+    assert out["text"] == ("" if gives else _fixture_markdown()), logs
+    assert _copied(chrome, page) == (None if gives else _fixture_markdown())
+    assert _clicked(chrome, page) == ["Copy"] * (3 if gives else 1)
+    assert _clip(chrome, page) == "the owner's own clipboard"
+
+
+def test_live_a_clipboard_that_could_not_be_read_first_is_emptied_not_left_with_the_marker(
+        chrome, page, quick, logs):
+    """What the clipboard held could not be read before the marker went on:
+    nothing can be put back, so it is emptied — never left holding the marker.
+    (The owner's content is what cannot be read here; the marker reads back,
+    so the Copy is still pressed.)"""
+    _open(chrome, page, "new", thread=True, reply_actions=True, copy_gives="nothing")
+    _set_clip(chrome, page, "the owner's content that cannot be read")
+    # The program's script world (see the test above).
+    chrome.run(page.evaluate("""() => {
+        const real = navigator.clipboard.readText.bind(navigator.clipboard);
+        navigator.clipboard.readText = async () => {
+            const t = await real();
+            if (t === "the owner's content that cannot be read") throw new Error('Read denied.');
+            return t;
+        };
+    }"""))
+    assert _brief(chrome, page) == ""
+    assert _clicked(chrome, page) == ["Copy"]
+    assert _lines(logs, "was not used — nothing was copied"), logs
+    assert _clip(chrome, page) == ""
 
 
 MARK = "superresearch-copy-check-0123456789abcdef"

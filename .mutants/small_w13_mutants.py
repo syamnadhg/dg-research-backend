@@ -86,6 +86,7 @@ MUTANTS = [
        "f\"may only use: {_may}. Do not type or press Enter.\"},\n"
        "                    " + _IMG_OLD + ",\n")]),
     ("E7", RESEARCH, "⛔ the picture after a refused click on Send is sent raw",
+     # Re-aimed (wave 13 review): the refusal's words are `_NEVER_CLICK_SAY`'s now.
      [("f\"clicked {_nc_btn}. {_nc_hint}\"},\n"
        "                    await _screen_block(),\n",
        "f\"clicked {_nc_btn}. {_nc_hint}\"},\n"
