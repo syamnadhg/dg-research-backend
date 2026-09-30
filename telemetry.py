@@ -67,7 +67,11 @@ _ID_TOKEN_QUIET = logquiet.Suppressor(logquiet.ONCE)
 # `run_id` is `safe_name(topic)_YYYYMMDD_HHMMSS` and a one-word topic survives
 # `safe_name` as bare alphanumerics — two independent guards, so a topic cannot
 # arrive by looking id-shaped.
-RESEARCH_ID_RE = re.compile(r"^chat_[0-9]{13}_[0-9]{1,6}$")
+# ⭐ AND THE CHAT ASSISTANT'S RUNS (wave 13): the agent bridge mints
+# `"agent-" + uuid4().hex[:16]` — sixteen random lower-case hex digits, nothing
+# of the topic. Before, every event of such a run was refused here: a WARNING
+# and a TELEMETRY_INVALID per event, and no event named the run.
+RESEARCH_ID_RE = re.compile(r"^(?:chat_[0-9]{13}_[0-9]{1,6}|agent-[0-9a-f]{16})$")
 RUN_ID_SUFFIX_RE = re.compile(r"_[0-9]{8}_[0-9]{6}$")
 
 
