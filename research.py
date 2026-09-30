@@ -9721,7 +9721,15 @@ def _claim_waiting_run(worker_id) -> "dict | None":
     ⭐ "ONGOING" WITH NOBODY HOLDING IT IS TAKEN, not dropped: it is the record
     whose "queued" write never landed (a Firestore blip at the move), or that
     the old worker's last second wrote over. Dropped, the run would be lost —
-    its record saying it runs while nothing runs it."""
+    its record saying it runs while nothing runs it.
+
+    ⛔ A RUN DROPPED HERE LEAVES THE PUBLISHED ORDER (w13 integrated review):
+    it stayed the amber #1 in `queueOwners`, and every other run one place
+    lower, until something else published. When this takes nothing it
+    publishes; when it takes a run, the caller publishes once that run is in
+    its worker's line — a publish started here would find that run in neither
+    place, and the caller's, finding one running, would be skipped."""
+    dropped = False
     for rec in _waiting_runs():
         d = rec["_dir"]
         uid = str(rec.get("uid") or "")
@@ -9752,6 +9760,7 @@ def _claim_waiting_run(worker_id) -> "dict | None":
                 log(f"[moved-run] {rid[:8]}… is {status} now — it is no longer "
                     f"waiting in the queue", "INFO")
             _drop_waiting_claim(d, worker_id)
+            dropped = True
             continue
         queued_job = rec.get("queued_job")
         if isinstance(queued_job, dict):
@@ -9779,6 +9788,8 @@ def _claim_waiting_run(worker_id) -> "dict | None":
             # It was running: until it starts here its pill says so (`moved`).
             "kept_work": True,
         }
+    if dropped:
+        _kick_queue_publish()
     return None
 
 
@@ -9856,7 +9867,9 @@ async def _offer_waiting_run(job_queue) -> bool:
                                     _restart_recovery_patch(rid))
             log(f"[moved-run] {rid[:8]}… has used up its automatic attempts — "
                 f"offered to its person to resume instead", "INFO")
-            _kick_queue_publish()
+        # ⛔ Whatever the funnel refused, it no longer waits anywhere — and the
+        # claim left publishing to here (w13 integrated review).
+        _kick_queue_publish()
         return False
     from google.cloud.firestore import DELETE_FIELD as _DF
     await asyncio.to_thread(_update_research_doc, job["uid"], job["research_id"], {

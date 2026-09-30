@@ -459,3 +459,73 @@ def test_a_new_run_taken_from_the_queue_is_still_cancelled_before_starting(
     assert [T._as_written(p) for _u, r, p in lis.writes if r == T.RID] == [
         {"status": "stopped", "phase": 0, "summary": "Cancelled before starting",
          "cancelled": True}]
+
+
+# ══ 3. a waiting run dropped at pickup leaves the published order ════════════
+
+def _kicks(monkeypatch, m):
+    """Every queue publish, with how many jobs were in this worker's line and
+    how many records had been written when it was asked for."""
+    kicks: list = []
+    monkeypatch.setattr(research, "_kick_queue_publish",
+                        lambda: kicks.append((len(research._job_queue._queue),
+                                              len(m.writes))) or m.published.set())
+    return kicks
+
+
+DROPPED = ["removed-sharer", "stopped", "deleted"]
+
+
+@pytest.mark.parametrize("why", DROPPED)
+def test_a_waiting_run_dropped_at_pickup_leaves_the_published_order(
+        monkeypatch, tmp_path, why):
+    """⛔ A removed sharer's waiting run, or one whose record ended or went,
+    is dropped by the next awake idle worker — and stayed the amber #1 in the
+    device's `queueOwners`, every other run one place lower and the dropped
+    run's record "queued #1" for good, until something else published."""
+    m, folder = T._waiting(monkeypatch, tmp_path, worker=1)
+    m.store.queue_docs.clear()
+    if why == "removed-sharer":
+        m.store.device = {"ownerUid": T.OWNER, "sharedWith": []}
+    elif why == "stopped":
+        m.store.records[(T.SHARER, T.RID)] = {"status": "stopped"}
+    else:
+        m.store.records.pop((T.SHARER, T.RID))
+    assert T._rescan(monkeypatch, m) == []
+    assert not (folder / T.MARKER).exists() and not list(folder.glob(f"{T.MARKER}.w*"))
+    assert m.published.wait(5), "the dropped run is still published as waiting"
+
+
+def test_a_run_the_funnel_refuses_at_pickup_leaves_the_published_order(monkeypatch, tmp_path):
+    """The claim took the run and the funnel refused it: it no longer waits
+    anywhere, and the order is published — not only when the run had used up
+    its automatic attempts."""
+    m, folder = T._waiting(monkeypatch, tmp_path, worker=1)
+    m.store.queue_docs.clear()
+    monkeypatch.setattr(research, "_safe_enqueue", lambda *a, **k: False)
+    assert T._rescan(monkeypatch, m) == []
+    assert not list(folder.glob(f"{T.MARKER}*"))
+    assert m.published.wait(5), "the refused run is still published as waiting"
+
+
+def test_a_drop_before_a_take_publishes_once_the_taken_run_is_in_the_line(
+        monkeypatch, tmp_path):
+    """⛔ The race a publish at the drop would open: started while the next run
+    is being taken, it finds that run neither waiting nor in the line, and the
+    publish after the take — finding one running — is skipped. So a pass that
+    takes a run publishes once, after the run is in the line and its record
+    says running."""
+    m, folder = T._waiting(monkeypatch, tmp_path, worker=1)
+    m.store.queue_docs.clear()
+    m.store.device = {"ownerUid": T.OWNER, "sharedWith": [T.SHARER]}
+    gone = tmp_path / "queues" / f"Former_{T._stamp()}"
+    (gone / "documents").mkdir(parents=True)
+    T._moved_marker(gone, "former-uid-requeue-0000000003", "chat_1759100000002_gone",
+                    moved_at_ms=int(_real_time.time() * 1000) + 60_000)
+    assert [w["research_id"] for w in research._waiting_runs()][0] == (
+        "chat_1759100000002_gone"), "precondition: the removed sharer's run is first"
+    kicks = _kicks(monkeypatch, m)
+
+    assert [j["research_id"] for j in T._rescan(monkeypatch, m)] == [T.RID]
+    assert not list(gone.glob(f"{T.MARKER}*")), "the removed sharer's run was not dropped"
+    assert kicks == [(1, 1)], kicks
