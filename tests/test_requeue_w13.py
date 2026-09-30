@@ -1400,8 +1400,12 @@ def _cancel_listener(monkeypatch, tmp_path, *, deque_jobs=None):
 
 
 CANCELS = {
-    "own-cancel": ({"submittedBy": SHARER}, {"status": "stopped", "summary": "Cancelled",
-                                             "cancelled": True}),
+    # ⛔⛔ THE RUN'S OWN PERSON STOPS IT (w13 integrated review, 09-29). This was
+    # a running run's CANCEL — `cancelled: true`, the app's delete-on-close — and
+    # the person's chat shows every queued run as "queued — Cancel", so the
+    # research and its reports went when the chat closed. A waiting run with work
+    # done is written as a stop: no `cancelled`, no `phase`, no `summary`.
+    "own-cancel": ({"submittedBy": SHARER}, {"status": "stopped"}),
     "owner-cancel": ({"submittedBy": OWNER, "ownerControl": "cancel"},
                      {"status": "stopped", "summary": "Cancelled by the device owner",
                       "stoppedBy": "owner_cancel", "cancelled": True}),
@@ -1423,7 +1427,8 @@ def test_a_waiting_run_is_stopped_or_cancelled_as_a_running_run_is(monkeypatch, 
     steps, the owner's Stop was dropped (and the run ran later), and its marker
     kept it the amber #1. Now it is ended for good (`.stop`, its marker retired)
     and written as a RUNNING run's stop or cancel is: its steps never reset, the
-    owner's Stop keeps everything, and it no longer reads as moved."""
+    owner's Stop keeps everything, and it no longer reads as moved. Its own
+    person's cancel is a stop (w13 integrated review): see CANCELS."""
     over, expect = CANCELS[who]
     _r, folder = _run_folder(tmp_path, RID, uid=SHARER)
     (folder / "phase2_complete.marker").write_text("x", encoding="utf-8")
@@ -1460,7 +1465,7 @@ def test_a_taken_run_not_yet_started_here_is_cancelled_as_a_running_run_is(
         monkeypatch, tmp_path):
     """This worker took the moved run into its line and has not started it.
     The cancel takes it out of the line — and it is still a run with work in
-    it, not one that never started."""
+    it, not one that never started: its own person's cancel keeps the work."""
     _r, folder = _run_folder(tmp_path, RID, uid=SHARER)
     _moved_marker(folder, SHARER, RID, worker=1)
     taken = _job(SHARER, RID, folder.name, resume_dir=str(folder), moved_run=True)

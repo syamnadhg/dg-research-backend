@@ -35,6 +35,7 @@ import types
 import pytest
 
 import research
+import test_requeue_w13 as T
 # ⛔ IMPORTED HERE, AT COLLECTION: it reads `research.__file__` once, when it is
 # first imported, and every test below points that at a temporary directory.
 import _run_server_closure  # noqa: F401
@@ -377,3 +378,84 @@ def test_the_device_document_is_read_once_and_only_for_another_account(
     research._recompute_deferred_queue_positions_locked()
     assert m.fs.member_reads == reads
     assert FORMER not in m.fs.refused
+
+
+# ══ 2. the run's own person ends a waiting run that kept work: a stop ═════════
+
+def _queued_resume_marker(folder, *, worker=None, resume=True):
+    """A job a resting worker had only QUEUED, put back at boot (`queued_job`):
+    a Resume of a run with work done (`resume_dir`), or a new run."""
+    job = T._job(T.SHARER, T.RID, folder.name,
+                 **({"resume_dir": str(folder)} if resume else {}))
+    name = T.MARKER if worker is None else f"{T.MARKER}.w{worker}"
+    (folder / name).write_text(json.dumps({
+        "uid": T.SHARER, "research_id": T.RID, "run_id": folder.name, "moved_at_ms": 1,
+        "queued_job": job}), encoding="utf-8")
+    return job
+
+
+def _queued_resume_waiting(folder):
+    _queued_resume_marker(folder)
+    return None
+
+
+def _queued_resume_taken(folder):
+    job = _queued_resume_marker(folder, worker=1)
+    return [dict(job, moved_run=True, kept_work=True)]
+
+
+def _moved_run_taken_marker_gone(folder):
+    """This worker took a moved run into its line; its marker is not on disk
+    any more — the job itself says it had work done."""
+    return [T._job(T.SHARER, T.RID, folder.name, resume_dir=str(folder),
+                   moved_run=True, kept_work=True)]
+
+
+KEPT_WORK = {
+    "queued-resume-waiting": _queued_resume_waiting,
+    "queued-resume-taken": _queued_resume_taken,
+    "moved-run-taken-marker-gone": _moved_run_taken_marker_gone,
+}
+
+
+@pytest.mark.parametrize("case", list(KEPT_WORK))
+def test_the_runs_own_person_ending_a_waiting_run_with_work_done_stops_it(
+        monkeypatch, tmp_path, case):
+    """⛔⛔ THE PERSON'S CHAT SAYS "queued — Cancel" for every queued run, and
+    the cancel it sends was written as a cancel: `cancelled: true` — the app's
+    delete-on-close — and, for a Resume a resting worker put back, `phase: 0`
+    as well. The research and its reports went when the chat closed. Every
+    waiting run with work done is written as a stop now: `stopped`, and nothing
+    about its steps or its summary touched."""
+    _r, folder = T._run_folder(tmp_path, T.RID, uid=T.SHARER)
+    (folder / "phase2_complete.marker").write_text("x", encoding="utf-8")
+    line = KEPT_WORK[case](folder)
+    lis, published = T._cancel_listener(monkeypatch, tmp_path, deque_jobs=line)
+
+    lis.feed(action="cancel", uid=T.SHARER, submittedBy=T.SHARER, researchId=T.RID)
+
+    mine = [p for _u, r, p in lis.writes if r == T.RID]
+    assert [T._as_written(p) for p in mine] == [{"status": "stopped"}], mine
+    assert "movedToQueueAt" in mine[0] and "queuePosition" in mine[0], "it still reads as queued"
+    assert list(lis.jobs._queue) == [], "the stopped run is still in this worker's line"
+    assert research._waiting_runs() == []
+    if case != "moved-run-taken-marker-gone":
+        assert (folder / ".stop").exists(), "it could still be taken and run"
+    assert published.wait(5), "the queue order was not re-published"
+    assert lis.incoming == ["incoming"], "the command was not taken away"
+
+
+def test_a_new_run_taken_from_the_queue_is_still_cancelled_before_starting(
+        monkeypatch, tmp_path):
+    """The control: a NEW run a resting worker had only queued, taken into this
+    worker's line and not started, has nothing to keep. Its own person's cancel
+    stays the ordinary one."""
+    folder = tmp_path / "queues" / f"Queued_{T._stamp()}"
+    folder.mkdir(parents=True)
+    job = _queued_resume_marker(folder, worker=1, resume=False)
+    lis, _p = T._cancel_listener(monkeypatch, tmp_path,
+                                 deque_jobs=[dict(job, moved_run=True, kept_work=False)])
+    lis.feed(action="cancel", uid=T.SHARER, submittedBy=T.SHARER, researchId=T.RID)
+    assert [T._as_written(p) for _u, r, p in lis.writes if r == T.RID] == [
+        {"status": "stopped", "phase": 0, "summary": "Cancelled before starting",
+         "cancelled": True}]

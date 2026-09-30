@@ -9565,6 +9565,24 @@ def _waiting_record_patch() -> dict:
     }
 
 
+def _waiting_run_stop_patch() -> dict:
+    """What a waiting run that KEPT WORK says once its own person ends it: a
+    stop, as the chat's own Stop of a running run is — `stopped`, with its
+    steps and its work as they were. ⛔ No `cancelled` (the app's
+    delete-on-close) and no `phase: 0`. ⛔ No `summary` either: a stop is a
+    status, and the app keeps whatever summary is there. It no longer waits,
+    so its queue fields and `movedToQueueAt` go."""
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    return {
+        "status": "stopped",
+        "stoppedAt": int(time.time() * 1000),
+        "queuePosition": _DF,
+        "queuedBehindRunId": _DF,
+        "queuedBehindTitle": _DF,
+        "movedToQueueAt": _DF,
+    }
+
+
 def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None":
     """Put `job`'s run at the front of this computer's queue: write its marker,
     naming the whole job, so whichever worker takes it can resume it without
@@ -16660,6 +16678,9 @@ def start_firestore_start_listener(job_queue, loop):
                         # One this worker took from the queue for a worker and
                         # has not started yet (wave 13) — see below.
                         removed_taken = any(_cancels(j) and j.get("moved_run") for j in dq)
+                        # …and whether that run had work done (`kept_work`).
+                        removed_taken_kept = any(_cancels(j) and j.get("moved_run")
+                                                 and j.get("kept_work") for j in dq)
                         dq.clear()
                         for j in kept:
                             dq.append(j)
@@ -16732,6 +16753,30 @@ def start_firestore_start_listener(job_queue, loop):
                         _waiting_rec = (_end_waiting_run(u, rid)
                                         if _start_doc_id is None and (removed_taken or not removed)
                                         else None)
+                        # ⭐⭐ THE RUN'S OWN PERSON, ON A WAITING RUN THAT KEPT
+                        # WORK, IS STOPPING IT (w13 integrated review, 09-29).
+                        # Their chat shows any queued run as "queued — Cancel",
+                        # so a run moved after an hour of research, or put back
+                        # at boot with its steps done, was written as a cancel:
+                        # `cancelled: true`, and the app deleted the research
+                        # and its reports when the chat closed. It is written as
+                        # a stop now — work kept, steps as they were — whatever
+                        # the chat called it. An ordinary queued run's own cancel
+                        # is still "Cancelled before starting", below.
+                        if (not _owner_control_patch(oc, running=True)
+                                and (_waiting_kept_work(_waiting_rec)
+                                     if _waiting_rec is not None else removed_taken_kept)):
+                            if _firebase_db:
+                                _update_research_doc(u, rid, _waiting_run_stop_patch())
+                            _kick_queue_publish()
+                            log(f"Cancel: rid={rid[:8]}… was waiting in the queue for a "
+                                f"worker with work done — its person stopped it, and "
+                                f"everything it did is kept", "INFO")
+                            try:
+                                dref.delete()
+                            except Exception:
+                                pass
+                            return
                         if _waiting_rec is not None and _waiting_rec.get("queued_job") is not None:
                             removed = True
                             _kick_queue_publish()
