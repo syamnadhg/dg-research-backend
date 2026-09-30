@@ -26,7 +26,12 @@
   K* — the startup sweep keeps a waiting run's folder.
   X* — Clear Local Storage keeps every run running or waiting, on ANY worker.
   Z* — Reset Backend ends the waiting runs too.
-  Y* — the capability the app reads, in its own write.
+  Y* — the capability the app reads, in its own write: `capabilities` listing
+       "requeue", cleared on a backend started by hand.
+  M* — the published queue marks a waiting run with work done `moved: true`
+       (the owner's long-press then stops it and keeps the work) — at the
+       front, and in one worker's own line once taken; an ordinary queued run,
+       or a job a resting worker had only queued, carries no `moved` key.
   R* — the repair after review (rv13, 09-29): the move takes the run out of its
        old worker's snapshot; the boot restore and rehydration leave a run
        another worker runs or has taken; a run out of automatic attempts is
@@ -492,12 +497,44 @@ MUTANTS = [
      [("                        if _rq != _last_published_requeue_patch:",
        "                        if False:")]),
     ("Y2", RESEARCH, "⛔ a backend started by hand advertises it — the move would kill it",
-     [('    if _supervisor_is_my_parent():\n        return {"requeueRuns": _REQUEUE_RUNS_CAPABILITY}',
-       '    if True:\n        return {"requeueRuns": _REQUEUE_RUNS_CAPABILITY}')]),
+     [('    if _supervisor_is_my_parent():\n        return {"capabilities": [REQUEUE_CAPABILITY]}',
+       '    if True:\n        return {"capabilities": [REQUEUE_CAPABILITY]}')]),
     ("Y3", RESEARCH, "⛔ the capability rides the version patch — one unadmitted key refuses both",
      [("                        _vf = await asyncio.to_thread(_device_version_fields)\n",
        "                        _vf = dict(await asyncio.to_thread(_device_version_fields),\n"
        "                                   **(await asyncio.to_thread(_requeue_capability_patch)))\n")]),
+    ("Y4", RESEARCH, "⛔⛔ the list names it under a word the app does not read — no chip anywhere",
+     [('REQUEUE_CAPABILITY = "requeue"', 'REQUEUE_CAPABILITY = "move_to_queue"')]),
+    ("Y5", RESEARCH, "⛔⛔ it is announced under a key of its own — the app never reads it and the "
+     "rules refuse it",
+     [('        return {"capabilities": [REQUEUE_CAPABILITY]}',
+       '        return {"requeue": [REQUEUE_CAPABILITY]}')]),
+    ("Y6", RESEARCH, "a backend started by hand leaves an empty list instead of clearing the field",
+     [('    return {"capabilities": _crun_delete_field()}', '    return {"capabilities": []}')]),
+
+    # ═══ M — the moved mark on the published queue ═══════════════════════════
+    ("M1", RESEARCH, "⛔⛔ a moved run's pill is not marked — the owner's long-press offers "
+     "Cancel and throws its work away",
+     [("    if kept_work:\n", "    if False:\n")]),
+    ("M2", RESEARCH, "⛔ every waiting run is marked — a job a resting worker had only queued "
+     "offers Stop instead of Cancel",
+     [('    return not isinstance((rec or {}).get("queued_job"), dict)', "    return True")]),
+    ("M3", RESEARCH, "⛔ the front of the queue never asks whether the run has work done",
+     [("kept_work=_waiting_kept_work(w))", "kept_work=False)")]),
+    ("M4", RESEARCH, "⛔ a moved run one worker took and has not started loses its mark",
+     [('kept_work=bool(job.get("kept_work"))))', "kept_work=False))")]),
+    ("M5", RESEARCH, "every job in one worker's line is marked moved — a run sent while it "
+     "was busy offers Stop",
+     [('kept_work=bool(job.get("kept_work"))))', "kept_work=True))")]),
+    ("M6", RESEARCH, "every run taken from the queue is marked, a job that had only been "
+     "queued too",
+     [('kept_work=bool(job.get("kept_work"))))', 'kept_work=bool(job.get("moved_run"))))')]),
+    ("M7", RESEARCH, "the claim never says the run it took had work done — its pill loses the "
+     "mark until it starts",
+     [('            "kept_work": True,\n', "")]),
+    ("M8", RESEARCH, "an ordinary queued run carries `moved: False` instead of no key",
+     [('    return {"uid": uid, "runId": run_id, "position": position}',
+       '    return {"uid": uid, "runId": run_id, "position": position, "moved": False}')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

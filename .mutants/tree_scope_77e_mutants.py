@@ -84,11 +84,10 @@ _QUEUE_OWNERS = """        _queue_owners.append({
             "position": new_pos,
         })"""
 
-_LOCAL_ENTRIES = """        out.append({
-            "uid": uid_v,
-            "runId": rid_v,
-            "position": len(out) + 1,
-        })"""
+# Re-aimed (wave 13): the entry is built by `_waiting_owner_entry` now, which
+# also carries a moved run's `moved` mark.
+_LOCAL_ENTRIES = """        out.append(_waiting_owner_entry(uid_v, rid_v, len(out) + 1,
+                                        kept_work=bool(job.get("kept_work"))))"""
 
 MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ the rehydration scope ══════════════════════════════════════════
@@ -198,12 +197,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "⛔ the locally-pending half of that same array carries the topic, so the "
      "leak returns for the jobs this worker has claimed but not started",
      [(_LOCAL_ENTRIES,
-       '        out.append({\n'
-       '            "uid": uid_v,\n'
-       '            "runId": rid_v,\n'
-       '            "title": (job.get("topic") or "")[:60],\n'
-       '            "position": len(out) + 1,\n'
-       '        })')],
+       '        out.append(dict(_waiting_owner_entry(uid_v, rid_v, len(out) + 1,\n'
+       '                                             kept_work=bool(job.get("kept_work"))),\n'
+       '                        title=(job.get("topic") or "")[:60]))')],
      [T_NEW, T_OWNERS]),
     ("Q1", "over",
      "⛔⛔ the machine reaches into the tree of the person queued AHEAD to fetch "
