@@ -536,6 +536,9 @@ def test_live_p1_a_short_reply_is_never_taken_as_the_brief(chrome, page, p1, log
     assert _clicked(chrome, page) == ["Copy", "Copy", "Copy"]       # the read + 2 re-reads
     assert QUESTION[0] in _copied(chrome, page)                      # it WAS copied
     assert len(_lines(logs, "was not used — it was only")) == 3, logs
+    # ⛔ Wave 13: a short reply is not a brief that could not be read — the
+    # card keeps "No brief was generated" and its Retry asks again.
+    assert "reread" not in out
 
 
 #: The paragraphs of the fixture's reply, in its Copy's markdown.

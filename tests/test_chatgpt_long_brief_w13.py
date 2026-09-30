@@ -310,6 +310,26 @@ def test_live_phase1_takes_the_long_brief_from_the_copy_button(chrome, page, p1,
     assert [ln for ln in text.splitlines() if ln.startswith("#")] == shown["headings"]
 
 
+def test_live_phase1_a_brief_on_the_page_that_cannot_be_read_is_read_again(
+        chrome, page, p1, logs):
+    """⛔ Wave 13: the long brief is on the page, but neither read can take it
+    (no marker names the reply, and its Copy copies nothing). run_phase1 says
+    the reply is there and hands back a way to read it again — the card's Retry
+    then reads it instead of asking ChatGPT for a new brief. Once the Copy
+    works, that re-read is the brief, the Copy clicked once more."""
+    cf._open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True,
+             long_brief=True, copy_gives="nothing")
+    out = p1.run()
+    assert out["text"] == "" and callable(out.get("reread")), logs
+    assert cf._lines(logs, "but the brief could not be read from it"), logs
+    clicks = len(cf._clicked(chrome, page))
+    chrome.run(page.evaluate("() => { delete document.body.dataset.copyGives; }"))
+    again = chrome.run(out["reread"]())
+    assert len(cf._clicked(chrome, page)) == clicks + 1
+    assert again["text"] == cf._copied(chrome, page).strip() and len(again["text"]) > 35000
+    assert "reread" not in again
+
+
 # ── the CUA, when no Copy button can be found: a table's own buttons ─────────
 
 #: A table's own buttons at work: the first button of a table's row (its "Copy

@@ -56004,6 +56004,32 @@ async def _chatgpt_copy_on_page(page, text, unanswered=0) -> bool:
     return bool(probes) and hits >= max(min(2, len(probes)), -(-2 * len(probes) // 3))
 
 
+#: Where ChatGPT's latest reply is, as `_CG_PAGE_TEXT_JS` finds it — but null
+#: when neither the reply nor the person's message is marked: the whole page's
+#: text (the sidebar's chat titles and all) says nothing about a reply.
+_CG_REPLY_SHOWN_JS = _cg_js("""(skip) => {
+    const replies = document.querySelectorAll('__CG_ASSISTANT__');
+    if (replies.length) return [replies[replies.length - 1].innerText || '', null];
+    const users = document.querySelectorAll('__CG_USER__');
+    const k = skip || 0;
+    if (users.length <= k) return null;
+    return [(document.body && document.body.innerText) || '',
+            users[users.length - 1 - k].innerText || ''];
+}""")
+
+
+async def _chatgpt_reply_shown_len(page, unanswered=0) -> int:
+    """How many letters and digits ChatGPT's latest reply shows on the page; 0
+    when that cannot be told. Never raises."""
+    try:
+        got = await page.evaluate(_CG_REPLY_SHOWN_JS, unanswered)
+    except Exception:
+        return 0
+    if not got:
+        return 0
+    return len(_cg_latest_reply_letters(got[0], got[1]))
+
+
 async def _chatgpt_find_copy_button(page, unanswered=0):
     """The Copy button under the latest reply (an element handle), or None."""
     try:
@@ -57499,6 +57525,40 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                                              verbose=verbose,
                                              unanswered=_p1_unanswered)) or text
 
+    async def _p1_unread(out):
+        """`out` (a read that came back empty) — and, when ChatGPT's reply is
+        plainly on the page (longer than the page read's own floor), a way to
+        read it again: the card then says the brief was written but could not
+        be read, and its Retry re-reads it instead of asking ChatGPT again
+        (wave 13; before, the card blamed the sign-in)."""
+        shown = await _chatgpt_reply_shown_len(browser.page, _p1_unanswered)
+        if shown > _CG_COPY_MIN_CHARS:
+            log(f"Phase 1: ChatGPT's reply is on the page ({shown} letters and digits) "
+                f"but the brief could not be read from it", "WARN")
+            out["reread"] = _p1_reread
+        return out
+
+    async def _p1_reread():
+        """Retry on the "couldn't be read" card: read the brief again (the page,
+        then the Copy button), the topic check as on the first read."""
+        text = await _p1_read_brief()
+        try:
+            url = await browser.current_url()
+        except Exception:
+            url = ""
+        if len(text or "") <= 100:
+            return await _p1_unread({"text": text or "", "url": url})
+        action = await brief_topic_gate(text, topic, retry_count=_retry_count,
+                                        max_retries=P1_MAX_USER_RETRIES)
+        if action == "stop":
+            return None
+        if action == "retry":
+            return await run_phase1(browser, cua_client, topic, pdf_paths,
+                                    verbose=verbose, feedback=feedback,
+                                    _retry_count=_retry_count + 1)
+        log(f"Brief extracted on the re-read: {len(text)} chars")
+        return {"text": text, "url": url}
+
     brief_text = await _p1_read_brief()
     chat_url = await browser.current_url()
 
@@ -57651,7 +57711,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         return {"text": brief_text, "url": chat_url}
     else:
         log(f"Brief too short ({brief_len} chars)", "WARN")
-        return {"text": brief_text or "", "url": chat_url}
+        return await _p1_unread({"text": brief_text or "", "url": chat_url})
 
 
 # ── Phase 2: Parallel Deep Research (Sequential Start + Verify) ──────────────
@@ -76451,6 +76511,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # what to do with no brief; Stop returns from the pipeline.
             _p1_skipped_after_error = False
             _brief_from_file = False
+            # Wave 13: Retry on the "couldn't be read" card re-reads the brief
+            # already on ChatGPT's page (run_phase1's `reread`) — once.
+            _p1_reread = None
             while True:
                 if brief_file:
                     brief_text = Path(brief_file).read_text(encoding="utf-8")
@@ -76479,7 +76542,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         try:
                             p1 = await _await_phase_with_active_deadline(
                                 1, PHASE_1_MAX_MIN,
-                                lambda: run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1),
+                                lambda: (_p1_reread() if _p1_reread else
+                                         run_phase1(browser, cua_client, current_topic,
+                                                    pdf_paths, verbose, feedback=fb1)),
                                 soft_warn_only=True,  # 2026-05-04: long brief gens (30+m on large PDFs) are legitimate; warn but don't bail
                             )
                             break  # success — exit inner retry loop
@@ -76512,6 +76577,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # stop / fall-through (user explicitly hit Stop)
                             emit_event("pipeline_stopped", phase=1, reason=f"user_{_decision}_after_timeout")
                             return
+                    _p1_reread = None
                     if _p1_skipped_after_error:
                         break  # exit outer for _p1_attempt loop too
                     if fb1:
@@ -76552,6 +76618,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # nobody asked for.
                         log("Phase 1: ChatGPT skipped at the login pause → manual brief flow", "INFO")
                         decision = "skip"
+                    elif p1 and p1.get("reread"):
+                        # Wave 13: ChatGPT wrote it — it is on the page — and
+                        # the reads could not take it. Not a sign-in problem.
+                        log("Phase 1 failed — the brief is on ChatGPT's page but could "
+                            "not be read; awaiting user decision", "ERROR")
+                        fail_phase(
+                            phase=1,
+                            error="The brief couldn't be read",
+                            reason="ChatGPT wrote the brief, but it couldn't be read from the page. Retry reads it again — or Skip and write your own.",
+                            agent="chatgpt",
+                        )
+                        decision = await _controls.await_phase_decision(1)
                     else:
                         log("Phase 1 failed — no brief generated; awaiting user decision", "ERROR")
                         fail_phase(
@@ -76561,6 +76639,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             agent="chatgpt",
                         )
                         decision = await _controls.await_phase_decision(1)
+                    if decision == "retry" and p1 and p1.get("reread"):
+                        log("Phase 1: user requested retry — reading the brief again "
+                            "from ChatGPT's page", "INFO")
+                        _p1_reread = p1["reread"]
+                        emit_event("phase_restart", phase=1, reason="user_retry_reread", attempt=0)
+                        continue
                     if decision == "retry":
                         log("Phase 1: user requested retry — re-running from the top", "INFO")
                         # #899: a Retry supersedes any stale login-pause skip —
