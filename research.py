@@ -14064,9 +14064,14 @@ _DEFAULT_PHASE_MINUTES = {0: 0.2, 1: 27, 2: 55, 3: 15, 4: 8, 5: 4}
 # avoids panicking the user when actual exceeds estimate). These are minutes
 # of GENERATION, not the audio's own length (which the Settings copy gives).
 # ⭐ 2026-09-30: short is Deep dive + Short now, no longer Brief (every length
-# is a Deep dive). Its (5, 10) stays, read now as half of Default's (10, 20),
-# the same step Long takes above Default in the Settings copy. ASSUMED: no
-# Deep dive + Short has been generated yet to measure.
+# is a Deep dive). Its (5, 10) is BRIEF's measured generation band carried
+# over (this machine's logs: Brief took 4.3–7.8 min over 7 runs); no Deep
+# dive + Short has been generated yet to measure. The same logs put Deep dive
+# + Long at 9.5–17.7 min over 5 runs, under the (30, 45) below, and its audio
+# at 39:05 and 53:50 (capture 5: 61:59), about twice the Settings copy's Long
+# ≈ 20–30 — so the Settings "Short ≈ 5–8" (half of Default, by the copy's own
+# Default→Long step) rests on a step no run has measured. Measure Short on the
+# next E2E, then set this, the Settings line and the support bullet together.
 _AUDIO_TYPICAL_RANGE_MIN = {
     "short":   (5, 10),
     "default": (10, 20),

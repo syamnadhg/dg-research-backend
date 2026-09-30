@@ -821,9 +821,13 @@ IMPORTANT: Only touch the ONE failed source named for you. Never remove a health
 # picked. Three variants, every one a Deep dive (owner, 2026-09-30 — short
 # was Brief before, and Brief is never chosen now):
 #   - "short"   → Format="Deep dive", Length="Short" (~5–8 min, ASSUMED: half
-#                 of Default, the step Long takes above it; none measured yet)
+#                 of Default, the step Long takes above it in these notes;
+#                 none measured yet)
 #   - "default" → Format="Deep dive", Length="Default" (~10–15 min)
-#   - "long"    → Format="Deep dive", Length="Long" (~20–30 min, current)
+#   - "long"    → Format="Deep dive", Length="Long" (~20–30 min, current —
+#                 but this machine's Deep dive + Long audio ran 39:05 and
+#                 53:50, and capture 5 shows 61:59, so that step is not a
+#                 measurement either)
 # The "short" variant exists for the YouTube unverified-channel 15-min cap;
 # ASSUMED that Deep dive + Short still stays under it.
 
