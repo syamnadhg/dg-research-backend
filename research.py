@@ -38228,6 +38228,27 @@ DETECT_FNS = {
 }
 
 
+async def _gemini_finished_on_its_own(page) -> bool:
+    """True when Gemini's FINISHED report is on the page — the done-only marks
+    `detect_completion_gemini` ranks above a leftover Start button (the report's
+    "Contents · Share & Export · Create" row, or Gemini's own "I've completed
+    your research" line), with no Stop showing. Never the weak "Share & Export
+    alone" mark. Never raises.
+
+    ⛔ Wave 13 (the 09-21 run): Gemini sometimes starts its research by itself
+    and FINISHES it inside the five-minute plan wait, never showing a "Start
+    research" button to press. The wait did not look for that: at five minutes
+    it raised "Gemini couldn't start Deep Research", then spent seven more
+    minutes asking the vision step to re-draft a plan while the vision step said
+    "The page shows a finished research report", and only the round-robin
+    after it found the 70k-character report and took the card back."""
+    try:
+        done, reason, _snap = await detect_completion_gemini(page)
+    except Exception:
+        return False
+    return bool(done) and ("report_button_trio" in reason or "completed_chat_text" in reason)
+
+
 # ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
 
 async def _claude_modern_marker(page, strict=False) -> bool:
@@ -67477,6 +67498,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # truly-dead (non-streaming) plan only.
         _stream_handoff_sec = int(os.environ.get("GEMINI_PLAN_STREAM_HANDOFF_SEC", "360"))
         _streaming_handoff = False
+        # Wave 13: Gemini started AND finished on its own inside this wait — see
+        # `_gemini_finished_on_its_own`. No card, no vision re-drafts.
+        _finished_handoff = False
 
         def _raise_plan_alert(where: str):
             """Put the non-blocking [Retry][Skip] card up, once."""
@@ -67516,6 +67540,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # #929: dynamic budget — original 300s window, extended while the
             # plan is visibly streaming, hard-capped at _stream_max_sec.
             _elapsed = int(time.time() - _loop_start)
+            # ⛔ Wave 13: FIRST, before the budget below can raise "couldn't
+            # start" — a Gemini whose report is already on the page started and
+            # finished by itself. Hand it to the round-robin to collect.
+            if await _gemini_finished_on_its_own(gemini_page):
+                _finished_handoff = True
+                log(f"[2D] Gemini started and finished its research on its own "
+                    f"({_elapsed}s, no 'Start research' was needed) — handing it to "
+                    "the round-robin to collect the report", "INFO")
+                break
             _streaming_recent = (time.time() - _last_stream_seen_at) < 45
             # #953: still streaming past the hand-off point → the research
             # (almost certainly) auto-started — hand off to the round-robin
@@ -67905,7 +67938,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # the grayed button) + the false "couldn't start" card. The ladder is
         # for the truly-dead, non-streaming plan only.
         if (not _gemini_2d_skipped and not start_clicked and not _streaming_handoff
-                and not _controls.is_stop()):
+                and not _finished_handoff and not _controls.is_stop()):
             _FALLBACK_MAX_REGEN = 3   # CUA-driven re-draft attempts (the in-loop #755 path already tried 3 via JS)
             log(f"[2D] No 'Start research' after {_start_wait_max_sec}s — CUA recovery: "
                 f"retry the plan (≤{_FALLBACK_MAX_REGEN}×) until 'Start research' appears, then click it")
@@ -68086,6 +68119,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         elif _controls.is_stop():
             log("[2D] Stop requested — skipping Gemini verify", "INFO")
             verified_b = False
+        elif _finished_handoff:
+            # Wave 13: its report is on the page — it ran. The block below
+            # takes back any "couldn't start" card; the round-robin collects.
+            verified_b = True
         elif _streaming_handoff:
             # #953: Gemini was still actively streaming past the hand-off point —
             # research almost certainly auto-started (2026-07-13 run: plan at
