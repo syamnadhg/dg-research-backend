@@ -242,7 +242,7 @@ def resumed(tmp_path, monkeypatch):
     _FakeBrowser.instances = []
     seen = {"created": 0, "audio": [], "plan": [], "cards": [], "lines": [],
             "waits": [], "downloads": [], "published": [], "hotspots": [],
-            "shared": 0}
+            "shared": 0, "signins": []}
 
     monkeypatch.setattr(research, "resolve_api_key", lambda *_a, **_k: "test-key")
     monkeypatch.setattr(research, "_capture_anthropic_attribution", lambda *a, **k: None)
@@ -279,6 +279,18 @@ def resumed(tmp_path, monkeypatch):
     async def _hv(*_a, **_k):
         return True
     monkeypatch.setattr(research, "check_hv_gate", _hv)
+
+    # ── the sign-in pause: the person signs in, and the pause brings the tab
+    # back to the address it was working on (as the real one does). The
+    # signed-out probe itself is real; its note on the jar stays in this test.
+    monkeypatch.setattr(research._controls, "cookie_trust_broken", set())
+
+    async def _sign_in(page, agent_key, phase, label, *, work_url):
+        seen["signins"].append(work_url)
+        _FakeBrowser.notebook.signed_in = True
+        await page.goto(work_url)
+        return "ok"
+    monkeypatch.setattr(research, "_work_tab_login_pause", _sign_in)
 
     # ── NotebookLM's page, read from whichever fake notebook the tab shows ──
     async def _census(page, expected):
@@ -506,6 +518,22 @@ def test_a_sign_in_page_is_not_a_gone_notebook(resumed):
 
     assert seen["created"] == 0, "a sign-in page made a new notebook"
     assert seen["audio"] and seen["audio"][0]["url"] == NB_URL
+
+
+def test_signed_out_and_the_notebook_deleted_meanwhile_gets_a_new_one_after_sign_in(resumed):
+    """⛔ Wave 13: signed out AND the notebook deleted while Chrome was down. The
+    sign-in page hides that the notebook is gone, and it was read as "carry on"
+    — the podcast step was sent to a notebook that no longer existed. Now the
+    person signs in first, on the notebook's own address, and what NotebookLM
+    shows then decides: gone, so a new notebook is made."""
+    run, nb, _qd, _seen = resumed
+    nb.signed_in = False
+    nb.exists = False
+    seen = run(_stop_here)
+
+    assert seen["signins"] == [NB_URL], "the sign-in was not asked for on the notebook"
+    assert seen["created"] == 1, "no new notebook for a notebook that is gone"
+    assert seen["audio"] and seen["audio"][0]["url"] == NEW_NB_URL
 
 
 # ══ 2. …and makes a new one only when the old one is not there ════════════

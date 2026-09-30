@@ -69375,8 +69375,9 @@ async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
                                            is gone, its first new tab meets the
                                            same dead browser and unwinds it as a
                                            crash (`_p3_upload_failure_kind`)
-      * NotebookLM asks to sign in       → carry on: the podcast step waits for
-                                           the sign-in on this notebook's page
+      * NotebookLM asks to sign in       → wait for the sign-in (wave 13), then
+                                           the checks below; a sign-in that ends
+                                           in Skip or Stop → no carry-on
       * the tab is not on the notebook   → gone: make a new one
       * a podcast is ready or being made → carry on (the podcast step adopts a
                                            finished one or waits on it)
@@ -69386,7 +69387,8 @@ async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
 
     ⛔ A SIGN-IN WALL IS NOT A GONE NOTEBOOK. Signed out, NotebookLM sends the tab
     to Google's sign-in page, which the id test below would read as "gone" — and
-    a new notebook would be made for a person who only needed to sign in.
+    a new notebook would be made for a person who only needed to sign in. Nor is
+    it a notebook that is still there: it could have been deleted meanwhile.
 
     The notebook stays public and renamed: it is recorded only after the upload
     step has shared and renamed it. Read-only apart from opening the tab."""
@@ -69402,10 +69404,21 @@ async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
         log(f"Phase 3: could not open the notebook this research made "
             f"({type(e).__name__}) — going to the upload instead", "WARN")
         return False
-    if await _page_shows_login_wall(page):
-        log("Phase 3: NotebookLM is asking to sign in — carrying on in the notebook "
-            "this research made; the podcast step waits there for the sign-in", "WARN")
-        return True
+    # ⛔ Wave 13: SIGN IN FIRST, THEN LOOK. Signed out, the sign-in page hides
+    # whether the notebook is still there: a notebook deleted while Chrome was
+    # down was read as "carry on", and the podcast step then waited for a
+    # sign-in only to land on a notebook that no longer existed. So the person
+    # signs in here (the pause brings the tab back to the notebook's address),
+    # and the checks below decide on what NotebookLM then shows.
+    if await _work_tab_signed_out(page, "notebooklm", "NotebookLM"):
+        log("Phase 3: NotebookLM is asking to sign in — waiting for the sign-in "
+            "before looking at the notebook this research made", "WARN")
+        signed_in = await _work_tab_login_pause(page, "notebooklm", 3, "NotebookLM",
+                                                work_url=notebook_url)
+        if signed_in != "ok":
+            log(f"Phase 3: NotebookLM sign-in ended '{signed_in}' — not carrying on in "
+                f"the notebook this research made", "WARN")
+            return False
     try:
         here = page.url or ""
     except Exception:
