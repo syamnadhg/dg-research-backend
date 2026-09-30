@@ -73026,6 +73026,9 @@ async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dic
     fmt, length = _nlm_audio_choice(podcast_length)
     res = {"generated": False, "pressed": False, "format": fmt, "length": length,
            "reason": ""}
+    # The format first: it redraws the Length row. Each choice is read back
+    # before the next step, and the length's read-back is the last read before
+    # the press.
     for op, want in (("format", fmt), ("length", length)):
         if not want:
             continue
@@ -73033,14 +73036,6 @@ async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dic
         if not r["ok"]:
             res["reason"] = r["reason"]
             return res
-    # The last read before the press decides.
-    f_opts = (await _nlm_customise_read(page, "format", fmt)).get("options") or []
-    l_opts = ((await _nlm_customise_read(page, "length", length)).get("options") or []
-              if length else [])
-    if not _nlm_reads_as(f_opts, fmt) or (length and not _nlm_reads_as(l_opts, length)):
-        res["reason"] = (f"the choices moved before Generate now (format reads "
-                         f"{_nlm_chosen(f_opts)}, length reads {_nlm_chosen(l_opts)})")
-        return res
     st = await _nlm_customise_read(page, "generate", value="nlm-generate-now")
     if not st.get("marked"):
         res["reason"] = f"no Generate now button to press (found: {st.get('button') or 'none'})"
