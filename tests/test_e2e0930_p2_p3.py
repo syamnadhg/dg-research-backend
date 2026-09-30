@@ -669,11 +669,13 @@ def test_the_wanted_tier_on_the_button_at_send_says_nothing(monkeypatch):
 
 
 def test_the_wanted_tier_is_extra_high_in_the_existing_words():
-    """The owner, 09-30: Extra high (Max uses about six times the usage). The
-    policy keeps the Effort menu's own word, which every reader already knows."""
+    """The owner, 09-30: Extra (Max uses 5.5× or more usage). The policy keeps
+    the Effort menu's own word, which every reader already knows — and since
+    round 2 the run SAYS the page's word too: the 09-30 capture's row reads
+    "Extra" and the model button "Opus 5.5 Extra"."""
     assert models.p2_labels("claude")["effort"] == "extra"
     assert research._claude_effort_option_testid("extra") == "effort-option-xhigh"
-    assert models.effort_label("extra") == "Extra high"
+    assert models.effort_label("extra") == "Extra"
     assert models.effort_label("max") == "Max"
 
 
