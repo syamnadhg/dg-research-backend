@@ -192,11 +192,12 @@ Steps:
 1. If a menu, popover or dialog is open, press Escape (at most twice) to close it.
 2. Find ChatGPT's latest reply: the last answer in the conversation, below the
    user's own message. Scroll down to its end if you need to. A row of small
-   icons sits directly under it; Copy is usually the first of them (two
-   overlapping squares).
-3. Click that Copy icon once. Not the "Copy message" icon under the user's own
-   message, not a Copy button inside a code block, and not Share, Read aloud,
-   Regenerate, Edit or Send.
+   icons sits directly under the END of the reply, below its last line; Copy is
+   usually the first of them (two overlapping squares).
+3. Click that Copy icon once. Not the "Copy table" or "Expand table" icons at
+   the corner of a table inside the reply (they copy one table, not the reply),
+   not the "Copy message" icon under the user's own message, not a Copy button
+   inside a code block, and not Share, Read aloud, Regenerate, Edit or Send.
 4. Do NOT type anything. Do NOT paste. Do NOT press Enter. Do NOT use
    select-all.
 5. Say "copied" once you have clicked it, or describe what you see instead."""

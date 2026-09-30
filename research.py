@@ -39969,17 +39969,25 @@ CUA_NEVER_CLICK_SEND = CHATGPT_SEND_SEL + ', button[type="submit"]'
 #: Share sits right next to Copy and opens the dialog that makes a public link
 #: to the chat; Edit message under the user's own message opens an editor whose
 #: Send re-submits the prompt, which throws the brief away like Regenerate. The
-#: copy mission needs none of them.
+#: copy mission needs none of them. Nor the other Copy buttons the owner's
+#: capture of a finished brief shows (2026-09-29): every table INSIDE the reply
+#: has its own "Copy table" (the first icon of its row) and "Expand table", and
+#: a Copy table click hands back that one table — long enough, and its rows
+#: wordy enough, to pass for the brief; the user's own message has "Copy message".
 CUA_NEVER_CLICK_COPY = (CUA_NEVER_CLICK_SEND + ', button[aria-label="Regenerate response"]'
                         ', button[aria-label="Share"], button[aria-label="Share prompt"]'
-                        ', button[aria-label="Edit message"]')
+                        ', button[aria-label="Edit message"]'
+                        ', button[aria-label="Copy table"]'
+                        ', button[aria-label="Expand table"]'
+                        ', button[aria-label="Copy message"]')
 #: What agent_loop says when `never_click` refuses a click, per mission: the
 #: button(s) the list names, what the mission is for, and what to click
 #: instead. "caret" (the default) is the wording the caret missions always had.
 _NEVER_CLICK_SAY = {
     "caret": ("Send", "only puts the cursor in the message box",
               "Click inside the message box itself, never on Send."),
-    "copy": ("Send, Regenerate, Share or Edit", "only clicks the Copy button under ChatGPT's latest reply",
+    "copy": ("Send, Regenerate, Share, Edit, Copy message or a table's own button",
+             "only clicks the Copy button under ChatGPT's latest reply",
              "Click only the Copy button directly under ChatGPT's latest reply."),
 }
 
@@ -54354,8 +54362,12 @@ def _brief_prose_line(line: str) -> bool:
     """A line of prose: eight words or more (or, in a script written without
     spaces, twenty letters or more), not crowded with code symbols, and not a
     code comment ("#" or "//" first — a long comment reads like prose; a
-    markdown heading is not counted either, and a brief does not need it to be)."""
+    markdown heading is not counted either, and a brief does not need it to be).
+    Nor a markdown table's row ("|" first): a table's rows can be as wordy as
+    prose, and a table copied on its own (a table's own Copy) is not the brief."""
     if line.lstrip().startswith(("#", "//")):
+        return False
+    if line.lstrip().startswith("|"):
         return False
     if (len(re.findall(r"[^\W\d_]{2,}", line)) < 8
             and len(_CG_UNSPACED_RE.findall(line)) < 20):

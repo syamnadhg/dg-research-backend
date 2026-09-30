@@ -9,7 +9,8 @@ while the finished brief sat on the screen, under a Copy button that hands out
 its markdown. The page read stays the default. Only when it comes back empty
 does Phase 1 put a marker on the clipboard, press the Copy button under the
 latest reply (or, when no Copy button can be found, have a CUA press it — a CUA
-that may only click, and never on Send, Regenerate, Share or Edit message), and
+that may only click, and never on Send, Regenerate, Share, Edit message, Copy
+message or a table's own Copy table / Expand table), and
 read the clipboard, keeping the text only if it is not the marker, is as long as
 the page read requires (more than 2000 characters of prose), is not our own
 prompt, reads like a brief, and is text this page shows (fleet workers on one
@@ -817,8 +818,9 @@ def test_live_p1_the_copy_cua_only_clicks_and_never_regenerate_or_send(chrome, p
             p1.at[at])) == label
     refused = _lines(logs, "REFUSED")
     assert len(refused) == 7, refused
-    assert len(_lines(logs, "[cua] REFUSED a click on Send, Regenerate, Share or Edit — this "
-                            "task only clicks the Copy button under ChatGPT's latest reply")) == 5, refused
+    assert len(_lines(logs, "[cua] REFUSED a click on Send, Regenerate, Share, Edit, Copy "
+                            "message or a table's own button — this task only clicks the Copy "
+                            "button under ChatGPT's latest reply")) == 5, refused
     assert any("Click only the Copy button directly under ChatGPT's latest reply." in t
                for t in cua.told), cua.told
 
@@ -1027,6 +1029,27 @@ def test_live_a_copy_outside_every_turns_row_is_never_used(chrome, page, quick, 
     assert _clicked(chrome, page) == ["Copy"]
 
 
+def test_live_a_reply_no_turn_holds_gets_no_copy_button(chrome, page, quick, logs):
+    """⛔ The reply's marker still names it, but no turn marker holds it (a
+    rename of the turn). Its row's Copy is on the page and the marker names it —
+    yet it is not looked for across the page, where it could as well be an
+    earlier reply's: none is found, and the CUA is asked to press it (here there
+    is no CUA, so no brief)."""
+    _open(chrome, page, "new", thread=True, reply_actions=True)
+    chrome.run(page.evaluate("() => document.querySelector('[data-turn-key]').removeAttribute('data-turn-key')"))
+    assert chrome.run(page.evaluate(
+        "(s) => document.querySelectorAll(s).length", research.CHATGPT_TURN_SEL)) == 0
+    assert chrome.run(page.evaluate(
+        "(s) => document.querySelectorAll(s).length", research.CHATGPT_ASSISTANT_MSG_SEL)) == 1
+    assert chrome.run(page.evaluate(
+        "(s) => [...document.querySelectorAll(s)].map((b) => b.getAttribute('aria-label'))",
+        research.CHATGPT_COPY_REPLY_SEL)) == ["Copy"]
+    assert chrome.run(research._chatgpt_find_copy_button(page)) is None
+    assert _brief(chrome, page) == ""
+    assert _clicked(chrome, page) == []
+    assert _lines(logs, "no Copy button found under ChatGPT's reply, and no CUA to click it"), logs
+
+
 def test_live_the_users_copy_message_is_never_used(chrome, page, quick, logs):
     """A message of ours after the latest reply (a follow-up whose reply has not
     started): its "Copy message" is ours, and its turn holds no reply — the
@@ -1127,6 +1150,14 @@ def _sized(n):
     return t
 
 
+#: One table on its own, as a table's own "Copy table" hands it out (the
+#: owner's captured brief has four): past the floor, and every row as wordy as
+#: prose — but a table is not the brief.
+TABLE = "\n".join(["| Part of the brief | What the research agent should do |", "| --- | --- |"]
+                  + [f"| {k} | {v.strip()} |" for k, v in
+                     (p.split(":", 1) for p in OLD_BRIEF.split("\n\n")[1:])])
+
+
 #: A short brief padded past the floor by an image's ADDRESS — which the page
 #: read does not count either (`_doc_img_prose_len`).
 IMAGED = ("\n\n".join(PLAIN.split("\n\n")[:4])
@@ -1152,9 +1183,12 @@ IMAGED = ("\n\n".join(PLAIN.split("\n\n")[:4])
     # A script written without spaces: its lines are counted by their letters.
     (JA_BRIEF, ""),
     (JA_LABELS, "it does not read like a brief"),
+    (TABLE, "it does not read like a brief"),
+    # A brief WITH a table is still a brief.
+    (OLD_BRIEF + "\n\n" + TABLE, ""),
 ], ids=["marker", "empty", "blank", "300", "2000", "2001", "image-address", "our-prompt",
         "our-prompt-after-a-file-card", "code", "another-brief", "plain", "the-reply",
-        "japanese", "japanese-labels"])
+        "japanese", "japanese-labels", "a-table-alone", "a-brief-with-a-table"])
 def test_what_counts_as_the_brief(text, why):
     assert research._chatgpt_copy_verdict(text, MARK, (PROMPT + "\n\n" + FEEDBACK,)) == why
 

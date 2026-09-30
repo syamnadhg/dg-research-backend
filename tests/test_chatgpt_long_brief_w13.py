@@ -224,12 +224,23 @@ _SHOWN_JS = """() => {
 }"""
 
 
+def _md_words(md):
+    """The markdown's words as a person reads them: a link as its text, with
+    no heading, quote, bold, code or table marks — and the spacing kept, so two
+    words run together (`pass.**Paintings`) are one word here."""
+    t = re.sub(r"\[([^\]]*)\]\([^)\s]*\)", r"\1", md)
+    t = re.sub(r"^(?:#{1,6}|>) ", "", t, flags=re.M)
+    t = re.sub(r"^\|(?: --- \|)+$", "", t, flags=re.M)
+    return t.replace("**", "").replace("`", "").replace("|", " ").split()
+
+
 def _assert_clean_brief(md, shown):
     """The brief is the page's reply as clean markdown: its headings as
     #/##/###, its tables as markdown tables, each source chip a plain link to
     its source (no image, no icon address), its inline code as code (nothing
     escaped), its bold runs and quote as markdown, no button's words — and
-    every word the page shows, in order, and nothing else."""
+    every word the page shows, in order, spaced as the page spaces them, and
+    nothing else."""
     assert [ln for ln in md.splitlines() if ln.startswith("#")] == shown["headings"]
     assert len(shown["tables"]) == 4
     for rows in shown["tables"]:
@@ -252,8 +263,7 @@ def _assert_clean_brief(md, shown):
     for junk in ("Copy table", "Expand table", "Copy message", "Read aloud"):
         assert junk not in md
     # Every word, in order, and nothing else: the links' destinations aside.
-    words = re.sub(r"\]\([^)\s]*\)", "]", md)
-    assert research._cg_letters(words) == research._cg_letters(shown["text"])
+    assert _md_words(md) == shown["text"].split()
 
 
 def test_live_the_page_read_of_a_long_brief_is_clean_markdown(chrome, page, fast, logs):
@@ -300,6 +310,128 @@ def test_live_phase1_takes_the_long_brief_from_the_copy_button(chrome, page, p1,
     assert [ln for ln in text.splitlines() if ln.startswith("#")] == shown["headings"]
 
 
+# ── the CUA, when no Copy button can be found: a table's own buttons ─────────
+
+#: A table's own buttons at work: the first button of a table's row (its "Copy
+#: table") copies that one table — written here as a markdown table, the way
+#: the reply's Copy writes tables (what ChatGPT's own Copy table writes is not
+#: captured). Keyed on the row, not the label, so a relabelled one still copies.
+TABLE_COPY_JS = """() => {
+    for (const row of document.querySelectorAll('[data-block-actions]')) {
+        row.querySelector('button').addEventListener('click', () => {
+            const t = row.closest('[data-markdown-table]').querySelector('table');
+            const rows = [...t.querySelectorAll('tr')].map((tr) =>
+                [...tr.children].map((c) => c.innerText.trim()));
+            const md = [rows[0], rows[0].map(() => '---'), ...rows.slice(1)]
+                .map((r) => '| ' + r.join(' | ') + ' |').join('\\n');
+            setTimeout(() => navigator.clipboard.writeText(md), 150);
+        });
+    }
+}"""
+#: One button pinned where a scripted click reaches it, and named for the test
+#: (its icons clipped to it: an empty <svg> is drawn 300 pixels wide).
+PIN_JS = """([s, i, name, left]) => {
+    const b = document.querySelectorAll(s)[i];
+    b.dataset.srPin = name;
+    b.style.cssText = `position: fixed; left: ${left}px; top: 300px; width: 40px; `
+        + 'height: 30px; z-index: 9; display: block; overflow: hidden;';
+}"""
+
+
+def _cua_long_page(chrome, page, p1, *, table_label=None):
+    """The owner's run on the long brief after a future rename: no marker names
+    the reply's text or its own Copy (relabelled "Copy response"), so the CUA
+    is asked to press it. Every table's Copy table copies its table. Pinned
+    where a click reaches them, clear of one another: the reply's row, the
+    fourth table's Copy table (the captured 2155-character table), the second
+    table's Expand table and the user's Copy message. `table_label`: that Copy
+    table relabelled too."""
+    cf._open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True,
+             long_brief=True)
+
+    async def _hook():
+        await page.add_style_tag(content=cf.PIN_ROW_CSS)
+        await page.evaluate("() => document.querySelector('[data-sr-act=\"copy\"]')"
+                            ".setAttribute('aria-label', 'Copy response')")
+        await page.evaluate(TABLE_COPY_JS)
+        for name, s, i, left in (("table", 'button[aria-label="Copy table"]', 3, 600),
+                                 ("expand", 'button[aria-label="Expand table"]', 1, 700),
+                                 ("message", 'button[aria-label="Copy message"]', 0, 800)):
+            await page.evaluate(PIN_JS, [s, i, name, left])
+        if table_label:
+            await page.evaluate("(l) => document.querySelector('[data-sr-pin=\"table\"]')"
+                                ".setAttribute('aria-label', l)", table_label)
+        p1.at = {n: await page.evaluate(cf.CENTER_JS, f'[data-sr-pin="{n}"]')
+                 for n in ("table", "expand", "message")}
+        p1.at["copy"] = await page.evaluate(cf.CENTER_JS, '[data-sr-act="copy"]')
+
+    p1.hooks = [_hook]
+
+
+#: What the copy mission's refusal says (agent_loop's line).
+REFUSED = ("[cua] REFUSED a click on Send, Regenerate, Share, Edit, Copy message or a "
+           "table's own button — this task only clicks the Copy button under ChatGPT's "
+           "latest reply")
+
+
+def test_live_p1_the_cua_pressing_a_tables_copy_never_makes_the_table_the_brief(
+        chrome, page, p1, logs):
+    """⛔ The fallback's own case on the captured brief: the CUA presses the
+    Copy of a table INSIDE the reply — the first icon of that table's row, as
+    the reply's Copy is the first of the reply's. That one table (over 2000
+    characters, its rows as wordy as prose, and on this page) would have been
+    Phase 1's whole brief, and the research would start from one table. The
+    click is refused, on the read and on both re-reads; with no other click,
+    Phase 1 has no brief."""
+    _cua_long_page(chrome, page, p1)
+    cua = cf._CopyCua(lambda: [cf._click(p1, "table")])
+    out = p1.run(cua)
+    assert out["text"] == "", logs
+    assert chrome.run(page.evaluate(      # the click aimed at that button itself
+        "([x, y]) => document.elementFromPoint(x, y).closest('button').getAttribute('aria-label')",
+        p1.at["table"])) == "Copy table"
+    assert cf._clicked(chrome, page) == []
+    assert cua.missions == ["copy", "copy", "copy"]
+    assert len(cf._lines(logs, REFUSED)) == 3, logs
+    assert not cf._lines(logs, "brief taken from"), logs
+
+
+def test_live_p1_the_cua_is_held_off_every_other_copy_on_the_page(chrome, page, p1, logs):
+    """The CUA tries a table's Copy table and Expand table and the user's Copy
+    message before the reply's own Copy: each of the three is refused, with the
+    copy mission's words, and the reply's Copy gives the whole brief."""
+    _cua_long_page(chrome, page, p1)
+    cua = cf._CopyCua(lambda: [cf._click(p1, "table"), cf._click(p1, "expand"),
+                               cf._click(p1, "message"), cf._click(p1, "copy")])
+    out = p1.run(cua)
+    for label, at in (("Copy table", "table"), ("Expand table", "expand"),
+                      ("Copy message", "message"), ("Copy response", "copy")):
+        assert chrome.run(page.evaluate(
+            "([x, y]) => document.elementFromPoint(x, y).closest('button').getAttribute('aria-label')",
+            p1.at[at])) == label
+    assert cf._clicked(chrome, page) == ["Copy response"]
+    assert cua.missions == ["copy"]
+    assert len(cf._lines(logs, REFUSED)) == 3, logs
+    text = out["text"]
+    assert text == cf._clip(chrome, page).strip() and len(text) > 35000, logs
+    assert cf._lines(logs, "brief taken from ChatGPT's Copy button, clicked by the CUA ("), logs
+
+
+def test_live_p1_a_table_copied_under_another_label_is_still_not_the_brief(
+        chrome, page, p1, logs):
+    """⛔ A later rename could change the table's label too — here to plain
+    "Copy", which no never-click rule can refuse without refusing the reply's
+    own. The CUA presses it and it copies the table: the copy is refused as not
+    reading like a brief, since a table's rows are not counted as prose."""
+    _cua_long_page(chrome, page, p1, table_label="Copy")
+    cua = cf._CopyCua(lambda: [cf._click(p1, "table")])
+    out = p1.run(cua)
+    assert cf._clicked(chrome, page) == ["Copy", "Copy", "Copy"]     # it WAS pressed
+    assert cf._clip(chrome, page).startswith("| ")                  # and copied its table
+    assert out["text"] == "", logs
+    assert len(cf._lines(logs, "was not used — it does not read like a brief")) == 3, logs
+
+
 # ═══ 3. HTML→markdown on the captured shapes, with no browser ═══════════════
 
 CHIP = ('<p>The hospice kept dogs. <span data-state="closed" class="contents"><span '
@@ -330,3 +462,13 @@ def test_inline_code_written_as_a_span_is_code():
         '<p><span>a plain span_with an underscore</span></p>')
     assert md == ("**Search string:**\n`hip_score *giant* site:ofa.example`\n\n"
                   "a plain span\\_with an underscore")
+
+
+def test_inline_code_with_a_backtick_or_spaces_at_its_edges():
+    """A backtick inside the code gets a longer fence, spaced; spaces at its
+    edges go outside the fence — and the spans around it keep their spacing."""
+    md = research.html_to_markdown(
+        '<p><span>Run the </span><span data-markdown-copy="inline-code">grep `ls`</span>'
+        '<span> check, then</span><span data-markdown-copy="inline-code"> edge </span>'
+        '<span>now.</span></p>')
+    assert md == "Run the `` grep `ls` `` check, then `edge` now."
