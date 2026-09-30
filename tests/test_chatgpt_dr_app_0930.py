@@ -464,3 +464,19 @@ def test_a_link_in_the_report_is_never_taken_for_the_download(chrome, page, logs
     _serve(chrome, page, _dr_host_html(35), _app_html("finished", download=False, report=rep))
     assert chrome.run(research._chatgpt_dr_dom_download(page)) == ""
     assert _pressed_in_app(chrome, page) == []
+
+
+def test_the_phase2_poll_writes_the_census_for_chatgpt_only(monkeypatch):
+    """The census moments ride on the Phase 2 poll's own page read — the real
+    statements of `poll_all_agents_round_robin`, lifted as round 1's test does —
+    and only for ChatGPT."""
+    import test_p2_stop_skips_cua_e2e0930 as rr
+    ticks = []
+
+    async def _tick(p, **k):
+        ticks.append(k.get("label"))
+
+    monkeypatch.setattr(research, "_chatgpt_dr_census_tick", _tick, raising=False)
+    for name in ("ChatGPT", "Claude"):
+        rr._run_polls(name, [rr.STOP] * 2, lines=[], looks=[])
+    assert ticks == ["ChatGPT", "ChatGPT"], ticks

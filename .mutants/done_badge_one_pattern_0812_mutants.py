@@ -61,9 +61,10 @@ MUTANTS = [
      [("_THINKING_TIME_HEADER = re.compile(_THINKING_TIME_HEADER_SRC)",
        '_THINKING_TIME_HEADER = re.compile(r"\\bthought\\s+for\\s+\\d+\\s*(?:m|min|s|sec)\\b")')]),
     ("U4", "under", "the P2 completion probe ships the raw placeholder to the browser",
-     [('             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh };\n'
+     # 2026-09-30 (round 2): the probe also returns `drApp` — re-aimed.
+     [('             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };\n'
        '}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)',
-       '             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh };\n'
+       '             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };\n'
        '}"""')]),
     ("U5", "under", "the host verify ships the raw placeholder",
      [("            return !!document.querySelector('.result-streaming, [data-is-streaming=\"true\"]');\n"

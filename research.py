@@ -35647,7 +35647,7 @@ _CHATGPT_STEP_LIST_JS = _cg_js(r"""() => {
                   thoughts: 0, line: false };
 """ + _CG_UNDOUBLE_JS + r"""
     const turns = document.querySelectorAll('__CG_TURN__');
-    const last = turns.length ? turns[turns.length - 1] : null;
+    const last = turns[turns.length - 1] || null;
     if (!last) return out;
     const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
     let head = null, btn = null;
