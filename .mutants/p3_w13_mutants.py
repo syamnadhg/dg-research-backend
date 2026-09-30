@@ -30,6 +30,15 @@
        record's brief slot and Phase 1 complete. A move in Phase 1's last
        seconds (or a crash between the two halves) left only the disk half,
        and the resume trusts the disk. No brief on disk, nothing is written.
+  A* — the Phase 3 twin (w13 integrated review, second round, 09-30): a resume
+       past Phase 3 publishes the podcast on disk again — the checkpoint's
+       file, else the newest podcast in podcasts/ (an original beside an mp3
+       is a cut-off transcode, run again first) — and completes Phase 3 only
+       when it reached the app. A file that is not a podcast is not uploaded.
+  M* — a run moved to the queue while it ran writes no hand-off: its folder
+       holds its queue marker (waiting, or taken by another worker that has
+       not started it), and the worker that takes it publishes the podcast
+       and hands it off. Every other run still hands off.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 the REAL `run_pipeline` driven from a resume directory into Phase 3, the real
@@ -248,6 +257,57 @@ MUTANTS = [
      "nothing",
      [('    if not (brief_md or "").strip():\n        return\n    save_document_to_firestore(',
        '    save_document_to_firestore(')]),
+
+    # ═══ A — a resume past Phase 3 publishes the podcast on disk again ════════
+    ("A1", RESEARCH, "⛔⛔ the resume reads the checkpoint back and never publishes the "
+     "podcast — no Podcasts entry, no Play, no video",
+     [("            audio_path, _ = await _p3_publish_on_resume(queue_dir, cp, _fb_research_id)\n",
+       "            audio_path = None\n")]),
+    ("A2", RESEARCH, "⛔⛔ only a podcast the checkpoint names is published — the move's "
+     "cut-off upload never named one",
+     [("    if not found:\n        return None\n    originals = ",
+       "    if True:\n        return None\n    originals = ")]),
+    ("A3", RESEARCH, "another file in the folder is published in place of the podcast "
+     "the checkpoint names",
+     [("    if p and Path(p).is_file():\n        return Path(p)\n",
+       "    if False:\n        return Path(p)\n")]),
+    ("A4", RESEARCH, "⛔ a half-written mp3 is published over the original its transcode "
+     "never finished",
+     [("    return max(originals or found, key=lambda f: f.stat().st_mtime)\n",
+       "    return max(found, key=lambda f: f.stat().st_mtime)\n")]),
+    ("A5", RESEARCH, "the cut-off transcode is not run again — the original goes up as it is",
+     [("    audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)\n"
+       "    stored = await _p3_publish_audio(audio_path, research_id)\n",
+       "    stored = await _p3_publish_audio(audio_path, research_id)\n")]),
+    ("A6", RESEARCH, "⛔ the published podcast never completes Phase 3 — no \"Podcast ready\"",
+     [("    emit_event(\"phase_complete\", phase=3, durationSec=0, links=links,\n",
+       "    (lambda *_a, **_k: None)(\"phase_complete\", phase=3, durationSec=0, links=links,\n")]),
+    ("A7", RESEARCH, "⛔ Phase 3 is called complete on a podcast that never reached the app",
+     [("            f\"on this resume — going on without it\", \"WARN\")\n"
+       "        return audio_path, \"\"\n",
+       "            f\"on this resume — going on without it\", \"WARN\")\n")]),
+    ("A8", RESEARCH, "any file in podcasts/ is uploaded as the podcast",
+     [("                 if f.is_file() and f.suffix.lower() in _P3_PODCAST_SUFFIXES]\n",
+       "                 if f.is_file()]\n")]),
+
+    # ═══ M — a run moved while it ran leaves the hand-off to the next worker ══
+    ("M1", RESEARCH, "⛔⛔ the moved run hands off to disk in its last second — the next "
+     "worker only re-sends the kick and the podcast never reaches the app",
+     [("        if _run_dir_held_by_queue(queue_dir):\n"
+       "            log(\"Moved to the queue before its hand-off",
+       "        if False:\n"
+       "            log(\"Moved to the queue before its hand-off")]),
+    ("M2", RESEARCH, "⛔ a moved run another worker has just taken (and will put back) "
+     "hands off",
+     [("        if _run_dir_held_by_queue(queue_dir):\n"
+       "            log(\"Moved to the queue before its hand-off",
+       "        if _run_dir_waiting(queue_dir):\n"
+       "            log(\"Moved to the queue before its hand-off")]),
+    ("M3", RESEARCH, "⛔⛔ no run hands off at all",
+     [("        if _run_dir_held_by_queue(queue_dir):\n"
+       "            log(\"Moved to the queue before its hand-off",
+       "        if True:\n"
+       "            log(\"Moved to the queue before its hand-off")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

@@ -30,6 +30,7 @@ real website.
 """
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -1084,6 +1085,7 @@ def test_a_transcode_cut_off_is_finished_before_the_podcast_is_published(
     monkeypatch.setattr(research, "_fb_research_id", RID)
     original = _podcast(queue_dir, "Grid_storage.m4a")
     half = _podcast(queue_dir, "Grid_storage.mp3", b"\x00" * 16)
+    os.utime(original, (1_759_000_000, 1_759_000_000))   # the mp3 came after it
     asked = []
 
     def _transcode(src):
@@ -1099,6 +1101,25 @@ def test_a_transcode_cut_off_is_finished_before_the_podcast_is_published(
     run(_stop_here)
 
     assert asked == [original.name], "the unfinished transcode was not run again"
+    assert w["uploaded"] == ["Grid_storage.mp3"]
+    assert _published(w)
+
+
+def test_the_podcast_the_checkpoint_names_is_the_one_published(resumed, monkeypatch):
+    """The checkpoint names the podcast Phase 3 completed on. Another file in
+    the folder, even a newer one, is not published in its place."""
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    ours = _podcast(queue_dir, "Grid_storage.mp3")
+    _podcast(queue_dir, "Other_topic.mp3")
+    os.utime(ours, (1_759_000_000, 1_759_000_000))
+    research.save_checkpoint(queue_dir, 3, topic="Grid storage", brief_url="",
+                             notebook_url=NB_URL, audio_path=str(ours))
+    w = _the_real_publish(monkeypatch)
+    _watch_in_order(monkeypatch)
+    run(_stop_here)
+
     assert w["uploaded"] == ["Grid_storage.mp3"]
     assert _published(w)
 
@@ -1138,8 +1159,10 @@ def test_a_stray_file_in_the_podcast_folder_is_not_published(resumed, monkeypatc
     assert ("hand-off", UID, RID) in order
 
 
+@pytest.mark.parametrize("marker", ["waiting", "taken"],
+                         ids=["waiting-in-the-queue", "taken-by-another-worker"])
 def test_a_run_moved_as_its_podcast_upload_finishes_is_published_by_the_next_worker(
-        resumed, monkeypatch):
+        resumed, monkeypatch, marker):
     """⛔⛔ END TO END. The move lands during the podcast upload, and the upload
     finishes inside the move's five-second wait: its two writes are skipped,
     because the move cut the record off, and the pipeline runs on to the
@@ -1163,6 +1186,11 @@ def test_a_run_moved_as_its_podcast_upload_finishes_is_published_by_the_next_wor
              "topic": "Grid storage"}, from_worker=1) == queue_dir
         research._fb_uid = None
         research._fb_research_id = None
+        if marker == "taken":
+            # Another awake worker's claim renames the marker; it puts it back
+            # once it sees this worker's lock — here, in this last second.
+            os.replace(queue_dir / research.WAITING_MARKER,
+                       queue_dir / research._waiting_taken_name(2))
         stored = await research._p3_publish_audio(audio, RID)
         return {"audio_path": audio, "audio_stored_url": stored}
     run(_moved_during_the_upload)
@@ -1176,7 +1204,8 @@ def test_a_run_moved_as_its_podcast_upload_finishes_is_published_by_the_next_wor
     assert research.detect_resume_phase(queue_dir)[0] == 4
 
     # The next worker takes it: the marker goes, the record is this run's again.
-    (queue_dir / research.WAITING_MARKER).unlink()
+    for m in queue_dir.glob(research.WAITING_MARKER + "*"):
+        m.unlink()
     monkeypatch.setattr(research, "_fb_uid", UID)
     monkeypatch.setattr(research, "_fb_research_id", RID)
     del order[:]

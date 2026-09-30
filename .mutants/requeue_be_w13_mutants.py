@@ -49,7 +49,7 @@
        once per renumber — so a removed sharer's run no longer spends the
        re-mint every research write shares; a membership nobody could read is
        written through the heal as before.
-  S* — the run's own person ending a waiting run that KEPT WORK (moved, put
+  P* — the run's own person ending a waiting run that KEPT WORK (moved, put
        back at boot with steps done, or taken and not started) is a stop:
        stopped, no `cancelled`, no `phase`, no `summary`; an ordinary queued
        run's own cancel, and the owner's Stop and Cancel, are unchanged.
@@ -561,40 +561,40 @@ MUTANTS = [
      [("        if uid_s and uid_s != paired:\n            if members is _MEMBERS_UNREAD:\n",
        "        if uid_s:\n            if members is _MEMBERS_UNREAD:\n")]),
 
-    # ═══ S — the run's own person stops a waiting run that kept work ══════════
-    ("S1", RESEARCH, "⛔⛔ the person's own cancel of a run with work done is a cancel — "
+    # ═══ P — the run's own person stops a waiting run that kept work ══════════
+    ("P1", RESEARCH, "⛔⛔ the person's own cancel of a run with work done is a cancel — "
      "deleted with its reports when the chat closes",
      [(OWN_STOP_GATE, OWN_STOP_GATE.replace("if (not _owner_control_patch",
                                             "if False and (not _owner_control_patch"))]),
-    ("S2", RESEARCH, "⛔ the owner's Stop or Cancel is written as the person's own stop",
+    ("P2", RESEARCH, "⛔ the owner's Stop or Cancel is written as the person's own stop",
      [(OWN_STOP_GATE, OWN_STOP_GATE.replace(
          "if (not _owner_control_patch(oc, running=True)\n                                and (",
          "if (True\n                                and ("))]),
-    ("S3", RESEARCH, "⛔ every waiting run's own cancel is a stop — a new run that never "
+    ("P3", RESEARCH, "⛔ every waiting run's own cancel is a stop — a new run that never "
      "started is kept for ever",
      [(OWN_STOP_GATE, OWN_STOP_GATE.replace("_waiting_kept_work(_waiting_rec)", "True"))]),
-    ("S4", RESEARCH, "a moved run taken into the line, its marker gone, is cancelled",
+    ("P4", RESEARCH, "a moved run taken into the line, its marker gone, is cancelled",
      [(OWN_STOP_GATE, OWN_STOP_GATE.replace("else removed_taken_kept)", "else False)"))]),
-    ("S5", RESEARCH, "a NEW run taken into the line, its marker gone, is kept as a stop",
+    ("P5", RESEARCH, "a NEW run taken into the line, its marker gone, is kept as a stop",
      [("                        removed_taken_kept = any(_cancels(j) and j.get(\"moved_run\")\n"
        "                                                 and j.get(\"kept_work\") for j in dq)\n",
        "                        removed_taken_kept = any(_cancels(j) and j.get(\"moved_run\")\n"
        "                                                 for j in dq)\n")]),
-    ("S6", RESEARCH, "⛔⛔ the person's stop carries `cancelled` — the delete-on-close",
+    ("P6", RESEARCH, "⛔⛔ the person's stop carries `cancelled` — the delete-on-close",
      [(OWN_STOP, OWN_STOP.replace('        "status": "stopped",\n',
                                   '        "status": "stopped",\n        "cancelled": True,\n'))]),
-    ("S7", RESEARCH, "a stopped waiting run still reads as moved to the queue",
+    ("P7", RESEARCH, "a stopped waiting run still reads as moved to the queue",
      [(OWN_STOP, OWN_STOP.replace('        "movedToQueueAt": _DF,\n', ""))]),
-    ("S8", RESEARCH, "the stopped waiting run stays the amber #1",
+    ("P8", RESEARCH, "the stopped waiting run stays the amber #1",
      [("                                _update_research_doc(u, rid, _waiting_run_stop_patch())\n"
        "                            _kick_queue_publish()\n",
        "                                _update_research_doc(u, rid, _waiting_run_stop_patch())\n")]),
-    ("S9", RESEARCH, "the person's stop leaves the command behind — every worker runs it again",
+    ("P9", RESEARCH, "the person's stop leaves the command behind — every worker runs it again",
      [('                                f"everything it did is kept", "INFO")\n'
        "                            try:\n                                dref.delete()\n",
        '                                f"everything it did is kept", "INFO")\n'
        "                            try:\n                                pass\n")]),
-    ("S10", RESEARCH, "the person's stop writes a summary over the research's own",
+    ("P10", RESEARCH, "the person's stop writes a summary over the research's own",
      [(OWN_STOP, OWN_STOP.replace('        "status": "stopped",\n',
                                   '        "status": "stopped",\n        "summary": "Cancelled",\n'))]),
 
