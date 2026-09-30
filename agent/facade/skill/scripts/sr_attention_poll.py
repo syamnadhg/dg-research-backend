@@ -544,7 +544,13 @@ def _attention_line(run: dict) -> str:
     with no runtime to reformat, and that channel may be SMS."""
     t = _title(run)
     reason = run.get("attention") or "a decision is needed"
-    head = f"⚠ “{t}” needs you: {reason}"
+    # ⭐ A card that asks nothing of the person (the login pause that continues
+    # by itself, wave 13) is not headed "needs you" over "Nothing to do".
+    _asks = run.get("attentionAction")
+    if isinstance(_asks, str) and _asks.startswith("Nothing to do"):
+        head = f"⏸ “{t}” is paused: {reason}"
+    else:
+        head = f"⚠ “{t}” needs you: {reason}"
     act = run.get("attentionAction")
     if not act:
         # Older bridge — today's tail, verbatim.
@@ -574,8 +580,14 @@ def _ended_line(run: dict) -> str:
 
 #: The longest move note (the app and the research computer cut it the same).
 _MOVE_NOTE_MAX = 280
-#: sr.py's agent-only marker text — never let another person's note carry it.
-_AGENT_ONLY_MARKER_TEXT = "for the assistant · do NOT relay to the user"
+#: The pauses a waiting run can be put in with its move stamp left on.
+_PAUSED_STATUSES = ("paused", "paused_backend_restart", "paused_backend_restart_failed")
+#: sr.py's agent-only marker, in any case or separators — never in another
+#: person's note.
+_AGENT_ONLY_MARKER_RE = re.compile(r"(?i)for\W+the\W+assistant\W*do\W+not\W+relay\W+to\W+the\W+user")
+#: Hermes' `MEDIA:<path>` directive, in any case: this script's output is
+#: delivered by Hermes, which ATTACHES the file it names from this host.
+_HERMES_MEDIA_RE = re.compile(r"(?i)media\s*:")
 
 
 def _moved_at(run: dict) -> "float | None":
@@ -590,13 +602,18 @@ def _moved_at(run: dict) -> "float | None":
 
 def _move_note(run: dict) -> "str | None":
     """The owner's note on the move, one line and at most 280 characters, or None.
-    Cut again here (the bridge cuts it too): it is another person's free text,
-    posted word for word into this chat."""
+    Cut again here (the bridge cuts it too, and this script can sit a release
+    apart from it): it is another person's free text, posted word for word.
+    ⛔⛔ Nothing Hermes would obey: `MEDIA:` broken apart (it would ATTACH the file
+    it names from this host), `[[` directives too, and no `"` or `\\` to close
+    the note's own quotes (review of the wave-13 chat change, 2026-09-30)."""
     v = run.get("moveNote")
     if not isinstance(v, str):
         return None
-    s = " ".join(v.replace(_AGENT_ONLY_MARKER_TEXT, " ").replace("──", " ").split())
-    return s[:_MOVE_NOTE_MAX].rstrip() or None
+    s = _AGENT_ONLY_MARKER_RE.sub(" ", " ".join(v.split())).replace("──", " ")
+    s = _HERMES_MEDIA_RE.sub("media ", s)
+    s = s.replace('"', "'").replace("\\", "/").replace("[[", "[ [")
+    return " ".join(s.split())[:_MOVE_NOTE_MAX].rstrip() or None
 
 
 def _moved_lines(run: dict) -> list[str]:
@@ -703,22 +720,33 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
         # moved off can write "ongoing" in its last second.
         # First tick, or a state written before this existed: only a RECENT move
         # is told (as a recent completion is); an older one is marked, not told.
+        # ⛔ A RETRY OUT OF A PAUSE ENDS THE STAY TOO (review, 2026-09-30). A restart
+        # can pause a waiting run with the stamp left on, and the resume the
+        # person's Retry starts leaves it on as well: seen paused and then running,
+        # the stay is over — said nothing (they did it themselves), and a later
+        # move is told again.
         stamp = _moved_at(run)
         prior_moved = bool(prior.get("moved"))
         moved = prior_moved
+        moved_paused = bool(prior.get("moved_paused"))
         if stamp is not None:
             if not prior_moved:
                 quiet = ((baseline or "moved" not in prior)
                          and now_ms - stamp > _RECENT_COMPLETION_MS)
                 if not quiet and not (suppress_replay and not prior):
                     out.extend(_moved_lines(run))
-            moved = True
+            moved, moved_paused = True, False
         elif prior_moved and run.get("status") == "ongoing":
             if run.get("movedToQueueAt") is None:
                 out.append(_running_again_line(run))
                 moved = False
+            elif moved_paused:
+                moved = False
+            moved_paused = False
         elif not _is_active(run):
-            moved = False
+            moved, moved_paused = False, False
+        if moved and run.get("status") in _PAUSED_STATUSES:
+            moved_paused = True
 
         # Ended early — stopped / cancelled from the app or chat (NOT a normal
         # finish, which is status=="completed" → the 🎉 banner above). Announce ONCE
@@ -742,6 +770,7 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
             "ended": ended,
             "completed": completed_announced,
             "moved": moved,
+            "moved_paused": moved_paused,
         }
     return out, new_state
 

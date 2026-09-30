@@ -844,9 +844,15 @@ def _move_note(r: dict) -> "str | None":
     v = r.get("moveNote")
     if not isinstance(v, str):
         return None
-    marker = _AGENT_ONLY_MARKER.strip("─ ")
-    s = " ".join(v.replace(marker, " ").replace("──", " ").split())
-    return s[:_MOVE_NOTE_MAX].rstrip() or None
+    # ⛔⛔ Nothing the chat runtime would obey (review of the wave-13 chat change,
+    # 2026-09-30): `MEDIA:` broken apart in any case (Hermes ATTACHES the file it
+    # names from this host), `[[` directives too, and no `"` or `\` to close the
+    # note's own quotes. status reads the record whole, not the bridge's cut.
+    s = re.sub(r"(?i)for\W+the\W+assistant\W*do\W+not\W+relay\W+to\W+the\W+user", " ",
+               " ".join(v.split())).replace("──", " ")
+    s = re.sub(r"(?i)media\s*:", "media ", s)
+    s = s.replace('"', "'").replace("\\", "/").replace("[[", "[ [")
+    return " ".join(s.split())[:_MOVE_NOTE_MAX].rstrip() or None
 
 
 def _queued_stat(r: dict) -> str:
@@ -888,7 +894,13 @@ def _attention_lines(r: dict) -> list[str]:
         text = pd.get("title") or pd.get("message") or pd.get("reason")
     if not text and not r.get("needsAttention"):
         return []
-    lines = [f"  ⚠ Needs you: {text or 'a decision is needed'}"]
+    # ⭐ A card that asks nothing of the person (the login pause that continues by
+    # itself, wave 13) is not headed "Needs you" over "Nothing to do".
+    _act = r.get("attentionAction")
+    if isinstance(_act, str) and _act.startswith("Nothing to do"):
+        lines = [f"  ⏸ Paused: {text or 'a decision is needed'}"]
+    else:
+        lines = [f"  ⚠ Needs you: {text or 'a decision is needed'}"]
     det = r.get("attentionDetails") or (pd.get("details") if isinstance(pd, dict) else None)
     if det:
         lines.append(f"  ↳ {det}")

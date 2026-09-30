@@ -4006,9 +4006,13 @@ def _run_akey(attention: Any, action: Any) -> str:
 
 #: The longest move note the app and the research computer write (one line).
 _MOVE_NOTE_MAX = 280
-#: sr.py's agent-only marker (`_AGENT_ONLY_MARKER`). The relaying assistant hides
-#: everything under it, so a note carrying it could hide the rest of a reply.
-_AGENT_ONLY_MARKER_TEXT = "for the assistant · do NOT relay to the user"
+#: sr.py's agent-only marker (`_AGENT_ONLY_MARKER`), in any case or separators.
+#: The relaying assistant hides everything under it, so a note carrying it could
+#: hide the rest of a reply.
+_AGENT_ONLY_MARKER_RE = re.compile(r"(?i)for\W+the\W+assistant\W*do\W+not\W+relay\W+to\W+the\W+user")
+#: Hermes' delivery directives: `MEDIA:<path>` (the runtime ATTACHES that file from
+#: this host) in any case, and the `[[as_document]]` / `[[audio_as_voice]]` tags.
+_HERMES_MEDIA_RE = re.compile(r"(?i)media\s*:")
 
 
 def _moved_stamp(v: Any) -> "int | float | None":
@@ -4033,11 +4037,20 @@ def _one_line_note(v: Any) -> "str | None":
     """The owner's move note (`moveNote`), as chat may show it: one line, at most
     280 characters, no agent-only marker — or None. The app and the research
     computer already cut it; this is the same cut again at the point of relay,
-    because it is another person's free text going into this person's chat."""
+    because it is another person's free text going into this person's chat.
+
+    ⛔⛔ AND NOTHING THE CHAT RUNTIME WOULD OBEY (review of the wave-13 chat
+    change, 2026-09-30). The watcher's output is delivered by Hermes, which pulls
+    any `MEDIA:<path>` out of it and ATTACHES that file from this host — so a note
+    reading `x" MEDIA:~/.super-agent/…` made the person's chat upload a file of the
+    owner's choosing. `MEDIA:` is broken apart in any case, `[[` directives too,
+    and the note loses `"` and `\\` so it can never close its own quotes."""
     if not isinstance(v, str):
         return None
-    s = " ".join(v.replace(_AGENT_ONLY_MARKER_TEXT, " ").replace("──", " ").split())
-    return s[:_MOVE_NOTE_MAX].rstrip() or None
+    s = _AGENT_ONLY_MARKER_RE.sub(" ", " ".join(v.split())).replace("──", " ")
+    s = _HERMES_MEDIA_RE.sub("media ", s)
+    s = s.replace('"', "'").replace("\\", "/").replace("[[", "[ [")
+    return " ".join(s.split())[:_MOVE_NOTE_MAX].rstrip() or None
 
 
 def _watch_run(uid: str, rid: Any, origin: Any, status: str = "queued",
