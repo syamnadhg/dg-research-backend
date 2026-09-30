@@ -177,6 +177,31 @@ Steps:
    Enter. Do NOT click Send. Do NOT use select-all or Delete.
 4. Say "box focused" once you have clicked inside it, or describe what blocks it."""
 
+#: Phase 1's last way to the brief (wave 13): the page read came back empty AND
+#: no Copy button could be found by its marker. The program writes a marker to
+#: the clipboard first and reads the clipboard itself afterwards; the CUA only
+#: clicks, and research.py holds it to clicks mechanically (CUA_CLICK_ONLY).
+PROMPT_COPY_REPLY_CHATGPT = SYSTEM_BASE + """
+
+Your task: click the Copy button directly under ChatGPT's latest reply. NOTHING else.
+
+The program reads what that button copies. You do not need to read, select or
+paste anything.
+
+Steps:
+1. If a menu, popover or dialog is open, press Escape (at most twice) to close it.
+2. Find ChatGPT's latest reply: the last answer in the conversation, below the
+   user's own message. Scroll down to its end if you need to. A row of small
+   icons sits directly under the END of the reply, below its last line; Copy is
+   usually the first of them (two overlapping squares).
+3. Click that Copy icon once. Not the "Copy table" or "Expand table" icons at
+   the corner of a table inside the reply (they copy one table, not the reply),
+   not the "Copy message" icon under the user's own message, not a Copy button
+   inside a code block, and not Share, Read aloud, Regenerate, Edit or Send.
+4. Do NOT type anything. Do NOT paste. Do NOT press Enter. Do NOT use
+   select-all.
+5. Say "copied" once you have clicked it, or describe what you see instead."""
+
 PROMPT_ATTACH_PDF = SYSTEM_BASE + """
 
 Your task: Attach a PDF file to the ChatGPT conversation.

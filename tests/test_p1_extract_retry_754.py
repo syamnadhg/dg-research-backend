@@ -61,15 +61,24 @@ def test_extract_retry_wait_is_stop_aware():
     assert "return None" in body, "a Stop during the retry doesn't abort the phase"
 
 
-def test_extract_retry_repulls_html_md_only_no_cua():
-    # The re-pull must be the DOM-only HTML→MD path: extract_chatgpt_response on
-    # the page with NO browser/cua (so no Tier-1/Tier-3 — the brief has no canvas).
+def test_extract_retry_rereads_the_same_way_and_the_page_read_never_opens_the_canvas():
+    # Wave 13 (owner's lane): the re-pull is the SAME step as the first read —
+    # the page read, then ChatGPT's own Copy button when that comes back empty
+    # (with a click-only CUA when no Copy button can be found). That behaviour
+    # is EXECUTED in tests/test_chatgpt_copy_fallback_w13.py (run_phase1 on the
+    # rebuilt page; its re-reads press Copy again). This pin keeps what the old
+    # one protected: the page read is extract_chatgpt_response on the page with
+    # NO browser/cua, so its canvas tiers (download / hijack) never run for the
+    # brief — the brief has no canvas.
     body = _retry_block()
-    assert "extract_chatgpt_response(browser.page)" in body, (
-        "the re-pull isn't the plain HTML→MD path"
+    assert "_retry_text = await _p1_read_brief()" in body, (
+        "the re-pull no longer reads the brief the way the first read does"
     )
-    assert "browser=browser" not in body and "cua_client=cua_client" not in body, (
-        "the re-pull passes browser/cua — that re-enables the removed canvas tiers"
+    import re
+    calls = re.findall(r"extract_chatgpt_response\(([^)]*)\)", _src())
+    assert calls and all(c == "browser.page" for c in calls), (
+        f"a page read in Phase 1 passes more than the page: {calls} — browser/cua "
+        f"re-enable the removed canvas tiers"
     )
 
 
