@@ -199,10 +199,12 @@ MUTANTS = [
      "no reply yet, no Copy is found and the brief is lost",
      [("const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;",
        "const scope = replies.length ? [...document.querySelectorAll('__CG_TURN__')].pop() : document;")]),
-    ("L4", RESEARCH, "⛔ the FIRST Copy row on the page is pressed — after a follow-up, the "
-     "first draft",
-     [("    return ok.length ? ok[ok.length - 1] : null;",
-       "    return ok.length ? ok[0] : null;")]),
+    # L4 ("the FIRST Copy row on the page is pressed — after a follow-up, the first
+    # draft") is RETIRED (wave 13 review): the rows before the person's newest
+    # message are now dropped before one is picked (S4), and after that message
+    # every page the captures and tests hold draws one shown Copy row, so first
+    # and last are the same button — an equivalent mutant, which measures nothing.
+    # Its case, the first draft's row, is S4's now.
     ("L5", RESEARCH, "a hidden Copy is pressed — the click times out and the brief is lost",
      [("[...scope.querySelectorAll('__CG_COPY__')].filter(shown)",
        "[...scope.querySelectorAll('__CG_COPY__')].filter(() => true)")]),
