@@ -27,11 +27,14 @@
   X* — Clear Local Storage keeps every run running or waiting, on ANY worker.
   Z* — Reset Backend ends the waiting runs too.
   Y* — the capability the app reads, in its own write: `capabilities` listing
-       "requeue", cleared on a backend started by hand.
+       "requeue", cleared on a backend started by hand; a refused write is
+       tried again at the next pass, and a backend whose supervisor goes
+       clears it then (rv13b).
   M* — the published queue marks a waiting run with work done `moved: true`
        (the owner's long-press then stops it and keeps the work) — at the
        front, and in one worker's own line once taken; an ordinary queued run,
-       or a job a resting worker had only queued, carries no `moved` key.
+       or a new run a resting worker had only queued, carries no `moved` key —
+       but a queued Resume it put back has work done and is marked (rv13b).
   R* — the repair after review (rv13, 09-29): the move takes the run out of its
        old worker's snapshot; the boot restore and rehydration leave a run
        another worker runs or has taken; a run out of automatic attempts is
@@ -470,8 +473,8 @@ MUTANTS = [
     ("R33", RESEARCH, "the taking worker ignores the job as it was queued",
      [("        if isinstance(queued_job, dict):\n", "        if False:\n")]),
     ("R34", RESEARCH, "a queued job taken from the queue still reads as taken once started",
-     [("                        queued_at_ms=int(time.time() * 1000), moved_run=True)\n",
-       "                        queued_at_ms=int(time.time() * 1000))\n")]),
+     [("                        queued_at_ms=int(time.time() * 1000), moved_run=True,\n",
+       "                        queued_at_ms=int(time.time() * 1000),\n")]),
     ("R35", RESEARCH, "a record that already says queued is written again",
      [(BEHIND_STATUS, BEHIND_STATUS.replace('        if status != "queued":\n', "        if True:\n"))]),
     ("R36", RESEARCH, "a queued Resume waiting behind still reads as running",
@@ -516,9 +519,9 @@ MUTANTS = [
     ("M1", RESEARCH, "⛔⛔ a moved run's pill is not marked — the owner's long-press offers "
      "Cancel and throws its work away",
      [("    if kept_work:\n", "    if False:\n")]),
-    ("M2", RESEARCH, "⛔ every waiting run is marked — a job a resting worker had only queued "
-     "offers Stop instead of Cancel",
-     [('    return not isinstance((rec or {}).get("queued_job"), dict)', "    return True")]),
+    ("M2", RESEARCH, "⛔ every waiting run is marked — a new run a resting worker had only "
+     "queued offers Stop instead of Cancel",
+     [('    return bool(queued_job.get("resume_dir"))', "    return True")]),
     ("M3", RESEARCH, "⛔ the front of the queue never asks whether the run has work done",
      [("kept_work=_waiting_kept_work(w))", "kept_work=False)")]),
     ("M4", RESEARCH, "⛔ a moved run one worker took and has not started loses its mark",
@@ -535,6 +538,36 @@ MUTANTS = [
     ("M8", RESEARCH, "an ordinary queued run carries `moved: False` instead of no key",
      [('    return {"uid": uid, "runId": run_id, "position": position}',
        '    return {"uid": uid, "runId": run_id, "position": position, "moved": False}')]),
+    # rv13b — a queued Resume a resting worker put back has work done
+    ("M9", RESEARCH, "⛔⛔ a queued Resume put back at boot is not marked — the owner's Cancel "
+     "throws its finished steps away",
+     [('    return bool(queued_job.get("resume_dir"))', "    return False")]),
+    ("M10", RESEARCH, "⛔ a queued Resume taken into one worker's line loses its mark until it "
+     "starts — Cancel again",
+     [("                        kept_work=_waiting_kept_work(rec))", "                        kept_work=False)")]),
+    ("M11", RESEARCH, "every job taken from the queue is marked — a new run that was only "
+     "queued offers Stop",
+     [("                        kept_work=_waiting_kept_work(rec))", "                        kept_work=True)")]),
+    ("M12", RESEARCH, "⛔⛔ the run that was RUNNING loses its mark once the helper asks about "
+     "Resumes",
+     [("    if not isinstance(queued_job, dict):\n        return True\n",
+       "    if not isinstance(queued_job, dict):\n        return False\n")]),
+
+    # rv13b — the capability's retry and its re-check
+    ("Y7", RESEARCH, "⛔ a refused capability write is remembered as sent — the chip stays "
+     "hidden until the backend restarts",
+     [("                        if _rq != _last_published_requeue_patch:\n"
+       "                            await asyncio.wait_for(\n",
+       "                        if _rq != _last_published_requeue_patch:\n"
+       "                            _last_published_requeue_patch = _rq\n"
+       "                            await asyncio.wait_for(\n")]),
+    ("Y8", RESEARCH, "⛔ the capability is written once per process — a backend whose supervisor "
+     "died keeps offering the move",
+     [("                        if _rq != _last_published_requeue_patch:",
+       "                        if _last_published_requeue_patch is None:")]),
+    ("Y9", RESEARCH, "an unchanged capability is written again at every pass",
+     [("                        if _rq != _last_published_requeue_patch:",
+       "                        if True:")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

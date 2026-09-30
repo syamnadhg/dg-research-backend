@@ -9468,8 +9468,15 @@ def _waiting_kept_work(rec) -> bool:
     the owner moved to the queue or a resting worker's restart put back? Its
     amber pill carries `moved: true`, and the owner's long-press offers Stop,
     which keeps the work, instead of Cancel. A job a resting worker had only
-    queued (`queued_job`) waits as the ordinary queued run it was."""
-    return not isinstance((rec or {}).get("queued_job"), dict)
+    queued (`queued_job`) waits as the ordinary queued run it was.
+
+    ⛔⛔ EXCEPT A QUEUED RESUME (its job names a `resume_dir`): it has finished
+    steps, and the owner's Cancel wrote `cancelled: true, phase: 0` on it — the
+    app's delete-on-close for a run with work done (rv13b, 09-29)."""
+    queued_job = (rec or {}).get("queued_job")
+    if not isinstance(queued_job, dict):
+        return True
+    return bool(queued_job.get("resume_dir"))
 
 
 def _waiting_owner_entry(uid, run_id, position, *, kept_work: bool) -> dict:
@@ -9678,11 +9685,14 @@ def _claim_waiting_run(worker_id) -> "dict | None":
         if isinstance(queued_job, dict):
             # A job a resting worker had only queued: run exactly as it was
             # queued (a new run starts in the place kept for it).
+            # ⭐ A queued Resume keeps its mark until it starts here (`moved`,
+            # see `_waiting_kept_work`); a new run stays unmarked.
             log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the queue — "
                 f"a run that had not started on the worker that is off", "INFO")
             return dict(queued_job, uid=uid, research_id=rid,
                         run_id=str(queued_job.get("run_id") or d.name),
-                        queued_at_ms=int(time.time() * 1000), moved_run=True)
+                        queued_at_ms=int(time.time() * 1000), moved_run=True,
+                        kept_work=_waiting_kept_work(rec))
         log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the front of "
             f"the queue — it goes on from the start of the step it was on", "INFO")
         return {

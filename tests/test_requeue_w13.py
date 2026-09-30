@@ -180,6 +180,10 @@ class _Node:
             self._store.device_updates.append(dict(payload))
 
 
+# The device document's own update, before any test wraps it.
+_NODE_UPDATE = _Node.update
+
+
 class _Store:
     """`users/{uid}/researches/{rid}`, `devices/{id}` and its `queue`."""
 
@@ -1052,18 +1056,39 @@ def test_reset_backend_ends_the_runs_waiting_for_a_worker(monkeypatch, tmp_path,
 
 # ══ 10. the app learns this computer can do it ════════════════════════════════
 
-def _one_heartbeat(monkeypatch, tmp_path, *, supervised):
-    """Run the REAL heartbeat loop for exactly one tick."""
+def _heartbeats(monkeypatch, tmp_path, ticks):
+    """Run the REAL heartbeat loop for one tick per `(supervised, refused)` in
+    `ticks`: whether the backend runs under its startup supervisor on that
+    tick, and whether the rules refuse that tick's `capabilities` write. The
+    five-minute clock is run out between ticks, as five minutes would.
+    Returns the machine, every `capabilities` write TRIED, and those that
+    LANDED."""
     store = _Store()
     m = _machine(monkeypatch, tmp_path, store, worker=1)
+    tick = {"n": 0}
+    tried: list = []
 
     class _Tick(Exception):
         pass
 
-    async def _stop(_s):
-        raise _Tick()
+    async def _next(_s):
+        tick["n"] += 1
+        if tick["n"] >= len(ticks):
+            raise _Tick()
+        research._version_publish_next_ms = 0
 
-    monkeypatch.setattr(research, "_supervisor_is_my_parent", lambda: supervised)
+    # ⛔ The class's own, not whatever an earlier call in the same test set.
+    real_update = _NODE_UPDATE
+
+    def update(node, payload):
+        if "capabilities" in payload:
+            tried.append(dict(payload))
+            if ticks[tick["n"]][1]:
+                raise PermissionError("Missing or insufficient permissions.")
+        real_update(node, payload)
+
+    monkeypatch.setattr(_Node, "update", update)
+    monkeypatch.setattr(research, "_supervisor_is_my_parent", lambda: ticks[tick["n"]][0])
     monkeypatch.setattr(research, "_device_version_fields",
                         lambda **k: {"version": "9.9.9", "servingVersion": "9.9.9"})
     monkeypatch.setattr(research, "_last_published_version_fields", None)
@@ -1072,10 +1097,17 @@ def _one_heartbeat(monkeypatch, tmp_path, *, supervised):
     monkeypatch.setattr(research, "_publish_run_log_index", lambda: None)
     monkeypatch.setattr(research, "_prune_due", lambda *_a: False, raising=False)
     monkeypatch.setattr(research, "_spawn_maintenance", lambda *a, **k: None)
-    monkeypatch.setattr(research.asyncio, "sleep", _stop)
+    monkeypatch.setattr(research.asyncio, "sleep", _next)
     with pytest.raises(_Tick):
         asyncio.run(research._heartbeat_loop())
-    return m, [u for u in store.device_updates if "capabilities" in u]
+    assert tick["n"] == len(ticks), "the heartbeat did not run every tick"
+    return m, tried, [u for u in store.device_updates if "capabilities" in u]
+
+
+def _one_heartbeat(monkeypatch, tmp_path, *, supervised):
+    """Run the REAL heartbeat loop for exactly one tick."""
+    m, _tried, sent = _heartbeats(monkeypatch, tmp_path, [(supervised, False)])
+    return m, sent
 
 
 def test_the_heartbeat_tells_the_app_move_to_queue_works_here(monkeypatch, tmp_path):
@@ -1101,6 +1133,28 @@ def test_the_heartbeat_tells_the_app_move_to_queue_works_here(monkeypatch, tmp_p
     stray = [k for u in m.store.device_updates + m2.store.device_updates for k in u
              if "requeue" in k.lower()]
     assert stray == [], f"a key of its own the app never reads: {stray}"
+
+
+def test_a_refused_capability_write_is_tried_again_at_the_next_pass(monkeypatch, tmp_path):
+    """⛔ A rules deploy that lags this build refuses the first write — the case
+    its own write is there for. It is tried again five minutes later and lands;
+    once it has, an unchanged answer is not written again. Remembered as sent
+    before it landed, the chip stayed hidden until the backend restarted."""
+    _m, tried, sent = _heartbeats(monkeypatch, tmp_path,
+                                  [(True, True), (True, False), (True, False)])
+    assert tried == [{"capabilities": ["requeue"]}] * 2, tried
+    assert sent == [{"capabilities": ["requeue"]}], sent
+
+
+def test_a_backend_whose_supervisor_goes_stops_offering_the_move(monkeypatch, tmp_path):
+    """⛔ The answer is worked out again at every pass, and written only when it
+    changes. A backend whose startup supervisor dies mid-run clears the field
+    at the next pass — the move would answer "not supervised" there, and the
+    chip must not promise it. Written once per process, it kept "requeue"."""
+    from google.cloud.firestore import DELETE_FIELD
+    _m, _tried, sent = _heartbeats(monkeypatch, tmp_path,
+                                   [(True, False), (True, False), (False, False)])
+    assert sent == [{"capabilities": ["requeue"]}, {"capabilities": DELETE_FIELD}], sent
 
 
 # ══ 11. the repair: the worker it was moved off comes back ══════════════════════
@@ -1633,3 +1687,81 @@ def test_the_move_clears_a_taken_marker_left_in_the_runs_folder(monkeypatch, tmp
     _command(monkeypatch, m, _requeue())
     assert (folder / MARKER).exists()
     assert not list(folder.glob(MARKER + ".w*")), "the leftover taken marker is still there"
+
+
+# ══ 16. the repair (rv13b): a queued Resume put back at boot has work done ═════
+
+NEW_RID = "chat_1759100000003_new"
+
+
+def test_a_queued_resume_a_resting_worker_puts_back_is_marked_moved_and_stops_with_its_work(
+        monkeypatch, tmp_path):
+    """⛔⛔ One worker is running the owner's run, and a sharer's Resume — a run
+    with finished steps — waits in its line. The owner moves the running run
+    and the worker comes back off: the boot restore puts the Resume behind the
+    moved run, as a job that was only queued. It went out with no `moved` key,
+    so the owner's long-press offered Cancel, which writes `cancelled: true,
+    phase: 0` — deleted when the chat closes. Now it is marked, the long-press
+    offers Stop, and Stop ends it with its work kept. Beside it, a new run the
+    worker had only queued stays unmarked (Cancel)."""
+    store = _Store(records={(OWNER, OTHER_RID): {"status": "ongoing"},
+                            (SHARER, RID): {"status": "ongoing"},
+                            (OWNER, NEW_RID): {"status": "queued"}})
+    m = _machine(monkeypatch, tmp_path, store, worker=1, fleet=1)
+    monkeypatch.setattr(research, "_worker_is_resting", lambda *a, **k: True)
+    running_id, _running_dir = _run_folder(tmp_path, OTHER_RID, uid=OWNER, topic="Running")
+    _r, resumed = _run_folder(tmp_path, RID, uid=SHARER, topic="Resumed")
+    (resumed / "phase2_complete.marker").write_text("x", encoding="utf-8")
+    new_id = f"New_{_stamp()}"
+    path = _snapshot(tmp_path, _job(OWNER, OTHER_RID, running_id), [
+        _job(SHARER, RID, resumed.name, resume_dir=str(resumed)),
+        _job(OWNER, NEW_RID, new_id, brief_text="a new run")])
+
+    research._restore_pending_queue_snapshot(path, _Q(), set())
+
+    owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u][-1]
+    assert owners == [
+        {"uid": OWNER, "runId": OTHER_RID, "position": 1, "moved": True},
+        {"uid": SHARER, "runId": RID, "position": 2, "moved": True},
+        {"uid": OWNER, "runId": NEW_RID, "position": 3}], owners
+    waiting = research._waiting_runs()
+    assert [w["research_id"] for w in waiting] == [OTHER_RID, RID, NEW_RID], m.lines
+    assert waiting[1]["queued_job"]["resume_dir"] == str(resumed), (
+        "the Resume did not wait as the job it was queued as")
+
+    # The owner's long-press on its pill now sends Stop: ended, its work kept.
+    lis, _published = _cancel_listener(monkeypatch, tmp_path)
+    lis.feed(action="cancel", uid=SHARER, researchId=RID, **CANCELS["owner-stop"][0])
+    assert [_as_written(p) for _u, r, p in lis.writes if r == RID] == [
+        CANCELS["owner-stop"][1]], lis.writes
+    assert (resumed / "phase2_complete.marker").exists()
+
+
+def test_a_queued_resume_taken_into_one_workers_line_keeps_its_mark(monkeypatch, tmp_path):
+    """⛔ The same run once the worker is back on: it takes the queued Resume
+    into its own line, and until it starts there its pill still says `moved`
+    — it has work done. Beside it, a new run that was only queued is taken
+    with no mark. Both are parked by the real park and taken by the real idle
+    rescan."""
+    store = _Store(records={(SHARER, RID): {"status": "queued"},
+                            (OWNER, NEW_RID): {"status": "queued"}})
+    m = _machine(monkeypatch, tmp_path, store, worker=1, fleet=1)
+    _r, resumed = _run_folder(tmp_path, RID, uid=SHARER, topic="Resumed")
+    resume = _job(SHARER, RID, resumed.name, resume_dir=str(resumed))
+    assert research._park_waiting_run(resume, from_worker=1, behind=True) is not None
+    fresh = _job(OWNER, NEW_RID, f"New_{_stamp()}", brief_text="a new run")
+    assert research._park_waiting_run(fresh, from_worker=1, behind=True) is not None
+    first = _rescan(monkeypatch, m, fleet=1)
+    second = _rescan(monkeypatch, m, fleet=1)
+    assert [j["research_id"] for j in first + second] == [RID, NEW_RID]
+    line = _Q()
+    for j in first + second:
+        line.put_nowait(j)
+    monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", line)
+
+    research._recompute_deferred_queue_positions_locked()
+
+    owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u][-1]
+    assert owners == [
+        {"uid": SHARER, "runId": RID, "position": 1, "moved": True},
+        {"uid": OWNER, "runId": NEW_RID, "position": 2}], owners
