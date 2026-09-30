@@ -71,7 +71,11 @@ COUNT = "seven subsystems live in their own modules"
 # 83,380 lines. Both replacements below still violate their own bound — 95,000
 # overstates a file of 83,380, and 58,800 understates it by 24,580 against a
 # 12,000 tolerance — so the two mutations are unchanged in meaning, only re-pointed.
-TODAY_ROW = "| **today (2026-09-19)** | **83,374** |"
+# ⛔ RE-ANCHORED A THIRD TIME 2026-09-30: df26bdd re-measured the table to 96,156
+# and both mutants went stale again (the anchor sweep flagged them). G1 now
+# writes 120,000, which overstates the file as G1 needs; 58,800 still
+# understates it by far more than the 12,000 tolerance.
+TODAY_ROW = "| **today (2026-09-30)** | **96,156** |"
 
 REVISIT = """- A second engineer edits `research.py` regularly. Single-author work has been
   hiding what would otherwise be constant merge pain."""
@@ -145,12 +149,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("G1", "over", "⛔⛔ THE SIZE IS OVERSTATED. The one direction this figure must "
      "never drift: a doc that inflates the problem makes the refusal look braver "
      "than it was, and an inflated number is the kind a reviewer checks",
-     [(TODAY_ROW, "| **today (2026-09-19)** | **95,000** |")],
+     [(TODAY_ROW, "| **today (2026-09-30)** | **120,000** |")],
      [T_NEW]),
     ("G2", "under", "⚠ THE FIGURE GOES BADLY STALE — understated by more than the "
      "guard tolerates, so the growth objection reads as answered when it has "
      "simply stopped being measured",
-     [(TODAY_ROW, "| **today (2026-09-19)** | **58,800** |")],
+     [(TODAY_ROW, "| **today (2026-09-30)** | **58,800** |")],
      [T_NEW]),
     ("G3", "under", "⛔ THE REVISIT CONDITIONS GO, so a will-not-do becomes "
      "permanent by omission. The second-engineer condition is the one most likely "
