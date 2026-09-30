@@ -20,8 +20,10 @@
   P* — the computer-use prompt and the vision hints open Customise from the tile.
   S* — short is Deep dive + Short in the rest of the step too: the words
        computer use is handed, the completion check, the download and its
-       pick (the LAST Deep dive card, as for default and long — never the
-       Brief). tests/test_nlm_short_deep_dive_0930.py.
+       pick (never the Brief: Short the shortest Deep dive card and Long the
+       longest, by the duration the card shows; else the LAST), and the
+       page's own ⋮ → Download opens the picked card's menu, not the topmost.
+       tests/test_nlm_short_deep_dive_0930.py.
 
 ⛔ The browser tests need patchright and Chrome; where they SKIP the baseline is
 not a measurement, so the runner refuses to score a skipped baseline.
@@ -211,6 +213,21 @@ MUTANTS = [
     ("S9", PROMPTS, "the download's tie-break targets the Brief entry",
      [('target the SHORTEST-DURATION Deep Dive entry.",',
        'target the BRIEF entry (short duration / no \'Deep Dive\' label).",')]),
+    ("S10", RESEARCH, "⛔⛔ the pick ignores the duration and takes the LAST Deep dive "
+     "card — a Default or Long card below the Short is handed over as the Short",
+     [('    if timed and length in ("short", "long"):\n',
+       '    if False and timed:\n')]),
+    ("S11", RESEARCH, "short takes the LONGEST Deep dive card",
+     [('            target = min(timed, key=lambda c: (c["seconds"], -c["ordinal"]))',
+       '            target = max(timed, key=lambda c: (c["seconds"], c["ordinal"]))')]),
+    ("S12", RESEARCH, "⛔⛔ the page's own download opens the TOPMOST audio card's ⋮ "
+     "again, whatever the pick chose",
+     [('_dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)',
+       '_dl_menu = await _nlm_open_audio_menu(browser.page)')]),
+    ("S13", RESEARCH, "the shared finder ignores `nth` — opener and verifier answer "
+     "with the first audio card",
+     [("                if (P.nth && (scope.offsetParent === null || ++seen !== P.nth)) continue;\n",
+       "")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

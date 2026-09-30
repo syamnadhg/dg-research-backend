@@ -77,7 +77,7 @@ def test_the_menu_is_opened_with_the_scoped_helper():
     """`_nlm_open_audio_menu` scopes into the Studio panel and confirms via
     aria-expanded. The alternative it replaced — clicking the first
     `aria-label*="More"` on the page — is how a menu on the wrong card gets opened."""
-    assert "_nlm_open_audio_menu(browser.page)" in _download_block()
+    assert "_nlm_open_audio_menu(browser.page, nth=_target_ord)" in _download_block()
 
 
 # ── it picks by LABEL, never by index ───────────────────────────────────────
@@ -89,7 +89,7 @@ def test_the_row_is_chosen_by_label():
     block = _download_block()
     assert 'want=("download",)' in block
     # No index-based selection anywhere in the rung.
-    rung = block[block.index("_nlm_open_audio_menu(browser.page)"):block.index("_shadow_observed_cua")]
+    rung = block[block.index("_nlm_open_audio_menu(browser.page, nth=_target_ord)"):block.index("_shadow_observed_cua")]
     assert not re.search(r"rows\s*\[\s*\d+\s*\]", rung), rung
     assert not re.search(r"nth\(\s*\d+\s*\)", rung), rung
 
@@ -98,7 +98,7 @@ def test_the_destructive_guard_is_carried_not_bypassed():
     """`_nlm_menu_pick`'s default deny-list is the guard. The rung must not pass its
     own `deny=`, and must report a block rather than swallowing it."""
     block = _download_block()
-    rung = block[block.index("_nlm_open_audio_menu(browser.page)"):block.index("_shadow_observed_cua")]
+    rung = block[block.index("_nlm_open_audio_menu(browser.page, nth=_target_ord)"):block.index("_shadow_observed_cua")]
     assert "deny=" not in rung, "the rung must not override the destructive deny-list"
     # STRUCTURE, not presence. `"blocked" in rung` passed against a mutant that
     # replaced the whole check with `if False:` — the word was still there and the

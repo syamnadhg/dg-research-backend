@@ -71157,9 +71157,10 @@ def _nlm_js(src: str) -> str:
 # The first scope is the same population `_count_nlm_audio_cards` and
 # `_pick_nlm_audio_card` already count — a visible <artifact-library-item>
 # carrying one of the `_NLM_AUDIO_ICONS` ligatures — so all three agree on what
-# an audio card is. WHICH audio card does not matter here: NotebookLM emits one
-# `/notebook/{id}` link for the notebook however you reach the share dialog, so
-# a duplicate changes nothing about the URL, only about whose menu opens.
+# an audio card is. WHICH audio card did not matter for Share: NotebookLM emits
+# one `/notebook/{id}` link for the notebook however you reach the share dialog.
+# It matters for the download, which saves that card's file — so the download
+# names the card the picker chose (`nth`, below).
 _NLM_AUDIO_MENU_SCOPES = [
     {"name": "audio-card", "sel": "artifact-library-item", "needs": list(_NLM_AUDIO_ICONS)},
     {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": []},
@@ -71185,21 +71186,31 @@ _NLM_AUDIO_TRIGGER_SELS = [
 # collapsed or hidden panel needs no special case either: its buttons inherit
 # zero rects and fail the gate that matters, which is the one on the button
 # being clicked.
+#
+# `P.nth` (1-based, optional): the nth audio card only, counted as
+# `_pick_nlm_audio_card` counts them (a displayed card carrying an audio icon).
+# With it set, the wider scopes are never used and no other card's button
+# answers — the download of a picked card must not fall back to the topmost.
 _NLM_FIND_AUDIO_TRIGGER_JS = r"""
     const findTrigger = (P) => {
         for (const g of (P.scopes || [])) {
+            const counted = !!(g.needs && g.needs.length);
+            if (P.nth && !counted) continue;
+            let seen = 0;
             for (const scope of document.querySelectorAll(g.sel)) {
                 // `needs`: the card must carry ANY of these icon names.
-                if (g.needs && g.needs.length) {
+                if (counted) {
                     const st = (scope.innerText || scope.textContent || '');
                     if (!g.needs.some(n => st.indexOf(n) !== -1)) continue;
                 }
+                if (P.nth && (scope.offsetParent === null || ++seen !== P.nth)) continue;
                 for (const sel of (P.triggers || [])) {
                     for (const btn of scope.querySelectorAll(sel)) {
                         if (!onScreen(btn)) continue;
                         return { btn: btn, via: g.name, hook: sel };
                     }
                 }
+                if (P.nth) return null;
             }
         }
         return null;
@@ -71289,8 +71300,11 @@ _NLM_MENU_PICK_JS = (r"""(P) => {""" + _NLM_ONSCREEN_JS + _NLM_LABEL_JS + r"""
 }""")
 
 
-async def _nlm_open_audio_menu(page, label="Audio") -> dict:
+async def _nlm_open_audio_menu(page, label="Audio", nth=None) -> dict:
     """Open the AUDIO card's ⋮ menu — and prove it was that one.
+
+    `nth` (1-based) names which audio card when there are several — the
+    download picker's `target_ordinal`; unset, the first audio card's.
 
     Returns {opened, verified, via, hook, reason, outside}. `verified` is the
     only field a caller should act on: `opened` alone means a click landed, which
@@ -71300,7 +71314,8 @@ async def _nlm_open_audio_menu(page, label="Audio") -> dict:
     try:
         res = await page.evaluate(_NLM_OPEN_AUDIO_MENU_JS,
                                   {"scopes": _NLM_AUDIO_MENU_SCOPES,
-                                   "triggers": _NLM_AUDIO_TRIGGER_SELS}) or {}
+                                   "triggers": _NLM_AUDIO_TRIGGER_SELS,
+                                   "nth": nth}) or {}
     except Exception as _e:
         return {"opened": False, "verified": False, "via": "",
                 "reason": f"evaluate_failed:{type(_e).__name__}", "outside": 0}
@@ -71318,7 +71333,8 @@ async def _nlm_open_audio_menu(page, label="Audio") -> dict:
         try:
             chk = await page.evaluate(_NLM_AUDIO_MENU_VERIFY_JS,
                                       {"scopes": _NLM_AUDIO_MENU_SCOPES,
-                                       "triggers": _NLM_AUDIO_TRIGGER_SELS}) or {}
+                                       "triggers": _NLM_AUDIO_TRIGGER_SELS,
+                                       "nth": nth}) or {}
         except Exception as _e:
             chk = {}
             log(f"[{label}] audio ⋮ open-verify skipped: {_e}", "DEBUG")
@@ -73434,8 +73450,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # user-requested one. On the happy single-card path the ordinal is
         # omitted → the download prompt is byte-identical to before. When a
         # duplicate slipped past prevention the picker resolves the target by
-        # format + DOM order (duration is absent from the card) and the prompt
-        # is told to download ONLY that entry — so a dup never blocks delivery.
+        # format + the duration each card shows (DOM order when none shows one)
+        # and both the DOM rung below and the prompt download ONLY that entry —
+        # so a dup never blocks delivery.
         _pick = await _pick_nlm_audio_card(browser.page, podcast_length)
         _target_ord = _pick.get("target_ordinal") if _pick.get("count", 0) > 1 else None
         log(f"[Phase3] Download target: ordinal={_pick.get('target_ordinal')}/"
@@ -73494,9 +73511,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # Same shape as every other rung here: DOM first, CUA only if it misses.
         # Never by index — `Delete` is two rows away, so an ordinal click is one
         # layout change from destroying the user's audio instead of saving it.
+        # (The ROW is chosen by label. The CARD is the picker's: with two audio
+        # cards the menu opened is `_target_ord`'s, never simply the topmost.)
         _dl_via_dom = False
         try:
-            _dl_menu = await _nlm_open_audio_menu(browser.page)
+            _dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)
             if _dl_menu.get("verified"):
                 _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
                 # `blocked` is ADVISORY — the denied rows the picker filtered out
@@ -74447,18 +74466,18 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     _count_nlm_audio_cards — visible <artifact-library-item> carrying the
     "audio_magic_eraser" Material-icon ligature.
 
-    Duration is NOT in the card text (confirmed user dump 2026-06-03: a completed
-    card reads "audio_magic_eraser <Title> Deep dive · N sources · <ago> ..." —
-    no MM:SS / "N min" token), so the pick uses FORMAT (Deep dive, which IS in
-    the text) + DOM order. Every length is a Deep dive (owner, 2026-09-30:
-    short is Deep dive + Short, no longer Brief), so every length picks the
-    same way:
-      - short/default/long → the LAST complete Deep-dive card (the last card
-                       of any kind only when none reads Deep dive).
-                       The misclick default fires FIRST (so completes first) →
-                       the user-requested length is typically the LATER card.
-                       Best-effort; ambiguous=True whenever >1 Deep-dive card
-                       exists (they are indistinguishable by text).
+    Every length is a Deep dive (owner, 2026-09-30: short is Deep dive + Short,
+    no longer Brief), so the FORMAT alone cannot tell the requested card from a
+    second Deep dive. The DURATION can: the card's details line reads
+    "61:59 · Deep dive · 2 sources · 6h ago" (capture 5, 2026-09-30 — the
+    2026-06-03 dump had no duration, so it is read when shown, never required):
+      - short → the SHORTEST complete Deep-dive card that shows a duration.
+      - long  → the LONGEST one.
+      - default, or no Deep-dive card showing a duration → the LAST complete
+                Deep-dive card (the last card of any kind only when none reads
+                Deep dive). Card order is a guess: which card came later
+                depends on how the second one was made.
+    Ties go to the later card. ambiguous=True whenever >1 card exists.
 
     Returns {count, target_ordinal (1-based, top-down DOM order), complete,
     ambiguous, reason, snippet}. Best-effort and exception-safe: on any
@@ -74473,9 +74492,13 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
             const cards = items.map((el, i) => {
                 const t = (el.innerText || el.textContent || '');
                 const low = t.toLowerCase();
+                // "61:59 · Deep dive · …" or "1:02:03 · …" → seconds; null when
+                // the card shows no duration.
+                const d = /(?:(\d+):)?(\d{1,2}):(\d{2})\s*·/.exec(t);
                 return {
                     ordinal: i + 1,                                   // 1-based DOM order
                     isDeepDive: low.indexOf('deep dive') !== -1,
+                    seconds: d ? (+(d[1] || 0)) * 3600 + (+d[2]) * 60 + (+d[3]) : null,
                     // in-flight cards still show the "Generating Audio Overview…"
                     // text; a completed card does not.
                     generating: /generating audio overview/i.test(t),
@@ -74510,16 +74533,26 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     _all_generating = not complete_cards
     length = (podcast_length or "long").lower()
 
-    # Every length → the LAST complete Deep-dive card (short too since
-    # 2026-09-30; it was the first Brief card). The dominant residual dup vector
-    # (a fail-open CUA body-misclick during the OPEN step) fires the default
-    # FIRST, so the user-requested card completes LATER → last. Best-effort +
-    # ambiguous when >1 (text can't distinguish two Deep Dives); worst case
-    # streams a valid complete Deep-dive podcast.
+    # Short and long → by the duration each Deep-dive card shows: Short is the
+    # shortest Deep dive and Long the longest, whichever came first. Card order
+    # cannot say it: a leftover or a misclick card may sit above or below the
+    # requested one. Default, or no duration shown → the LAST complete
+    # Deep-dive card, as before (short too since 2026-09-30; it was the first
+    # Brief card). Worst case streams a valid complete Deep-dive podcast.
     deep = [c for c in cpool if c.get("isDeepDive")]
     cand = deep or cpool
     target = cand[-1]
     reason = f"{length}→last deep-dive card"
+    timed = [c for c in deep if isinstance(c.get("seconds"), (int, float))]
+    if timed and length in ("short", "long"):
+        # Ties go to the later card, as the order rule above has it.
+        if length == "short":
+            target = min(timed, key=lambda c: (c["seconds"], -c["ordinal"]))
+        else:
+            target = max(timed, key=lambda c: (c["seconds"], c["ordinal"]))
+        _s = int(target["seconds"])
+        reason = (f"{length}→{'shortest' if length == 'short' else 'longest'} "
+                  f"deep-dive card ({_s // 60}:{_s % 60:02d})")
 
     return {
         "count": count,

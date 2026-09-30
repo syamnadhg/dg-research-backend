@@ -1005,8 +1005,10 @@ def make_prompt_audio_download(podcast_length: str = "long",
     prevention and >1 audio entry is visible, the read-only picker
     (_pick_nlm_audio_card) resolves WHICH entry (1-based, top-down DOM order)
     is the user-requested one and passes it here so the download targets that
-    exact card. Duration is NOT in the card text, so the picker uses format +
-    DOM order; this prompt restates the ordinal as the authoritative target.
+    exact card. The picker reads each card's format and, when the card shows
+    one, its duration (Short the shortest Deep dive, Long the longest; DOM
+    order otherwise); this prompt restates the ordinal as the authoritative
+    target.
     With the default (None — the happy single-card path) the prompt is
     BYTE-IDENTICAL to the prior version."""
     v = _PROMPT_AUDIO_TARGET_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_TARGET_VARIANTS["long"]
