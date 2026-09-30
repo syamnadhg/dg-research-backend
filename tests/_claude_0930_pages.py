@@ -145,12 +145,22 @@ def effort_submenu() -> str:
                                "hidden": ""})
 
 
-def plus_menu(research_on: bool = False) -> str:
+def plus_menu(research_on: bool = False, *, testid: bool = True,
+              sticks: bool = True) -> str:
     """Frame 17's menu; with `research_on`, the Research row as frame 22 shows
-    it after the press: aria-checked, data-checked and the ✓ glyph."""
+    it after the press: aria-checked, data-checked and the ✓ glyph.
+
+    `testid=False` takes the row's test id off (the row must still be found by
+    its text past the icon glyph); `sticks=False` makes a press that closes the
+    menu and changes nothing (a press that did not take)."""
     wrap = json.loads(json.dumps(frame(M, 17)["menus"][0]))
     row = _find(wrap, lambda x: x.get("a", {}).get("data-testid") == "add-menu-research")
     assert row is not None
+    row["a"]["data-sr-research-row"] = ""
+    if not testid:
+        row["a"].pop("data-testid")
+    if not sticks:
+        row["a"]["data-sr-inert"] = ""
     if research_on:
         row["a"].pop("data-unchecked", None)
         row["a"].update({"data-checked": "", "aria-checked": "true"})
@@ -348,9 +358,12 @@ _JS = r"""
       const m = $('#sr-plus-menu'); const open = m.hasAttribute('hidden');
       show(m, open); $('#sr-plus').setAttribute('aria-expanded', open ? 'true' : 'false'); return;
     }
-    const rr = t.closest('[data-testid="add-menu-research"]');
+    const rr = t.closest('[data-sr-research-row]');
     if (rr) {
       note('research-row', e);
+      if (rr.hasAttribute('data-sr-inert')) {
+        show($('#sr-plus-menu'), false); $('#sr-plus').setAttribute('aria-expanded', 'false'); return;
+      }
       const on = rr.getAttribute('aria-checked') !== 'true';
       rr.setAttribute('aria-checked', on ? 'true' : 'false');
       if (on) { rr.setAttribute('data-checked', ''); rr.removeAttribute('data-unchecked'); }
@@ -402,7 +415,8 @@ _JS = r"""
 
 
 def page(*, tier: str = "Medium", finished: bool = False, running: bool = False,
-         research_on: bool = False, panel: str = "") -> str:
+         research_on: bool = False, panel: str = "", research_testid: bool = True,
+         research_sticks: bool = True) -> str:
     """The whole page. `panel` is "", "research" or "report" (open at load)."""
     pill = ('<button type="button" id="sr-research-pill" aria-label="Research" '
             'aria-pressed="true"' + ("" if research_on else " hidden") + '></button>')
@@ -416,7 +430,8 @@ def page(*, tier: str = "Medium", finished: bool = False, running: bool = False,
         + plus_button() + pill + '</div><div class="flex items-center gap-2">'
         + model_button(tier) + (stop_button() if running else "")
         + '</div></div></div></div></fieldset>')
-    menus = (model_popover(tier.lower()) + effort_submenu() + plus_menu(research_on)
+    menus = (model_popover(tier.lower()) + effort_submenu()
+             + plus_menu(research_on, testid=research_testid, sticks=research_sticks)
              + copy_menu())
     slot = {"research": research_panel(), "report": report_panel()}.get(panel, "")
     data = ("<script>"

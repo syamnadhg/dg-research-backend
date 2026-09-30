@@ -130,6 +130,9 @@ def test_setup_sets_extra_by_the_page_and_believes_the_button(chrome, open_page,
     ledger = [r for r in research._DOM_ATTEMPTS if r["intent"] == "claude.select_effort_tier"]
     assert ledger and ledger[-1]["outcome"] in research._DOM_OK, (ledger, lines)
     assert not any(lv == "WARN" and "effort" in m.lower() for lv, m in lines), lines
+    # The option was found by its captured `data-effort-id`, not by its text.
+    assert any("Step 1C OK: Effort 'extra' selected via effort-id" in m
+               for _, m in lines), lines
 
 
 def test_a_tier_moved_by_hand_before_send_is_set_again_by_the_page(chrome, open_page, lines):
@@ -181,6 +184,27 @@ def test_research_is_switched_on_by_a_real_press_and_read_back(chrome, open_page
     assert chrome.run(page.evaluate(
         "() => document.getElementById('sr-plus-menu').hasAttribute('hidden')")), \
         "the menu opened to read the row back must be closed again"
+    assert any("Step 3B: pressed Research (playwright, via testid)" in m
+               for _, m in lines), lines
+
+
+def test_research_is_found_by_its_text_past_the_icon_glyph(chrome, open_page, lines):
+    """The row without its test id: its text is "\ue0d0Research" — the glyph that
+    has defeated the exact match since 09-03."""
+    page = open_page(tier="Extra", research_testid=False)
+    assert chrome.run(research.setup_claude_dr(page)) is True, lines
+    assert chrome.run(page.evaluate(
+        "() => document.querySelector('[data-sr-research-row]')"
+        ".getAttribute('aria-checked')")) == "true"
+    assert any("via text)" in m and "Step 3B: pressed Research" in m for _, m in lines), lines
+
+
+def test_a_press_that_did_not_take_is_not_called_on(chrome, open_page, lines):
+    """Found is not on, and pressed is not on: only the row read back decides."""
+    page = open_page(tier="Extra", research_sticks=False)
+    assert chrome.run(research.setup_claude_dr(page)) is False, lines
+    assert any(lv == "WARN" and "the row now reads NOT checked" in m
+               for lv, m in lines), lines
 
 
 def test_research_already_on_is_left_alone(chrome, open_page, lines):
@@ -274,16 +298,62 @@ def test_the_report_is_opened_and_downloaded_by_the_page(chrome, open_page, line
                                                          monkeypatch):
     """Capture 2, frames 86-91: the report card (`artifact-card-open`), its
     panel (`[role=region][aria-label^="Artifact panel"]`), "Copy options", then
-    "Download as Markdown" (`export-download`). No browser or computer-use
-    client is given: on df26bdd the report could only come from computer use."""
+    "Download as Markdown" (`export-download`). Computer use is THERE and must
+    not be called: on 09-30 it opened the report (3 steps) and downloaded it
+    (2), and the mount probe never once saw Claude's panel in the corpus."""
+    cua = []
+
+    async def _cua(*a, **k):
+        cua.append(k.get("current_step") or (a[4] if len(a) > 4 else "?"))
+        return {"text": ""}
+
+    async def _cua_download(*a, **k):
+        cua.append("cua_download")
+        return ""
+
+    async def _agent_loop(*a, **k):
+        cua.append("agent_loop")
+        return {}
+
+    class _Browser:
+        async def switch_to_page(self, page):
+            return None
+
+    monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
+    monkeypatch.setattr(research, "_extract_via_cua_download", _cua_download)
+    monkeypatch.setattr(research, "agent_loop", _agent_loop)
     page = open_page(finished=True)
-    text = chrome.run(research.extract_claude_response(page, browser=None,
-                                                       cua_client=None))
+    text = chrome.run(research.extract_claude_response(page, browser=_Browser(),
+                                                       cua_client=object()))
     assert text == P.REPORT_MD, (text[:200], lines)
+    assert cua == [], (cua, lines)
     presses = _presses(chrome, page)
     for what in ("report-card", "copy-options", "download-md"):
         assert {"what": what, "trusted": True} in presses, (what, presses)
     assert any("Download as Markdown" in m for _, m in lines), lines
+    # Claude's own left sidebar is not an open panel to close first.
+    assert not any("Closing artifact panel" in m for _, m in lines), lines
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The words: no Max for Claude's effort; the narrator hears the panel's sites
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_claude_effort_is_not_max_in_the_hints_or_the_narration():
+    for key in ("setup-dr", "validate-setup"):
+        hint = research._sub_claude_family(research._HOTSPOT_VISION_HINTS[key])
+        text = hint["context_hint"] + " ".join(hint.get("success_signals") or [])
+        assert not re.search(r"\bmax\b", text, re.I), (key, text)
+    assert "Extra effort" in research.PHASE_FLOW_CONTEXT[2]
+    assert not re.search(r"\bmax effort\b", research.PHASE_FLOW_CONTEXT[2], re.I)
+    flow = " ".join(research.AGENT_PHASE_FLOWS[("claude", 2)])
+    assert "(Extra effort)" in flow and "Max" not in flow
+
+
+def test_the_narrator_hears_the_sites_the_research_panel_lists():
+    events = [{"type": "agent_progress",
+               "data": {"sourceUrls": [], "sourceHosts": ["royalcanin.com", "petsmart.com"]}}]
+    assert research._extract_top_hosts(events) == ["royalcanin.com", "petsmart.com"]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
