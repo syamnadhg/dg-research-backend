@@ -6683,8 +6683,10 @@ _DOM_OK = ("already", "verified")
 
 def _dom_reset():
     """Start a run with an empty ledger. Called where the run begins, so a
-    long-lived worker cannot carry the previous run's verdict into this one."""
+    long-lived worker cannot carry the previous run's verdict into this one.
+    The computer-use count starts empty with it (`_cua_reset`)."""
     _DOM_ATTEMPTS.clear()
+    _cua_reset()
 
 
 def _dom_note(intent: str, outcome: str, *, phase: int = 0, via: str = "",
@@ -6760,6 +6762,7 @@ def _dom_summary(tag: str = "") -> dict:
     head = f"[dom-summary]{(' ' + tag) if tag else ''}"
     if not total:
         log(f"{head} no DOM attempts were recorded this run", "WARN")
+        _cua_summary(tag)
         return {"total": 0, "ok": 0, "missed": 0}
     log(f"{head} {len(ok)}/{total} DOM intents handled without escalating "
         f"({len(missed)} missed)", "INFO" if not missed else "WARN")
@@ -6774,7 +6777,104 @@ def _dom_summary(tag: str = "") -> dict:
     if missed:
         log(f"{head} each ✗ above is a place vision had to step in; the detail "
             f"names what the page showed instead", "WARN")
+    _cua_summary(tag)
     return {"total": total, "ok": len(ok), "missed": len(missed)}
+
+
+# ── The computer-use count ───────────────────────────────────────────────────
+# ⛔⛔ 2026-09-30 — "2 MISSED" FOR 28 SESSIONS AND 75 STEPS. The DOM ledger above
+# tracks eight setup intents, and its verdict was the only end-of-run word on
+# vision spend: the 09-30 run's summary read "6/8 DOM intents handled without
+# escalating (2 missed)" while computer use had run 28 times — completion checks,
+# panels, downloads, uploads, audio polls, recovery — none of which the ledger
+# sees. So every computer-use session is counted where it RUNS (`agent_loop`,
+# with its steps), every vision-model screen read where it is made, and the
+# end-of-run summary prints one line per phase, platform and purpose.
+#
+#   grep '\[cua-summary\]'
+#
+# ⭐ The purpose comes from the call site: the step name every
+# `_shadow_observed_cua` call already carries, passed down to `agent_loop`
+# through `_CUA_TAG`. A session started outside it is named by its prompt.
+import contextvars as _cua_contextvars  # noqa: E402
+
+_CUA_CALLS: list = []
+_CUA_TAG = _cua_contextvars.ContextVar("_CUA_TAG", default=None)
+
+
+def _cua_reset():
+    """Start a run with an empty count (called by `_dom_reset`)."""
+    _CUA_CALLS.clear()
+
+
+def _cua_prompt_purpose(system_prompt) -> str:
+    """A session started outside the dispatcher is named by its prompt constant
+    ("PROMPT_CLICK_SEND" → "click send"); a prompt built on the spot is "other"."""
+    for k, v in list(globals().items()):
+        if k.startswith("PROMPT_") and v is system_prompt:
+            return k[len("PROMPT_"):].lower().replace("_", " ")
+    return "other"
+
+
+def _cua_open(kind: str, *, phase=None, platform="", purpose="") -> dict:
+    """Count one computer-use session (`kind="cua"`) or one vision-model screen
+    read (`kind="vision"`). The call site's tag, when there is one, names it;
+    the arguments are the fallback. Returns the record, whose `steps` the
+    session keeps current."""
+    tag = _CUA_TAG.get() or {}
+    try:
+        _ph = int(tag.get("phase") or phase or getattr(_runtime, "phase", 0) or 0)
+    except Exception:
+        _ph = 0
+    _plat = tag.get("platform") or platform or ""
+    rec = {"kind": kind, "phase": _ph,
+           "platform": normalize_agent_key(_plat) if _plat else "",
+           "purpose": str(tag.get("purpose") or purpose or "other").replace("_", " "),
+           "steps": 0}
+    _CUA_CALLS.append(rec)
+    return rec
+
+
+def _cua_tagged(factory, *, phase, platform, purpose):
+    """`factory` (a dispatcher's `cua_coro_factory`) with the call site's
+    phase, platform and purpose in force while it runs, so the `agent_loop`
+    inside it is counted under them."""
+    async def _run():
+        token = _CUA_TAG.set({"phase": phase, "platform": platform, "purpose": purpose})
+        try:
+            return await factory()
+        finally:
+            _CUA_TAG.reset(token)
+    return _run
+
+
+def _cua_summary(tag: str = "") -> dict:
+    """One line for the run, then one per phase · platform · purpose."""
+    head = f"[cua-summary]{(' ' + tag) if tag else ''}"
+    cua = [r for r in _CUA_CALLS if r["kind"] == "cua"]
+    vis = [r for r in _CUA_CALLS if r["kind"] == "vision"]
+    steps = sum(int(r.get("steps") or 0) for r in cua)
+    if not _CUA_CALLS:
+        log(f"{head} no computer use and no vision-model screen reads this run")
+        return {"sessions": 0, "steps": 0, "vision": 0}
+    log(f"{head} computer use ran {len(cua)} time{'s' if len(cua) != 1 else ''} "
+        f"({steps} step{'s' if steps != 1 else ''} in all), plus {len(vis)} "
+        f"vision-model screen read{'s' if len(vis) != 1 else ''} — the DOM line "
+        "above counts only the setup steps it tracks")
+    groups: dict = {}
+    for r in _CUA_CALLS:
+        g = groups.setdefault((r["phase"], r["platform"], r["purpose"], r["kind"]),
+                              [0, 0])
+        g[0] += 1
+        g[1] += int(r.get("steps") or 0)
+    for (ph, plat, purpose, kind), (n, st) in sorted(groups.items()):
+        if kind == "cua":
+            what = (f"{n} time{'s' if n != 1 else ''}, "
+                    f"{st} step{'s' if st != 1 else ''}")
+        else:
+            what = f"{n} vision read{'s' if n != 1 else ''}"
+        log(f"{head}   p{ph} {plat or '?'} · {purpose}: {what}")
+    return {"sessions": len(cua), "steps": steps, "vision": len(vis)}
 
 
 # Canonical agent/platform key the frontend uses in details[<key>]. Matches the
@@ -29619,6 +29719,10 @@ async def _shadow_observed_cua(
 
     Failure modes (Vision side) are silently logged — never re-raised.
     """
+    # ⭐ 2026-09-30: the computer use this call starts is counted under its step
+    # (`current_step`), phase and platform — see `_CUA_TAG`.
+    cua_coro_factory = _cua_tagged(cua_coro_factory, phase=phase, platform=platform,
+                                   purpose=current_step)
     if _vision is None:
         return await cua_coro_factory()
     try:
@@ -29664,6 +29768,7 @@ async def _shadow_observed_cua(
             _act_kw["refuse"] = lambda r: _vision_refusal(r, act_allow)
         try:
             _steps = 1 if read_only else (act_max_steps or _vision.ACT_MAX_STEPS_DEFAULT)
+            _cua_open("vision", phase=phase, platform=platform, purpose=current_step)
             _final = await asyncio.wait_for(_vision.act_loop(
                 page,
                 flow_context=flow_ctx,
@@ -41697,6 +41802,12 @@ async def agent_loop(client, browser, system_prompt, user_message,
         return {"type": "text", "text": "The screenshot could not be taken because the page "
                 "is busy. Wait a moment, then take another screenshot."}
 
+    # ⭐ 2026-09-30: every session is counted for the end-of-run summary, under
+    # the call site's purpose (`_CUA_TAG`) or its prompt; `steps` follows the
+    # model turns below.
+    _cua_rec = _cua_open("cua", phase=phase, platform=agent_name or "",
+                         purpose=_cua_prompt_purpose(system_prompt))
+
     initial_ss = await _anchored_screenshot()
     if not initial_ss:
         return {"status": "error", "text": "Could not take initial screenshot"}
@@ -41735,6 +41846,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
         if abort_event is not None and abort_event.is_set():
             return {"status": "aborted", "text": last_text}
 
+        _cua_rec["steps"] = iteration
         if verbose: log(f"Iteration {iteration}/{max_iterations}")
         try:
             # 2026-07-11 (+review r2): transient server-side 5xx errors retry
@@ -43089,6 +43201,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
             log(f"[{agent_key}] vision-urls call error: {e}", "WARN")
             return [], 0.0
 
+    _cua_open("vision", platform=agent_key, purpose="read source links off the screen")
     try:
         raw_urls, conf = await asyncio.to_thread(_sync_call)
     except Exception as e:
