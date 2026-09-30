@@ -35685,8 +35685,10 @@ _CHATGPT_STEP_LIST_JS = _cg_js(r"""() => {
     if (!steps.length && !out.thoughts) return out;
     out.open = true;
     out.rows = steps.length;
-    // Wave 13: the rows themselves, for the live activity feed.
-    out.steps = steps.slice(0, 15);
+    // Wave 13: the rows themselves, for the live activity feed. ⛔ The NEWEST
+    // 15, as the feed keeps them: the first 15 froze the feed at a normal Pro
+    // brief's 15th step (the owner's recording has 18 by the finish).
+    out.steps = steps.slice(-15);
     return out;
 }""")
 

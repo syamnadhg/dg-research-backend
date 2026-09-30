@@ -71,16 +71,38 @@ def test_the_recorded_open_list_reads_open_with_its_steps(chrome, page, index):
     sl = _probe(chrome, page, index, research._CHATGPT_STEP_LIST_JS)
     assert sl["open"] is True, sl
     assert sl["label"] == label, sl
-    assert sl["steps"][:len(first_steps)] == first_steps, sl["steps"]
+    # Past 15 rows the list hands on the newest 15, so the oldest are dropped.
+    kept = first_steps[max(0, sl["rows"] - 15):]
+    assert sl["steps"][:len(kept)] == kept, sl["steps"]
     assert sl["rows"] == len(sl["steps"]) or sl["rows"] > 15
 
 
 def test_the_finished_list_carries_its_last_steps(chrome, page):
+    """⛔ Review of round 2: the list kept its FIRST 15 rows, so from the 15th
+    step on the feed was stuck on "Searched 16 websites". It keeps the newest 15,
+    the way the feed does, and never a thought."""
     sl = _probe(chrome, page, 71, research._CHATGPT_STEP_LIST_JS)
-    # 18 steps on the page: the feed takes the first 15, and never a thought.
     assert sl["rows"] == 18 and len(sl["steps"]) == 15, sl
+    assert sl["steps"][-1] == "Searched 5 websites", sl["steps"]
+    assert "Planned research scope" not in sl["steps"], sl["steps"]
     assert sl["thoughts"] == 2
     assert all(len(s) <= 220 for s in sl["steps"])
+
+
+#: Frames past the 15th row: (rows on the page, the newest step on it).
+PAST_15 = {56: (18, "Searched 5 websites"), 71: (18, "Searched 5 websites")}
+
+
+@pytest.mark.parametrize("index", sorted(PAST_15))
+def test_the_live_feed_ends_on_the_newest_step_past_the_15th(chrome, page, index):
+    """⛔⛔ THE CONSUMER, on the recorded page: `scrape_progress_chatgpt` merges the
+    list's rows and keeps its last 15. With the first 15 handed to it, the feed
+    stopped moving at the 15th step of a normal Pro brief."""
+    rows, newest = PAST_15[index]
+    sl = _probe(chrome, page, index, research._CHATGPT_STEP_LIST_JS)
+    assert sl["open"] is True and sl["rows"] == rows, sl
+    r = chrome.run(research.scrape_progress_chatgpt(page))
+    assert r["steps"] and r["steps"][-1] == newest, r["steps"]
 
 
 @pytest.mark.parametrize("index", LONG)

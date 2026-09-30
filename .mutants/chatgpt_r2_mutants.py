@@ -6,7 +6,7 @@
       it; thoughts are not steps; the rows sit in one wrapper; the line is known
       whatever its label (long, drawn once; "Worked for …"); a label drawn twice
       is read once; the reply and the message are never the line; the rows reach
-      the live activity feed.
+      the live activity feed, the newest 15 of them.
   M*  Phase 2 picks "Deep research" inside the overlay the "+" opened — never the
       suggestion strip or the sidebar — and the Pro check runs after it.
   D*  Deep research as an app: done is the Stop button gone; "Worked for …" never
@@ -45,6 +45,7 @@ RESEARCH = "research.py"
 SUITES = {
     "steps": ["tests/test_chatgpt_r2_0930.py", "-k",
               "recorded or long_label or line or status_line or control or hidden"],
+    "newest": ["tests/test_chatgpt_r2_0930.py", "-k", "finished_list or past_the_15th"],
     "feed": ["tests/test_chatgpt_thinking_list_0929.py", "-k",
              "never_presses_the_line_while or listed_steps"],
     "menu": ["tests/test_chatgpt_r2_0930.py", "-k", "menu or deep_research_row"],
@@ -102,6 +103,13 @@ MUTANTS = [
      [("            if _sl and _sl.get(\"open\") and _rows:\n",
        "            if False:\n")],
      "feed"),
+    ("S10", RESEARCH, "⛔⛔ the list hands on its FIRST 15 rows — the live feed freezes at "
+     "the 15th step (review of round 2)",
+     [("    // brief's 15th step (the owner's recording has 18 by the finish).\n"
+       "    out.steps = steps.slice(-15);\n",
+       "    // brief's 15th step (the owner's recording has 18 by the finish).\n"
+       "    out.steps = steps.slice(0, 15);\n")],
+     "newest"),
 
     # ── M: the Deep research row ───────────────────────────────────────────
     ("M1", RESEARCH, "⛔⛔ the overlay's rows are not read — 'no deep research row among 0 "
