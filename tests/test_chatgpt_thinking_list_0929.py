@@ -179,7 +179,36 @@ SCRIPT = r"""
     return '<span class="inline-flex items-center" data-sr-toggle="1">'
          + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span>' + two + '</span>';
   }
+  // 2026-09-30 (round 2): 'captured' — the thinking block exactly as the owner's
+  // recording of chatgpt.com has it (tests/fixtures/chatgpt_0930/
+  // 4-chatgpt-p1-thinking.json, rendered by `_capture_page`): the line is the
+  // element holding a button[aria-expanded][aria-labelledby], the list the
+  // element after it, and a press takes the list off the page and puts it back
+  // (recorded: after each press the list is gone, then there again).
+  function capturedBlock() {
+    const t = document.createElement('div');
+    t.innerHTML = cfg.capturedOpen;
+    const b = t.firstElementChild;
+    b.setAttribute('data-sr-think', '1');
+    const btn = b.querySelector('button[aria-expanded][aria-labelledby]');
+    const line = btn.parentElement;
+    line.setAttribute('data-sr-toggle', '1');
+    const l = line.nextElementSibling;
+    l.setAttribute('data-sr-list', '1');
+    if (cfg.collapsed) { l.remove(); btn.setAttribute('aria-expanded', 'false'); }
+    b.addEventListener('click', (e) => {
+      if (!e.target.closest('[data-sr-toggle]')) return;
+      window.__srPresses = (window.__srPresses || 0) + 1;
+      document.body.dataset.srPresses = String(window.__srPresses);
+      if (l.isConnected) { l.remove(); btn.setAttribute('aria-expanded', 'false'); }
+      else { line.after(l); btn.setAttribute('aria-expanded', 'true'); }
+      window.__srToggles += 1;
+      document.body.dataset.srToggles = String(window.__srToggles);
+    });
+    return b;
+  }
   function makeBlock() {
+    if (cfg.header === 'captured') return capturedBlock();
     const b = document.createElement('div');
     b.className = 'min-w-0 flex flex-col';
     b.setAttribute('data-sr-think', '1');
@@ -290,7 +319,13 @@ SCRIPT = r"""
     mode = 'done';
     document.body.dataset.srFinishedAt = String(Date.now());
     if (labelTimer) clearInterval(labelTimer);
-    block.innerHTML = '<span>' + (cfg.doneLabel || 'Worked for 7m 23s') + '</span>';
+    if (cfg.capturedDone) {
+      const t = document.createElement('div');
+      t.innerHTML = cfg.capturedDone;
+      block.replaceChildren(...t.firstElementChild.childNodes);
+    } else {
+      block.innerHTML = '<span>' + (cfg.doneLabel || 'Worked for 7m 23s') + '</span>';
+    }
     if (stash && stash.reply) {
       if (cfg.reply === 'absent') stash.parent.appendChild(stash.reply);
       for (const k of stash.kids) stash.root.appendChild(k);
@@ -413,50 +448,19 @@ def test_the_rebuilt_block_reads_like_the_captured_one(chrome, page, logs, when,
     assert len(line) == 1 and line[0]["inter"] is False, line
 
 
-# ═══ 1. Open is open; folded, finished and the old shape are not ══════════════
-
-@pytest.mark.parametrize("header", HEADERS)
-@pytest.mark.parametrize("md_attr", ["", "assistant-message"])
-@pytest.mark.parametrize("place", PLACES)
-def test_the_open_step_list_reads_as_open(chrome, page, logs, place, md_attr, header):
-    """⭐⭐ THE FIX, where the audit measured it read as closed in all six
-    variants — and, since the 09-29 review, with the chevron between the copies
-    and the list ("row", "stack", "overlay"), where the first version still read
-    it as closed."""
-    _thinking(chrome, page, place=place, mdAttr=md_attr, header=header)
-    assert _list_shown(chrome, page)
-    st = _state(chrome, page)
-    assert research._chatgpt_p1_activity_open(st) is True, st
-    assert research._chatgpt_open_shape(st) == "steps"
-    assert st["inline_step_rows"] == len(ROWS)
-
-
-@pytest.mark.parametrize("header", HEADERS)
-@pytest.mark.parametrize("how", [True, "invisible", "removed"])
-@pytest.mark.parametrize("place", PLACES)
-def test_a_folded_list_reads_as_closed(chrome, page, logs, place, how, header):
-    """⛔ Folded, whatever the fold does. Taken off the page ("removed"), the
-    line is alone in its block and the look for the list carries on past the
-    block — where, with the block inside the reply's unit, the next thing is
-    the reply's own "ChatGPT said:" heading. That is never the list."""
-    _thinking(chrome, page, place=place, collapsed=how, header=header)
-    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
-
-
-def test_the_finished_line_reads_as_closed(chrome, page, logs):
-    _thinking(chrome, page, place="column")
-    chrome.run(page.evaluate("() => document.dispatchEvent(new CustomEvent('sr-finish'))"))
-    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
-
-
-@pytest.mark.parametrize("header", HEADERS)
-def test_a_line_drawn_once_is_not_this_list(chrome, page, logs, header):
-    """⛔ The doubled label is what keeps this off the OLD page: its status line
-    is drawn once, and rows under it are not the new page's list — reading them
-    as open would stop Phase 1 ever opening the old page's chip row."""
-    _thinking(chrome, page, place="column", once=True, header=header)
-    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
-
+# ═══ 1. The reader, on the RECORDED markup ════════════════════════════════════
+# ⛔⛔ 2026-09-30 (round 2) — THE TESTS THAT STOOD HERE READ THE REBUILT BLOCK
+# ABOVE, and they passed against a page that did not exist: on 09-30 the live
+# page's open list read as closed on every poll while every one of them was
+# green. The owner has since recorded the real thing
+# (tests/fixtures/chatgpt_0930/4-chatgpt-p1-thinking.json), the reader was
+# rebuilt on it, and its tests — open, folded, finished, a long label drawn
+# once, the reply and the message excluded — run on that recording:
+# tests/test_chatgpt_r2_0930.py, section 1. The rebuilt block cannot answer the
+# new reader at all (it has no line control), so a test here could only pass by
+# the reader saying "closed" — a pin nothing could fail. What stays: the older
+# pages below must still not read as this list, and Phase 1 run on the recorded
+# block (section 2).
 
 # ── pages that are not this list at all ─────────────────────────────────────
 
@@ -481,79 +485,6 @@ def test_the_captured_pages_and_the_older_shapes_are_not_this_list(chrome, page,
     the look for it — which now moves out from the line — finds none."""
     chrome.run(page.set_content(build()))
     assert chrome.run(page.evaluate(research._CHATGPT_STEP_LIST_JS))["open"] is False
-
-
-# ── what may LOOK like the line and a list, and is not ──────────────────────
-
-DOUBLED = ('<span class="inline-flex"><span>Findings</span><span>Findings</span></span>'
-           '<div><div>First point</div><div>Second point</div></div>')
-
-
-def _static(chrome, page, body):
-    chrome.run(page.set_content(
-        "<style>.inline-flex{display:inline-flex}</style><main>" + body + "</main>"))
-    return research._chatgpt_p1_activity_open(_state(chrome, page))
-
-
-def test_the_bare_shape_reads_as_open(chrome, page, logs):
-    """The control for the three below: the same markup, loose in the page."""
-    assert _static(chrome, page, f"<div>{DOUBLED}</div>") is True
-
-
-def test_the_shape_inside_the_reply_is_not_the_list(chrome, page, logs):
-    assert _static(chrome, page, '<div data-markdown-text-style="assistant-message">'
-                   f"<div>{DOUBLED}</div></div>") is False
-
-
-def test_the_shape_inside_the_persons_message_is_not_the_list(chrome, page, logs):
-    assert _static(chrome, page, f'<div data-user-message-bubble="true"><div>{DOUBLED}</div>'
-                   "</div>") is False
-
-
-def test_the_shape_inside_the_message_box_is_not_the_list(chrome, page, logs):
-    assert _static(chrome, page, f"<form><div>{DOUBLED}</div></form>") is False
-
-
-def test_the_container_of_a_folded_line_is_not_the_line(chrome, page, logs):
-    """⛔ Folded, the block's own text is the label twice too — and what comes
-    after the BLOCK is the reply. Only the element holding the two copies is
-    the line."""
-    assert _static(chrome, page, '<div><div><span class="inline-flex"><span>Thinking</span>'
-                   '<span>Thinking</span></span><div hidden>Validated financial claims</div>'
-                   '</div><div><p>Scope: the breed</p></div></div>') is False
-
-
-LONE = '<div><span class="inline-flex"><span>Thinking</span><span>Thinking</span></span></div>'
-
-
-def test_the_reply_after_a_lone_line_is_not_its_list(chrome, page, logs):
-    """⛔ A folded list taken off the page leaves the line alone in its block,
-    and the look carries on past the block. When what it meets there is the
-    reply — its "ChatGPT said:" heading and its words — that is not the list."""
-    assert _static(chrome, page, f'<div>{LONE}<div><h4 class="sr-only" data-conversation-role='
-                   '"assistant">ChatGPT said:</h4><div>Scope: the breed</div></div></div>') is False
-
-
-def test_the_look_for_the_list_never_leaves_the_conversation(chrome, page, logs):
-    """A line that is all the conversation holds: the words after the
-    conversation (the page's own footer) are not its list."""
-    chrome.run(page.set_content("<style>.inline-flex{display:inline-flex}</style>"
-                                f"<main>{LONE}</main>"
-                                "<div>ChatGPT can make mistakes. Check important info.</div>"))
-    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
-
-
-@pytest.mark.parametrize("header", HEADERS)
-@pytest.mark.parametrize("place", ["column", "block-plain"])
-def test_a_folded_line_at_the_end_of_the_exchange_is_not_open(chrome, page, logs, place,
-                                                              header):
-    """⛔ The list taken off the page and no reply yet — which is what that
-    day's snapshots show while ChatGPT thinks (no "ChatGPT said:" anywhere).
-    The look moves out only through what holds no other words, so it stops at
-    the exchange (it holds the person's message) and never reaches the message
-    box below."""
-    _thinking(chrome, page, place=place, reply="absent", collapsed="removed", header=header)
-    assert research._chatgpt_p1_activity_open(_state(chrome, page)) is False
 
 
 # ═══ 2. Phase 1, executed: the line is never pressed while the list shows ═════
@@ -663,26 +594,50 @@ def p1run(chrome, page, fast, logs, monkeypatch):
     return run
 
 
-@pytest.mark.parametrize("place,reply,header", [
-    ("column", "empty", "pair"), ("column", "absent", "pair"), ("unit", "empty", "pair"),
-    ("block-unit", "empty", "pair"), ("block-plain", "absent", "pair"),
-    # ⛔ 09-29 review: the chevron between the copies and the list — the first
-    # version pressed the line 49-50 times in these nine seconds, as before.
-    ("column", "empty", "row"), ("column", "empty", "stack"), ("unit", "empty", "overlay")])
-def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply, header):
-    """⭐⭐ THE OWNER'S SYMPTOM, executed: the real Phase 1 (submit, poll, open
-    check, opener, vision escalation, extraction) on the thinking page. Before
-    the fix the audit counted 50 presses in nine seconds and three vision calls;
-    now the line is left alone and, while ChatGPT thinks, the vision step is
-    never asked. (Once it has finished the list is gone and Phase 1 may still
-    try to open the finished line — that is not this defect, and it presses
-    nothing here.)"""
-    out = p1run(place=place, reply=reply, finishMs=9000, header=header,
-                labels=["Searching the web", "Thinking", "Searching liquidcompute.com"])
+def captured_block(index):
+    """The recorded thinking block of frame `index` of the owner's recording
+    (tests/fixtures/chatgpt_0930/4-chatgpt-p1-thinking.json) — the element
+    holding the line and, when open, its list — as HTML, via `_capture_page`."""
+    import _capture_page as cp
+    fr = cp.load("4-chatgpt-p1-thinking.json")["frames"][index]
+    pick = lambda n: (cp.has_class("overflow-visible")(n)            # noqa: E731
+                      and cp.has_class("text-size-chat")(n))
+    for n in fr["lastTurn"]:
+        hit = cp.find(n, pick)
+        if hit is not None:
+            return cp.node_html(hit)
+    raise AssertionError(f"frame {index} holds no thinking block")
+
+
+#: Thinking, list open: frame 30 ("Thinking", drawn twice, five steps) and frame
+#: 53 (a long label drawn ONCE, fifteen steps). Finished: frame 68 ("Worked for
+#: 7m 59s", the list folded).
+CAPTURED_STEPS_30 = ["Planned research scope", "Searched 37 websites",
+                     "Read PDF research instructions", "Refined insurance evidence",
+                     "Built budget scenarios"]
+
+
+def captured(open_frame=30, done_frame=68):
+    return dict(header="captured", capturedOpen=captured_block(open_frame),
+                capturedDone=captured_block(done_frame))
+
+
+@pytest.mark.parametrize("place,reply,frame", [
+    ("block-plain", "empty", 30), ("column", "absent", 30),
+    # ⛔ a long label is drawn ONCE: round 1's reader, which knew the line only
+    # by its doubled label, did not know this one.
+    ("block-plain", "empty", 53), ("column", "empty", 53)])
+def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply, frame):
+    """⭐⭐ THE OWNER'S SYMPTOM, executed on the RECORDED block: the real Phase 1
+    (submit, poll, open check, opener, vision escalation, extraction). On 09-30
+    the line was pressed six times and the list flapped shut and open; now it
+    is read as open, left alone, and no vision step is asked while ChatGPT
+    thinks."""
+    out = p1run(place=place, reply=reply, finishMs=9000, **captured(frame))
     assert HEADING in out.text, out.text[:200]
     assert out.presses == 0 and out.toggles == 0, (out.presses, out.toggles)
     assert out.while_thinking == [], out.while_thinking
-    assert any("activity already open (shape=steps, 6 step lines showing)" in m
+    assert any("activity already open (shape=steps" in m
                for m in out.lines), [m for m in out.lines if "activity" in m][:10]
 
 
@@ -724,10 +679,12 @@ def test_the_listed_steps_reach_the_live_activity_feed(p1run, monkeypatch):
     Phase 1's progress events carry every row, in the page's order."""
     events = []
     monkeypatch.setattr(research, "emit_event", lambda name, **k: events.append((name, k)))
-    out = p1run(place="column", reply="empty", finishMs=9000, header="pair")
+    # ⛔ 2026-09-30 (round 2): on the RECORDED block — on the rebuilt one this
+    # passed while the live page fed nothing.
+    out = p1run(place="block-plain", reply="empty", finishMs=9000, **captured(30))
     assert HEADING in out.text
     fed = [k.get("steps") or [] for name, k in events
            if name == "agent_progress" and k.get("phase") == 1]
-    rows = [t for _kind, t in ROWS]
+    rows = CAPTURED_STEPS_30
     assert any([s for s in steps if s in rows] == rows for steps in fed), (
         [steps for steps in fed if steps][-3:])

@@ -24828,7 +24828,24 @@ _CHATGPT_MODEL_ROW_GROUPS = [
 # row and Step 2 had been falling through to the CUA fallback on every run.
 # `button, a, li` is deliberately NOT in here: those are what the suggestion
 # strip is made of.
+#
+# ⭐⭐ 2026-09-30 (round 2) — THE 09-28 PAGE'S MENU. `.__menu-item` is gone from
+# the whole page and the rows are plain <button>s with no role (the 09-30 run's
+# own dump: 'Deep researchGet a detailed report', 'Web searchFind real-time news
+# and info', … beside the strip's 'Search the web'), so both old groups found 0
+# rows and computer use enabled Deep research — and the Phase 2 Pro check,
+# which runs only after this step's DOM path, never ran. The owner's capture of
+# the press (tests/fixtures/chatgpt_0930/3-chatgpt-dr-toppage.json, 3885 ms)
+# gives the row's container: the "+" opens a portal under <body> —
+# div.fixed > div[data-composer-overlay-floating-ui] > … >
+# div[data-mention-list-scroll-area] > div > button[data-list-navigation-item].
+# So this group reads buttons ONLY inside that overlay: the suggestion strip and
+# the sidebar are never inside it, whatever their words. It goes first because
+# it is the only group scoped to the menu the "+" opened.
 _CHATGPT_TOOL_ROW_GROUPS = [
+    {"name": "composer-overlay",
+     "sel": ('[data-composer-overlay-floating-ui] button[data-list-navigation-item], '
+             '[data-composer-overlay-floating-ui] [data-mention-list-scroll-area] button')},
     {"name": "menu-item-class", "sel": ".__menu-item"},
     {"name": "role", "sel": '[role="menuitemradio"], [role="menuitem"], [role="option"]'},
 ]
@@ -35127,7 +35144,24 @@ _CHATGPT_SHIMMER_JS_HELPERS = """
 """
 
 
-_CHATGPT_INLINE_ACTIVITY_JS = _cg_js("""() => {
+# ⭐ 2026-09-30 (round 2) — ONE READING OF A LABEL THE NEW PAGE DRAWS TWICE.
+# ChatGPT draws a short status label twice, the text and an aria-hidden shimmer
+# copy laid over it, so its innerText is "Thinking\nThinking" (the owner's
+# capture, tests/fixtures/chatgpt_0930/4-chatgpt-p1-thinking.json, and every
+# 09-29/09-30 log). Every reader of such a label — the step list's line and rows,
+# the new page's line, the inline walker's status line — keeps one copy through
+# this helper. JS, spliced into each reader's page script.
+_CG_UNDOUBLE_JS = r"""
+    const undouble = (t) => {
+        const s = String(t || '').trim();
+        const parts = s.split('\n').map(x => x.trim()).filter(Boolean);
+        if (parts.length === 2 && parts[0] === parts[1]) return parts[0];
+        return s.replace(/\s+/g, ' ');
+    };
+"""
+
+
+_CHATGPT_INLINE_ACTIVITY_JS = _cg_js("""() => {""" + _CG_UNDOUBLE_JS + """
     // Scope: the LAST assistant turn. The status row + drawer render inside
     // the <article> turn wrapper but OUTSIDE [data-message-author-role], so
     // prefer the article; fall back to the role node's parent.
@@ -35355,7 +35389,7 @@ _CHATGPT_INLINE_ACTIVITY_JS = _cg_js("""() => {
         else if (t.length <= 240 && r.top < statusTop && shimmerLine(el)) from = 'shimmer';
         if (from && r.top < statusTop) {
             statusTop = r.top;
-            out.status_line = t.slice(0, 200);
+            out.status_line = undouble(t).slice(0, 200);
             out.dbg.statusFrom = from;
         }
         // Activity rows: verb-prefixed leaves + hostname chips. Exclude the
@@ -35570,138 +35604,124 @@ _CHATGPT_SIDE_PANEL_JS = _cg_js("""() => {
 }""")
 
 
-# ⛔⛔ 2026-09-29 — THE NEW PAGE'S STEP LIST, OPEN, READ AS CLOSED. While ChatGPT
-# thinks, the new page shows a "Thinking ▾" line with the model's steps listed
-# under it ("Validated financial claims", "Searched 69 websites", ...), and the
-# list is ALREADY OPEN. Nothing here could see it: no side panel, no region
-# named "thought"/"activity", no hostname chips. So Phase 1 read it as closed
-# and pressed the line every ~30 s — a toggle — folding the list shut and open
-# again in the person's tab, and paid the vision step up to three times a brief
-# to open a list that was open. The vision step saw it happen (10:10:18):
-# "clicking on "Thinking ▾" collapsed the activity list (it was previously
-# expanded showing the steps) … I accidentally closed what was already open."
+# ⛔⛔ 2026-09-30 (round 2) — THE STEP LIST, READ FROM THE OWNER'S CAPTURE.
+# The 09-29 reader was built from snapshot rows, not a capture, and pinned on a
+# rebuild of a page that did not exist. On the live page it read the open list
+# as closed on every poll, so Phase 1 pressed it shut and open (09-30, six
+# presses) and no step row ever reached the live activity feed. The owner's
+# capture of a Pro thinking chat (tests/fixtures/chatgpt_0930/
+# 4-chatgpt-p1-thinking.json — thinking, pressed twice, finished "Worked for
+# 7m 59s", pressed again) shows the real markup:
 #
-# Measured, from that day's own panel-miss snapshot rows (0.1.13's census of the
-# live page; first class token in brackets):
-#   * the line: SPAN[inline-flex] whose text is the label TWICE ("Thinking\n
-#     Thinking" — one copy is a SPAN[cadencedShimmerSweep-…]), in every capture
-#     whatever the label said ("Searching the web", "Extracting Credit Map …");
-#   * the list directly under it: DIV[-ms-2], its rows DIV[MarkdownRoot-…] or
-#     DIV[min-w-0], one step per row; their container's text is the line and
-#     then the list ("Thinking\nThinking\n\nCrafted a refined research brief…");
-#   * finished, the line reads "Worked for 7m 23s", once, and the list is gone.
-# So "open" is: a line whose label is drawn twice, followed by a shown element
-# with words in it. The doubled label is what keeps this off the OLD page, whose
-# status line is drawn once.
-# ⛔ 2026-09-29 (review) — WHAT COMES "AFTER THE LINE" IS NOT ALWAYS ITS NEXT
-# ELEMENT. The snapshot skips any element with more than two children, so it
-# cannot see a row that holds the two copies AND an icon and the chevron the
-# vision step saw ("Thinking ▾", a globe icon while searching), nor a chevron
-# inside SPAN[inline-flex] with the copies stacked one level down. Both give
-# exactly that day's snapshot rows, and in both the element holding the copies
-# is followed by the chevron, not the list — the first version read the open
-# list as closed there and Phase 1 pressed it as before. So the look for the
-# list starts at the element holding the copies and moves out through what is
-# around it while that holds no other words (the row, a wrapper), and the list
-# is the first thing after it with words. It stops at the reply's own heading:
-# a folded list taken off the page leaves the line alone in its block, and the
-# look must not carry on past the block and take the reply for the list.
-# Its own probe, not a field of `_CHATGPT_INLINE_ACTIVITY_JS`: that
-# walker returns nothing at all when it finds no turn, and whether the reply's
-# unit exists before any reply text is not known (no capture of the thinking
-# phase's markup exists) — the line must be seen either way.
-# ⚠ ASSUMED: that a closed list is hidden or removed (the vision step saw it
-# fold; the markup of the folded state was never captured).
-_CHATGPT_STEP_LIST_JS = _cg_js("""() => {
-    const out = { open: false, rows: 0, label: '', steps: [] };
-    const main = document.querySelector('main') || document.body;
-    const lines = (n) => (n.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+#   div.min-w-0.text-size-chat …
+#     div.flex.min-w-0.flex-col
+#       div.group/activity-header                 ← the line
+#         button[aria-expanded][aria-labelledby]    laid over the whole line
+#         span#<id>                                 the label: a short one drawn
+#                                                   twice (a text node and an
+#                                                   aria-hidden shimmer copy), a
+#                                                   long one ("Searching for …",
+#                                                   67-185 chars) drawn ONCE
+#         span.pointer-events-none                  the chevron
+#       div.-ms-2.ps-2                            ← the list, ONLY while open —
+#         div.flex.flex-col                          a press takes it off the page
+#           div[data-markdown-text-tone=primary]     a thought (a paragraph)
+#           div[data-markdown-text-tone=tertiary]    a step: "Planned research scope"
+#           div.min-w-0 > … > div.group/activity-header   a count: "Searched 37 websites"
+#
+# The 09-29 reader wanted the element holding the two copies to have TWO element
+# children. The shimmer copy is the text node's sibling, so it has ONE, and every
+# poll read "closed"; a long label, drawn once, it could not see at all.
+#
+# So the line is the first element in the latest exchange holding a button with
+# aria-expanded AND aria-labelledby — the captured control, whatever its label
+# says — and the list is what comes right after it. Open is "the list is on the
+# page, shown, with a step in it". `aria-expanded` is reported, never trusted:
+# one captured frame has it read "false" over a list that is open. Steps are the
+# list's rows except the thoughts, one line each, the label read once
+# (`_CG_UNDOUBLE_JS`).
+# ⚠ ASSUMED (the capture stops 14 levels down): what sits inside a count row. It
+# does not matter here — its text is the row's text either way.
+_CHATGPT_STEP_LIST_JS = _cg_js(r"""() => {
+    const out = { open: false, rows: 0, label: '', steps: [], expanded: '',
+                  thoughts: 0, line: false };
+""" + _CG_UNDOUBLE_JS + r"""
+    const turns = document.querySelectorAll('__CG_TURN__');
+    const last = turns.length ? turns[turns.length - 1] : null;
+    if (!last) return out;
     const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-    let all;
-    try { all = main.querySelectorAll('*'); } catch (e) { return out; }
-    if (all.length > 8000) return out;
-    for (const h of all) {
-        // Cheap first: only a short element can be the line.
-        const tc = h.textContent || '';
-        if (tc.length < 6 || tc.length > 250) continue;
-        // The line: the element holding its label twice — two children with
-        // words, the same words. (Not one that merely CONTAINS the line: with
-        // the list folded, the block's own text is the label twice too.)
-        const texts = [...h.children].map(c => lines(c).join(' ')).filter(Boolean);
-        if (texts.length !== 2 || texts[0] !== texts[1]) continue;
-        // Never the person's message, the message box, or the reply itself.
-        if (h.closest('__CG_REPLY_TEXT__')) continue;
-        if (h.closest('__CG_USER__')) continue;
-        if (h.closest('form, __CG_COMPOSER__')) continue;
-        // What it opens: the first thing after the line with words in it
-        // (past anything with none, such as an icon or a chevron), shown.
-        // The two copies may sit inside a row with such things — an icon
-        // before them, the chevron after, a wrapper around them — so the look
-        // starts at the element holding the copies and moves out through each
-        // element around it that holds no other words.
-        const words = (n) => (n.textContent || '').trim();
-        const own = words(h);
-        let list = null;
-        for (let n = h; n && n !== main; n = n.parentElement) {
-            if (words(n) !== own) break;
-            let s = n.nextElementSibling;
-            while (s && !words(s)) s = s.nextElementSibling;
-            if (s) { list = s; break; }
-        }
-        // ⛔ Never the reply. A folded list taken off the page leaves the line
-        // alone in its block, and the look then carries on past the block: if
-        // what it meets is the reply ("ChatGPT said:"), there is no list.
-        if (!list || list.matches('[data-conversation-role]')
-                || list.querySelector('[data-conversation-role]')) continue;
-        if (!shown(list)) continue;
-        const steps = lines(list);
-        if (!steps.length) continue;
-        out.open = true;
-        out.rows = steps.length;
-        out.label = texts[0].slice(0, 60);
-        // Wave 13: the rows themselves, for the live activity feed.
-        out.steps = steps.slice(0, 15).map(s => s.slice(0, 220));
+    let head = null, btn = null;
+    for (const b of last.querySelectorAll('button[aria-expanded][aria-labelledby]')) {
+        // Never the reply's text, the person's message or the message box.
+        if (b.closest('__CG_REPLY_TEXT__') || b.closest('__CG_USER__')) continue;
+        if (b.closest('form, __CG_COMPOSER__')) continue;
+        if (!b.parentElement) continue;
+        head = b.parentElement;
+        btn = b;
         break;
     }
+    if (!head) return out;
+    out.line = true;
+    out.label = undouble(head.innerText || '').slice(0, 80);
+    out.expanded = btn.getAttribute('aria-expanded') || '';
+    let list = head.nextElementSibling;
+    while (list && !(list.textContent || '').trim()) list = list.nextElementSibling;
+    // ⛔ Never the reply: a folded list leaves nothing after the line in its box.
+    if (!list || list.matches('[data-conversation-role]')
+            || list.querySelector('[data-conversation-role]')) return out;
+    if (!shown(list)) return out;
+    // The rows sit in ONE wrapper inside the list (captured).
+    let box = list;
+    if (box.children.length === 1
+            && !box.children[0].matches('[data-markdown-text-style]')) box = box.children[0];
+    const steps = [];
+    for (const row of box.children) {
+        const t = undouble(row.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (row.getAttribute('data-markdown-text-tone') === 'primary') { out.thoughts += 1; continue; }
+        steps.push(t.slice(0, 220));
+    }
+    // Open: a shown list with a row in it — a step, or only a thought so far.
+    if (!steps.length && !out.thoughts) return out;
+    out.open = true;
+    out.rows = steps.length;
+    // Wave 13: the rows themselves, for the live activity feed.
+    out.steps = steps.slice(0, 15);
     return out;
 }""")
 
 
-# ⛔⛔ 2026-09-30 — THE PROBE ABOVE IS BLIND ON THE LIVE PAGE, AND PHASE 1 KEPT
-# PRESSING. The owner's 09-30 run had 0246230 in it and still pressed the new
-# page's "Searching the web ▾" line six times in three minutes (05:04:24 to
-# 05:07:13), each logged as a miss, while the two snapshots taken right after a
-# press both show the list OPEN under it. The vision step saw it too (05:05:02:
-# "This list of steps is **already showing**"). Which of the probe's gates the
-# live markup fails is not in any capture yet (round 2 rebuilds the probe from
-# one), so this does not guess at the list at all.
-#
-# It reads the one thing every log since 09-29 has measured: the line itself
-# reads its label TWICE, SPAN[inline-flex] "Searching the web\nSearching the
-# web" (a plain copy and a shimmer copy), inside the exchange (`inTurn: true`),
-# in every snapshot whatever the label said. The old page draws its line once,
-# and a finished line reads "Worked for 3m 25s" once. So this line on screen
-# means "the new page, still thinking" — and on the new page the step list
-# under it shows by default, so Phase 1 never presses it.
-#
-# Keyed on innerText, not on how the two copies are built (element or bare
-# text), because innerText is what was measured. The words are compared with
-# all white space removed first — cheap, and the line's textContent is the
-# label twice with nothing between — so innerText is only read for the few
-# elements that can pass. Only in the latest exchange, and never inside the
-# reply's text or the person's message. Returns one copy of the label, or "".
-_CHATGPT_DOUBLED_LINE_JS = _cg_js("""() => {
+# ⛔⛔ 2026-09-30 — THE NEW PAGE'S LINE, SO PHASE 1 NEVER PRESSES IT. Round 1 read
+# it by its label drawn twice, the one thing the 09-29/09-30 logs had measured.
+# The owner's capture (see above) shows that holds only for a SHORT label: a long
+# one ("Searching for Golden Retriever …") is drawn once, and while it shows the
+# round-1 reader saw nothing and Phase 1 could press the line again. So the line
+# is read first by its captured control — the element holding a button with
+# aria-expanded AND aria-labelledby, in the latest exchange — whatever its label
+# says, thinking or "Worked for …"; the doubled label stays as the second way in.
+# Returns one copy of the label, or "". Phase 1 only.
+_CHATGPT_DOUBLED_LINE_JS = _cg_js(r"""() => {
+""" + _CG_UNDOUBLE_JS + r"""
     const turns = document.querySelectorAll('__CG_TURN__');
     const last = turns.length ? turns[turns.length - 1] : null;
     if (!last) return '';
+    const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    for (const b of last.querySelectorAll('button[aria-expanded][aria-labelledby]')) {
+        if (b.closest('__CG_REPLY_TEXT__') || b.closest('__CG_USER__')) continue;
+        if (b.closest('form, __CG_COMPOSER__')) continue;
+        const head = b.parentElement;
+        if (!head || !shown(head)) continue;
+        const t = undouble(head.innerText || '');
+        if (t) return t.slice(0, 80);
+    }
     let all;
     try { all = last.querySelectorAll('*'); } catch (e) { return ''; }
     if (all.length > 20000) return '';
     for (const el of all) {
-        const flat = (el.textContent || '').replace(/\\s+/g, '');
+        const flat = (el.textContent || '').replace(/\s+/g, '');
         if (flat.length < 6 || flat.length > 200 || flat.length % 2) continue;
         if (flat.slice(0, flat.length / 2) !== flat.slice(flat.length / 2)) continue;
-        const parts = (el.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+        const parts = (el.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
         if (parts.length !== 2 || parts[0] !== parts[1]) continue;
         // Not the reply's text or the person's message — nor a box around
         // either (a wrapper holding only a short reply reads just like it).

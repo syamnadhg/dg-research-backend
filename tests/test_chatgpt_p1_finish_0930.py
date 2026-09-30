@@ -310,7 +310,10 @@ def test_the_new_pages_line_is_left_alone_after_it_reads_worked_for(p1run, chrom
         return await real_open(pg, *a, **k)
 
     monkeypatch.setattr(research, "_open_chatgpt_activity_panel", _open)
-    out = p1run(place="column", reply="empty", finishMs=5000, streamMs=4000, header="pair")
+    # ⛔ 2026-09-30 (round 2): on the RECORDED block (frame 30, finished as frame
+    # 68) — the rebuilt one no longer answers the step-list reader.
+    out = p1run(place="block-plain", reply="empty", finishMs=5000, streamMs=4000,
+                **tl.captured(30))
     assert HEADING in out.text, out.text[:200]
     assert any("activity already open (shape=steps" in m for m in out.lines)
     assert opened == [], f"the opener went looking for the line {len(opened)} time(s)"
