@@ -141,6 +141,7 @@ from prompts import (
     PROMPT_VALIDATE_CHATGPT_SETUP,
     PROMPT_VALIDATE_GEMINI_SETUP,
     claude_deep_research_prompt,
+    claude_research_only_prompt,
     claude_validate_setup_prompt,
     make_prompt_audio_check,
     make_prompt_audio_download,
@@ -172,8 +173,10 @@ from models import (
     p2_free_family,
     p2_known_good,
     p2_labels,
+    p2_claude_research_only_directive,
     p2_claude_setup_directive,
     p2_claude_validate_directive,
+    effort_label,
     parse_family_version,
     reject_terms,
     upsell_nouns as _models_upsell_nouns,
@@ -6722,6 +6725,30 @@ def _dom_note(intent: str, outcome: str, *, phase: int = 0, via: str = "",
         bits.append(f"— {rec['detail']}")
     log(" ".join(bits), "INFO" if outcome in _DOM_OK else "WARN")
     return outcome
+
+
+def _dom_restate(intent: str, outcome: str, *, phase: int = 0, via: str = "",
+                 detail: str = "") -> str:
+    """Restate an intent's LATEST ledger entry when a later read disagrees.
+
+    The ledger holds one answer per attempt. When the run learns more after the
+    attempt — Claude's effort, read again right before Send — the entry for that
+    intent is corrected in place rather than joined by a second one, so the
+    end-of-run summary shows one line per intent and that line is the latest
+    fact. A later read that AGREES with the entry changes nothing. With no entry
+    for the intent, this records one."""
+    for rec in reversed(_DOM_ATTEMPTS):
+        if rec.get("intent") != intent:
+            continue
+        if (rec.get("outcome") in _DOM_OK) == (outcome in _DOM_OK):
+            return rec.get("outcome")
+        rec.update(outcome=outcome, via=via or "", press="", ms=None,
+                   detail=(detail or "")[:400])
+        log(f"[dom] p{rec['phase']} {intent}: {outcome} (restated)"
+            f"{(' via=' + via) if via else ''}{(' — ' + rec['detail']) if detail else ''}",
+            "INFO" if outcome in _DOM_OK else "WARN")
+        return outcome
+    return _dom_note(intent, outcome, phase=phase, via=via, detail=detail)
 
 
 def _claude_effort_outcome(confirmed: bool, via: str) -> str:
@@ -59458,7 +59485,8 @@ def _claude_effort_row_confirms(row_shows, wanted) -> bool:
     return bool(w) and str(row_shows or "").strip().lower() == w
 
 
-def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict:
+def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool,
+                               shown=None) -> dict:
     """What the post-setup telemetry line says about Claude's effort, once the
     computer-use pass has run.
 
@@ -59467,10 +59495,19 @@ def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict
     effect ('low') and recorded it, and even when the computer-use pass had since
     set it. It is written just before the brief is sent, so it can say both:
 
+      * `shown`                 — ⭐⭐ 2026-09-30: the tier the model button
+                                  showed in the LAST read before Send. When it
+                                  names a tier that is not the one wanted, that
+                                  is the answer, whatever setup read earlier:
+                                  on 09-30 setup read Max off the button, the
+                                  tier was Low by Send, and this returned early
+                                  on setup's flag — Claude researched at Low and
+                                  the run said nothing.
       * `state["effort"]`       — setup confirmed the wanted tier: nothing to add.
-      * `button_shows_wanted`   — the pre-send read of the model button (taken
-                                  AFTER the computer-use pass) shows the wanted
-                                  tier: it was set after setup. A note, no miss.
+      * `button_shows_wanted`   — the pre-send read of the model button shows
+                                  the wanted tier though setup did not confirm
+                                  it: it was set after setup's read. A note, no
+                                  miss.
       * `state["effort_got"]`   — the tier last READ and not the one wanted: named.
                                   The caller passes the tier the pre-send read
                                   saw on the model button when it saw one, and
@@ -59485,18 +59522,51 @@ def _claude_effort_after_setup(wanted, state, button_shows_wanted: bool) -> dict
     """
     w = str(wanted or "").strip().lower()
     st = state if isinstance(state, dict) else {}
-    if not w or st.get("effort"):
+    if not w:
+        return {"missing": None, "note": None}
+    s = str(shown or "").strip().lower()
+    if s and s != w:
+        return {"missing": f"effort is '{s}', not the '{w}' wanted", "note": None}
+    if st.get("effort"):
         return {"missing": None, "note": None}
     if button_shows_wanted:
         return {"missing": None,
                 "note": (f"effort '{w}' now shows on the model button — set after "
-                         f"setup, by the computer-use pass")}
+                         f"setup's read")}
     got = str(st.get("effort_got") or "").strip().lower()
     if got == w:
         return {"missing": None, "note": None}
     if got:
         return {"missing": f"effort is '{got}', not the '{w}' wanted", "note": None}
     return {"missing": f"{w} effort", "note": None}
+
+
+def _claude_effort_ledger_at_send(wanted, shown, *, label: str = "") -> None:
+    """Restate the run's effort entry from the LAST read before Send.
+
+    ⭐⭐ 2026-09-30. The ledger entry was written once, in setup: "already
+    via=trigger" when the button read Max at 05:09:54. The tier was Low by
+    05:11:18, Claude researched at Low, and the end-of-run summary still said
+    "✓ p2 claude.select_effort_tier: already". When the pre-send read shows a
+    tier, the entry now says what that read saw — a miss named plainly, or a
+    confirmation — and when it shows none, setup's entry stands."""
+    w = str(wanted or "").strip().lower()
+    s = str(shown or "").strip().lower()
+    if not w or not s:
+        return
+    if s == w:
+        _dom_restate("claude.select_effort_tier", "verified", phase=2,
+                     via="read before Send",
+                     detail=f"the model button reads '{s}' right before Send")
+        return
+    _dom_restate("claude.select_effort_tier", "missed", phase=2,
+                 via="read before Send",
+                 detail=(f"the model button read '{s}' right before Send, not the "
+                         f"'{w}' wanted — the research runs at {effort_label(s)} "
+                         f"effort"))
+    log(f"[{label}] Claude's effort right before Send is {effort_label(s)}, not the "
+        f"{effort_label(w)} wanted — the research runs at {effort_label(s)} effort",
+        "WARN")
 
 
 def _claude_effort_report(wanted, got) -> dict:
@@ -59529,24 +59599,8 @@ def _claude_effort_report(wanted, got) -> dict:
             "level": "WARN",
             "detail": (f"tier is '{g}', not the '{w}' wanted — the answer may be "
                        f"weaker than the run reports"),
-            "notice": (f"Claude is researching at {g.capitalize()} effort — "
-                       f"{w.capitalize()} could not be set")}
-
-
-def _claude_validator_effort_ok(thinking_state) -> bool:
-    """Should the CUA validator be told the effort tier is already set?
-
-    Extracted from its call site so the POLARITY is testable. Inline it sat in a
-    900-line async function nothing in the suite executes, which is the shape
-    that has repeatedly let an inverted gate ship green.
-
-    ⭐ DEFAULTS TO TRUE — "assume it is fine". A platform that records nothing,
-    or a validate call arriving before any setup ran, then gets today's cheap
-    read-only pass. Defaulting the other way would send the validator into the
-    model popover on every run of every platform to buy nothing, and reopen the
-    "the model selector opens twice" report.
-    """
-    return bool((thinking_state or {}).get("effort", True))
+            "notice": (f"Claude is researching at {effort_label(g)} effort — "
+                       f"{effort_label(w)} could not be set")}
 
 
 # Re-open the model popover with a REAL press on the test-id'd trigger, and
@@ -61983,7 +62037,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         _eff_report = _claude_effort_report(_claude_effort, _effort_got)
         log(f"[setup_claude_dr] {_eff_report['log']}", _eff_report["level"])
         _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed,
-                                        "effort_got": _effort_got}
+                                        "effort_got": _effort_got,
+                                        # ⭐ 2026-09-30 — did the page confirm the
+                                        # MODEL? Then a computer-use setup pass has
+                                        # only the Research switch left to do —
+                                        # see `_claude_cua_setup_mission`.
+                                        "model": bool(opus_selected)}
         # ⭐⭐ 2026-08-06 — Claude's effort tier had NO entry in the run's DOM-intent
         # ledger while ChatGPT's model pill did, so when the Effort submenu failed
         # to mount the run carried on with whatever tier was already set and the
@@ -62127,8 +62186,18 @@ async def _dr_outcome_state(page, platform: str) -> str:
             #
             # Direction is safe either way: a False adds `unknown`, never `off`,
             # so the worst case is a rung that runs when it need not have.
-            return ("on" if (st.get("hasExtended") and st.get("researchOn")
-                             and st.get("effortOk")) else "unknown")
+            #
+            # ⛔⛔ 2026-09-30 — AND EFFORT IS OUT AGAIN, because nothing below can
+            # set it. Both rungs this reading can skip are computer-use passes,
+            # and effort was taken out of their missions (the Effort submenu
+            # closes before their click lands — 09-30: four presses, never open).
+            # Keeping the term would send a run whose only miss is the tier down
+            # two rungs that are now told to leave the tier alone: the cost with
+            # no repair that the note above warns about, from the other side.
+            # The tier is read on the model button right before Send and said
+            # plainly there (`_claude_effort_after_setup`).
+            return ("on" if (st.get("hasExtended") and st.get("researchOn"))
+                    else "unknown")
     except Exception as e:
         log(f"[ladder] outcome probe for {p} failed ({e})", "INFO")
     return "unknown"
@@ -62232,16 +62301,11 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
                     an ambiguous or errored validation (ok=True, confirmed=False)
                     must NOT be treated as proof Deep Research is on, or a real
                     chat-mode degradation could slip through silently (#709)."""
-    # ⭐⭐ 2026-08-17 — DID THE DOM LAYER CONFIRM THE EFFORT TIER? This is what
-    # decides whether the validator is permitted to go and set it. Defaults to
-    # True — "assume it is fine" — so a platform that records nothing, or a call
-    # that arrives before the setup ran, gets today's cheap read-only pass rather
-    # than a speculative trip into the model popover on every run.
-    #
-    # ⛔ The permission has to be granted in BOTH strings or neither: they are
-    # sent to one CUA call, and an agent holding a system prompt that forbids the
-    # submenu and a user message that demands it will do something arbitrary.
-    _claude_effort_ok = _claude_validator_effort_ok(_P2_THINKING_STATE.get("claude"))
+    # ⛔⛔ 2026-09-30 — NO EFFORT PERMISSION ANY MORE. From 08-17 this pass was
+    # told to open the Effort submenu whenever setup had not confirmed the tier.
+    # That hover submenu closes before a computer-use click lands (09-30: four
+    # presses, never open), so the permission bought steps and no tier. The
+    # effort is read on the model button right before Send and reported there.
     validator_map = {
         "chatgpt": PROMPT_VALIDATE_CHATGPT_SETUP,
         "gemini": PROMPT_VALIDATE_GEMINI_SETUP,
@@ -62253,8 +62317,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # validator into the menu whose only primary-family rows are the sales
         # chips the DOM layer just refused — the pass whose job is to confirm
         # the model would be the pass that undoes it.
-        "claude": claude_validate_setup_prompt(_p2_active_family("claude"),
-                                               effort_ok=_claude_effort_ok),
+        "claude": claude_validate_setup_prompt(_p2_active_family("claude")),
     }
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
@@ -62269,8 +62332,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         # Same family, same reason — this string and the system prompt above go
         # to ONE CUA call, so a family that reaches only one of them leaves the
         # agent holding two instructions that disagree about the model.
-        "claude": p2_claude_validate_directive(_p2_active_family("claude"),
-                                               effort_ok=_claude_effort_ok),
+        "claude": p2_claude_validate_directive(_p2_active_family("claude")),
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -63534,7 +63596,8 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
             # Positive branch logged too — see the ChatGPT note above.
             log(f"[{label}] Claude DR pre-send check: active={ok} reactivate={reactivate}"
                 f" extended={bool(state.get('hasExtended'))}"
-                f" research={bool(state.get('researchOn'))}", "DEBUG")
+                f" research={bool(state.get('researchOn'))}"
+                f" effort={state.get('effortShown') or 'not shown'}", "DEBUG")
             # `effortOk` is REPORTED, never gated on (see the detector): it is the
             # only read of the effort taken AFTER the computer-use pass, and the
             # post-setup telemetry line uses it to say what that pass left.
@@ -65482,6 +65545,26 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str,
     return page, False
 
 
+def _claude_cua_setup_mission(platform_l: str, prompt_system: str, prompt_user: str,
+                              *, label: str = "") -> tuple:
+    """The (system prompt, user message) the computer-use setup pass gets.
+
+    ⭐⭐ 2026-09-30. On Claude, when the page already confirmed the model, only
+    the Research switch is left, so the pass gets a Research-only mission. On
+    that run the DOM had read Opus 5.5 off the model button and missed only the
+    Research row, and the full mission sent the agent back into the model menu
+    for three of its eight steps. Effort is in neither mission (see
+    `models.EFFORT_HANDS_OFF`), so a model that is right leaves nothing in that
+    menu for the pass to do. Every other case keeps the strings it was given."""
+    if platform_l != "claude":
+        return prompt_system, prompt_user
+    if not (_P2_THINKING_STATE.get("claude") or {}).get("model"):
+        return prompt_system, prompt_user
+    log(f"[{label}] the page already confirmed the model — computer use only "
+        f"switches Research on")
+    return claude_research_only_prompt(), p2_claude_research_only_directive()
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
                                      brief_path=None, source_paths=None,
@@ -65756,9 +65839,14 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     async def _rung_cua_setup():
         # Playwright failed — try original CUA setup as a first fallback (tight iterations)
         log(f"[{label}] Playwright setup failed — CUA fallback setup (tight)...")
+        # ⭐ 2026-09-30 — what is LEFT to do, not the whole setup again. Chosen
+        # here, after the DOM setup ran, because only now is it known what the
+        # page confirmed.
+        _sys_p, _user_p = _claude_cua_setup_mission(platform_l, prompt_system, prompt_user,
+                                                    label=label)
 
         async def _setup_fallback_cua():
-            return await agent_loop(cua_client, browser, prompt_system, prompt_user,
+            return await agent_loop(cua_client, browser, _sys_p, _user_p,
                 model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
         # #839 act tier: side-effect-only setup (result ignored — the ladder's
@@ -65771,7 +65859,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                       "want to research?' (chat mode = 'Ask Gemini'); a visible DR chip "
                       "alone is NOT proof — don't toggle a pill that's already active.",
             "chatgpt": "enable Deep Research mode; do NOT type — set up and focus the input.",
-            "claude": "enable Research + the right model/effort; do NOT type.",
+            "claude": "enable Research (and the model, if it is not already right); "
+                      "leave the effort alone; do NOT type.",
         }.get(platform_l, "enable Deep Research mode; do NOT type.")
         await _shadow_observed_cua(
             page, hotspot_id="setup-dr", phase=2, platform=platform_l,
@@ -65780,7 +65869,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                          + _setup_placeholder_hint,
             expected_outcome="Deep Research mode is active and the input is focused (not typed)",
             cua_coro_factory=_setup_fallback_cua,
-            mission_prompt=f"{prompt_system}\n\nTASK: {prompt_user}",
+            mission_prompt=f"{_sys_p}\n\nTASK: {_user_p}",
             act_timeout_s=120.0)
 
     async def _rung_cua_validate():
@@ -66133,13 +66222,24 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # and the tile cannot name two different tiers.
                 _eff_now = ((mode_state or {}).get("effortShown")
                             or _tstate.get("effort_got"))
+                # ⭐⭐ 2026-09-30 — `shown`: the tier the model button showed in
+                # the LAST read before Send. It decides over setup's flag — on
+                # 09-30 setup read Max, the tier was Low by Send, and nothing
+                # said so (the flag returned early). See the helper.
                 _eff_after = _claude_effort_after_setup(
                     _pol.get("effort"), {**_tstate, "effort_got": _eff_now},
-                    bool((mode_state or {}).get("effortOk")))
+                    bool((mode_state or {}).get("effortOk")),
+                    shown=(mode_state or {}).get("effortShown"))
                 if _eff_after["note"]:
                     log(f"[{label}] Phoenix: {_eff_after['note']}", "INFO")
                 if _eff_after["missing"]:
                     _missing.append(_eff_after["missing"])
+                # The same last read restates the run's ledger entry, so the
+                # end-of-run summary cannot say "✓ already" about a run that
+                # went out at another tier (09-30 did exactly that).
+                _claude_effort_ledger_at_send(_pol.get("effort"),
+                                              (mode_state or {}).get("effortShown"),
+                                              label=label)
                 # ⭐ The tile caption goes up HERE, not in setup: the computer-use
                 # pass has now had its turn at the tier and the button has been
                 # read again, so "Low — Max could not be set" is still true when
@@ -67286,7 +67386,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         emit_event("agent_progress", phase=2, agent="claude", status="starting",
                    progress=f"Opening Claude with the latest "
                             f"{(p2_family('claude') or 'Opus').capitalize()} "
-                            f"({str(p2_labels('claude').get('effort', 'max')).capitalize()} "
+                            f"({effort_label(p2_labels('claude').get('effort'))} "
                             f"effort) + Research tools...")
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)

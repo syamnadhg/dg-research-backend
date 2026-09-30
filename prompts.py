@@ -6,6 +6,7 @@ Imported by research.py — edit prompts here, logic stays in research.py.
 """
 
 from models import (
+    EFFORT_HANDS_OFF,
     VERSION_ORDER_RULE,
     free_family_note,
     p1_select_pro_directive,
@@ -28,7 +29,6 @@ _OPUS = p2_family("claude").capitalize() or "Opus"                     # "Opus"
 # from the same verb list the DOM picker refuses on, so the mission and the
 # selectors cannot drift apart about what a sales prompt is.
 _NO_UPSELL = upsell_warning(_OPUS)
-_CL_EFFORT = str(p2_labels("claude").get("effort", "max")).capitalize()  # "Max"
 
 SYSTEM_BASE = (
     "You are an expert browser automation agent. You control a browser via mouse clicks, "
@@ -321,7 +321,7 @@ Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. MODEL: {swap}the model must be {fam} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {fam} in the list; if the highest {fam} is the one already selected, close the menu without clicking it. {VERSION_ORDER_RULE} {no_upsell} In that SAME popover, if an "Effort" submenu is present, choose "{_CL_EFFORT}". If the menu will not open but the button already reads "{fam} …", that is fine — leave the model as it is and go to step 3.
+2. MODEL: {swap}the model must be {fam} — the VERSION NUMBER DOES NOT MATTER, and a higher number is always better. Open the model selector ONCE and pick the HIGHEST-numbered {fam} in the list; if the highest {fam} is the one already selected, close the menu without clicking it. {VERSION_ORDER_RULE} {no_upsell} {EFFORT_HANDS_OFF} If the menu will not open but the button already reads "{fam} …", that is fine — leave the model as it is and go to step 3.
 3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -333,7 +333,7 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - DO NOT attach any files.
-- If the model button already reads the HIGHEST "{fam}" on offer with {_CL_EFFORT} effort, and Research is on: say "ready for paste" immediately and STOP.
+- If the model button already reads the HIGHEST "{fam}" on offer, and Research is on: say "ready for paste" immediately and STOP.
 - If Research mode toggle is already on: leave it alone.
 - If options are unavailable: say "partial setup" and STOP.
 
@@ -341,6 +341,29 @@ Once model + Research mode are set and input is focused, your job is DONE. No ex
 
 
 PROMPT_CLAUDE_DEEP_RESEARCH = claude_deep_research_prompt()
+
+
+def claude_research_only_prompt() -> str:
+    """CUA system prompt for Claude P2 setup when the page already CONFIRMED the
+    model and only the Research tool is left (2026-09-30: the full mission sent
+    the agent back into a model menu the DOM had already read, three of its
+    eight steps). Rides with `models.p2_claude_research_only_directive`."""
+    tool = str(p2_labels("claude").get("tool", "research")).capitalize()
+    return SYSTEM_BASE + f"""
+
+Your task: switch Claude's "{tool}" tool ON. Nothing else — the model is already correct.
+
+Steps:
+1. Click the "+" (tools) button next to the message box.
+2. If "{tool}" is off, click it to switch it ON. If it is already on, leave it.
+3. Press Escape to close the menu and click the message box to focus it.
+4. Say "ready for paste" and STOP.
+
+ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
+- DO NOT open the model menu. The model is already correct.
+- {EFFORT_HANDS_OFF}
+- DO NOT type, paste or send anything. DO NOT attach any files.
+- If "{tool}" cannot be found: say "partial setup" and STOP."""
 
 # ── Verification & Diagnosis ──────────────────────────────────────────────────
 
@@ -397,7 +420,7 @@ ABSOLUTELY FORBIDDEN:
 - DO NOT treat a merely-visible chip as active — the placeholder is the proof."""
 
 
-def claude_validate_setup_prompt(family: str = "", effort_ok: bool = True) -> str:
+def claude_validate_setup_prompt(family: str = "") -> str:
     """CUA system prompt for the POST-SETUP validation pass. Runs after the DOM
     path SUCCEEDED, so its job is to leave a correct model alone.
 
@@ -409,37 +432,21 @@ def claude_validate_setup_prompt(family: str = "", effort_ok: bool = True) -> st
     examples are gone; the rule is now stated against whichever family this run
     is actually on.
 
-    ⭐⭐ 2026-08-17 — `effort_ok` MAKES THE EFFORT BAN CONDITIONAL, and both
-    directions matter. The ban existed because the Effort submenu would not
-    expand ("clicking a submenu that won't expand only wastes turns") — it was a
-    workaround for a defect, not a statement about what this pass should do. And
-    while it stood, NOTHING could repair a missed effort: the setup ladder's
-    outcome check had no effort term so it never descended here, and if it had,
-    this prompt forbade the fix. Lifting either one alone is worse than lifting
-    neither — a ladder that descends to a rung under orders not to help spends
-    money and changes nothing.
-
-    ⚠ Still off by default. On the ordinary run the DOM layer has already set the
-    tier, and sending the validator looking would reopen the "model selector
-    opens twice" report for no gain. This is permission granted exactly when the
-    run already knows the tier is unset."""
+    ⛔⛔ 2026-09-30 — THE EFFORT IS NEVER THIS PASS'S JOB. From 08-17 an
+    `effort_ok` flag let this prompt send the agent into the Effort submenu when
+    setup had not confirmed the tier. That submenu closes between a screenshot
+    and the next click: on 09-30 it was pressed four times across setup and
+    validation, never opened, and the validator gave up while Claude researched
+    at Low. The run now reads the tier on the model button right before Send and
+    says so plainly when it is not the one wanted (see `EFFORT_HANDS_OFF`)."""
     fam, swap = _fam_bits(family)
     no_upsell = upsell_warning(fam)
     effort_clause = (
-        f'That button ALSO shows the effort (e.g. "{_CL_EFFORT}") right on it. '
-        f'DO NOT open the model popover, and DO NOT try to expand the "Effort" '
-        f"submenu — those are quality knobs, NOT requirements, and clicking a "
-        f"submenu that won't expand only wastes turns."
-        if effort_ok else
-        f'That button ALSO shows the effort right on it, and on THIS run it does '
-        f'NOT read "{_CL_EFFORT}" — the automated pass could not set it. Fix that: '
-        f'open the model popover, open the "Effort" submenu, choose "{_CL_EFFORT}", '
-        f"and close both. If the submenu will not open on the first try, leave it "
-        f"and move on — say so in your answer rather than spending more turns.")
+        f'That button ALSO shows the effort right on it. DO NOT open the model '
+        f'popover, and DO NOT try to expand the "Effort" submenu — {EFFORT_HANDS_OFF}')
     forbid_effort = (
         f"\n- DO NOT open the model popover or chase the Effort/Adaptive submenu "
-        f"when the model button already shows {fam}."
-        if effort_ok else "")
+        f"when the model button already shows {fam}.")
     return SYSTEM_BASE + f"""
 
 Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.

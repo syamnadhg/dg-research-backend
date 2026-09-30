@@ -327,8 +327,9 @@ MUTANTS = [
      [('            detail=("" if _effort_confirmed else _eff_report["detail"]))',
        '            detail=("" if _effort_confirmed else "tier left as it was"))')]),
     ("E15", "under", "the tier in effect is not recorded with the run's effort state",
-     [('                                        "effort_got": _effort_got}',
-       '                                        "effort_got": None}')]),
+     # RE-ANCHORED 09-30: the record gained a "model" key after this one.
+     [('                                        "effort_got": _effort_got,\n',
+       '                                        "effort_got": None,\n')]),
     ("E16", "under", "⛔ the run log never names the tier",
      [("        log(f\"[setup_claude_dr] {_eff_report['log']}\", _eff_report[\"level\"])\n",
        "")]),
@@ -439,8 +440,9 @@ MUTANTS = [
     # ══ after the computer-use pass: the telemetry line says what is known ═
     ("T1", "under", "⛔ the consumer ignores the rule: the post-CUA button read is "
      "never passed, so a tier the CUA pass set is still 'unconfirmed'",
-     [('                    bool((mode_state or {}).get("effortOk")))',
-       "                    False)")]),
+     # RE-ANCHORED 09-30: the call gained `shown=` after this argument.
+     [('                    bool((mode_state or {}).get("effortOk")),\n',
+       "                    False,\n")]),
     ("T2", "under", "⛔ the pre-send check drops the button read on the way out",
      [('                    "effortOk": bool(state.get("effortOk"))}',
        "                    }")]),
@@ -455,13 +457,16 @@ MUTANTS = [
     ("T6", "over", "a row that read the wanted tier is reported as 'not the wanted'",
      [("    if got == w:\n        return {\"missing\": None, \"note\": None}\n", "")]),
     ("T7", "over", "a tier setup CONFIRMED is reported as unconfirmed",
-     [('    if not w or st.get("effort"):', "    if not w:")]),
+     # RE-ANCHORED 09-30: the confirmed-by-setup return now follows the
+     # last-read-before-Send check instead of sharing a line with `not w`.
+     [('    if st.get("effort"):\n        return {"missing": None, "note": None}\n', "")]),
 
     # ══ the computer-use missions read "highest" by ORDER ════════════════
     ("P1", "under", "⛔ the system prompt that rides with the setup directive loses "
      "the rule — two readings of 'highest' in one call",
-     [("close the menu without clicking it. {VERSION_ORDER_RULE} {no_upsell} In that SAME",
-       "close the menu without clicking it. {no_upsell} In that SAME")], "prompts.py"),
+     # RE-ANCHORED 09-30: the Effort pick after it became the hands-off sentence.
+     [("close the menu without clicking it. {VERSION_ORDER_RULE} {no_upsell} {EFFORT_HANDS_OFF}",
+       "close the menu without clicking it. {no_upsell} {EFFORT_HANDS_OFF}")], "prompts.py"),
     ("P2", "under", "the validator loses the rule",
      [('pick the highest-numbered "{fam}", and close it. {VERSION_ORDER_RULE} {no_upsell}',
        'pick the highest-numbered "{fam}", and close it. {no_upsell}')], "prompts.py"),

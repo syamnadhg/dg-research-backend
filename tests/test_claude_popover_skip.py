@@ -308,6 +308,11 @@ def _isolated_overlay(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "_MODEL_REFRESH_OVERLAY_PATH",
                         tmp_path / "model_refresh.json")
     monkeypatch.setenv("DG_MODEL_REFRESH_ENABLED", "1")
+    # ⚠ 2026-09-30 — the policy moved to Extra high. These tests measure the
+    # popover-skip mechanism against buttons reading "… Max", i.e. with Max as
+    # the wanted tier, so they are pinned to that word; the new policy word is
+    # driven end to end in test_e2e0930_p2_p3.py.
+    monkeypatch.setitem(models.P2_MODEL_POLICY["claude"], "effort", "max")
 
 
 @pytest.fixture(autouse=True)

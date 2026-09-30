@@ -33,8 +33,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import models
 import research
 from _domshim import NODE, el, run_js
+from conftest import code_only
 
 needs_node = pytest.mark.skipif(NODE is None, reason="node runs the page scripts")
 
@@ -570,3 +572,209 @@ def test_a_thread_that_never_clears_is_still_refused_within_about_five_seconds(m
     assert ok is False
     assert 4.5 <= clock.t <= 6, f"waited {clock.t}s"
     assert [m for lv, m in lines if lv == "WARN" and "NOT a fresh chat" in m], lines
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. Claude's effort, told honestly
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _trigger(text):
+    return el("button", {"data-testid": research._CLAUDE_MODEL_TRIGGER_TESTID,
+                         "aria-label": f"Model: {text}", "aria-haspopup": "menu"}, text)
+
+
+def _research_pill():
+    return el("button", {"aria-label": "Research", "aria-pressed": "true"}, "Research")
+
+
+def _composer(trigger_text):
+    return el("body", {}, "", [
+        el("nav", {}, "", [el("button", {"aria-label": "plan"}, "Boss · Max")]),
+        _trigger(trigger_text), _research_pill()])
+
+
+def _telemetry_source() -> str:
+    src = code_only(inspect.getsource(research.start_agent_no_gemini_wait))
+    head = '        if research_ok and platform_l in ("claude", "gemini"):'
+    tail = '        if not research_ok:'
+    assert src.count(head) == 1, "the telemetry block header moved"
+    i = src.index(head)
+    block = textwrap.dedent(src[i:src.index(tail, i)])
+    return "def __telemetry__(research_ok):\n" + textwrap.indent(block, "    ")
+
+
+def _label(word):
+    return getattr(models, "effort_label", lambda w: str(w).capitalize())(word)
+
+
+@needs_node
+def test_a_tier_that_moved_after_setup_is_said_on_the_tile_the_log_and_the_summary(monkeypatch):
+    """⛔⛔ 09-30: setup read the wanted tier off the button (05:09:54, "already
+    via=trigger"); the tier was Low by Send (05:11:18); Claude researched at Low,
+    the tile said nothing and the end-of-run summary said "✓ already". The LAST
+    read before Send decides now."""
+    wanted = models.p2_labels("claude")["effort"]
+    lines, events = [], []
+    monkeypatch.setattr(research, "_DOM_ATTEMPTS", [])
+    monkeypatch.setattr(research, "log", lambda m, lv="INFO", *a, **k: lines.append((lv, str(m))))
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: events.append((a, k)))
+    # Setup, as it went: the button showed the wanted tier.
+    research._dom_note("claude.select_effort_tier", "already", phase=2, via="trigger")
+    state = {"effort": True, "thinking": False, "effort_got": wanted, "model": True}
+    # The real pre-send read, on a button that now reads Low.
+    mode_state = _go(research.ensure_deep_mode_active(
+        NodePage(_composer("Opus 5.5 Low")), "claude", "2B", reactivate=False))
+    assert mode_state.get("effortShown") == "low", mode_state
+    ns = dict(vars(research))
+    ns.update({"platform_l": "claude", "label": "2B", "mode_state": mode_state,
+               "_P2_THINKING_STATE": {"claude": state},
+               "record_known_good": lambda *a, **k: None,
+               "emit_event": lambda *a, **k: events.append((a, k)),
+               "log": lambda m, lv="INFO", *a, **k: lines.append((lv, str(m)))})
+    exec(compile(_telemetry_source(), "<telemetry>", "exec"), ns)
+    ns["__telemetry__"](True)
+    captions = [k.get("progress") for a, k in events
+                if a and a[0] == "agent_progress" and k.get("agent") == "claude"]
+    assert captions == [f"Claude is researching at Low effort — {_label(wanted)} could "
+                        f"not be set"], (captions, lines)
+    assert any(lv == "WARN" and f"(effort is 'low', not the '{wanted}' wanted)" in m
+               for lv, m in lines), lines
+    research._dom_summary("run complete")
+    summary = [m for _, m in lines if m.startswith("[dom-summary] run complete   ")]
+    assert any("✗ p2 claude.select_effort_tier: missed" in m and "right before Send" in m
+               for m in summary), summary
+    assert not any("✓ p2 claude.select_effort_tier" in m for m in summary), summary
+
+
+@needs_node
+def test_the_wanted_tier_on_the_button_at_send_says_nothing(monkeypatch):
+    wanted = models.p2_labels("claude")["effort"]
+    lines, events = [], []
+    monkeypatch.setattr(research, "_DOM_ATTEMPTS", [])
+    monkeypatch.setattr(research, "log", lambda m, lv="INFO", *a, **k: lines.append((lv, str(m))))
+    research._dom_note("claude.select_effort_tier", "already", phase=2, via="trigger")
+    mode_state = _go(research.ensure_deep_mode_active(
+        NodePage(_composer(f"Opus 5.5 {wanted.capitalize()}")), "claude", "2B",
+        reactivate=False))
+    ns = dict(vars(research))
+    ns.update({"platform_l": "claude", "label": "2B", "mode_state": mode_state,
+               "_P2_THINKING_STATE": {"claude": {"effort": True, "effort_got": wanted}},
+               "record_known_good": lambda *a, **k: None,
+               "emit_event": lambda *a, **k: events.append((a, k)),
+               "log": lambda m, lv="INFO", *a, **k: lines.append((lv, str(m)))})
+    exec(compile(_telemetry_source(), "<telemetry>", "exec"), ns)
+    ns["__telemetry__"](True)
+    assert events == [] and not [m for lv, m in lines if lv == "WARN"], (events, lines)
+    assert [r["outcome"] for r in research._DOM_ATTEMPTS] == ["already"]
+
+
+def test_the_wanted_tier_is_extra_high_in_the_existing_words():
+    """The owner, 09-30: Extra high (Max uses about six times the usage). The
+    policy keeps the Effort menu's own word, which every reader already knows."""
+    assert models.p2_labels("claude")["effort"] == "extra"
+    assert research._claude_effort_option_testid("extra") == "effort-option-xhigh"
+    assert models.effort_label("extra") == "Extra high"
+    assert models.effort_label("max") == "Max"
+
+
+@needs_node
+def test_a_run_whose_only_miss_is_the_tier_does_not_descend_to_computer_use():
+    """Both rungs below are computer-use passes, which no longer touch effort."""
+    page = NodePage(_composer("Opus 5.5 Low"))
+    assert _go(research._dr_outcome_state(page, "claude")) == "on"
+
+
+def _cua_setup_rung_source() -> str:
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    a = src.index("    async def _rung_cua_setup():")
+    b = src.index("    async def _rung_cua_validate():", a)
+    return textwrap.dedent(src[a:b])
+
+
+def _run_cua_setup_rung(monkeypatch, state):
+    sent = []
+
+    async def _agent_loop(client, browser, system, user, **k):
+        sent.append((system, user))
+        return "ready for paste"
+
+    async def _observed(page, **k):
+        return await k["cua_coro_factory"]()
+
+    monkeypatch.setitem(research._P2_THINKING_STATE, "claude", state)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    ns = dict(vars(research))
+    ns.update({"platform_l": "claude", "platform": "Claude", "label": "2B",
+               "prompt_system": "SETUP-SYSTEM", "prompt_user": "SETUP-USER",
+               "cua_client": object(), "browser": object(), "page": object(),
+               "verbose": False, "agent_loop": _agent_loop,
+               "_shadow_observed_cua": _observed, "log": lambda *a, **k: None})
+    exec(compile(_cua_setup_rung_source(), "<rung>", "exec"), ns)
+    _go(ns["_rung_cua_setup"]())
+    return sent
+
+
+def test_a_confirmed_model_leaves_computer_use_only_the_research_switch(monkeypatch):
+    """05:09:57: DOM had read Opus 5.5 and missed only Research; the full
+    mission spent steps 1-3 reopening the model menu."""
+    sent = _run_cua_setup_rung(monkeypatch, {"effort": True, "model": True})
+    assert len(sent) == 1
+    system, user = sent[0]
+    assert (system, user) != ("SETUP-SYSTEM", "SETUP-USER"), "the full mission went out"
+    assert "do NOT open the model menu" in user and "switch 'Research' ON" in user, user
+    assert "DO NOT open the model menu" in system, system
+
+
+def test_an_unconfirmed_model_keeps_the_full_mission(monkeypatch):
+    sent = _run_cua_setup_rung(monkeypatch, {"effort": True, "model": False})
+    assert sent == [("SETUP-SYSTEM", "SETUP-USER")]
+
+
+@needs_node
+def test_setup_records_that_the_page_confirmed_the_model(monkeypatch):
+    """The fact the rung above keys on is written by setup itself."""
+    wanted = models.p2_labels("claude")["effort"]
+
+    async def _instant(*a, **k):
+        return None
+    monkeypatch.setattr(research.asyncio, "sleep", _instant)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_DOM_ATTEMPTS", [])
+    monkeypatch.delitem(research._P2_THINKING_STATE, "claude", raising=False)
+    page = NodePage(el("body", {}, "", [_trigger(f"Opus 5.5 {wanted.capitalize()}")]),
+                    url="https://claude.ai/new")
+
+    async def _no_click(*a, **k):
+        return None
+    page.click = _no_click
+    page.hover = _no_click
+    page.query_selector = _no_click
+    _go(research.setup_claude_dr(page))
+    assert research._P2_THINKING_STATE["claude"].get("model") is True
+
+
+def test_the_validator_is_never_sent_into_the_effort_submenu(monkeypatch):
+    """05:10:43-05:10:51: the validator was pointed at the Effort submenu,
+    said it would not expand, and gave up. Driven through the validator itself
+    with setup NOT having confirmed the tier — the case that used to grant it."""
+    missions = []
+
+    async def _observed(page, **k):
+        missions.append(k.get("mission_prompt") or "")
+        return {"text": "setup verified"}
+
+    async def _switch(p):
+        return None
+
+    monkeypatch.setitem(research._P2_THINKING_STATE, "claude",
+                        {"effort": False, "effort_got": "low", "model": True})
+    monkeypatch.setattr(research, "_shadow_observed_cua", _observed)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    browser = SimpleNamespace(switch_to_page=_switch)
+    _go(research.validate_setup_with_cua(browser, object(), object(), "claude", "2B"))
+    assert len(missions) == 1
+    low = missions[0].lower()
+    assert "open the \"effort\" submenu, choose" not in low
+    assert "open the effort submenu, choose" not in low
+    assert models.EFFORT_HANDS_OFF.lower() in low

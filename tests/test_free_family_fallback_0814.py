@@ -384,7 +384,9 @@ def test_a_renamed_family_still_fails_loudly_instead_of_downgrading():
 def test_a_pro_account_never_reaches_the_fallback():
     """The whole pro path, unchanged. The trigger names the family, so the
     fallback branch is not even considered."""
-    page = ScriptedPage("Opus 5 Max")
+    # The button shows the family AND the wanted tier (policy's word since
+    # 09-30 is Extra, not Max), so nothing needs the popover.
+    page = ScriptedPage(f"Opus 5 {models.P2_MODEL_POLICY['claude']['effort'].capitalize()}")
     assert _run(page) is True
     assert "claude" not in research._P2_ACTIVE_FAMILY
     assert not page.evaluated(_POPOVER_OPEN_MARK)

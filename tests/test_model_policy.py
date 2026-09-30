@@ -63,11 +63,13 @@ def test_family_accessor_returns_the_family_word():
 def test_claude_setup_directive_is_derived_from_policy():
     d = models.p2_claude_setup_directive()
     fam = models.P2_MODEL_POLICY["claude"]["family"].capitalize()
-    effort = models.P2_MODEL_POLICY["claude"]["effort"].capitalize()
     tool = models.P2_MODEL_POLICY["claude"]["tool"].capitalize()
     assert fam in d, "the family must come from the policy"
-    assert f"{effort} effort" in d, "the effort label must come from the policy"
     assert f"{tool} tool" in d
+    # ⛔ 2026-09-30 — no effort target: effort is out of the computer-use
+    # missions (the owner), and the directive says to leave it alone instead.
+    assert models.EFFORT_HANDS_OFF in d
+    assert "effort and the" not in d.lower()
 
 
 def test_claude_setup_directive_names_no_version():
@@ -119,7 +121,9 @@ def test_claude_setup_directive_no_longer_asks_for_a_thinking_toggle():
 
 def test_labels_carry_the_thinking_and_tool_policy():
     claude = models.p2_labels("claude")
-    assert claude["effort"] == "max"
+    # ⭐ 2026-09-30 — Extra high, not Max (the owner: Max uses about six times
+    # the usage), in the word the Effort menu labels that rung with.
+    assert claude["effort"] == "extra"
     # FALSE on purpose since 2026-07-30: Opus 5 dropped the separate Thinking
     # toggle that Opus 4.x carried inside the Effort submenu — effort IS the
     # reasoning lever there now. While this was True, setup opened the model
@@ -225,7 +229,7 @@ def test_overlay_cannot_set_a_label_to_the_wrong_type(monkeypatch, tmp_path):
     trigger read that lets setup skip the popover at all."""
     _arm(monkeypatch, tmp_path, {"claude": {"labels": {"effort": 5, "family": ["opus"]}}})
     merged = models.p2_labels("claude")
-    assert merged["effort"] == "max", "a wrong-typed override must lose to the code default"
+    assert merged["effort"] == "extra", "a wrong-typed override must lose to the code default"
     assert merged["family"] == "opus"
 
 
