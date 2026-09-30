@@ -16112,6 +16112,79 @@ async def _p3_publish_audio(audio_path, research_id) -> str:
     return ""
 
 
+#: The podcast files a run's `podcasts/` folder can hold — the suffixes the
+#: download fallback in `run_phase3_audio` keeps a file under.
+_P3_PODCAST_SUFFIXES = (".m4a", ".m4b", ".mp3", ".wav", ".webm", ".ogg")
+
+
+def _p3_podcast_on_disk(queue_dir, cp) -> "Path | None":
+    """The podcast a run resumed past Phase 3 already has on disk, or None.
+
+    The checkpoint's `audio_path` when that file is there. Otherwise the newest
+    podcast in `podcasts/`, which is what `detect_resume_phase` read when it
+    answered "Phase 3 done": the file lands there before the publish runs, and
+    the checkpoint names it only after the publish returned.
+
+    ⛔ AN ORIGINAL BESIDE AN MP3 IS TAKEN, NOT THE MP3. The mp3 transcode deletes
+    its source only once it finished, so the pair means it did not — and that
+    mp3 may be half written. The caller runs the transcode again on it."""
+    p = str((cp or {}).get("audio_path") or "")
+    if p and Path(p).is_file():
+        return Path(p)
+    try:
+        found = [f for f in (Path(queue_dir) / "podcasts").iterdir()
+                 if f.is_file() and f.suffix.lower() in _P3_PODCAST_SUFFIXES]
+    except OSError:
+        return None
+    if not found:
+        return None
+    originals = [f for f in found if f.suffix.lower() != ".mp3"]
+    return max(originals or found, key=lambda f: f.stat().st_mtime)
+
+
+async def _p3_publish_on_resume(queue_dir, cp, research_id) -> "tuple[Path | None, str]":
+    """A run resumed PAST Phase 3 publishes the podcast on disk again, and
+    answers `(the podcast, its Storage URL)` — `(None, "")` with none there.
+
+    ⛔⛔ PHASE 3'S END IS TWO HALVES, AND ONLY THE DISK HALF DECIDES THE RESUME
+    (w13 integrated review, 09-30) — the twin of `_resave_phase1_on_resume`. The
+    podcast lands in `podcasts/`, then `_p3_publish_audio` uploads it and writes
+    the `audios` row and `links.audio_file`. A Move to queue unsets the record
+    globals and gives an upload in flight five seconds, so the upload was cut
+    off, or finished and its two writes were skipped. A crash between the two
+    halves does the same. The next worker saw the file, resumed at Phase 4 and
+    only read the checkpoint back: no Podcasts entry, no Play in the chat, no
+    "Podcast ready", and the cloud's video step found no podcast to use.
+
+    ⭐ SAFE TO REPEAT. The Storage object and the `audios` row are keyed by the
+    file's name, and `links.audio_file` is a merge — so a resume after a publish
+    that did land costs one upload and changes nothing.
+
+    ⭐ PHASE 3 IS COMPLETE ON THE PUBLISHED PODCAST, as at Phase 3's end: the
+    same `phase_complete:3` goes out when the publish answers with a URL (its
+    notice is keyed by the research, so it is never shown twice). When the
+    publish fails the resume goes on without it, as it did before."""
+    audio_path = _p3_podcast_on_disk(queue_dir, cp)
+    if audio_path is None:
+        return None, ""
+    # An mp3 comes back untouched; an original is the transcode that did not
+    # finish (or a computer with no ffmpeg, which delivers it as it is).
+    audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)
+    stored = await _p3_publish_audio(audio_path, research_id)
+    if not stored:
+        log(f"Phase 3: the podcast on disk ({audio_path.name}) did not reach the app "
+            f"on this resume — going on without it", "WARN")
+        return audio_path, ""
+    nb = str((cp or {}).get("notebook_url") or "")
+    links = ([{"label": "NotebookLM Notebook", "url": nb, "verified": True}]
+             if nb and validate_link("notebooklm", nb) else [])
+    emit_event("phase_complete", phase=3, durationSec=0, links=links,
+               summary="NotebookLM notebook created, audio generated"
+                       + (", notebook link recorded" if links else ""))
+    log(f"Phase 3: the podcast on disk ({audio_path.name}) is in the app again")
+    return audio_path, stored
+
+
 #: What phase 3 tells the person when it ends holding no podcast for a run that
 #: keeps nothing — the tile's line and the notice's line.
 #:
@@ -78357,9 +78430,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             links_file = queue_dir / "links.json"
             if links_file.exists():
                 links = json.loads(links_file.read_text(encoding="utf-8"))
-            audio_str = cp.get("audio_path", "")
-            if audio_str and Path(audio_str).exists():
-                audio_path = Path(audio_str)
+            # ⛔⛔ AND THE PODCAST ON DISK IS PUBLISHED AGAIN, every time — see
+            # `_p3_publish_on_resume`. It used to be read back from the
+            # checkpoint only, which names it only after a publish that ran.
+            audio_path, _ = await _p3_publish_on_resume(queue_dir, cp, _fb_research_id)
             log(f"Phase 3: Loaded existing (links={len(links)}, audio={'yes' if audio_path else 'no'})")
 
         if _controls.is_stop_or_pause():
@@ -78422,6 +78496,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # FE "Paused" — P4/P5 are FE-owned, so the BE emits nothing more and no
         # later BE resume is coming. Emit pipeline_resumed so the FE clears its
         # paused chrome if a pause somehow survived to completion.
+        #
+        # ⛔⛔ A RUN MOVED TO THE QUEUE WHILE IT RAN HANDS NOTHING OFF (w13
+        # integrated review, 09-30). The move waits up to five seconds for an
+        # upload in flight, so a podcast upload that finished in that wait came
+        # straight here: the podcast's `audios` row and `links.audio_file` were
+        # skipped (the move had cut the record off), and the hand-off below was
+        # written to disk only. The worker that took the run then read "handed
+        # off" and only re-sent the kick, so the podcast never reached the app.
+        # A moved run's folder holds its queue marker, and nothing else puts one
+        # in a folder while its run is running; the worker that takes it resumes
+        # past Phase 3, publishes the podcast again and hands it off itself.
+        if _run_dir_held_by_queue(queue_dir):
+            log("Moved to the queue before its hand-off — the worker that takes it "
+                "hands it off", "WARN")
+            return
         try:
             if _controls.is_pause():
                 _controls.request_resume()
