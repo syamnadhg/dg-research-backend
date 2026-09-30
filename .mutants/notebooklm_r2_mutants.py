@@ -4,9 +4,12 @@
   O* — Customise is opened from the Audio Overview tile, and the window is
        waited for before anything is chosen.
   C* — the configured length keeps its meaning: long = Deep dive + Long,
-       default = Deep dive + Default, short = Brief (no Length row).
+       default = Deep dive + Default, short = Deep dive + Short (every length
+       is a Deep dive, owner 09-30; Brief is never chosen).
   F* — the format is chosen first and read back by its radio's checked state
-       (the row's class lags the click), and the Length row is waited for.
+       (the row's class lags the click) AND by the Length row the app redraws
+       for it — Deep dive's alone offers Long (the browser checks the radio
+       even when the app ignored the press) — and the Length row is waited for.
   L* — the length is chosen and read back by aria-checked; a length that does
        not read back is never generated.
   G* — "Generate now", never "Generate later"; a press reads as started only
@@ -59,9 +62,10 @@ MUTANTS = [
     ("C1", RESEARCH, "⛔⛔ the default (long) generates Deep dive + Default",
      [('    "long": ("Deep dive", "Long"),\n}',
        '    "long": ("Deep dive", "Default"),\n}')]),
-    ("C2", RESEARCH, "short generates a Deep dive instead of Brief",
-     [('    "short": ("Brief", None),',
-       '    "short": ("Deep dive", "Short"),')]),
+    ("C2", RESEARCH, "short generates Brief instead of Deep dive + Short "
+     "(every length is a Deep dive, owner 09-30)",
+     [('    "short": ("Deep dive", "Short"),',
+       '    "short": ("Brief", None),')]),
     ("C3", RESEARCH, "default generates Long",
      [('    "default": ("Deep dive", "Default"),\n    "long"',
        '    "default": ("Deep dive", "Long"),\n    "long"')]),
@@ -81,6 +85,12 @@ MUTANTS = [
        '            offered =',
        '        if True:\n'
        '            offered =')]),
+
+    ("F4", RESEARCH, "⛔⛔ the format is believed from its radio alone — a Deep dive "
+     "the app ignored generates on the other format's Length row (09-30 review)",
+     [('        if r["ok"] and op == "format":\n'
+       '            r = await _nlm_deep_dive_took(page)\n',
+       '')]),
 
     # ═══ L — the length: chosen, read back ═════════════════════════════════
     ("L1", RESEARCH, "⛔ the length is never chosen — Long is never pressed",

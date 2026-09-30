@@ -37,6 +37,8 @@
 
   Test switches, on <body>:
     data-start-format  the format chosen when the window opens (default Deep dive)
+    data-format-ignored a Format row whose choice the app ignores: the browser
+                       checks its radio, the Length row is not redrawn
     data-length-stuck  a Length option that ignores presses
     data-generate-dead "1": Generate now does nothing
     data-generate-slow milliseconds: Generate now takes, but the window closes
@@ -176,6 +178,7 @@
     row.dataset.name = name;
     input.addEventListener('change', () => {
       log.push('format:' + name);
+      if (document.body.dataset.formatIgnored === name) return;
       state.format = name;
       state.length = (LENGTHS[name] || []).length ? 'Default' : null;   // the form now; the row redraws later
       // The capture: the "checked" class drops on the click and is only put

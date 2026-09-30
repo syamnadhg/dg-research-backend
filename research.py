@@ -74160,9 +74160,10 @@ _NLM_CANARY_STATE: set = set()
 # closes the window and starts the audio.
 
 # The configured podcast length → (Format, Length) in the page's own words.
-# "short" is Brief, which has no Length row. Anything unknown is the default.
+# ⭐ Every length is a Deep dive (owner, 2026-09-30): "short" is Deep dive +
+# Short, no longer Brief. Anything unknown is the default.
 _NLM_AUDIO_CHOICES = {
-    "short": ("Brief", None),
+    "short": ("Deep dive", "Short"),
     "default": ("Deep dive", "Default"),
     "long": ("Deep dive", "Long"),
 }
@@ -74170,7 +74171,7 @@ _NLM_AUDIO_CHOICES = {
 
 def _nlm_audio_choice(podcast_length) -> tuple:
     """(format, length) for a configured podcast length; Deep dive + Long by
-    default. `length` is None for Brief."""
+    default."""
     return _NLM_AUDIO_CHOICES.get(str(podcast_length or "long").lower(),
                                   _NLM_AUDIO_CHOICES["long"])
 
@@ -74361,6 +74362,25 @@ async def _nlm_customise_choose(page, op: str, want: str, wait_s: float = 4.0) -
         await asyncio.sleep(0.2)
 
 
+async def _nlm_deep_dive_took(page, wait_s: float = 3.0) -> dict:
+    """NotebookLM's own word that it took Deep dive: the Length row it redraws
+    for Deep dive offers Long, and no other format's does (Critique and Debate
+    offer Short and Default, Brief has no Length row). The format's radio alone
+    cannot say it — the browser checks it after any press on its row, even when
+    the app ignored the choice. {"ok": bool, "reason": str}."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        st = await _nlm_customise_read(page, "length", "Long")
+        opts = st.get("options") or []
+        if any(o.get("want") for o in opts):
+            return {"ok": True, "reason": ""}
+        if time.monotonic() >= deadline or not st.get("dialog"):
+            shown = ", ".join(o.get("name", "?") for o in opts) or "no Length row"
+            return {"ok": False,
+                    "reason": f"format reads Deep dive, but the Length row shows {shown}"}
+        await asyncio.sleep(0.2)
+
+
 #: How long the page watches for its own "Generate now" to show — the window
 #: closing, or the audio generating. A slow server reply can take longer than a
 #: few seconds. Only the log line depends on it: once the press landed, nothing
@@ -74384,11 +74404,14 @@ async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dic
            "reason": ""}
     # The format first: it redraws the Length row. Each choice is read back
     # before the next step, and the length's read-back is the last read before
-    # the press.
+    # the press. The format is read back twice: by its radio, and by the Length
+    # row the app redrew for it.
     for op, want in (("format", fmt), ("length", length)):
         if not want:
             continue
         r = await _nlm_customise_choose(page, op, want)
+        if r["ok"] and op == "format":
+            r = await _nlm_deep_dive_took(page)
         if not r["ok"]:
             res["reason"] = r["reason"]
             return res
