@@ -36164,7 +36164,8 @@ except ValueError:
 
 def vision_url_rescue_should_run(*, agent, panel_open, elapsed_sec,
                                  dom_source_count, open_attempts_burned=0,
-                                 dom_misses=0, ever_opened=False) -> tuple:
+                                 dom_misses=0, ever_opened=False,
+                                 listed_sites=0) -> tuple:
     """Should the screenshot source-rescue run right now? Returns (bool, reason).
 
     ⛔⛔ THE DEFECT THIS FIXES IS THE SIGNATURE ONE IN THIS FILE: the rescue was
@@ -36202,11 +36203,20 @@ def vision_url_rescue_should_run(*, agent, panel_open, elapsed_sec,
     succeeds three times as often, and nothing has been measured about its
     never-opened case. Widening this to an unmeasured path is not a bug fix.
 
+    ⭐ 2026-09-30 round 3 — `listed_sites`, and it outranks every arm. Claude's
+    Research panel lists sites and their counts ("royalcanin.com 19 sources"),
+    not urls; the poll loop keeps them in `_claude_row_hosts`, never in
+    `sources`, which stays 0 for Claude. So the panel-open arm took a screenshot
+    and a model call on EVERY Claude run and found nothing. A run whose panel
+    has listed its sites is not rescued.
+
     Pure and module-level: the caller is a closure inside
     `poll_all_agents_round_robin`, which nothing in the suite executes, so a
     predicate written inline there could only ever be source-scanned — and
     mutation has already proved a source-scanned gate can ship inverted.
     """
+    if agent == "Claude" and int(listed_sites or 0) > 0:
+        return False, "panel-lists-sites"
     if agent in ("ChatGPT", "Claude") and panel_open:
         return True, "panel-open"
     if agent == "Gemini" and int(elapsed_sec or 0) > 120:
@@ -51730,6 +51740,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 _panel_open_now = bool(
                     p.get("chatgpt_activity_panel_open") if name == "ChatGPT"
                     else p.get("artifact_panel_open"))
+                # ⭐ 2026-09-30 round 3 — the sites Claude's Research panel has
+                # listed (the rows block above) stand for its sources here. The
+                # panel usually first opens in THIS check, after those rows were
+                # read with it shut, so an open panel with nothing kept yet is
+                # read once more — pressing nothing.
+                _listed_sites = 0
+                if name == "Claude":
+                    _cl_sites = p.setdefault("_claude_row_hosts", {})
+                    if _panel_open_now and not _cl_sites:
+                        _claude_fold_row_hosts(
+                            _cl_sites, await _claude_panel_source_rows(p["page"]))
+                    _listed_sites = len(_cl_sites)
                 _gate_ok, _gate_why = vision_url_rescue_should_run(
                     agent=name,
                     panel_open=_panel_open_now,
@@ -51742,7 +51764,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     open_attempts_burned=int(p.get("claude_panel_reopens", 0) or 0),
                     dom_misses=int(p.get("claude_artifact_dom_misses", 0) or 0),
                     ever_opened=bool(p.get("_claude_panel_ever_open")),
+                    listed_sites=_listed_sites,
                 )
+                if _gate_why == "panel-lists-sites":
+                    p["vision_urls_done"] = True
+                    log(f"[{name}] vision-urls rescue not needed: the research "
+                        f"panel lists {_listed_sites} site(s)", "INFO")
                 if _gate_ok:
                     if _gate_why.startswith("panel-never-opened"):
                         # The rescue firing on a never-opened panel is not

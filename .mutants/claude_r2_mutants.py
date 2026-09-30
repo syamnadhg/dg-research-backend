@@ -10,6 +10,7 @@
        to read it, and closed after).
   P* — the Research panel: the card pressed for real, the panel waited for.
   S* — its sources rows read on every check, pressing nothing, kept for the run.
+  V* — the vision rescue is not spent on a panel that has listed its sites.
   N* — Claude's left sidebar kept out of the steps.
   D* — the report: its card pressed, its panel seen, downloaded by the page; the
        sidebar is not an open panel.
@@ -108,6 +109,17 @@ MUTANTS = [
     ("S5", RESEARCH, "the rows' counts no longer reach the source number",
      [('                        rows=sum(_cl_union.values()),',
        '                        rows=0,')]),
+
+    # ═══ V — the vision rescue, not spent on a panel that lists sites ═══════
+    ("V1", RESEARCH, "⛔⛔ listed sites do not count — a screenshot and a model call on "
+     "every Claude run, finding nothing (09-30 review)",
+     [('    if agent == "Claude" and int(listed_sites or 0) > 0:\n'
+       '        return False, "panel-lists-sites"\n',
+       '')]),
+    ("V2", RESEARCH, "⛔ the panel opened in this check is not read before the rescue "
+     "decides — the rows were read while it was shut",
+     [('                    if _panel_open_now and not _cl_sites:',
+       '                    if False and _panel_open_now and not _cl_sites:')]),
 
     # ═══ N — the sidebar ════════════════════════════════════════════════════
     ("N1", RESEARCH, "⛔ Claude's left sidebar is read as a panel — 'Chats and tasks' steps",
