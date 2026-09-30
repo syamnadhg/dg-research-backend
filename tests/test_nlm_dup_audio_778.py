@@ -16,6 +16,9 @@ Three cooperating parts, all guarded here (BE-only; NO-DELETE throughout):
      terminal Generate from the already-open panel (panel_already_open=True).
      A once-per-process read-only `customize-open` canary pins the un-supplied
      Generate/length controls.
+     2026-09-30 (capture 5): the arrow is gone and the Audio Overview TILE
+     opens Customise; the page now chooses Format + Length and presses
+     "Generate now" itself (tests/test_nlm_customise_0930.py).
 
   B) RESILIENT DOWNLOAD — a read-only `_pick_nlm_audio_card` resolves WHICH card
      is the user-requested one (format + DOM order; duration is absent from the
@@ -55,32 +58,37 @@ def test_open_customize_helper_exists_and_is_async():
 
 
 def test_open_customize_uses_confirmed_arrow_selector():
-    src = _src(research._open_nlm_audio_customize)
-    assert 'button[aria-label="Customise Audio Overview"]' in src, (
+    # 2026-09-30 (capture 5): the arrow is gone and the TILE opens Customise.
+    # The arrow selectors stay as the first rungs — on a page that still has
+    # one, the tile beside it may be the one-click default — then the tile.
+    js = research._NLM_AUDIO_OPENER_JS
+    assert 'button[aria-label="Customise Audio Overview"]' in js, (
         "the confirmed arrow selector (user console dump 2026-06-03) is gone"
     )
-    assert "data-edit-button-type" in src, (
+    assert "data-edit-button-type" in js, (
         "the defensive data-edit-button-type fallback for the arrow is gone"
     )
+    assert js.index("Customise Audio Overview") < js.index("audio overview\\s*$"), (
+        "the old arrow must be tried before the tile"
+    )
 
 
-def test_open_customize_never_clicks_card_body_or_deletes():
-    # It may click ONLY a button (the arrow). It must never open a menu / delete
-    # / run a CUA loop (all of which are how a dup or a no-delete violation would
-    # happen). Every selector it clicks is a <button>. (Check for actual CALLS,
-    # not the prose word "deletes" in the docstring.)
+def test_open_customize_presses_one_control_and_never_deletes():
+    # It presses ONE control — the arrow or the Audio Overview tile — through
+    # the person's-click helper, then waits for the window. It must never open
+    # a menu, delete, or run a CUA loop. (Check for actual CALLS, not the prose
+    # words in the docstring.)
     src = _src(research._open_nlm_audio_customize)
     low = src.lower()
-    assert "agent_loop" not in low, "the arrow-opener must be pure DOM, not CUA"
-    assert ".delete(" not in low, "the arrow-opener must never call delete (no-delete)"
-    assert "menuitem" not in low, "the arrow-opener must not open/click a menu"
-    # Only button selectors are clicked — never the card body container
-    # (basic-create-artifact-button itself / div[aria-label="Audio Overview"]).
-    assert "el.click()" in src or "b.click()" in src, (
-        "the helper no longer clicks the arrow button"
+    assert "agent_loop" not in low, "the opener must be pure DOM, not CUA"
+    assert ".delete(" not in low, "the opener must never call delete (no-delete)"
+    assert "menuitem" not in low, "the opener must not open/click a menu"
+    assert src.count("await _sr_real_click(") == 1, (
+        "the opener must press exactly one control, once"
     )
-    assert "querySelectorAll('button" in src or "button[" in src, (
-        "the helper must target BUTTON controls (the arrow), not the card body"
+    js = research._NLM_AUDIO_OPENER_JS
+    assert "artifact-library-item" not in js, (
+        "the opener must never aim at an existing audio card"
     )
 
 

@@ -820,18 +820,22 @@ IMPORTANT: Only touch the ONE failed source named for you. Never remove a health
 # so the literal Format/Length names inside the body match whatever the user
 # picked. Three variants:
 #   - "short"   → Format="Brief", no separate length step (~3–5 min)
-#   - "default" → Format="Deep Dive", Length="Default" (~10–15 min)
-#   - "long"    → Format="Deep Dive", Length="Longer" (~20–30 min, current)
+#   - "default" → Format="Deep dive", Length="Default" (~10–15 min)
+#   - "long"    → Format="Deep dive", Length="Long" (~20–30 min, current)
 # The "short" variant solves the YouTube unverified-channel 15-min cap by
 # producing audio that always stays under the limit.
 
+# ⭐ 2026-09-30 (capture 5): the words are the page's own. The Customise window
+# lists Format as Deep dive / Brief / Critique / Debate and Length as Short /
+# Default / Long; Brief shows NO Length row, and changing the format redraws
+# the Length row, so the format is always chosen first.
 _PROMPT_AUDIO_GENERATE_VARIANTS = {
     "short": {"format": "Brief", "length": "Default",
-              "set_step_5": 'Set FORMAT = "Brief". Length is implied by the Brief format — do not look for a Length selector and do not skip Generate waiting on one.'},
-    "default": {"format": "Deep Dive", "length": "Default",
-                "set_step_5": 'Set FORMAT = "Deep Dive" and LENGTH = "Default" (the default length when the customize panel opens). Both must be confirmed visible before Generate.'},
-    "long": {"format": "Deep Dive", "length": "Long",
-             "set_step_5": 'Set FORMAT = "Deep Dive" and LENGTH = "Long". Both must be set explicitly — do not leave defaults.'},
+              "set_step_5": 'Choose FORMAT = "Brief". Brief has no Length row — do not look for one and do not wait for one before "Generate now".'},
+    "default": {"format": "Deep dive", "length": "Default",
+                "set_step_5": 'Choose FORMAT = "Deep dive", then LENGTH = "Default" (Default is already selected when the window opens — confirm it). Both must show as selected before "Generate now".'},
+    "long": {"format": "Deep dive", "length": "Long",
+             "set_step_5": 'Choose FORMAT = "Deep dive" first, then LENGTH = "Long" (changing the format redraws the Length row). Both must show as selected before "Generate now" — do not leave the defaults.'},
 }
 
 
@@ -842,14 +846,16 @@ def make_prompt_audio_generate(podcast_length: str = "long",
     audio generation entirely.
 
     #778 (2026-06-03): `panel_already_open` — set True when the caller has
-    ALREADY DOM-clicked the Audio Overview *Customise* arrow to open the
-    customize panel (the deterministic dup-kill: the arrow, never the card
-    body). The model then skips the open-step (steps 3-4 — the historical
-    card-body misclick vector) and goes straight to confirming the Format
-    selector + setting Format/Length + the terminal Generate. With the default
-    (False) the prompt is BYTE-IDENTICAL to the prior full-CUA flow (the
-    fail-open path when the DOM arrow-click can't find its target), so the
-    #757-A terminal-Generate hardening + its tests are unchanged."""
+    ALREADY opened the "Customise Audio Overview" window by the page. The model
+    then skips the open-step (steps 3-4) and goes straight to Format/Length +
+    the terminal "Generate now". With the default (False) the prompt is the
+    full flow (the fallback when the page could not open the window).
+
+    ⭐ 2026-09-30 (capture 5): clicking the "Audio Overview" tile now OPENS
+    Customise — it no longer fires a one-click default audio, and the separate
+    Customise arrow is gone. So the full flow may click the tile, once; the
+    danger that remains is a SECOND Generate, and step 7 still forbids every
+    click after "Generate now"."""
     v = _PROMPT_AUDIO_GENERATE_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_GENERATE_VARIANTS["long"]
     fmt = v["format"]
     length = v["length"]
@@ -863,16 +869,15 @@ def make_prompt_audio_generate(podcast_length: str = "long",
 
 {header}
 
-CRITICAL — NEVER CLICK THESE (any one of these creates an unwanted default audio):
-- The "Audio Overview" card body itself
-- The card's headline / title text
-- The card's thumbnail / play-icon area
-- Any "Generate" / "Create" button on the card BEFORE you've opened the customize panel
-- An existing audio entry that's already in the Studio panel (its play button, its row)
+CRITICAL — NEVER CLICK THESE (any one of these makes an unwanted second audio):
+- An existing audio entry already listed in the Studio panel (its row, title, play button or ⋮ menu)
+- The "Audio Overview" tile a SECOND time — one click opens the Customise window; that is all it is for
+- "Generate later" in the Customise window
+- Anything at all after "Generate now"
 
 You may ONLY click:
-- The gear / settings icon, "Customize" link, or three-dot menu on the Audio Overview card.
-- Inside the customize panel: the Format dropdown, the Length dropdown (if visible), and the final Generate button.
+- The "Audio Overview" tile in the Studio panel's grid of create tiles (the tile itself — its › arrow only shows on hover), ONCE. It opens the "Customise Audio Overview" window.
+- Inside that window: one Format option (Deep dive, Brief, Critique, Debate), one Length option (Short, Default, Long — Brief has none), and the final "Generate now" button.
 
 Steps (do them in order, do not skip):
 
@@ -882,40 +887,36 @@ Steps (do them in order, do not skip):
    - If the count is 0 → continue.
    - If the count is ≥ 1 → say exactly: "abort: audio already present" and STOP. Do not click anything else.
 
-3. Find the Audio Overview card's gear / Customize / three-dot affordance and click ONLY that.
-   - If you cannot find a clear gear/Customize/three-dot control, say exactly: "abort: no customize affordance" and STOP. Do not click the card body as a fallback.
+3. If the "Customise Audio Overview" window is already open, go to step 5. Otherwise click the "Audio Overview" tile in the Studio panel ONCE.
+   - If you cannot find the Audio Overview tile, say exactly: "abort: no customize affordance" and STOP.
 
-4. WAIT for the customize panel to open. Confirm you can see a Format selector before any next click.
-   - If the panel doesn't open or the dropdown isn't visible, say exactly: "abort: customize did not open" and STOP.
+4. WAIT for the "Customise Audio Overview" window to open. Confirm you can see its Format options before any next click.
+   - If the window doesn't open, say exactly: "abort: customize did not open" and STOP. Do not click the tile again.
 
 5. {step5}
 
-6. Click the Generate button inside the customize panel EXACTLY ONCE. This is the FINAL click of the entire task. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
+6. Click "Generate now" (never "Generate later") EXACTLY ONCE. This is the FINAL click of the entire task. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
 
-7. STOP — do not click ANYTHING after that Generate click. Not the Audio Overview card, not its title / thumbnail / play area, not a "verify" / "open" / "play" control, not anywhere on a tile, and not any NEW button that appears ON the just-created / generating card (e.g. "Interactive mode", "Join", "Customize", "Share", a play button) — nothing. This OVERRIDES the general "post-action verify" habit: a single click on the card body or any audio tile here fires a SECOND, unwanted DEFAULT audio, and that duplicate cannot be undone (it is a failure). To confirm it started, just READ the screenshot you already have (you may take at most ONE more screenshot — but NEVER a click). The instant a loading / "Generating…" / progress indicator appears for the new audio, respond with ONLY the word: generating — as plain text — and STOP.
+7. STOP — do not click ANYTHING after that "Generate now" click. Not the Audio Overview tile, not an audio card, its title / thumbnail / play area, not a "verify" / "open" / "play" control, and not any NEW button that appears ON the just-created / generating card (e.g. "Interactive mode", "Join", "Customize", "Share", a play button) — nothing. This OVERRIDES the general "post-action verify" habit: a click on the tile or an audio card here can start a SECOND, unwanted audio (a DEFAULT audio, or a second Generate), and that duplicate cannot be undone (it is a failure). To confirm it started, just READ the screenshot you already have (you may take at most ONE more screenshot — but NEVER a click). The instant a loading / "Generating…" / progress indicator appears for the new audio, respond with ONLY the word: generating — as plain text — and STOP.
 
 If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
 
     if panel_already_open:
-        # #778: the caller already DOM-clicked the Customise ARROW, so the
-        # customize panel is open. Neutralize steps 3-4 (the open-step is the
-        # card-body misclick vector) — the model must NOT re-click the card,
-        # its gear, or its arrow (re-clicking closes the panel OR fires NLM's
-        # one-click default = a duplicate). It goes straight to Format/Length +
-        # the terminal Generate. Injected right after the header so the
-        # CRITICAL no-click list + steps 5-7 (terminal Generate) stay intact.
+        # #778: the caller already opened the Customise window by the page.
+        # Neutralize steps 3-4 — the model must NOT click the tile again. It
+        # goes straight to Format/Length + the terminal "Generate now".
+        # Injected right after the header so the CRITICAL no-click list +
+        # steps 5-7 (terminal Generate) stay intact.
         _panel_note = (
             "ALREADY DONE FOR YOU — THE CUSTOMIZE PANEL IS OPEN: We have already "
-            "clicked the Audio Overview *Customise* arrow for you, so the customize "
-            "panel is OPEN. Steps 1-4 below are therefore already satisfied: do NOT "
-            "click the \"Audio Overview\" card body, its title, thumbnail, gear, or "
-            "arrow again — re-clicking it CLOSES the panel or fires NotebookLM's "
-            "one-click DEFAULT audio (an unwanted duplicate). Go STRAIGHT to step 5: "
-            "confirm the Format selector is visible in the open panel, set "
-            "Format/Length, then click Generate ONCE (step 6) and STOP (step 7). "
-            "ONLY if the Format selector is NOT visible (the panel didn't actually "
-            "open) may you look for the Customise gear/arrow — and even then click "
-            "ONLY that control, NEVER the card body."
+            "clicked the \"Audio Overview\" tile for you, so the customize panel is "
+            "OPEN (the \"Customise Audio Overview\" window). Steps 1-4 below are "
+            "therefore already satisfied: do NOT click the \"Audio Overview\" tile "
+            "again, and do NOT click any audio card body, title or thumbnail. Go "
+            "STRAIGHT to step 5: confirm the Format options are visible in the open "
+            "window, choose Format/Length, then click \"Generate now\" ONCE (step 6) "
+            "and STOP (step 7). ONLY if the window is NOT visible (it did not "
+            "actually open) may you click the \"Audio Overview\" tile — once."
         )
         _body = _body.replace(
             "CRITICAL — NEVER CLICK THESE",

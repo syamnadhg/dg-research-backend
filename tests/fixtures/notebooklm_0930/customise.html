@@ -1,0 +1,313 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>NotebookLM Studio + Customise Audio Overview (local fixture)</title>
+<!--
+  Built from the owner's capture 5 (customise-capture.json beside this file),
+  structure only. Tags, roles, aria attributes, classes and text are the
+  capture's. What the capture does not show is marked ASSUMED below.
+
+  From the capture:
+    - The Studio's create tiles: basic-create-artifact-button >
+      div[role=button][aria-label="Audio Overview"]; its chevron_forward sits
+      INSIDE the tile, hidden until hover (frame 2).
+    - Clicking the tile opens mat-dialog-container[role=dialog] titled
+      "Customise Audio Overview" (frames 3 -> 4, about 120 ms).
+    - Format: mat-radio-group[role=radiogroup][aria-labelledby=showFormat-label]
+      of mat-radio-button rows Deep dive / Brief / Critique / Debate, each a
+      label.mdc-form-field holding span.mdc-radio > input[type=radio] (values
+      1 / 2 / 3 / 4) and "<name> check <description>". Deep dive is chosen when
+      the window opens. The row's "mat-mdc-radio-checked" class was dropped on
+      a click and came back only on a later click (frames 7, 10, 16 vs 18).
+    - Length: mat-button-toggle-group[role=radiogroup]
+      [aria-labelledby=episodeLength-label] of button[role=radio][aria-checked]:
+      Short / Default / Long for Deep dive, Short / Default for Critique and
+      Debate, no Length row for Brief (frames 7, 10, 16). Redrawn on a format
+      change (its name moves from -group-0 to -group-1), Default chosen.
+    - Footer: "Generate later" and "Generate now" buttons with aria-label="".
+  ASSUMED:
+    - The inside of a format row (a title span, the check icon, then the
+      description paragraph) — the capture gives only the row's text.
+    - "Generate now" closes the window and shows "Generating Audio Overview…"
+      in the Studio list; "Generate later" closes the window. The capture closed
+      the window without pressing either.
+    - A fresh notebook: no audio in the Studio list yet.
+    - The redraw and open delays (short timers, so a reader must wait).
+
+  Test switches, on <body>:
+    data-start-format  the format chosen when the window opens (default Deep dive)
+    data-length-stuck  a Length option that ignores presses
+    data-generate-dead "1": Generate now does nothing
+  <body data-log> records every press, as JSON (a page script's globals are
+  out of reach of patchright's isolated evaluate; the DOM is shared).
+-->
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.4 sans-serif; background: #1e1f20; color: #e3e3e3; }
+  .studio { position: absolute; left: 0; top: 100px; width: 728px; }
+  .panel-content-scrollable { padding: 12px 16px; }
+  .create-artifact-buttons-container { display: grid; grid-template-columns: repeat(3, 227px); gap: 8px; }
+  basic-create-artifact-button { display: block; height: 48px; }
+  .create-artifact-button-container { height: 47px; border-radius: 12px; background: #2b3a55; cursor: pointer;
+    display: flex; align-items: center; padding: 0 8px; }
+  .option-icon { display: none; }
+  .create-artifact-button-container:hover .option-icon { display: inline; }
+  .artifact-library-container { min-height: 60px; margin-top: 12px; }
+  .cdk-overlay-container { position: fixed; inset: 0; pointer-events: none; }
+  .cdk-overlay-container > * { pointer-events: auto; }
+  /* The capture's boxes: the window at [36,34,655,679], its content scrolling
+     at [36,138,655,486] and the actions at [36,625,655,89]; the component host
+     is display:contents. */
+  mat-dialog-container { position: fixed; left: 36px; top: 34px; width: 655px; height: 679px; display: block;
+    background: #2a2b2e; border-radius: 24px; }
+  .mat-mdc-dialog-inner-container, .mat-mdc-dialog-surface { height: 100%; }
+  configurable-form-dialog { display: contents; }
+  .dialog-container { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .dialog-title { display: flex; align-items: center; gap: 8px; padding: 40px 32px 16px; height: 48px; }
+  .dialog-title h2 { flex: 1; margin: 0; font-size: 20px; }
+  mat-dialog-content { display: block; overflow: auto; flex: 1; min-height: 0; padding: 0 28px; }
+  .control-label { display: block; margin: 12px 0 8px; }
+  mat-radio-group { display: flex; flex-direction: column; gap: 12px; }
+  mat-radio-button { display: block; position: relative; border: 1px solid #555; border-radius: 16px; padding: 17px; }
+  mat-radio-button.mat-mdc-radio-checked { border-color: #8ab4f8; }
+  label.mdc-form-field { display: block; cursor: pointer; }
+  .mdc-radio { position: absolute; left: 16px; top: 50%; width: 1px; height: 1px; overflow: hidden; }
+  .mdc-radio input { opacity: 0; margin: 0; }
+  .tile-title { font-weight: 600; }
+  .tile-description { margin: 6px 0 0; }
+  mat-button-toggle-group { display: inline-flex; border: 1px solid #555; border-radius: 20px; }
+  .mat-button-toggle-button { background: none; color: inherit; border: 0; height: 40px; padding: 0 12px; cursor: pointer; }
+  mat-button-toggle.mat-button-toggle-checked .mat-button-toggle-button { background: #394457; }
+  mat-dialog-actions { display: flex; justify-content: space-between; align-items: center; height: 89px; flex: none; padding: 0 20px; }
+  .dialog-actions-container button { height: 48px; padding: 0 16px; }
+  textarea { width: 100%; height: 120px; }
+</style>
+</head>
+<body class="dark-theme luminous-ui mat-app-background notebook" data-start-format="Deep dive">
+<labs-tailwind-root>
+<div class="app-body">
+<notebook>
+<section class="studio-panel" data-panel-state="studio-home">
+<studio-panel class="studio">
+  <div class="panel-content-scrollable">
+    <div class="create-artifact-buttons-container studio-panel-open-create">
+      <basic-create-artifact-button>
+        <div role="button" tabindex="0" class="mat-mdc-tooltip-trigger blue create-artifact-button-container mat-label-medium" aria-label="Audio Overview" id="tile-audio">
+          <span class="default-container"><span class="icon-container">
+            <span class="icon-container-row"><mat-icon role="img" aria-hidden="true" class="mat-icon notranslate artifact-icon google-symbols">audio_spark</mat-icon></span>
+            <span class="create-label-container mat-label-medium">Audio Overview</span>
+          </span>
+          <div class="option-icon"><mat-icon role="img" aria-hidden="true" class="mat-icon notranslate edit-icon mat-icon-rtl-mirror">chevron_forward</mat-icon></div>
+          </span>
+        </div>
+      </basic-create-artifact-button>
+      <basic-create-artifact-button data-create-button-type="8">
+        <div role="button" tabindex="0" class="mat-mdc-tooltip-trigger create-artifact-button-container mat-label-medium pink" aria-label="Slide deck">
+          <span class="default-container"><span class="icon-container"><mat-icon class="mat-icon artifact-icon google-symbols">tablet</mat-icon>
+          <span class="create-label-container mat-label-medium">Slide deck</span></span></span>
+        </div>
+      </basic-create-artifact-button>
+      <basic-create-artifact-button>
+        <div role="button" tabindex="0" class="mat-mdc-tooltip-trigger create-artifact-button-container green mat-label-medium" aria-label="Video Overview">
+          <span class="default-container"><span class="icon-container"><mat-icon class="mat-icon artifact-icon google-symbols">videocam</mat-icon>
+          <span class="create-label-container mat-label-medium">Video Overview</span></span></span>
+        </div>
+      </basic-create-artifact-button>
+      <basic-create-artifact-button>
+        <div role="button" tabindex="0" class="mat-mdc-tooltip-trigger create-artifact-button-container mat-label-medium purple" aria-label="Mind Map">
+          <span class="default-container"><span class="icon-container"><mat-icon class="mat-icon artifact-icon google-symbols">flowchart</mat-icon>
+          <span class="create-label-container mat-label-medium">Mind Map</span></span></span>
+        </div>
+      </basic-create-artifact-button>
+    </div>
+    <div class="panel-divider"></div>
+    <div class="artifact-library-container">
+      <artifact-library class="luminous-ui"><div class="artifact-library-ungrouped-items" id="library"></div></artifact-library>
+    </div>
+  </div>
+</studio-panel>
+</section>
+</notebook>
+</div>
+</labs-tailwind-root>
+<div class="cdk-overlay-container" id="overlay"></div>
+
+<script>
+(() => {
+  const presses = [];
+  const log = { push: (x) => { presses.push(x); document.body.dataset.log = JSON.stringify(presses); } };
+  const FORMATS = [
+    ['Deep dive', '1', 'A lively conversation between two hosts, unpacking and connecting topics in your sources'],
+    ['Brief', '2', 'A bite-sized overview to help you grasp the core ideas from your sources quickly'],
+    ['Critique', '3', 'An expert review of your sources, offering constructive feedback to help you improve your material'],
+    ['Debate', '4', 'A thoughtful debate between two hosts, illuminating different perspectives on your sources'],
+  ];
+  const LENGTHS = { 'Deep dive': ['Short', 'Default', 'Long'], 'Critique': ['Short', 'Default'],
+                    'Debate': ['Short', 'Default'], 'Brief': [] };
+  let groupNo = 0;
+  let state = null;
+
+  const h = (tag, attrs, kids) => {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+    for (const k of kids || []) e.append(k);
+    return e;
+  };
+
+  function formatRow([name, value, desc]) {
+    const input = h('input', { type: 'radio', 'aria-invalid': 'false', class: 'mdc-radio__native-control',
+                                name: 'mat-radio-group-0', value, tabindex: '-1' });
+    const row = h('mat-radio-button', { class: 'mat-mdc-radio-button tile-radio-button mat-accent' }, [
+      h('label', { class: 'mdc-form-field mat-internal-form-field' }, [
+        h('span', { class: 'mdc-radio' }, [input]),
+        h('span', { class: 'mat-internal-form-field-label mdc-label' }, [
+          h('div', { class: 'tile-content' }, [
+            h('span', { class: 'tile-title' }, [name]), ' ',
+            h('mat-icon', { class: 'mat-icon notranslate google-symbols' }, ['check']), ' ',
+            h('p', { class: 'tile-description' }, [desc]),
+          ]),
+        ]),
+      ]),
+    ]);
+    row.dataset.name = name;
+    input.addEventListener('change', () => {
+      log.push('format:' + name);
+      state.format = name;
+      state.length = (LENGTHS[name] || []).length ? 'Default' : null;   // the form now; the row redraws later
+      // The capture: the "checked" class drops on the click and is only put
+      // back by a later one.
+      for (const r of document.querySelectorAll('mat-radio-button')) r.classList.remove('mat-mdc-radio-checked');
+      state.classDue = row;
+      setTimeout(drawLength, 150);
+    });
+    return row;
+  }
+
+  function drawLength() {
+    const slot = document.getElementById('length-slot');
+    slot.textContent = '';
+    const opts = LENGTHS[state.format] || [];
+    state.length = opts.length ? 'Default' : null;
+    if (!opts.length) return;
+    const gname = 'mat-button-toggle-group-' + (groupNo++);
+    const group = h('mat-button-toggle-group', {
+      class: 'mat-button-toggle-group button-toggle-group mat-button-toggle-group-appearance-standard ng-untouched',
+      'aria-labelledby': 'episodeLength-label', role: 'radiogroup', 'aria-disabled': 'false' });
+    for (const n of opts) {
+      const btn = h('button', { type: 'button', class: 'mat-button-toggle-button mat-focus-indicator', role: 'radio',
+                                tabindex: n === 'Default' ? '0' : '-1', 'aria-checked': n === 'Default' ? 'true' : 'false',
+                                name: gname }, [
+        h('div', { class: 'mat-button-toggle-checkbox-wrapper' }),
+        h('span', { class: 'mat-button-toggle-label-content' }, [n]),
+      ]);
+      const tog = h('mat-button-toggle', { role: 'presentation',
+        class: 'mat-button-toggle flex-grow mat-button-toggle-appearance-standard' +
+               (n === 'Default' ? ' mat-button-toggle-checked' : '') }, [btn]);
+      btn.addEventListener('click', () => {
+        log.push('length:' + n);
+        if (document.body.dataset.lengthStuck === n) return;
+        state.length = n;
+        for (const b of group.querySelectorAll('button[role="radio"]')) {
+          const on = b === btn;
+          b.setAttribute('aria-checked', on ? 'true' : 'false');
+          b.closest('mat-button-toggle').classList.toggle('mat-button-toggle-checked', on);
+        }
+      });
+      group.append(tog);
+    }
+    slot.append(h('div', { class: 'control-wrapper' }, [
+      h('label', { class: 'control-label', id: 'episodeLength-label' }, ['Length']), group]));
+  }
+
+  function openDialog() {
+    const start = document.body.dataset.startFormat || 'Deep dive';
+    state = { format: start, length: null, classDue: null };
+    const radios = h('mat-radio-group', { role: 'radiogroup', 'aria-label': 'Tile group',
+      class: 'mat-mdc-radio-group tile-group ng-untouched ng-pristine', 'aria-labelledby': 'showFormat-label' },
+      FORMATS.map(formatRow));
+    for (const r of radios.querySelectorAll('mat-radio-button')) {
+      if (r.dataset.name === start) {
+        r.classList.add('mat-mdc-radio-checked');
+        r.querySelector('input').checked = true;
+      }
+    }
+    const pressLater = h('button', { type: 'button', class: 'mdc-button mat-mdc-button-base mat-badge mat-mdc-button', 'aria-label': '' },
+      [h('span', { class: 'mdc-button__label' }, [h('span', { class: 'nb-button-content' }, [h('span', {}, ['Generate later'])])])]);
+    const pressNow = h('button', { type: 'button', class: 'mdc-button mat-mdc-button-base mat-badge mat-tonal-button', 'aria-label': '' },
+      [h('span', { class: 'mdc-button__label' }, [h('span', { class: 'nb-button-content' }, [h('span', {}, ['Generate now'])])])]);
+    const close = h('button', { class: 'mdc-icon-button mat-mdc-icon-button mat-mdc-button-base mat-badge', 'aria-label': 'Close dialogue' },
+      [h('mat-icon', { class: 'mat-icon notranslate google-symbols' }, ['close'])]);
+    const dlg = h('div', { class: 'cdk-overlay-pane gmat-mdc-dialog mat-mdc-dialog-panel' }, [
+      h('mat-dialog-container', { tabindex: '-1', role: 'dialog', 'aria-modal': 'false',
+        'aria-labelledby': 'mat-mdc-dialog-title-0',
+        class: 'mat-mdc-dialog-container mdc-dialog cdk-dialog-container mat-mdc-dialog-container-with-actions' }, [
+        h('div', { class: 'mat-mdc-dialog-inner-container mdc-dialog__container' }, [
+          h('div', { class: 'mat-mdc-dialog-surface mdc-dialog__surface' }, [
+            h('configurable-form-dialog', { class: 'mat-mdc-dialog-component-host luminous-ui' }, [
+              h('div', { class: 'dialog-container' }, [
+                h('div', { class: 'mat-mdc-dialog-title mdc-dialog__title dialog-title', id: 'mat-mdc-dialog-title-0' }, [
+                  h('mat-icon', { role: 'img', 'aria-hidden': 'true', class: 'mat-icon notranslate dialog-title-icon icon-color--blue' }, ['audio_magic_eraser']),
+                  h('h2', { class: 'dialog-title-text' }, ['Customise Audio Overview']),
+                  h('nb-icon-button', { 'aria-label': 'Close dialogue', class: 'dialog-title-close-icon nb-button' }, [close]),
+                ]),
+                h('mat-dialog-content', { class: 'mat-mdc-dialog-content mdc-dialog__content ng-untouched ng-pristine' }, [
+                  h('div', { class: 'dialog-section' }, [h('div', { class: 'controls-grid' }, [h('div', { class: 'control-wrapper' }, [
+                    h('label', { class: 'control-label', id: 'showFormat-label' }, ['Format']), radios])])]),
+                  h('div', { class: 'dialog-section' }, [h('div', { class: 'controls-grid' }, [
+                    h('div', { class: 'control-wrapper' }, [
+                      h('label', { class: 'control-label', id: 'language-label' }, ['Choose language']),
+                      h('mat-form-field', { class: 'mat-mdc-form-field select-form-field' }, [h('div', {}, ['English'])])]),
+                    h('div', { id: 'length-slot' }),
+                    h('div', { class: 'control-wrapper' }, [
+                      h('label', { class: 'control-label', id: 'itemSelection-label' }, ['Sources']),
+                      h('div', { class: 'item-selection-trigger repositioned' }, [
+                        h('button', { class: 'mdc-button mat-mdc-button-base mdc-button--outlined mat-mdc-outlined-button' },
+                          [h('span', { class: 'mdc-button__label' }, [h('span', {}, ['2 sources'])]),
+                           h('mat-icon', { class: 'mat-icon notranslate dropdown-icon google-symbols' }, ['keyboard_arrow_down'])])])]),
+                  ])]),
+                  h('div', { class: 'dialog-section' }, [h('div', { class: 'controls-grid' }, [h('div', { class: 'control-wrapper' }, [
+                    h('label', { class: 'control-label', id: 'focus-label' }, ['What should the AI hosts focus on in this episode?']),
+                    h('div', { class: 'text-form-field-container' }, [h('textarea', { 'aria-labelledby': 'focus-label' })])])])]),
+                ]),
+                h('mat-dialog-actions', { class: 'mat-mdc-dialog-actions mdc-dialog__actions dialog-actions dialog-actions-justified' }, [
+                  h('expected-usage', { class: 'expected-usage-dialog-footer' }, [h('span', { role: 'button', tabindex: '0' }, ['AI usage'])]),
+                  h('span', { class: 'dialog-actions-container' }, [
+                    h('span', { class: 'mat-mdc-tooltip-trigger' }, [h('nb-button', { tabindex: '-1', class: 'nb-button' }, [pressLater])]),
+                    h('span', { class: 'mat-mdc-tooltip-trigger action-button-wrapper' }, [h('nb-button', { tabindex: '-1', class: 'button-color--primary nb-button' }, [pressNow])]),
+                  ]),
+                ]),
+              ]),
+            ]),
+          ]),
+        ]),
+      ]),
+    ]);
+    const shut = () => dlg.remove();
+    close.addEventListener('click', () => { log.push('close'); shut(); });
+    pressLater.addEventListener('click', () => { log.push('generate-later'); shut(); });
+    pressNow.addEventListener('click', () => {
+      log.push('generate-now:' + state.format + '|' + (state.length || '-'));
+      if (document.body.dataset.generateDead === '1') return;
+      shut();
+      document.getElementById('library').append(h('div', { class: 'artifact-placeholder' }, [
+        h('span', {}, ['Generating Audio Overview…']), ' ', h('span', {}, ['Come back in a few minutes'])]));
+    });
+    // Any later press inside the window puts the lagging class back.
+    dlg.addEventListener('click', () => {
+      if (!state.classDue) return;
+      const due = state.classDue;
+      setTimeout(() => { if (state.classDue === due) { due.classList.add('mat-mdc-radio-checked'); state.classDue = null; } }, 0);
+    }, true);
+    document.getElementById('overlay').append(dlg);
+    drawLength();
+  }
+
+  document.getElementById('tile-audio').addEventListener('click', () => {
+    log.push('tile');
+    setTimeout(openDialog, 300);
+  });
+})();
+</script>
+</body>
+</html>
