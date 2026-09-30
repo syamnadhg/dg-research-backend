@@ -34291,6 +34291,22 @@ async def scrape_progress_chatgpt(page):
         except Exception as _ile:
             log(f"ChatGPT inline activity sweep skipped: {_ile}", "DEBUG")
 
+        # ---- Wave 13: the new page's step list under "Thinking ▾" ----
+        # Its rows ("Validated financial claims", "Searched 69 websites") are
+        # the model's own steps. They are written in the past tense, so the
+        # walker's verb gate above passes none of them, and only the status word
+        # ("Thinking") reached the app's live activity feed. `_CHATGPT_STEP_LIST_JS`
+        # already knows which list they are; its rows join the steps here.
+        try:
+            _sl = await page.evaluate(_CHATGPT_STEP_LIST_JS)
+            _rows = [str(r)[:220] for r in ((_sl or {}).get("steps") or [])
+                     if str(r).strip()]
+            if _sl and _sl.get("open") and _rows:
+                result["steps"] = list(dict.fromkeys(
+                    list(result.get("steps") or []) + _rows))[-15:]
+        except Exception as _sle:
+            log(f"ChatGPT step-list read skipped: {_sle}", "DEBUG")
+
         # ---- Iframe scrape (Deep Research content lives here as of 2026)
         # 2026-08-06: candidates come from `_chatgpt_surface_frame_targets`. This
         # scrape feeds narration AND `last_growth_len`/`last_growth_sources`,
@@ -35160,7 +35176,7 @@ _CHATGPT_SIDE_PANEL_JS = _cg_js("""() => {
 # ⚠ ASSUMED: that a closed list is hidden or removed (the vision step saw it
 # fold; the markup of the folded state was never captured).
 _CHATGPT_STEP_LIST_JS = _cg_js("""() => {
-    const out = { open: false, rows: 0, label: '' };
+    const out = { open: false, rows: 0, label: '', steps: [] };
     const main = document.querySelector('main') || document.body;
     const lines = (n) => (n.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
     const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -35206,6 +35222,8 @@ _CHATGPT_STEP_LIST_JS = _cg_js("""() => {
         out.open = true;
         out.rows = steps.length;
         out.label = texts[0].slice(0, 60);
+        // Wave 13: the rows themselves, for the live activity feed.
+        out.steps = steps.slice(0, 15).map(s => s.slice(0, 220));
         break;
     }
     return out;

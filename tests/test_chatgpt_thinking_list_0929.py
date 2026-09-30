@@ -690,3 +690,20 @@ def test_the_vision_step_is_told_to_look_for_the_list_first(p1run):
     assert "'Thinking ▾'" in mission
     assert "LOOK FIRST" in mission
     assert "Expected result: a row of small website chips" not in mission
+
+
+def test_the_listed_steps_reach_the_live_activity_feed(p1run, monkeypatch):
+    """⛔ Wave 13: the rows under "Thinking ▾" are the model's own steps, but
+    they are written in the past tense ("Validated financial claims", "Searched
+    69 websites"), so the walker's verb gate passed none of them and the app's
+    live activity feed showed only the status word. Now, while ChatGPT thinks,
+    Phase 1's progress events carry every row, in the page's order."""
+    events = []
+    monkeypatch.setattr(research, "emit_event", lambda name, **k: events.append((name, k)))
+    out = p1run(place="column", reply="empty", finishMs=9000, header="pair")
+    assert HEADING in out.text
+    fed = [k.get("steps") or [] for name, k in events
+           if name == "agent_progress" and k.get("phase") == 1]
+    rows = [t for _kind, t in ROWS]
+    assert any([s for s in steps if s in rows] == rows for steps in fed), (
+        [steps for steps in fed if steps][-3:])
