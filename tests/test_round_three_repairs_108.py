@@ -501,12 +501,20 @@ def test_the_resume_success_write_deletes_the_drop_fields():
     limit", suppressing "Your PC was fine throughout" — the sentence a
     2026-09-01 measurement exists to protect."""
     fn = _fn("start_firestore_start_listener")
-    branch = next(n for n in ast.walk(fn)
-                  if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
-                  and isinstance(n.test.left, ast.Name) and n.test.left.id == "action"
-                  and n.test.comparators
-                  and isinstance(n.test.comparators[0], ast.Constant)
-                  and n.test.comparators[0].value == "resume")
+    resume_branch = next(n for n in ast.walk(fn)
+                         if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                         and isinstance(n.test.left, ast.Name) and n.test.left.id == "action"
+                         and n.test.comparators
+                         and isinstance(n.test.comparators[0], ast.Constant)
+                         and n.test.comparators[0].value == "resume")
+    # ⭐ Wave 13: the branch's success tail moved into `_resume_from_checkpoint`,
+    # which a run the login command paused also takes. The branch must still
+    # call it; the write is read from there.
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "_resume_from_checkpoint"
+               for n in ast.walk(resume_branch)), (
+        "the Resume branch no longer goes through the one resume helper")
+    branch = _fn("_resume_from_checkpoint")
     writes = [n for n in ast.walk(branch)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
               and n.func.id == "_update_research_doc"
