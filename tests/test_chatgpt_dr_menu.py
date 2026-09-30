@@ -160,14 +160,24 @@ def test_a_gone_index_or_group_refuses_rather_than_clicking_something_else():
 
 
 def test_the_candidate_set_excludes_the_generic_elements_the_chips_are_made_of():
-    """`button, a, li` is what the suggestion strip is built from. Its absence is
-    the SAFETY half of the fix, so it is asserted on the code, not the prose."""
+    """`button, a, li` is what the suggestion strip is built from. Keeping them out
+    of the candidate set is the SAFETY half of the fix, so it is asserted on the
+    code, not the prose.
+
+    ⛔ 2026-09-30 (round 2): the 09-28 page's menu rows ARE plain buttons, so a
+    generic element may now appear — but only inside the overlay the "+" opens
+    (`[data-composer-overlay-floating-ui]`, the owner's recording), which the
+    strip and the sidebar are never in. Pressed-element proof, on the recorded
+    menu with a 'Deep research' chip and sidebar link beside it:
+    tests/test_chatgpt_r2_0930.py, section 2."""
+    import re
     groups = research._CHATGPT_TOOL_ROW_GROUPS
-    sels = " ".join(g["sel"] for g in groups)
-    for generic in ("button", " a,", " li"):
-        assert generic not in sels, (
-            f"{generic!r} in the tool-row candidate set re-opens the suggestion-chip hole"
-        )
+    for g in groups:
+        for part in (x.strip() for x in g["sel"].split(",")):
+            if re.search(r"(^|\s)(button|a|li)(?=$|[\s.\[:])", part):
+                assert part.startswith("[data-composer-overlay-floating-ui] "), (
+                    f"{part!r} in the tool-row candidate set re-opens the suggestion-chip hole"
+                )
 
 
 class _MenuPage:
