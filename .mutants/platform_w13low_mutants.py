@@ -63,7 +63,10 @@ MUTANTS = [
     # ═══ G — Gemini finished on its own ═════════════════════════════════════
     ("G1", RESEARCH, "⛔⛔ the plan wait never looks for a finished report — five "
      "minutes later \"Gemini couldn't start\" and three vision re-drafts",
-     [("            if await _gemini_finished_on_its_own(gemini_page):\n"
+     # ⚠ RE-ANCHORED 2026-09-30 (e2e0930 round 1): the plan wait now reads the
+     # same answer through `_gemini_done_read`, which also hands back the page
+     # reading it logs. Same decision, same mutation.
+     [("            if _gemini_done:\n"
        "                _finished_handoff = True",
        "            if False:\n"
        "                _finished_handoff = True")], GEMINI),

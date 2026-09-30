@@ -6683,8 +6683,10 @@ _DOM_OK = ("already", "verified")
 
 def _dom_reset():
     """Start a run with an empty ledger. Called where the run begins, so a
-    long-lived worker cannot carry the previous run's verdict into this one."""
+    long-lived worker cannot carry the previous run's verdict into this one.
+    The computer-use count starts empty with it (`_cua_reset`)."""
     _DOM_ATTEMPTS.clear()
+    _cua_reset()
 
 
 def _dom_note(intent: str, outcome: str, *, phase: int = 0, via: str = "",
@@ -6760,6 +6762,7 @@ def _dom_summary(tag: str = "") -> dict:
     head = f"[dom-summary]{(' ' + tag) if tag else ''}"
     if not total:
         log(f"{head} no DOM attempts were recorded this run", "WARN")
+        _cua_summary(tag)
         return {"total": 0, "ok": 0, "missed": 0}
     log(f"{head} {len(ok)}/{total} DOM intents handled without escalating "
         f"({len(missed)} missed)", "INFO" if not missed else "WARN")
@@ -6774,7 +6777,104 @@ def _dom_summary(tag: str = "") -> dict:
     if missed:
         log(f"{head} each ✗ above is a place vision had to step in; the detail "
             f"names what the page showed instead", "WARN")
+    _cua_summary(tag)
     return {"total": total, "ok": len(ok), "missed": len(missed)}
+
+
+# ── The computer-use count ───────────────────────────────────────────────────
+# ⛔⛔ 2026-09-30 — "2 MISSED" FOR 28 SESSIONS AND 75 STEPS. The DOM ledger above
+# tracks eight setup intents, and its verdict was the only end-of-run word on
+# vision spend: the 09-30 run's summary read "6/8 DOM intents handled without
+# escalating (2 missed)" while computer use had run 28 times — completion checks,
+# panels, downloads, uploads, audio polls, recovery — none of which the ledger
+# sees. So every computer-use session is counted where it RUNS (`agent_loop`,
+# with its steps), every vision-model screen read where it is made, and the
+# end-of-run summary prints one line per phase, platform and purpose.
+#
+#   grep '\[cua-summary\]'
+#
+# ⭐ The purpose comes from the call site: the step name every
+# `_shadow_observed_cua` call already carries, passed down to `agent_loop`
+# through `_CUA_TAG`. A session started outside it is named by its prompt.
+import contextvars as _cua_contextvars  # noqa: E402
+
+_CUA_CALLS: list = []
+_CUA_TAG = _cua_contextvars.ContextVar("_CUA_TAG", default=None)
+
+
+def _cua_reset():
+    """Start a run with an empty count (called by `_dom_reset`)."""
+    _CUA_CALLS.clear()
+
+
+def _cua_prompt_purpose(system_prompt) -> str:
+    """A session started outside the dispatcher is named by its prompt constant
+    ("PROMPT_CLICK_SEND" → "click send"); a prompt built on the spot is "other"."""
+    for k, v in list(globals().items()):
+        if k.startswith("PROMPT_") and v is system_prompt:
+            return k[len("PROMPT_"):].lower().replace("_", " ")
+    return "other"
+
+
+def _cua_open(kind: str, *, phase=None, platform="", purpose="") -> dict:
+    """Count one computer-use session (`kind="cua"`) or one vision-model screen
+    read (`kind="vision"`). The call site's tag, when there is one, names it;
+    the arguments are the fallback. Returns the record, whose `steps` the
+    session keeps current."""
+    tag = _CUA_TAG.get() or {}
+    try:
+        _ph = int(tag.get("phase") or phase or getattr(_runtime, "phase", 0) or 0)
+    except Exception:
+        _ph = 0
+    _plat = tag.get("platform") or platform or ""
+    rec = {"kind": kind, "phase": _ph,
+           "platform": normalize_agent_key(_plat) if _plat else "",
+           "purpose": str(tag.get("purpose") or purpose or "other").replace("_", " "),
+           "steps": 0}
+    _CUA_CALLS.append(rec)
+    return rec
+
+
+def _cua_tagged(factory, *, phase, platform, purpose):
+    """`factory` (a dispatcher's `cua_coro_factory`) with the call site's
+    phase, platform and purpose in force while it runs, so the `agent_loop`
+    inside it is counted under them."""
+    async def _run():
+        token = _CUA_TAG.set({"phase": phase, "platform": platform, "purpose": purpose})
+        try:
+            return await factory()
+        finally:
+            _CUA_TAG.reset(token)
+    return _run
+
+
+def _cua_summary(tag: str = "") -> dict:
+    """One line for the run, then one per phase · platform · purpose."""
+    head = f"[cua-summary]{(' ' + tag) if tag else ''}"
+    cua = [r for r in _CUA_CALLS if r["kind"] == "cua"]
+    vis = [r for r in _CUA_CALLS if r["kind"] == "vision"]
+    steps = sum(int(r.get("steps") or 0) for r in cua)
+    if not _CUA_CALLS:
+        log(f"{head} no computer use and no vision-model screen reads this run")
+        return {"sessions": 0, "steps": 0, "vision": 0}
+    log(f"{head} computer use ran {len(cua)} time{'s' if len(cua) != 1 else ''} "
+        f"({steps} step{'s' if steps != 1 else ''} in all), plus {len(vis)} "
+        f"vision-model screen read{'s' if len(vis) != 1 else ''} — the DOM line "
+        "above counts only the setup steps it tracks")
+    groups: dict = {}
+    for r in _CUA_CALLS:
+        g = groups.setdefault((r["phase"], r["platform"], r["purpose"], r["kind"]),
+                              [0, 0])
+        g[0] += 1
+        g[1] += int(r.get("steps") or 0)
+    for (ph, plat, purpose, kind), (n, st) in sorted(groups.items()):
+        if kind == "cua":
+            what = (f"{n} time{'s' if n != 1 else ''}, "
+                    f"{st} step{'s' if st != 1 else ''}")
+        else:
+            what = f"{n} vision read{'s' if n != 1 else ''}"
+        log(f"{head}   p{ph} {plat or '?'} · {purpose}: {what}")
+    return {"sessions": len(cua), "steps": steps, "vision": len(vis)}
 
 
 # Canonical agent/platform key the frontend uses in details[<key>]. Matches the
@@ -23967,6 +24067,9 @@ async def _cua_login_call(page, platform: str, cua_client, heavy: bool = False) 
         f"YES in those cases.\n\n"
         f"Reply with ONLY one word: YES or NO."
     )
+    # Counted for the end-of-run summary: each pass sends a screenshot to the
+    # vision model (the second pass is a second read).
+    _cua_open("vision", phase=0, platform=platform, purpose="check sign-in")
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
@@ -26396,6 +26499,9 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
     except Exception as e:
         log(f"[pro_tier:{pname}] screenshot failed: {e}", "WARN")
         return "unsure"
+    # Counted for the end-of-run summary: one screenshot to the vision model
+    # (the heavy re-read after an unclear answer is counted as its own read).
+    _cua_open("vision", phase=0, platform=platform, purpose="check subscription tier")
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
@@ -29834,6 +29940,10 @@ async def _shadow_observed_cua(
 
     Failure modes (Vision side) are silently logged — never re-raised.
     """
+    # ⭐ 2026-09-30: the computer use this call starts is counted under its step
+    # (`current_step`), phase and platform — see `_CUA_TAG`.
+    cua_coro_factory = _cua_tagged(cua_coro_factory, phase=phase, platform=platform,
+                                   purpose=current_step)
     if _vision is None:
         return await cua_coro_factory()
     try:
@@ -29879,6 +29989,7 @@ async def _shadow_observed_cua(
             _act_kw["refuse"] = lambda r: _vision_refusal(r, act_allow)
         try:
             _steps = 1 if read_only else (act_max_steps or _vision.ACT_MAX_STEPS_DEFAULT)
+            _cua_open("vision", phase=phase, platform=platform, purpose=current_step)
             _final = await asyncio.wait_for(_vision.act_loop(
                 page,
                 flow_context=flow_ctx,
@@ -38618,11 +38729,65 @@ async def _gemini_finished_on_its_own(page) -> bool:
     minutes asking the vision step to re-draft a plan while the vision step said
     "The page shows a finished research report", and only the round-robin
     after it found the 70k-character report and took the card back."""
+    return (await _gemini_done_read(page))[0]
+
+
+async def _gemini_done_read(page) -> tuple:
+    """`(finished_on_its_own, reason)` — `_gemini_finished_on_its_own`'s answer
+    together with the page reading behind it. Never raises.
+
+    ⭐ 2026-09-30: the plan wait called the detector every tick and threw its
+    reason away, so the 09-30 log could not say whether Gemini was still working
+    in the seven minutes before its card went up. The reason is what says so."""
     try:
         done, reason, _snap = await detect_completion_gemini(page)
-    except Exception:
+    except Exception as e:
+        return False, f"detect_error: {e}"
+    reason = str(reason or "")
+    return (bool(done) and ("report_button_trio" in reason
+                            or "completed_chat_text" in reason)), reason
+
+
+#: `detect_completion_gemini`'s reasons, in words a person reads in the log.
+#: Matched on the start of the reason; the first match wins.
+_GEMINI_STATE_WORDS = (
+    ("stop_btn_present", "still working (its Stop button is showing)"),
+    ("running_hidden_stop_btn",
+     "still working (its hidden 'Stop response' button is on the page)"),
+    ("running_weak_signal", "probably still working (something on it is still moving)"),
+    ("start_research_btn_visible", "a plan with 'Start research' showing"),
+    ("stale_start_btn_no_done_marker",
+     "a leftover 'Start research' button and nothing finished yet"),
+    ("no_stop + ", "finished"),
+    ("no_done_marker", "nothing running and nothing finished"),
+    ("detect_error", "unreadable"),
+)
+
+
+def _gemini_state_words(reason: str) -> str:
+    """What `reason` (a `detect_completion_gemini` reason) says about Gemini."""
+    reason = str(reason or "")
+    for key, words in _GEMINI_STATE_WORDS:
+        if reason.startswith(key):
+            return words
+    return "unknown"
+
+
+def _gemini_nothing_to_click(reading) -> bool:
+    """True when Gemini's latest reply was READ and holds nothing a vision step
+    could press: no button in it, no open menu, no failure text.
+
+    ⭐ 2026-09-30: on exactly that screen (no plan, no error, "controls read:
+    []") the vision recovery spent seven steps opening the owner's own brief
+    bubble; its mission has nothing it is allowed to click there. Only the
+    'Start research' watch that runs after it can help, and that keeps running.
+    ⛔ A read that FAILED is "cannot tell", never "nothing to click": it keeps
+    the vision step, as before."""
+    if not isinstance(reading, dict) or not reading.get("found"):
         return False
-    return bool(done) and ("report_button_trio" in reason or "completed_chat_text" in reason)
+    if reading.get("controls") or reading.get("rows"):
+        return False
+    return not _gemini_reads_as_failed(reading.get("text") or "")
 
 
 # ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
@@ -41810,9 +41975,17 @@ async def execute_action(browser, action, params):
             x, y = params["coordinate"]; log_action("mouse_move", f"({x}, {y})"); await browser.mouse_move(x, y)
         elif action == "scroll":
             x, y = params.get("coordinate", (640, 400))
-            d = params.get("direction", "down")
-            a = params.get("amount", 3)
-            log_action("scroll", f"({x},{y}) {d}"); await browser.scroll(x, y, d, a)
+            # ⛔⛔ 2026-09-30 — EVERY SCROLL WENT DOWN. The computer tool this loop
+            # declares (`computer_20251124`) names its scroll inputs
+            # `scroll_direction` and `scroll_amount`; this read `direction` and
+            # `amount`, found neither, and fell back to "down, 3" every time. All
+            # 71 scrolls ever logged on the Mac said "down", including the 09-30
+            # Phase 1 escalation where the model asked three times to scroll UP,
+            # was scrolled down each time, and gave up. The old names stay as a
+            # fallback only.
+            d = params.get("scroll_direction") or params.get("direction") or "down"
+            a = params.get("scroll_amount") or params.get("amount") or 3
+            log_action("scroll", f"({x},{y}) {d} {a}"); await browser.scroll(x, y, d, a)
         elif action == "left_click_drag":
             sx, sy = params.get("start_coordinate", (0, 0))
             ex, ey = params.get("end_coordinate", (0, 0))
@@ -41828,6 +42001,26 @@ async def execute_action(browser, action, params):
 
 
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
+
+class _SkipPressed:
+    """An `abort_event` for `agent_loop` that is set the moment the owner
+    presses Skip on `agent`.
+
+    ⭐ 2026-09-30: Gemini's plan recovery kept its vision step running for a
+    minute after the owner pressed Skip (05:19:28 → 05:20:33, four more steps),
+    because the loop checked the skip only between attempts. This reads the
+    Skip set itself, so no task has to be scheduled to set it, and it is seen
+    even while the loop's model call holds the event loop."""
+
+    def __init__(self, agent: str):
+        self._agent = agent
+
+    def is_set(self) -> bool:
+        try:
+            return self._agent in (_controls.skipped_agents or ())
+        except Exception:
+            return False
+
 
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
@@ -41889,6 +42082,12 @@ async def agent_loop(client, browser, system_prompt, user_message,
         return {"type": "text", "text": "The screenshot could not be taken because the page "
                 "is busy. Wait a moment, then take another screenshot."}
 
+    # ⭐ 2026-09-30: every session is counted for the end-of-run summary, under
+    # the call site's purpose (`_CUA_TAG`) or its prompt; `steps` follows the
+    # model turns below.
+    _cua_rec = _cua_open("cua", phase=phase, platform=agent_name or "",
+                         purpose=_cua_prompt_purpose(system_prompt))
+
     initial_ss = await _anchored_screenshot()
     if not initial_ss:
         return {"status": "error", "text": "Could not take initial screenshot"}
@@ -41927,6 +42126,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
         if abort_event is not None and abort_event.is_set():
             return {"status": "aborted", "text": last_text}
 
+        _cua_rec["steps"] = iteration
         if verbose: log(f"Iteration {iteration}/{max_iterations}")
         try:
             # 2026-07-11 (+review r2): transient server-side 5xx errors retry
@@ -43297,6 +43497,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
             log(f"[{agent_key}] vision-urls call error: {e}", "WARN")
             return [], 0.0
 
+    _cua_open("vision", platform=agent_key, purpose="read source links off the screen")
     try:
         raw_urls, conf = await asyncio.to_thread(_sync_call)
     except Exception as e:
@@ -52064,6 +52265,33 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "since": time.time(), "timeout": 600.0,
                     }
                     continue
+
+            # ⭐⭐ 2026-09-30 — WHILE STOP SHOWS, CHATGPT AND CLAUDE ARE STILL
+            # WORKING, AND NO SCREENSHOT IS NEEDED TO SAY SO. The owner: "the
+            # Stop button is a good determination point". Every ChatGPT and
+            # Claude computer-use completion check on record ran right after
+            # the page read above had logged `stop_btn_present`, and every one
+            # answered "still generating" (69 of 69 for Claude) — the page had
+            # already said it. The comment below promised this check ran "only
+            # if Playwright was not confident"; nothing enforced that until now.
+            # ⭐ THE CLOCK MOVES FORWARD, it is not merely skipped: the first
+            # computer-use look comes a full interval after the last poll that
+            # saw Stop, so a Stop that blinks out for one read is not a reason
+            # to look. A stall WITH Stop showing is the stuck arbiter's job above
+            # (15 minutes flat), which this does not touch.
+            # ⛔ GEMINI STAYS AS IT WAS: its detector has hidden-Stop and
+            # weak-signal cases, and its visible Stop has not been measured the
+            # way these two have.
+            if (detect_fn is not None and name in ("ChatGPT", "Claude")
+                    and str(dom_reason or "").startswith("stop_btn_present")):
+                p["last_cua_check"] = time.time()
+                if not p.get("stop_skips_cua_logged"):
+                    p["stop_skips_cua_logged"] = True
+                    log(f"[{name}] The page shows the Stop button, so {name} is still "
+                        "working — no computer-use completion check while it does "
+                        "(one runs 5 minutes after Stop goes, if the page cannot "
+                        "tell by then)")
+                continue
 
             # Check completion — CUA-primary fallback (only if Playwright was
             # not confident within the MIN_WAIT + budget window). CUA checks
@@ -66928,6 +67156,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             except Exception as _e:
                 log(f"[{label}] Send-decision wait errored: {_e}", "WARN")
 
+    # ⭐ 2026-09-30: when Send was done, for Gemini's "landed N s after Send".
+    _sent_at = time.time()
     await asyncio.sleep(3)
     # 2026-05-14: in-page Retry auto-click guard (Fix #515) — Gemini-only.
     # When Gemini's "show thinking" path lands on a soft-refusal screen
@@ -67097,6 +67327,21 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 return "/app/" in u  # /app/<conversation-id>, not the bare /app home
             except Exception:
                 return False
+
+        def _gemini_landing_note() -> str:
+            """Which chat the brief landed in and how long after Send, for the
+            "submission confirmed" line.
+
+            ⭐ 2026-09-30: the 09-30 chat was found nowhere in the log, and its
+            108 s landing (every earlier run: 93-94 s) was invisible. ⛔ The chat
+            is named the way every run-log line names one (`redacted_chat_url`):
+            run logs travel in Send logs, and since 09-02 they carry no chat
+            address. The short tag still matches the same chat's other lines."""
+            try:
+                _where = redacted_chat_url(page.url or "") or "unknown"
+            except Exception:
+                _where = "unknown"
+            return f" — chat {_where}, landed {int(time.time() - _sent_at)} s after Send"
 
         # ⛔⛔ THE URL'S SHAPE IS NOT THE QUESTION, AND THE COMMENT ABOVE ALREADY
         # SAID SO WHILE THE CODE DID SOMETHING ELSE: "the URL ADVANCES to
@@ -67271,7 +67516,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                         except Exception:
                             pass
                     # Adopt succeeded — a silent self-heal (no card was ever shown).
-                    log(f"[{label}] Gemini submission confirmed ✓ (adopted lost conversation)")
+                    log(f"[{label}] Gemini submission confirmed ✓ (adopted lost conversation)"
+                        + _gemini_landing_note())
                     return page, True
 
             # #955 Phase 2G (adversarial finding): a FAILED adoption can leave the
@@ -67512,7 +67758,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             if _landed or await _gemini_conversation_is_not_foreign():
                 # A re-submit created the conversation (the send really was
                 # dropped, now recovered) — a silent self-heal, no card to clear.
-                log(f"[{label}] Gemini submission confirmed ✓ (re-submit landed)")
+                log(f"[{label}] Gemini submission confirmed ✓ (re-submit landed)"
+                    + _gemini_landing_note())
                 return page, True
             # Adoption found nothing AND every re-submit failed → recovery is
             # EXHAUSTED, so NOW surface the terminal Retry/Skip blocker (the one
@@ -67528,7 +67775,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             except Exception:
                 pass
             return page, False
-        log(f"[{label}] Gemini submission confirmed ✓ (conversation started)")
+        log(f"[{label}] Gemini submission confirmed ✓ (conversation started)"
+            + _gemini_landing_note())
     return page, True
 
 
@@ -68235,6 +68483,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # Wave 13: Gemini started AND finished on its own inside this wait — see
         # `_gemini_finished_on_its_own`. No card, no vision re-drafts.
         _finished_handoff = False
+        # ⭐ 2026-09-30: what the per-tick page reading says about Gemini (still
+        # working, nothing running, finished), logged whenever it CHANGES. The
+        # 09-30 log could not say whether Gemini was working in the seven
+        # minutes before its card went up, although this reading was taken
+        # every ten seconds.
+        _gemini_state = ""
+        _gemini_state_logged = None
 
         def _raise_plan_alert(where: str):
             """Put the non-blocking [Retry][Skip] card up, once."""
@@ -68277,7 +68532,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # ⛔ Wave 13: FIRST, before the budget below can raise "couldn't
             # start" — a Gemini whose report is already on the page started and
             # finished by itself. Hand it to the round-robin to collect.
-            if await _gemini_finished_on_its_own(gemini_page):
+            _gemini_done, _gemini_state = await _gemini_done_read(gemini_page)
+            if _gemini_state.split(" (", 1)[0] != _gemini_state_logged:
+                _gemini_state_logged = _gemini_state.split(" (", 1)[0]
+                log(f"[2D] Gemini's page now reads: {_gemini_state_words(_gemini_state)} "
+                    f"({_gemini_state_logged or 'no reading'}, at {_elapsed}s)")
+            if _gemini_done:
                 _finished_handoff = True
                 log(f"[2D] Gemini started and finished its research on its own "
                     f"({_elapsed}s, no 'Start research' was needed) — handing it to "
@@ -68537,9 +68797,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         # click here and clicking an unidentified control is a
                         # destructive misclick waiting to happen. This is the
                         # state the early card exists for.
+                        # ⭐ 2026-09-30: + the reply's size and button count and
+                        # what the page says about Gemini, so this one line tells
+                        # "still working" from "a reply that stopped".
                         log(f"[2D] Gemini plan stall diag @ {_elapsed}s: no plan, no "
                             f"error text, not streaming (verdict={_verdict}); "
-                            f"controls read: {_reading.get('controls')}", "WARN")
+                            f"controls read: {_reading.get('controls')}; its reply: "
+                            f"{len(_reading.get('text') or '')} chars, "
+                            f"{len(_reading.get('controls') or [])} buttons; Gemini's "
+                            f"page reads: {_gemini_state_words(_gemini_state)}", "WARN")
                         _logged_stall_diag = True
 
             # 1c. (#755) Auto-regenerate exhausted but still no plan — surface it
@@ -68721,47 +68987,72 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     _retract_plan_alert("CUA recovery")
                     await asyncio.sleep(5)
                     break
-                # 2. No Start-research → the plan is in a FAIL state. CUA clicks the
-                #    Regenerate/Retry control (or Start research if it IS there).
-                #    Return text intentionally unused — #776 confirms via the DOM,
-                #    never by parsing the CUA's narration.
-                log(f"[2D] CUA recovery: plan not ready — CUA retrying the plan "
-                    f"(attempt {_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})")
-                await browser.switch_to_page(gemini_page)
+                # ⭐⭐ 2026-09-30 — NOTHING TO CLICK, NO VISION STEP. When Gemini's
+                # reply was read and holds no button, no open menu and no failure
+                # text, the vision mission below has nothing it is allowed to
+                # press: on 09-30 it spent seven steps opening the owner's own
+                # brief bubble. The 'Start research' watch under it still runs
+                # every attempt, and that is what caught the slow August plans.
+                _lad_quiet = _gemini_nothing_to_click(
+                    await _gemini_regen_read(gemini_page))
+                if _lad_quiet:
+                    _, _lad_state = await _gemini_done_read(gemini_page)
+                    log(f"[2D] Gemini's page shows nothing to click (no plan, no error, "
+                        f"no button in its reply; the page reads: "
+                        f"{_gemini_state_words(_lad_state)}) — no computer use; still "
+                        f"watching for 'Start research' (attempt {_regen_attempt + 1}/"
+                        f"{_FALLBACK_MAX_REGEN})")
+                else:
+                    # 2. No Start-research → the plan is in a FAIL state. CUA clicks the
+                    #    Regenerate/Retry control (or Start research if it IS there).
+                    #    Return text intentionally unused — #776 confirms via the DOM,
+                    #    never by parsing the CUA's narration.
+                    log(f"[2D] CUA recovery: plan not ready — CUA retrying the plan "
+                        f"(attempt {_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})")
+                    await browser.switch_to_page(gemini_page)
 
-                async def _gemini_start_cua():
-                    return await agent_loop(cua_client, browser,
-                        PROMPT_GEMINI_START_RESEARCH,
-                        "If an ENABLED (blue) 'Start research' button is visible, click it "
-                        "ONCE. If it is grayed out/disabled or the page shows research "
-                        "progress or a finished report, do NOT click — say 'research "
-                        "already running'. Only on a failed plan ('something went wrong') "
-                        "click Retry/Regenerate once. Do NOT type anything.",
-                        model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                    async def _gemini_start_cua():
+                        # ⭐ 2026-09-30: Skip stops it at once — see `_SkipPressed`.
+                        _res = await agent_loop(cua_client, browser,
+                            PROMPT_GEMINI_START_RESEARCH,
+                            "If an ENABLED (blue) 'Start research' button is visible, click it "
+                            "ONCE. If it is grayed out/disabled or the page shows research "
+                            "progress or a finished report, do NOT click — say 'research "
+                            "already running'. Only on a failed plan ('something went wrong') "
+                            "click Retry/Regenerate once. Do NOT type anything.",
+                            model=CUA_MODEL, max_iterations=10, verbose=verbose,
+                            abort_event=_SkipPressed("gemini"))
+                        if (_res or {}).get("status") == "aborted":
+                            log("[2D] Skip pressed — computer use on Gemini stopped at once",
+                                "INFO")
+                        return _res
 
-                # #839 act tier: DUAL-target mission — click 'Start research' OR
-                # the icon-only Regenerate/Retry the JS selector can't match.
-                # Return text is unused in EVERY mode (#776 confirms via the
-                # deterministic JS poll below), so an act success vs a CUA run
-                # is indistinguishable downstream — start_clicked is set only by
-                # _click_start_js. Non-blocking recovery, never the pipeline pause.
-                await _shadow_observed_cua(
-                    gemini_page, hotspot_id="gemini-start", phase=2, platform="gemini",
-                    current_step="start_or_regenerate_plan",
-                    context_hint="Gemini plan not ready — click an ENABLED (blue) 'Start "
-                                 "research' button ONCE if present; if it is grayed/disabled "
-                                 "or research is already running, do NOT click (say 'research "
-                                 "already running'); else click the Retry/Regenerate control "
-                                 "on the 'something went wrong' error once. NEVER type",
-                    expected_outcome="the research plan starts or is re-drafted",
-                    cua_coro_factory=_gemini_start_cua,
-                    mission_prompt=PROMPT_GEMINI_START_RESEARCH,
-                    act_timeout_s=120.0)
+                    # #839 act tier: DUAL-target mission — click 'Start research' OR
+                    # the icon-only Regenerate/Retry the JS selector can't match.
+                    # Return text is unused in EVERY mode (#776 confirms via the
+                    # deterministic JS poll below), so an act success vs a CUA run
+                    # is indistinguishable downstream — start_clicked is set only by
+                    # _click_start_js. Non-blocking recovery, never the pipeline pause.
+                    await _shadow_observed_cua(
+                        gemini_page, hotspot_id="gemini-start", phase=2, platform="gemini",
+                        current_step="start_or_regenerate_plan",
+                        context_hint="Gemini plan not ready — click an ENABLED (blue) 'Start "
+                                     "research' button ONCE if present; if it is grayed/disabled "
+                                     "or research is already running, do NOT click (say 'research "
+                                     "already running'); else click the Retry/Regenerate control "
+                                     "on the 'something went wrong' error once. NEVER type",
+                        expected_outcome="the research plan starts or is re-drafted",
+                        cua_coro_factory=_gemini_start_cua,
+                        mission_prompt=PROMPT_GEMINI_START_RESEARCH,
+                        act_timeout_s=120.0)
                 try:
                     emit_event("agent_progress", phase=2, agent="gemini", status="generating",
                                stage="planning",
-                               progress=(f"Gemini's plan didn't start — retrying "
-                                         f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…"))
+                               progress=((f"Still waiting for Gemini's plan "
+                                          f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…")
+                                         if _lad_quiet else
+                                         (f"Gemini's plan didn't start — retrying "
+                                          f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…")))
                 except Exception:
                     pass
                 # 3. Wait ~2 min for the re-draft, polling for "Start research"

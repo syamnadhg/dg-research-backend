@@ -166,11 +166,16 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      # twice and the harness reported it rather than measuring — which is the
      # sweep's own rule working. The `)` that closes the login prompt is the
      # nearest line that belongs to only one of them.
-     [("    )\n    try:\n        resp = await asyncio.to_thread(\n"
+     # ⛔ RE-AIMED 2026-09-30: the login check now counts its screen read for the
+     # end-of-run summary just before `try:`, so that count line is the one that
+     # belongs to it alone.
+     [('    _cua_open("vision", phase=0, platform=platform, purpose="check sign-in")\n'
+       "    try:\n        resp = await asyncio.to_thread(\n"
        "            cua_client.messages.create,\n"
        "            model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),\n"
        "            max_tokens=8,\n",
-       "    )\n    try:\n        resp = await asyncio.to_thread(\n"
+       '    _cua_open("vision", phase=0, platform=platform, purpose="check sign-in")\n'
+       "    try:\n        resp = await asyncio.to_thread(\n"
        "            cua_client.messages.create,\n"
        "            model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),\n"
        "            max_tokens=1024,\n")],
