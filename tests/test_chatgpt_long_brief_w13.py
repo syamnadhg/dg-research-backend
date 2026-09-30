@@ -288,6 +288,41 @@ def test_live_phase1_takes_the_long_brief_from_the_page(chrome, page, p1, logs):
     assert cf._clicked(chrome, page) == []
 
 
+_SCROLLED_JS = ("() => Math.max(window.scrollY,"
+                " ...[...document.querySelectorAll('*')].map((e) => e.scrollTop))")
+_TO_TOP_JS = ("() => { window.scrollTo(0, 0);"
+              " for (const e of document.querySelectorAll('*')) e.scrollTop = 0; }")
+
+
+def test_live_phase1s_polls_leave_a_long_brief_where_the_person_scrolled(
+        chrome, page, p1, logs, monkeypatch):
+    """⛔ 2026-09-30: "the page jumps to the bottom every 30 s". The "still
+    working?" check each Phase 1 poll runs — the brief's and, after the person
+    adds context, the follow-up's — is executed on the long brief scrolled to
+    its top, and the page stays there. The control: the shared check, which
+    scrolls first, does move this page."""
+    cf._open(chrome, page, "new", reply_actions=True, streaming=True, long_brief=True)
+    fixture_poll = research.poll_until_done
+    checks = []
+
+    async def _poll(pg, verify, label, *a, **k):
+        checks.append((label, verify))
+        return await fixture_poll(pg, verify, label, *a, **k)
+
+    monkeypatch.setattr(research, "poll_until_done", _poll)
+    p1.extra = cf.EXTRA
+    p1.run()
+    assert [label for label, _v in checks] == ["Phase1", "Phase1-followup"]
+    chrome.run(page.evaluate(_TO_TOP_JS))
+    chrome.run(research.verify_chatgpt_generating(page))
+    assert chrome.run(page.evaluate(_SCROLLED_JS)) > 5000, "the control did not scroll"
+    for label, verify in checks:
+        chrome.run(page.evaluate(_TO_TOP_JS))
+        assert chrome.run(verify(page)) is True, label        # Stop is showing
+        at = chrome.run(page.evaluate(_SCROLLED_JS))
+        assert at == 0, f"{label}'s check scrolled the page to {at}px"
+
+
 # ═══ 2. The Copy fallback on the same page ══════════════════════════════════
 
 def test_live_phase1_takes_the_long_brief_from_the_copy_button(chrome, page, p1, logs):

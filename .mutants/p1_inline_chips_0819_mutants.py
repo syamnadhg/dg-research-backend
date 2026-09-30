@@ -54,8 +54,10 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
     # ══ the three gates that were blind — the bug itself ══
     ("G1", SRC, "under", "⭐⭐ the per-cycle re-check goes back to the old pair, so "
      "an open chip row un-latches and the opener starts pressing again",
-     [("                        if not _chatgpt_p1_activity_open(_st_now):",
-       "                        if not (_st_now.get(\"side_panel\") "
+     # Re-anchored 2026-09-30: the re-check now reads "open" first and
+     # un-latches only when the DOM saw it open (`_panel_dom_seen_open`).
+     [("                        if _chatgpt_p1_activity_open(_st_now):",
+       "                        if (_st_now.get(\"side_panel\") "
        "or _st_now.get(\"inline_expanded\")):")],
      [T_NEW]),
     ("G2", SRC, "under", "⭐⭐ the anti-toggle PRE-check goes blind, so we press a "
