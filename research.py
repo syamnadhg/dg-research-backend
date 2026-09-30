@@ -35314,6 +35314,65 @@ _CHATGPT_STEP_LIST_JS = _cg_js("""() => {
 }""")
 
 
+# ⛔⛔ 2026-09-30 — THE PROBE ABOVE IS BLIND ON THE LIVE PAGE, AND PHASE 1 KEPT
+# PRESSING. The owner's 09-30 run had 0246230 in it and still pressed the new
+# page's "Searching the web ▾" line six times in three minutes (05:04:24 to
+# 05:07:13), each logged as a miss, while the two snapshots taken right after a
+# press both show the list OPEN under it. The vision step saw it too (05:05:02:
+# "This list of steps is **already showing**"). Which of the probe's gates the
+# live markup fails is not in any capture yet (round 2 rebuilds the probe from
+# one), so this does not guess at the list at all.
+#
+# It reads the one thing every log since 09-29 has measured: the line itself
+# reads its label TWICE, SPAN[inline-flex] "Searching the web\nSearching the
+# web" (a plain copy and a shimmer copy), inside the exchange (`inTurn: true`),
+# in every snapshot whatever the label said. The old page draws its line once,
+# and a finished line reads "Worked for 3m 25s" once. So this line on screen
+# means "the new page, still thinking" — and on the new page the step list
+# under it shows by default, so Phase 1 never presses it.
+#
+# Keyed on innerText, not on how the two copies are built (element or bare
+# text), because innerText is what was measured. The words are compared with
+# all white space removed first — cheap, and the line's textContent is the
+# label twice with nothing between — so innerText is only read for the few
+# elements that can pass. Only in the latest exchange, and never inside the
+# reply's text or the person's message. Returns one copy of the label, or "".
+_CHATGPT_DOUBLED_LINE_JS = _cg_js("""() => {
+    const turns = document.querySelectorAll('__CG_TURN__');
+    const last = turns.length ? turns[turns.length - 1] : null;
+    if (!last) return '';
+    let all;
+    try { all = last.querySelectorAll('*'); } catch (e) { return ''; }
+    if (all.length > 20000) return '';
+    for (const el of all) {
+        const flat = (el.textContent || '').replace(/\\s+/g, '');
+        if (flat.length < 6 || flat.length > 200 || flat.length % 2) continue;
+        if (flat.slice(0, flat.length / 2) !== flat.slice(flat.length / 2)) continue;
+        const parts = (el.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+        if (parts.length !== 2 || parts[0] !== parts[1]) continue;
+        // Not the reply's text or the person's message — nor a box around
+        // either (a wrapper holding only a short reply reads just like it).
+        if (el.closest('__CG_REPLY_TEXT__') || el.closest('__CG_USER__')) continue;
+        if (el.querySelector('__CG_REPLY_TEXT__') || el.querySelector('__CG_USER__')) continue;
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) continue;
+        return parts[0].slice(0, 80);
+    }
+    return '';
+}""")
+
+
+async def _chatgpt_doubled_line(page) -> str:
+    """The new page's thinking line, when it is on screen: one copy of its
+    label ("Searching the web"), or "" when there is none or the page cannot be
+    read. See `_CHATGPT_DOUBLED_LINE_JS`. Phase 1 only."""
+    try:
+        hit = await page.evaluate(_CHATGPT_DOUBLED_LINE_JS)
+    except Exception:
+        return ""
+    return str(hit or "")
+
+
 async def _chatgpt_activity_state(page):
     """#913: shape-agnostic ChatGPT activity state — what is open RIGHT NOW.
 
@@ -41900,9 +41959,10 @@ async def agent_loop(client, browser, system_prompt, user_message,
 
 # ── Verification Helpers ───────────────────────────────────────────────────────
 
-async def verify_chatgpt_generating(page) -> bool:
+async def verify_chatgpt_generating(page, scroll=True) -> bool:
     """Check if ChatGPT is actively generating (stop button visible).
     Scrolls both page body AND chat container — DR stop button is in chat UI, not input area.
+    `scroll=False` reads the page where it is: see `verify_chatgpt_p1_generating`.
 
     2026-04 iframe fix: ChatGPT Deep Research renders inside a cross-origin
     sandbox iframe (connector_openai_deep_research.web-sandbox.oaiusercontent.com).
@@ -41910,15 +41970,16 @@ async def verify_chatgpt_generating(page) -> bool:
     walk `page.frames` and check inside the DR iframe for any "researching"/
     "sources"/"stop" signal. Matches the detect_completion_chatgpt pattern."""
     try:
-        await page.evaluate("""() => {
-            // Scroll the page body
-            window.scrollTo(0, document.body.scrollHeight);
-            // Also scroll common chat containers (DR stop button is inside the chat, not input)
-            const containers = document.querySelectorAll(
-                '[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"]');
-            containers.forEach(c => c.scrollTop = c.scrollHeight);
-        }""")
-        await asyncio.sleep(0.3)
+        if scroll:
+            await page.evaluate("""() => {
+                // Scroll the page body
+                window.scrollTo(0, document.body.scrollHeight);
+                // Also scroll common chat containers (DR stop button is inside the chat, not input)
+                const containers = document.querySelectorAll(
+                    '[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"]');
+                containers.forEach(c => c.scrollTop = c.scrollHeight);
+            }""")
+            await asyncio.sleep(0.3)
         host_hit = await page.evaluate(_cg_js("""() => {
             // Check standard composer stop buttons (ChatGPT's own Stop, either
             // page, is the one marker)
@@ -42113,6 +42174,20 @@ async def verify_chatgpt_generating(page) -> bool:
         return False
     except Exception:
         return False
+
+
+async def verify_chatgpt_p1_generating(page) -> bool:
+    """Phase 1's "still working?" check: `verify_chatgpt_generating`, read where
+    the page is.
+
+    ⛔ 2026-09-30 — THE PAGE JUMPED TO THE BOTTOM EVERY 30 SECONDS. The shared
+    check scrolls the window and every `main` / `[role="presentation"]` box to
+    the bottom first (for Deep research, whose Stop sits in the chat), and
+    Phase 1's poll ran it on every tick — so a person reading the brief's top
+    was thrown to the end of it twice a minute; the new page's thread box is
+    `role="presentation"`. Phase 1's Stop is the composer's, which is always in
+    view, and every read below is a DOM query that needs no scrolling."""
+    return await verify_chatgpt_generating(page, scroll=False)
 
 
 async def _verify_chatgpt_generating_diag(page) -> str:
@@ -43731,6 +43806,97 @@ async def _chatgpt_done_badge(page) -> str:
     return ""
 
 
+# ⭐⭐ 2026-09-30 — PHASE 1 ENDS WHEN CHATGPT DOES. The owner's run finished its
+# brief at about 05:07:16 and the brief was read at 05:08:31: up to 30 s until
+# the next poll, a 5 s re-poll that ran the whole opener block again (it pressed,
+# missed a sixth time and paid the vision step 35 s on the finished page), then
+# a 3 s double-check. The owner named the determination point: the composer's
+# Stop button. Both halves were already in this file — the Stop marker and the
+# thinking-time header — and were just read late and slowly.
+#
+# So this reads the two signs together, cheaply, once a second:
+#   * no Stop button in the composer (either page's marker);
+#   * the thinking-time header ("Worked for 3m 25s") in the LATEST exchange.
+#     The 09-30 snapshot has that row inside the exchange (`inTurn: true`), and
+#     one exchange holds the person's message and the reply (the 09-28
+#     capture), so an earlier exchange's header can never answer for this one —
+#     the staleness `_chatgpt_done_badge` has to lean on its caller for. The
+#     reply's own text and the person's message are skipped, so a brief that
+#     writes "worked for 5 hours" is never the header.
+# plus the reply's length, for the one steady re-read that confirms it.
+_CHATGPT_P1_FINISH_JS = _cg_js("""() => {
+    const out = { stop: false, header: '', reply_len: 0 };
+    out.stop = !!document.querySelector('button[aria-label="Stop generating"], __CG_STOP__');
+    const turns = document.querySelectorAll('__CG_TURN__');
+    const last = turns.length ? turns[turns.length - 1] : null;
+    if (!last) return out;
+    const re = __DONE_BADGE_RE__;
+    for (const el of last.querySelectorAll('*')) {
+        const t = el.textContent || '';
+        if (t.length < 10 || t.length > 80 || !/\\d/.test(t) || !/for/i.test(t)) continue;
+        const m = (el.innerText || t).match(re);
+        if (!m) continue;
+        if (el.closest('__CG_REPLY_TEXT__') || el.closest('__CG_USER__')) continue;
+        if (el.querySelector('__CG_REPLY_TEXT__') || el.querySelector('__CG_USER__')) continue;
+        out.header = m[0];
+        break;
+    }
+    const replies = last.querySelectorAll('__CG_REPLY_TEXT__');
+    if (replies.length) out.reply_len = (replies[replies.length - 1].textContent || '').length;
+    return out;
+}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
+
+#: How often Phase 1 looks for the finish while it waits between polls, and how
+#: long the one steady re-read waits. Seconds.
+_P1_FINISH_TICK_S = 1.0
+_P1_FINISH_STEADY_S = 1.0
+
+
+async def _chatgpt_p1_finish_signs(page) -> dict:
+    """The two finish signs as the page shows them now. `done` is both at once:
+    no Stop button, and the thinking-time header in the latest exchange. A page
+    that cannot be read is never done."""
+    try:
+        r = await page.evaluate(_CHATGPT_P1_FINISH_JS)
+    except Exception:
+        r = None
+    if not isinstance(r, dict):
+        return {"done": False, "stop": None, "header": "", "reply_len": -1}
+    header = str(r.get("header") or "")
+    stop = bool(r.get("stop"))
+    try:
+        reply_len = int(r.get("reply_len") or 0)
+    except (TypeError, ValueError):
+        reply_len = -1
+    return {"done": (not stop) and bool(header), "stop": stop,
+            "header": header, "reply_len": reply_len}
+
+
+async def _chatgpt_p1_finish_holds(page, verify_fn, first) -> bool:
+    """ONE steady re-read, in place of the 5 s + 3 s double-check: a second
+    later both signs still hold, the reply is the same length, and the page's
+    own "still working?" check agrees it is not."""
+    await asyncio.sleep(_P1_FINISH_STEADY_S)
+    again = await _chatgpt_p1_finish_signs(page)
+    if not again["done"] or again["reply_len"] != first.get("reply_len"):
+        return False
+    try:
+        return not await verify_fn(page)
+    except Exception:
+        return False
+
+
+async def _chatgpt_p1_wait_for_finish(page, seconds) -> None:
+    """Wait up to `seconds` between Phase 1 polls, looking for the finish once a
+    second, and come back as soon as it shows (or a Stop was asked for)."""
+    for _ in range(max(1, int(round(float(seconds) / _P1_FINISH_TICK_S)))):
+        await asyncio.sleep(_P1_FINISH_TICK_S)
+        if _controls.is_stop():
+            return
+        if (await _chatgpt_p1_finish_signs(page))["done"]:
+            return
+
+
 # ⭐ 2026-08-12 — THE PROMPT THAT COULD NOT BE ANSWERED.
 #
 # The mission this replaces read:
@@ -43902,6 +44068,19 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     _panel_poll_cycles = 0  # ticks once per ChatGPT P1 poll while panel still closed
     _panel_reopens = 0      # #913: bounded drawer re-opens after auto-collapse (max 3)
     _last_panel_walk = 0.0  # 2026-07-13: throttle for the P1 panel WALK (live steps/links)
+    _p1 = label in ("Phase1", "Phase1-followup")
+    # ⛔ 2026-09-30 — who may un-latch an open activity. At 05:05:02 the vision
+    # step saw the new page's list "**already showing**" and latched it; 31 s
+    # later the step-list read, which had never once seen that shape open,
+    # called it "collapsed" and handed the line back to the opener, which
+    # pressed it four more times. A read that has never seen the shape open is
+    # blind, not a witness to a collapse: only a DOM that saw it open since the
+    # latch may say it closed.
+    _panel_dom_seen_open = False
+    # The new page's thinking line (its label drawn twice) is on screen: the
+    # step list shows under it by default, so it is latched open for the rest
+    # of this poll and never pressed. See `_CHATGPT_DOUBLED_LINE_JS`.
+    _panel_by_page_shape = False
     # Stall detector — multi-signal (2026-04-25 strictness rewrite):
     # tracks text + sources + steps. ChatGPT DR's "researching" phase
     # legitimately produces zero text growth for 5-15 min while sources
@@ -44057,6 +44236,27 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             emit_event("heartbeat", phase=phase, agent=normalize_agent_key(label))
             last_heartbeat = time.time()
 
+        # ── ⭐⭐ 2026-09-30: ChatGPT is done → read the brief NOW ──────────────
+        # Before any panel work, every cycle: the composer's Stop button is
+        # gone AND the latest exchange shows its "Worked for …" header. One
+        # steady re-read a second later stands in for the 5 s + 3 s double-check
+        # below, and nothing else runs on a finished answer — no press, no
+        # vision step. See `_CHATGPT_P1_FINISH_JS`.
+        # `_p1_quiet`: the page says it may be finished (both signs, or the
+        # DOM's last read said "not generating") — no press and no vision step
+        # for the activity while that is being settled. On 09-30 the sixth
+        # miss landed in exactly that gap and cost 35 s of vision on a
+        # finished brief.
+        _p1_quiet = False
+        if _p1:
+            _fin = await _chatgpt_p1_finish_signs(page)
+            if _fin["done"] and await _chatgpt_p1_finish_holds(page, verify_fn, _fin):
+                log(f"[{label}] ChatGPT has finished — the Stop button is gone and the "
+                    f"reply shows {_fin['header']!r}. Reading the brief now "
+                    f"({int(time.time() - wait_start)}s)")
+                return True
+            _p1_quiet = bool(_fin["done"]) or consecutive_not_generating >= 1
+
         # Scrape progress FIRST — every cycle, regardless of state
         scrape_fn = SCRAPE_FNS.get(label)
         if scrape_fn:
@@ -44078,7 +44278,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # #913: once open, cheap per-cycle state check — the inline
                 # drawer auto-collapses on some UI transitions. Bounded
                 # re-open (3 max) instead of the old fire-and-forget.
-                if (label in ("Phase1", "Phase1-followup") and _panel_open_done):
+                if (label in ("Phase1", "Phase1-followup") and _panel_open_done
+                        and not _panel_by_page_shape and not _p1_quiet):
                     try:
                         _st_now = await _chatgpt_activity_state(page)
                         # ⛔⛔ 2026-08-19 — THIS LINE UN-LATCHED AN OPEN DRAWER. At
@@ -44086,10 +44287,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         # said "collapsed" and handed the toggle back to the
                         # opener, which then clicked it eight times. The chip row
                         # is what P1 opens, so P1 has to be able to see it.
-                        if not _chatgpt_p1_activity_open(_st_now):
+                        # ⛔ 2026-09-30 — and a read that has never seen this
+                        # shape open since the latch is blind, not a witness:
+                        # see `_panel_dom_seen_open`.
+                        if _chatgpt_p1_activity_open(_st_now):
+                            _panel_dom_seen_open = True
+                        elif _panel_dom_seen_open:
                             _panel_reopens += 1
                             if _panel_reopens <= 3:
                                 _panel_open_done = False
+                                _panel_dom_seen_open = False
                                 _panel_dom_misses = 0
                                 log(f"[{label}] activity drawer collapsed — will re-open "
                                     f"(reopen #{_panel_reopens}/3)", "DEBUG")
@@ -44097,7 +44304,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         pass
                 if (label in ("Phase1", "Phase1-followup")
                         and (_panel_poll_cycles >= 2 or elapsed_sec >= 60)
-                        and not _panel_open_done):
+                        and not _panel_open_done and not _p1_quiet):
                     try:
                         # #913 anti-toggle: the status line is a TOGGLE — the
                         # pre-#913 loop re-clicked it every cycle because the
@@ -44105,8 +44312,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         # skeleton-only Activity panel it had already opened.
                         # NEVER click while a shape is open.
                         _st_pre = await _chatgpt_activity_state(page)
+                        _line = await _chatgpt_doubled_line(page)
+                        if _line:
+                            _panel_by_page_shape = True
                         if _chatgpt_p1_activity_open(_st_pre):
                             _panel_open_done = True
+                            _panel_dom_seen_open = True
                             _shape = _chatgpt_open_shape(_st_pre)
                             log(f"[{label}] activity already open (shape={_shape}"
                                 + (f", {_st_pre.get('inline_chips', 0)} chips"
@@ -44114,6 +44325,14 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 + (f", {_st_pre.get('inline_step_rows', 0)} step lines showing"
                                    if _shape == "steps" else "")
                                 + f") at elapsed={elapsed_sec}s — no click needed")
+                            res = None
+                        elif _line:
+                            # ⛔⛔ 2026-09-30: never press the new page's line.
+                            # Its step list shows by default; the press folds it.
+                            _panel_open_done = True
+                            log(f"[{label}] the step list under \"{_line[:60]}\" shows by "
+                                f"default on this page — leaving it alone, no press and "
+                                f"no vision step (elapsed={elapsed_sec}s)")
                             res = None
                         else:
                             res = await _open_chatgpt_activity_panel(
@@ -44130,6 +44349,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 await _log_chatgpt_thread_snapshot(page, tag=f"p1-miss{_panel_dom_misses}")
                         elif res.get("alreadyExpanded"):
                             _panel_open_done = True
+                            _panel_dom_seen_open = True
                             log(f"[{label}] activity panel already expanded at "
                                 f"elapsed={elapsed_sec}s — label: \"{res.get('label','')[:80]}\"")
                             _observe_dom_success(page, hotspot_id="7c-p1", phase=phase,
@@ -44142,6 +44362,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             verified = _chatgpt_p1_activity_open(_st_post)
                             if verified:
                                 _panel_open_done = True
+                                _panel_dom_seen_open = True
                                 _shape = _chatgpt_open_shape(_st_post)
                                 log(f"[{label}] activity opened via DOM at "
                                     f"elapsed={elapsed_sec}s — shape={_shape} "
@@ -44913,7 +45134,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # block the CUA call if the diag eval fails.
                 _verify_fn_name = getattr(verify_fn, "__name__", "")
                 _diag_reason = ""  # #755: kept in scope for the stop-button veto below
-                if _verify_fn_name == "verify_chatgpt_generating":
+                if _verify_fn_name in ("verify_chatgpt_generating",
+                                       "verify_chatgpt_p1_generating"):
                     try:
                         _diag_reason = await _verify_chatgpt_generating_diag(page)
                         log(f"[{label}] Safety-net diag: verify_chatgpt_generating "
@@ -45159,7 +45381,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
 
         elapsed_min = int(time.time() - wait_start) // 60
         log(f"[{label}] Still generating... ({elapsed_min}m elapsed)")
-        await asyncio.sleep(poll_interval)
+        if _p1:
+            # ⭐ 2026-09-30: the wait between polls looks for the finish once a
+            # second, so the brief is read within about a second of ChatGPT
+            # finishing instead of up to a whole poll later.
+            await _chatgpt_p1_wait_for_finish(page, poll_interval)
+        else:
+            await asyncio.sleep(poll_interval)
 
 
 # ── Round-Robin Polling (Phase 2) ─────────────────────────────────────────────
@@ -57444,7 +57672,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # ChatGPT freezes mid-stream (text + sources + steps flat for 20m).
     log(f"Polling for response (every {POLL_PRO}s)...")
     try:
-        completed = await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1", POLL_PRO, MAX_WAIT_PRO,
+        completed = await poll_until_done(browser.page, verify_chatgpt_p1_generating, "Phase1", POLL_PRO, MAX_WAIT_PRO,
             browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
     except _BriefStreamStalled as _bs:
         log(f"Phase 1: brief stream stalled — {_bs}", "WARN")
@@ -57569,7 +57797,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         if verified_fu:
             log("Phase 1: Waiting for updated brief...")
             try:
-                await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1-followup",
+                await poll_until_done(browser.page, verify_chatgpt_p1_generating, "Phase1-followup",
                     POLL_PRO, 15,  # 15 min max — dead arg post-D2; kept for signature stability
                     browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
             except _BriefStreamStalled as _bs_fu:

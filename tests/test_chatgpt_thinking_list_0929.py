@@ -171,6 +171,11 @@ SCRIPT = r"""
            + (cfg.once ? '' : '<span aria-hidden="true" style="grid-area:1/1">' + label + '</span>')
            + '</span>' + chevron + '</span>';
     }
+    if (cfg.bareCopy) {
+      // 09-30: one copy a bare text node, the other the shimmer span.
+      return '<span class="inline-flex items-center" data-sr-toggle="1">' + label
+           + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span></span>';
+    }
     return '<span class="inline-flex items-center" data-sr-toggle="1">'
          + '<span class="cadencedShimmerSweep-ICUAVH">' + label + '</span>' + two + '</span>';
   }
@@ -181,8 +186,10 @@ SCRIPT = r"""
     // The list holds its rows through one inner container: the capture reported
     // DIV[-ms-2] WITH its rows' text, and that census skips an element with more
     // than two children, while each row was the outermost element of its text.
-    const list = '<div class="-ms-2 flex flex-col" data-sr-list="1">'
+    let list = '<div class="-ms-2 flex flex-col" data-sr-list="1">'
                + '<div class="flex flex-col" data-sr-rows="1"></div></div>';
+    // 09-30: the list inside a zero-size `display: contents` box.
+    if (cfg.listWrap === 'contents') list = '<div class="contents" style="display:contents">' + list + '</div>';
     b.innerHTML = header(labels[0]) + list;
     const l = b.querySelector('[data-sr-list]');
     for (const [k, t] of ROWS) b.querySelector('[data-sr-rows]').appendChild(row(k, t));
@@ -194,6 +201,7 @@ SCRIPT = r"""
       if (!e.target.closest('[data-sr-toggle]')) return;
       window.__srPresses = (window.__srPresses || 0) + 1;
       document.body.dataset.srPresses = String(window.__srPresses);
+      document.body.dataset.srPressTimes = (document.body.dataset.srPressTimes || '') + Date.now() + ',';
       if (cfg.deadToggle) return;
       if (cfg.collapsed === 'removed') {
         if (l.isConnected) l.remove(); else b.appendChild(l);
@@ -241,6 +249,14 @@ SCRIPT = r"""
   const replyIn = (col) => [...col.children].find(
       c => c.querySelector('[data-chatgpt-search-unit-key$=":assistant"]'));
   function startThinking(turnCol) {
+    if (cfg.tall && !document.querySelector('[data-sr-spacer]')) {
+      // An earlier, long part of the thread, so the page can be scrolled.
+      const sp = document.createElement('div');
+      sp.setAttribute('data-sr-spacer', '1');
+      sp.style.height = '4000px';
+      const tr = document.getElementById('sr-transcript');
+      tr.insertBefore(sp, tr.firstChild);
+    }
     block = makeBlock();
     mode = 'generating';
     turnCol.appendChild(block);
@@ -669,13 +685,16 @@ def test_phase1_never_presses_the_line_while_the_list_shows(p1run, place, reply,
 
 
 @pytest.mark.parametrize("header,how", [("pair", True), ("pair", "removed"), ("row", True)])
-def test_a_folded_list_is_opened_once_and_then_left_alone(p1run, header, how):
-    """The list starts folded: one press opens it, the open list is recognised,
-    and nothing presses it again."""
+def test_a_folded_list_on_the_new_page_is_left_alone(p1run, header, how):
+    """⛔ 2026-09-30 (was: "opened once and then left alone"). On the new page
+    Phase 1 never presses the line: its list shows by default, the 09-30 run
+    pressed it shut and open six times while this reader was blind to it, and
+    the owner's fix is that the line is not pressed at all. A list the person
+    folded stays folded, and no vision step is spent on it."""
     out = p1run(place="column", reply="empty", finishMs=9000, collapsed=how, header=header)
     assert HEADING in out.text
-    assert out.toggles == 1, out.toggles
-    assert any("activity opened via DOM" in m and "shape=steps" in m for m in out.lines)
+    assert out.presses == 0 and out.toggles == 0, (out.presses, out.toggles)
+    assert any("shows by default on this page" in m for m in out.lines)
     assert out.while_thinking == []
 
 
@@ -683,7 +702,10 @@ def test_the_vision_step_is_told_to_look_for_the_list_first(p1run):
     """When the press does nothing and the vision step is asked, its mission
     names the new page's list and says to leave an open one alone — not "expect
     a row of website chips", which is what it pressed the list shut for."""
-    out = p1run(place="column", reply="empty", finishMs=15000, collapsed=True, deadToggle=True)
+    # The line drawn once (the older shape): on the new page, whose line reads
+    # its label twice, the vision step is never asked (2026-09-30).
+    out = p1run(place="column", reply="empty", finishMs=15000, collapsed=True, deadToggle=True,
+                once=True)
     assert out.while_thinking, [m for m in out.lines if "tier-3" in m][:5]
     mission = out.while_thinking[0]
     assert "list of the model's steps" in mission
