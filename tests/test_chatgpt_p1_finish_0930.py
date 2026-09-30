@@ -137,7 +137,10 @@ def test_the_brief_is_read_within_seconds_of_the_finish(chrome, page, logs, stil
     the next poll (10 s) and then waited 5 s + 3 s more — about 17 s. Now the
     wait between polls looks for it once a second and one steady re-read ends
     the poll: about 2 s."""
-    tl._thinking(chrome, page, place="column", header="pair")
+    # At an http address, like ChatGPT's (a page at about:blank is a dead tab).
+    tl._load_at_url(chrome, page, thread=True, place="column", header="pair")
+    chrome.run(page.evaluate("() => document.dispatchEvent(new CustomEvent('sr-think'))"))
+    assert chrome.run(page.evaluate("() => document.body.dataset.srThink")) == "true"
     assert chrome.run(page.evaluate(
         "() => !!document.querySelector('button[aria-label=\"Stop\"]')")), "no Stop while thinking"
     chrome.run(page.evaluate(
