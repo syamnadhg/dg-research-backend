@@ -95,7 +95,7 @@ EXITING = ('    if _exit_scheduled:\n'
 DETACH = ("    if _fb_research_id == rid:\n"
           "        _fb_uid = None\n"
           "        _fb_research_id = None\n")
-RECORD = "    _update_research_doc(uid, rid, _waiting_record_patch())\n    _keep_worker_resting(WORKER_ID)"
+RECORD = "    _update_research_doc(uid, rid, _moved_record_patch(data))\n    _keep_worker_resting(WORKER_ID)"
 EXIT = '    _schedule_server_exit("requeue", delay_sec=1.5)'
 GATE = ("            elif (action == REQUEUE_ACTION\n"
         "                    and _requeue_target_worker(data) != WORKER_ID):")
@@ -138,13 +138,14 @@ MOVED_CANCEL = ('                                        "summary": "Cancelled",
                 '                                        "queuePosition": _DF,\n'
                 '                                        "queuedBehindRunId": _DF,\n'
                 '                                        "queuedBehindTitle": _DF,\n'
-                '                                    }, movedToQueueAt=_DF))\n')
+                '                                    }, movedToQueueAt=_DF, moveNote=_DF))\n')
 STOP_TOUCH = ('        try:\n            (d / ".stop").touch()\n        except Exception as e:\n'
               '            log(f"[moved-run] could not end {d.name}: {e}", "WARN")\n')
 OWN_STOP = ('    return {\n        "status": "stopped",\n'
             '        "stoppedAt": int(time.time() * 1000),\n'
             '        "queuePosition": _DF,\n        "queuedBehindRunId": _DF,\n'
-            '        "queuedBehindTitle": _DF,\n        "movedToQueueAt": _DF,\n    }\n')
+            '        "queuedBehindTitle": _DF,\n        "movedToQueueAt": _DF,\n'
+            '        "moveNote": _DF,\n    }\n')
 OWN_STOP_GATE = ("                        if (not _owner_control_patch(oc, running=True)\n"
                  "                                and (_waiting_kept_work(_waiting_rec)\n"
                  "                                     if _waiting_rec is not None "
@@ -398,8 +399,8 @@ MUTANTS = [
     # the old worker's snapshot, and the boot that reads it
     ("R1", RESEARCH, "⛔⛔ the old worker's snapshot still names the moved run — its boot "
      "puts it back or runs it a second time",
-     [("    _forget_running_job_in_snapshot()\n    _update_research_doc(uid, rid, _waiting_record_patch())\n",
-       "    _update_research_doc(uid, rid, _waiting_record_patch())\n")]),
+     [("    _forget_running_job_in_snapshot()\n    _update_research_doc(uid, rid, _moved_record_patch(data))\n",
+       "    _update_research_doc(uid, rid, _moved_record_patch(data))\n")]),
     ("R2", RESEARCH, "the move writes back a line Reset Backend is clearing",
      [('            if not _QUEUE_STATE.get("_hard_reset_in_progress"):\n'
        '                persist(current_job=None)',
@@ -471,13 +472,13 @@ MUTANTS = [
      [("                                        if _start_doc_id is None and (removed_taken or not removed)\n",
        "                                        if (removed_taken or not removed)\n")]),
     ("R23", RESEARCH, "a cancelled waiting run stays the amber #1 until something else moves",
-     [("                                    }, movedToQueueAt=_DF))\n                            _kick_queue_publish()\n",
-       "                                    }, movedToQueueAt=_DF))\n")]),
+     [("                                    }, movedToQueueAt=_DF, moveNote=_DF))\n                            _kick_queue_publish()\n",
+       "                                    }, movedToQueueAt=_DF, moveNote=_DF))\n")]),
     ("R24", RESEARCH, "a cancelled queued job is not taken out of the published order",
      [("                            removed = True\n                            _kick_queue_publish()\n",
        "                            removed = True\n")]),
     ("R25", RESEARCH, "a stopped run still reads as moved to the queue",
-     [(MOVED_CANCEL, MOVED_CANCEL.replace("}, movedToQueueAt=_DF))", "}))"))]),
+     [(MOVED_CANCEL, MOVED_CANCEL.replace("}, movedToQueueAt=_DF, moveNote=_DF))", "}, moveNote=_DF))"))]),
     ("R26", RESEARCH, "⛔ the owner's cancel resets the steps of a run with work in it",
      [("                                    _owner_control_patch(oc, running=True) or {\n",
        "                                    _owner_control_patch(oc, running=False) or {\n")]),
