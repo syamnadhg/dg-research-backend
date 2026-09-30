@@ -83,8 +83,9 @@ def test_streaming_handoff_breaks_before_hard_cap():
 def test_cua_ladder_gated_off_on_streaming_handoff():
     # The ladder must not run for a streaming hand-off — pointing the CUA at a
     # healthy streaming Gemini is what produced the click spam.
+    # ⭐ Wave 13: and not for a Gemini that already FINISHED on its own either.
     i_gate = P2_SRC.index("not start_clicked and not _streaming_handoff\n"
-                          "                and not _controls.is_stop()")
+                          "                and not _finished_handoff and not _controls.is_stop()")
     assert i_gate > 0
 
 

@@ -95,7 +95,7 @@ os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 # CHILD, in the moment before the child execs its program. Measured on this
 # Mac (grpcio 1.84, Python 3.13): 2,656 of 3,000 plain `sh -c 'exit 0'` children
 # of a process holding a Firestore-style stream printed ev_poll_posix.cc lines
-# from that moment. The same file's line 659 is the owner's
+# from that moment. The same file is the one in the owner's
 # "F… ev_poll_posix.cc:659] Check failed: wakeup_fd_->ConsumeWakeup().ok()"
 # (08-25, 09-16, 09-29 — the last two at the second the browser was launched):
 # that poller racing the exec and aborting the half-born child. Fork support
@@ -38340,7 +38340,7 @@ async def _gemini_finished_on_its_own(page) -> bool:
     ⛔ Wave 13 (the 09-21 run): Gemini sometimes starts its research by itself
     and FINISHES it inside the five-minute plan wait, never showing a "Start
     research" button to press. The wait did not look for that: at five minutes
-    it raised "Gemini couldn't start Deep Research", then spent seven more
+    it raised the couldn't-start card (_GEMINI_CANT_START), then spent seven more
     minutes asking the vision step to re-draft a plan while the vision step said
     "The page shows a finished research report", and only the round-robin
     after it found the 70k-character report and took the card back."""
