@@ -168,10 +168,14 @@ def test_a_new_run_starts_the_count_from_zero(run):
 def test_the_purpose_does_not_leak_past_its_call(run):
     """The call site's purpose is in force only while its own computer use runs:
     a session started afterwards, outside the dispatcher, is named by its own
-    prompt."""
-    asyncio.run(run.dispatched(1, phase=2, platform="gemini",
-                               step="start_or_regenerate_plan"))
-    asyncio.run(run.direct(1, prompt=research.PROMPT_DIAGNOSE, phase=2, agent="chatgpt"))
+    prompt. ⚠ Both in ONE task, the way a phase runs them: each `asyncio.run`
+    starts from a fresh copy of the context, so two separate runs could never
+    show a leak (the mutation harness caught exactly that)."""
+    async def _one_task():
+        await run.dispatched(1, phase=2, platform="gemini", step="start_or_regenerate_plan")
+        await run.direct(1, prompt=research.PROMPT_DIAGNOSE, phase=2, agent="chatgpt")
+
+    asyncio.run(_one_task())
     research._dom_summary()
     assert "[cua-summary]   p2 chatgpt · diagnose: 1 time, 1 step" in _summary(run.lines)
 
