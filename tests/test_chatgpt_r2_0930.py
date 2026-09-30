@@ -96,6 +96,18 @@ def test_a_recorded_folded_list_reads_closed(chrome, page, index):
     assert sl["open"] is False and sl["line"] is True, sl
 
 
+def test_a_list_on_the_page_but_hidden_reads_closed(chrome, page):
+    """⚠ The recording folds the list by taking it off the page. A list kept on
+    the page but hidden (another way a fold could be drawn) is not open either."""
+    chrome.run(page.set_content(_turn_page(P1, 30)))
+    chrome.run(page.evaluate("""() => {
+        const b = document.querySelector('button[aria-expanded][aria-labelledby]');
+        b.parentElement.nextElementSibling.style.display = 'none';
+    }"""))
+    sl = chrome.run(page.evaluate(research._CHATGPT_STEP_LIST_JS))
+    assert sl["open"] is False and sl["line"] is True, sl
+
+
 @pytest.mark.parametrize("index", sorted(OPEN) + FOLDED + LONG)
 def test_the_new_pages_line_is_read_whatever_its_label(chrome, page, index):
     """Phase 1 never presses the line (round 1's rule). Round 1 knew the line

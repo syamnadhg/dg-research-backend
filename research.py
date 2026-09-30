@@ -56622,7 +56622,13 @@ async def _chatgpt_dr_census(page, stage, *, label="ChatGPT"):
     plain line saying what it found and where it went. Never raises; returns the
     census (None when it wrote nothing)."""
     try:
-        key = (id(page), stage)
+        # The conversation's address is in the key: a later run's page can be
+        # given the same id() as an earlier one, never the same conversation.
+        try:
+            where = (page.url or "").split("?", 1)[0]
+        except Exception:
+            where = ""
+        key = (id(page), where, stage)
         if key in _CHATGPT_DR_CENSUS_SEEN:
             return None
         frames = _chatgpt_dr_app_frames(page)

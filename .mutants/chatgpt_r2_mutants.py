@@ -44,7 +44,7 @@ RESEARCH = "research.py"
 #: anchor sweep reads any "*.py" string in a mutant's row as its target file).
 SUITES = {
     "steps": ["tests/test_chatgpt_r2_0930.py", "-k",
-              "recorded or long_label or line or status_line or control"],
+              "recorded or long_label or line or status_line or control or hidden"],
     "feed": ["tests/test_chatgpt_thinking_list_0929.py", "-k",
              "never_presses_the_line_while or listed_steps"],
     "menu": ["tests/test_chatgpt_r2_0930.py", "-k", "menu or deep_research_row"],
@@ -78,7 +78,7 @@ MUTANTS = [
        "box = box.children[0];\n",
        "            && false) box = box.children[0];\n")],
      "steps"),
-    ("S5", RESEARCH, "⛔ a folded list's absence is not checked — the line alone reads open",
+    ("S5", RESEARCH, "⛔ a list kept on the page but hidden reads open",
      [("    if (!shown(list)) return out;\n    // The rows sit in ONE wrapper",
        "    // The rows sit in ONE wrapper")],
      "steps"),
@@ -143,6 +143,9 @@ MUTANTS = [
      "census"),
     ("C2", RESEARCH, "⛔ a stage is written on every poll — the log fills",
      [("        if key in _CHATGPT_DR_CENSUS_SEEN:\n            return None\n", "")],
+     "census"),
+    ("C5", RESEARCH, "a later run on the same tab writes no census (the page's id reused)",
+     [("        key = (id(page), where, stage)\n", "        key = (id(page), stage)\n")],
      "census"),
     ("C3", RESEARCH, "⛔ the report's words reach the census",
      [("return t.length <= 40 ? t : null; };", "return t; };")],

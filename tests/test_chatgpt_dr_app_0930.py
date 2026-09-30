@@ -85,11 +85,11 @@ def _dr_host_html(index, *, stop=None, strip_app=False, worked=None):
     return cp.page_html(body)
 
 
-def _serve(chrome, page, host_html, app_html):
+def _serve(chrome, page, host_html, app_html, host_url=HOST_URL):
     """Serve the host page and the app's frame locally; abort everything else."""
     async def _route(route):
         u = route.request.url
-        if u == HOST_URL:
+        if u == host_url:
             await route.fulfill(status=200, content_type="text/html", body=host_html)
         elif u.startswith(APP_URL):
             await route.fulfill(status=200, content_type="text/html", body=app_html)
@@ -97,8 +97,9 @@ def _serve(chrome, page, host_html, app_html):
             await route.abort()
 
     async def _go():
+        await page.unroute("**/*")
         await page.route("**/*", _route)
-        await page.goto(HOST_URL)
+        await page.goto(host_url)
         for _ in range(50):
             if _app_frame(page) is not None or APP_URL not in host_html:
                 break
@@ -235,6 +236,16 @@ def test_the_census_is_written_at_launch_and_five_minutes_in(chrome, page, logs,
     assert any((x.get("a") or {}).get("role") == "status" for x in fr["controls"])
     lines = [m for _lv, m in logs if "what its frames hold" in m]
     assert len(lines) == 2 and "(launch)" in lines[0] and "(mid-run)" in lines[1], lines
+
+
+def test_the_next_conversation_gets_its_own_census(chrome, page, logs, run_dir):
+    """Once per stage per CONVERSATION: the same tab in a later run (another
+    conversation) writes its launch census again."""
+    _serve(chrome, page, _dr_host_html(17), _app_html("running"))
+    assert chrome.run(research._chatgpt_dr_census(page, "launch")) is not None
+    assert chrome.run(research._chatgpt_dr_census(page, "launch")) is None
+    _serve(chrome, page, _dr_host_html(17), _app_html("running"), host_url=HOST_URL + "-next")
+    assert chrome.run(research._chatgpt_dr_census(page, "launch")) is not None
 
 
 def test_the_census_keeps_no_long_text(chrome, page, logs, run_dir):
