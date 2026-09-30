@@ -68801,6 +68801,34 @@ async def _nlm_click_first(page, patterns, *, expect_chooser=False):
     return label
 
 
+# ⭐⭐ 2026-09-30 — THE AUDIO CARD'S ICON NAME, ONE LIST FOR EVERY READER.
+# NotebookLM renamed the Material icon on its audio cards from
+# `audio_magic_eraser` to `audio_spark`. The 09-30 run's own dump shows it: the
+# finished card read "audio_sparkUnread Golden Retriever Science Versus
+# Marketing…", and the Studio tile "audio_spark Audio Overview chevron_forward".
+# Five readers each carried the old name as a literal — the done check, the
+# card count, the Deep Dive count, the download picker and the ⋮-menu scope —
+# so that run never saw its finished audio by reading the page: 12 computer-use
+# checks over 17 minutes, "0 total" after cleanup, and a picker with no card.
+# The old name stays in the list: it costs nothing, and a page still serving it
+# must not go blind the other way. Page JS reaches this list through `_nlm_js`.
+_NLM_AUDIO_ICONS = ("audio_magic_eraser", "audio_spark")
+_NLM_AUDIO_ICON_RE_JS = "/(?:" + "|".join(re.escape(i) for i in _NLM_AUDIO_ICONS) + ")/"
+
+
+def _nlm_js(src: str) -> str:
+    """Splice the audio-icon test into a NotebookLM page-JS string.
+
+    `__NLM_AUDIO_ICON__` becomes a regex literal matching any name in
+    `_NLM_AUDIO_ICONS`, so `__NLM_AUDIO_ICON__.test(text)` in the page asks
+    "does this text carry an audio card's icon?" the same way everywhere."""
+    out = src.replace("__NLM_AUDIO_ICON__", _NLM_AUDIO_ICON_RE_JS)
+    if "__NLM_" in out:
+        raise ValueError("unknown NotebookLM placeholder in page JS: "
+                         + out[out.index("__NLM_"):][:40])
+    return out
+
+
 # ── The audio card's ⋮ menu — scoped, never document-wide ──────────────
 #
 # ⛔ THE BUG THIS EXISTS TO KILL: the audio-share step opened a menu with a
@@ -68819,14 +68847,14 @@ async def _nlm_click_first(page, patterns, *, expect_chooser=False):
 #
 # The first scope is the same population `_count_nlm_audio_cards` and
 # `_pick_nlm_audio_card` already count — a visible <artifact-library-item>
-# carrying the `audio_magic_eraser` ligature — so all three agree on what an
-# audio card is. WHICH audio card does not matter here: NotebookLM emits one
+# carrying one of the `_NLM_AUDIO_ICONS` ligatures — so all three agree on what
+# an audio card is. WHICH audio card does not matter here: NotebookLM emits one
 # `/notebook/{id}` link for the notebook however you reach the share dialog, so
 # a duplicate changes nothing about the URL, only about whose menu opens.
 _NLM_AUDIO_MENU_SCOPES = [
-    {"name": "audio-card", "sel": "artifact-library-item", "needs": "audio_magic_eraser"},
-    {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": ""},
-    {"name": "studio-panel", "sel": "studio-panel", "needs": ""},
+    {"name": "audio-card", "sel": "artifact-library-item", "needs": list(_NLM_AUDIO_ICONS)},
+    {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": []},
+    {"name": "studio-panel", "sel": "studio-panel", "needs": []},
 ]
 
 # Ordered hooks within the scope. Exact label first so a rename to "More
@@ -68852,9 +68880,10 @@ _NLM_FIND_AUDIO_TRIGGER_JS = r"""
     const findTrigger = (P) => {
         for (const g of (P.scopes || [])) {
             for (const scope of document.querySelectorAll(g.sel)) {
-                if (g.needs) {
+                // `needs`: the card must carry ANY of these icon names.
+                if (g.needs && g.needs.length) {
                     const st = (scope.innerText || scope.textContent || '');
-                    if (st.indexOf(g.needs) === -1) continue;
+                    if (!g.needs.some(n => st.indexOf(n) !== -1)) continue;
                 }
                 for (const sel of (P.triggers || [])) {
                     for (const btn of scope.querySelectorAll(sel)) {
@@ -69094,6 +69123,34 @@ async def _nlm_census_settled(page, expected_names, attempts=4, interval=3.0):
     return present, row_count
 
 
+#: How long the DOM upload waits for NotebookLM's Add-sources dialog to show an
+#: upload control after "New notebook" (or "Add source"). The 09-30 dialog
+#: mounted a few seconds after the old 3 s give-up. See `_nlm_dom_add_files`.
+_NLM_UPLOAD_CONTROL_WAIT_S = 15
+
+#: The labels of NotebookLM's upload control inside the Add-sources dialog —
+#: ONE list for the look (`_nlm_upload_control_on_screen`) and the press (the
+#: chooser path in `_nlm_dom_add_files`), so the two cannot disagree about what
+#: an upload control is.
+_NLM_UPLOAD_CONTROL_PATTERNS = (r"upload file", r"choose file", r"select file",
+                                r"\bbrowse\b", r"\bupload\b")
+
+
+async def _nlm_upload_control_on_screen(page) -> bool:
+    """Is an upload control on screen right now? A LOOK, never a press: the
+    same matcher the press uses (`_NLM_CLICK_JS`) finds it, and the mark that
+    matcher leaves is removed at once so nothing later aims at it."""
+    try:
+        picked = await page.evaluate(_NLM_CLICK_JS, list(_NLM_UPLOAD_CONTROL_PATTERNS))
+    except Exception:
+        return False
+    try:
+        await page.evaluate(_SR_UNMARK_JS, {"attr": _SR_CLICK_MARK})
+    except Exception:
+        pass
+    return bool(isinstance(picked, dict) and picked.get("label"))
+
+
 async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
     """Add files to the CURRENT notebook via NotebookLM's own DOM. Opens the
     Add-sources dialog if needed, then feeds every path in ONE go through the
@@ -69104,22 +69161,43 @@ async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
     try:
         # The Add-sources dialog auto-opens on a fresh notebook; otherwise
         # open it ("Add source" / "+" in the sources panel).
+        #
+        # ⭐⭐ 2026-09-30 — WAIT FOR THE UPLOAD CONTROL, up to
+        # `_NLM_UPLOAD_CONTROL_WAIT_S`. This gave up about 3 s after "New
+        # notebook": two looks, no "Add source" to press, done. On 09-19 the
+        # create label was slower to press and two 4 s click timeouts happened
+        # to give the dialog time to mount; the faster 09-30 "New notebook" flow
+        # took that accident away, and the dialog mounted a few seconds after
+        # we had handed both files to computer use (3 + 3 steps, 05:32:53). So
+        # the wait is now on purpose: poll until the hidden file input or an
+        # upload control is on screen. "Add source" is pressed only while
+        # neither is there, and at most every few seconds, so a dialog that is
+        # still opening is not pressed over.
         inp = None
-        for attempt in range(3):
+        _add_pressed_at = None
+        _waited = 0.0
+        while True:
             try:
                 inp = await page.query_selector('input[type="file"]')
             except Exception:
                 inp = None
             if inp:
                 break
-            # (review r2) no bare '^add' pattern — mat-icon ligatures make
-            # every '+' button's textContent start with 'add', and a stray
-            # match creates notes / opens the wrong dialog.
-            clicked = await _nlm_click_first(page, (
-                r"^add source", r"\badd sources?\b", r"upload sources?"))
-            if attempt and not clicked:
+            if await _nlm_upload_control_on_screen(page):
+                break      # the chooser path below presses it
+            if _waited >= _NLM_UPLOAD_CONTROL_WAIT_S:
+                log(f"[{label}] DOM upload: no upload control after "
+                    f"{int(_waited)}s", "INFO")
                 break
-            await asyncio.sleep(2)
+            if _add_pressed_at is None or _waited - _add_pressed_at >= 4:
+                # (review r2) no bare '^add' pattern — mat-icon ligatures make
+                # every '+' button's textContent start with 'add', and a stray
+                # match creates notes / opens the wrong dialog.
+                if await _nlm_click_first(page, (
+                        r"^add source", r"\badd sources?\b", r"upload sources?")):
+                    _add_pressed_at = _waited
+            await asyncio.sleep(1)
+            _waited += 1
         if inp:
             try:
                 await inp.set_input_files(paths)
@@ -69163,9 +69241,8 @@ async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
             # global handler below can only answer a chooser that opened; this is
             # what makes "it opened" an observation rather than an inference, and
             # a synthetic in-page click could never have produced one at all.
-            clicked = await _nlm_click_first(page, (
-                r"upload file", r"choose file", r"select file", r"\bbrowse\b",
-                r"\bupload\b"), expect_chooser=True)
+            clicked = await _nlm_click_first(page, _NLM_UPLOAD_CONTROL_PATTERNS,
+                                             expect_chooser=True)
             if clicked.endswith("|chooser"):
                 clicked = clicked[: -len("|chooser")]
                 log(f"[{label}] DOM upload: file chooser opened from "
@@ -69431,6 +69508,17 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
                     browser.clear_upload_file()
                 await asyncio.sleep(3)
             continue  # next round re-censuses
+        # ⭐⭐ 2026-09-30 — EVERY FILE IS LISTED: NO COMPUTER-USE LOOK. The census
+        # found each filename in the Sources panel's own rows, which is the
+        # question this step asks. On 09-30 the computer-use check then spent
+        # two steps to say "all sources OK" about the same list. It still runs
+        # when the census could only read the page's text (no source rows
+        # matched), where a filename seen is weaker evidence.
+        if _rows > 0:
+            log(f"[NotebookLM] source census (round {_round}): all "
+                f"{len(expected)} files are listed in the Sources panel — no "
+                f"computer-use check needed")
+            return set()
         if not cua_client:
             log(f"[NotebookLM] source census (round {_round}): all "
                 f"{len(expected)} present (no CUA for red-state check)")
@@ -70908,34 +70996,46 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             audio_done = True
             break
 
-        # CUA fallback — strict: only "audio complete" counts.
-        # 2026-05-14: prompt is length-aware so CUA looks at the SAME
-        # card the generate step produced (not a hardcoded Long + Deep
-        # Dive that doesn't exist for short/default runs).
-        _audio_check_mission = make_prompt_audio_check(podcast_length)
+        # ⭐⭐ 2026-09-30 — NO COMPUTER-USE LOOK WHILE THE PAGE SAYS "GENERATING".
+        # When the Studio panel itself shows the "Generating Audio Overview…"
+        # placeholder, the answer is already on the page: still going. On the
+        # 09-30 run the computer-use check ran 11 times in 17 minutes and said
+        # "still generating" every time, reading that same placeholder off a
+        # screenshot. It still runs on a poll where the page is not that clear.
+        _gen_now = await _count_nlm_audio_generating(browser.page)
+        if _gen_now > 0:
+            log(f"[Phase3] the page shows {_gen_now} audio overview(s) still being "
+                f"made — no computer-use check this round")
+            diag_text = ""
+        else:
+            # CUA fallback — strict: only "audio complete" counts.
+            # 2026-05-14: prompt is length-aware so CUA looks at the SAME
+            # card the generate step produced (not a hardcoded Long + Deep
+            # Dive that doesn't exist for short/default runs).
+            _audio_check_mission = make_prompt_audio_check(podcast_length)
 
-        async def _audio_check_cua():
-            return await agent_loop(cua_client, browser, _audio_check_mission,
-                "Check: Has audio generation FINISHED? Is there a completed audio player "
-                "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
-                model=CUA_MODEL, max_iterations=3, verbose=verbose)
+            async def _audio_check_cua():
+                return await agent_loop(cua_client, browser, _audio_check_mission,
+                    "Check: Has audio generation FINISHED? Is there a completed audio player "
+                    "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
 
-        # #839 act tier — STRICTLY READ_ONLY (#778): a single click on any audio
-        # card here fires the DEFAULT-audio duplicate, so Vision may only READ
-        # and return a verdict; any proposed action defers to CUA unexecuted.
-        # The 'audio complete' marker is parsed from the returned text below in
-        # every mode; DOM (_check_audio_complete_dom) above is authoritative.
-        diag = await _shadow_observed_cua(
-            browser.page, hotspot_id="audio-check", phase=3, platform="notebooklm",
-            current_step="poll_audio_complete",
-            context_hint="READ ONLY — do not click anything. Is there a COMPLETED audio "
-                         "player with NO progress indicator/spinner? Say 'audio complete' "
-                         "only if fully done, otherwise say it is still generating.",
-            expected_outcome="an honest 'audio complete' verdict only when fully done",
-            cua_coro_factory=_audio_check_cua,
-            mission_prompt=_audio_check_mission,
-            read_only=True) or {}
-        diag_text = (diag.get("text") or "").lower()
+            # #839 act tier — STRICTLY READ_ONLY (#778): a single click on any audio
+            # card here fires the DEFAULT-audio duplicate, so Vision may only READ
+            # and return a verdict; any proposed action defers to CUA unexecuted.
+            # The 'audio complete' marker is parsed from the returned text below in
+            # every mode; DOM (_check_audio_complete_dom) above is authoritative.
+            diag = await _shadow_observed_cua(
+                browser.page, hotspot_id="audio-check", phase=3, platform="notebooklm",
+                current_step="poll_audio_complete",
+                context_hint="READ ONLY — do not click anything. Is there a COMPLETED audio "
+                             "player with NO progress indicator/spinner? Say 'audio complete' "
+                             "only if fully done, otherwise say it is still generating.",
+                expected_outcome="an honest 'audio complete' verdict only when fully done",
+                cua_coro_factory=_audio_check_cua,
+                mission_prompt=_audio_check_mission,
+                read_only=True) or {}
+            diag_text = (diag.get("text") or "").lower()
 
         if "audio complete" in diag_text:
             if not dom_complete:
@@ -71400,7 +71500,7 @@ async def _check_audio_complete_dom(page) -> bool:
     "audio_magic_eraser" icon ligature + the real title once done.
     """
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_nlm_js("""() => {
             // Still generating → the placeholder is present and no audio card
             // has materialized. Cross-checks _check_audio_generating's
             // body-wide read but scoped to the artifact container.
@@ -71412,10 +71512,10 @@ async def _check_audio_complete_dom(page) -> bool:
             const items = document.querySelectorAll('artifact-library-item');
             for (const el of items) {
                 if (el.offsetParent === null) continue;
-                if ((el.innerText || el.textContent || '').includes('audio_magic_eraser')) return true;
+                if (__NLM_AUDIO_ICON__.test(el.innerText || el.textContent || '')) return true;
             }
             return false;
-        }""") or False
+        }""")) or False
     except Exception:
         return False
 
@@ -71556,14 +71656,15 @@ def _nlm_notebook_id(url: str) -> str:
 #
 # _count_nlm_audio_cards / _count_nlm_deep_dive_cards / _check_audio_complete_dom
 # all count the SAME population — visible <artifact-library-item> elements
-# whose text carries the "audio_magic_eraser" Material-icon ligature — pinned
+# whose text carries an audio icon ligature (`_NLM_AUDIO_ICONS`: the 06-03
+# "audio_magic_eraser", renamed "audio_spark" by 09-30) — pinned
 # from the #757-B dom-dump (2026-06-03). The OLD guessed selectors
 # ([role=article]/[class*=audio-card]/[data-testid*=audio] + an <audio> element +
 # [role=progressbar]) matched NOTHING in the live Studio panel, so every count
 # read 0 and every dup-guard was a dead no-op. If NotebookLM ships a Studio
-# redesign that drops the artifact-library-item tag or the audio_magic_eraser
-# ligature (e.g. re-renders the icon as an SVG / CSS ::before, where the literal
-# string leaves both innerText AND textContent), all three break together and
+# redesign that drops the artifact-library-item tag or renames the icon again
+# (it did on 09-30), or re-renders the icon as an SVG / CSS ::before (where the
+# literal string leaves both innerText AND textContent), all three break together and
 # revert to 0 — fail-OPEN (healthy runs proceed, dups slip) — and the read-only
 # _dump_nlm_audio_dom on the zero-path is the canary to re-pin them.
 #
@@ -71588,7 +71689,7 @@ async def _count_nlm_audio_cards(page) -> int:
     clicks anything. Returns 0 on any DOM exception.
     """
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_nlm_js("""() => {
             // Real NLM Studio markup (pinned from the #757-B dom-dump,
             // 2026-06-03): a generated audio is an <artifact-library-item>
             // whose text carries the "audio_magic_eraser" Material-icon
@@ -71616,10 +71717,10 @@ async def _count_nlm_audio_cards(page) -> int:
                 // duplicate WARN, from the very fix that exists to stop the
                 // count disagreeing with the screen.
                 if (/generating audio overview/i.test(t)) return;
-                if (t.includes('audio_magic_eraser')) count++;
+                if (__NLM_AUDIO_ICON__.test(t)) count++;
             });
             return count;
-        }""") or 0
+        }""")) or 0
     except Exception:
         return 0
 
@@ -71682,16 +71783,16 @@ async def _count_nlm_deep_dive_cards(page) -> int:
     it (Format + Length are enforced upstream by make_prompt_audio_generate).
     """
     try:
-        return await page.evaluate("""() => {
+        return await page.evaluate(_nlm_js("""() => {
             const items = document.querySelectorAll('artifact-library-item');
             let count = 0;
             items.forEach((el) => {
                 if (el.offsetParent === null) return;
                 const t = (el.innerText || el.textContent || '');
-                if (t.includes('audio_magic_eraser') && /deep dive/i.test(t)) count++;
+                if (__NLM_AUDIO_ICON__.test(t) && /deep dive/i.test(t)) count++;
             });
             return count;
-        }""") or 0
+        }""")) or 0
     except Exception:
         return 0
 
@@ -71780,10 +71881,10 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     download) — Part A prevention is the real guarantee; this is the safety net.
     """
     try:
-        info = await page.evaluate(r"""() => {
+        info = await page.evaluate(_nlm_js(r"""() => {
             const items = Array.from(document.querySelectorAll('artifact-library-item'))
                 .filter((el) => el.offsetParent !== null
-                    && ((el.innerText || el.textContent || '').includes('audio_magic_eraser')));
+                    && __NLM_AUDIO_ICON__.test(el.innerText || el.textContent || ''));
             const cards = items.map((el, i) => {
                 const t = (el.innerText || el.textContent || '');
                 const low = t.toLowerCase();
@@ -71798,7 +71899,7 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
                 };
             });
             return { count: cards.length, cards };
-        }""")
+        }"""))
     except Exception as _e:
         return {"count": 0, "target_ordinal": 1, "complete": False,
                 "ambiguous": False, "reason": f"evaluate_failed:{type(_e).__name__}",

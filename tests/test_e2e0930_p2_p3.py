@@ -1,0 +1,458 @@
+"""The owner's 09-30 run — Phase 2 setup and Phase 3 on the changed pages.
+
+Round 1: only what needs no new capture. Every test here drives the consumer
+the run went through, and fails on the code the run used (2eddcf8).
+
+  1. NotebookLM renamed its audio icon (`audio_magic_eraser` → `audio_spark`).
+     The done check, the card counts, the download picker and the ⋮-menu scope
+     all looked for the old name, so the finished audio was invisible to the
+     page read: 12 computer-use checks over 17 minutes. And the computer-use
+     check ran on every poll even while the page itself said "Generating".
+  2. NotebookLM's upload gave up ~3 s after "New notebook", before the
+     Add-sources dialog mounted (3 + 3 computer-use steps), and the source
+     check spent 2 more computer-use steps on a list the page already showed.
+  3. ChatGPT's "+" lost its test id on 09-28; New chat was judged 2 s after
+     the press, while the old thread was still on screen (17 s lost).
+  4. Claude's effort was judged once, in setup. The tier was Low by Send and
+     nothing said so; the computer-use passes spent six steps on a hover
+     submenu they cannot hold open.
+
+The markup below is the 09-30 run's own #757-B dump (run.log 05:54:11) and the
+captured ChatGPT page (tests/fixtures/chatgpt_0928/new_page.html). Nothing here
+opens a real website: page JS runs under node against those shapes, and the one
+browser test loads the local fixture into headless Chrome.
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import research
+from _domshim import NODE, el, run_js
+
+needs_node = pytest.mark.skipif(NODE is None, reason="node runs the page scripts")
+
+GEN = "Generating Audio Overview…"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The pages
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _audio_tile():
+    """The Studio's "Audio Overview" create tile, as the 09-30 dump shows it.
+    It carries the SAME icon name as a finished card — which is why every
+    reader must look inside <artifact-library-item> only."""
+    return el("basic-create-artifact-button", {}, "", [
+        el("div", {"role": "button", "aria-label": "Audio Overview",
+                   "class": "mat-mdc-tooltip-trigger blue create-artifact-button-container"},
+           "", [el("span", {"class": "default-container"}, "", [
+               el("span", {"class": "icon-container"}, "", [
+                   el("mat-icon", {}, "audio_spark"),
+                   el("span", {"class": "create-label-container"}, "Audio Overview")]),
+               el("mat-icon", {}, "chevron_forward")])])])
+
+
+def _audio_card(icon="audio_spark", title="Golden Retriever Science Versus Marketing Myths",
+                meta="61:59 · Deep dive · 2 sources · 5m ago"):
+    """A finished audio card — artifact-library-item.has-unseen-dot, text
+    'audio_sparkUnread Golden Retriever Science Versus Marketing…' (05:54:11)."""
+    return el("artifact-library-item", {"class": "has-unseen-dot",
+                                        "data-studio-accent": "blue"}, "", [
+        el("div", {"class": "artifact-item-button"}, "", [
+            el("div", {"class": "artifact-button-content"}, "", [
+                el("div", {"class": "artifact-primary-content", "aria-hidden": "true"}, "", [
+                    el("mat-icon", {}, icon), el("span", {}, "Unread"),
+                    el("span", {}, title)]),
+                el("div", {"class": "artifact-secondary"}, meta)])]),
+        el("button", {"aria-label": "More", "aria-haspopup": "menu", "id": f"kebab-{icon}"}, "")])
+
+
+def _study_guide():
+    """Another artifact type in the same library, with its own icon."""
+    return el("artifact-library-item", {}, "", [
+        el("div", {"class": "artifact-primary-content"}, "", [
+            el("mat-icon", {}, "stylus_note"), el("span", {}, "Study guide")]),
+        el("button", {"aria-label": "More", "aria-haspopup": "menu", "id": "kebab-study"}, "")])
+
+
+def _placeholder():
+    return el("div", {"class": "artifact-placeholder"}, "", [
+        el("span", {}, GEN), el("span", {}, "Come back in a few minutes")])
+
+
+def _studio(*items):
+    """The Studio panel chain from the dump: notebook > section.studio-panel >
+    studio-panel > … > artifact-library-container > artifact-library."""
+    return el("body", {}, "", [el("notebook", {}, "", [
+        el("section", {"class": "studio-panel", "data-panel-state": "studio-home"}, "", [
+            el("studio-panel", {}, "", [
+                el("div", {"class": "panel-content-scrollable"}, "", [
+                    el("div", {"class": "create-artifact-buttons-container"}, "", [_audio_tile()]),
+                    el("div", {"class": "artifact-library-container"}, "", [
+                        el("artifact-library", {"class": "luminous-ui"}, "", [
+                            el("div", {"class": "artifact-library-ungrouped-items"}, "",
+                               list(items))])])])])])])])
+
+
+class NodePage:
+    """`evaluate` RUNS each script under node against the current spec. A
+    reload moves to the next spec in the list (the page NotebookLM serves on
+    the next poll); the last one repeats. The poll reloads at the START of
+    every cycle, so the first spec is the page before the poll begins."""
+
+    def __init__(self, *specs, url="https://notebooklm.google.com/notebook/nb-0930"):
+        self.specs, self.i, self.url = list(specs), 0, url
+        self.keys = []
+        self.keyboard = SimpleNamespace(press=self._press)
+
+    @property
+    def spec(self):
+        return self.specs[min(self.i, len(self.specs) - 1)]
+
+    async def _press(self, key):
+        self.keys.append(key)
+
+    async def evaluate(self, script, arg=None):
+        return run_js(self.spec, script, arg).get("ret")
+
+    async def reload(self, **kw):
+        self.i += 1
+
+    def is_closed(self):
+        return False
+
+
+def _go(coro):
+    return asyncio.run(coro)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. NotebookLM: the renamed audio icon, everywhere
+# ═════════════════════════════════════════════════════════════════════════════
+
+@needs_node
+def test_the_finished_0930_card_reads_as_done():
+    assert _go(research._check_audio_complete_dom(NodePage(_studio(_audio_card())))) is True
+
+
+@needs_node
+def test_the_finished_0930_card_is_counted_once_and_the_create_tile_is_not():
+    page = NodePage(_studio(_audio_card()))
+    assert _go(research._count_nlm_audio_cards(page)) == 1
+    assert _go(research._count_nlm_deep_dive_cards(page)) == 1
+
+
+@needs_node
+def test_the_picker_finds_the_0930_card():
+    """05:54:11 'Download target: ordinal=1/0 (… no_cards)' — the picker saw none."""
+    got = _go(research._pick_nlm_audio_card(NodePage(_studio(_audio_card())), "long"))
+    assert got["count"] == 1 and got["complete"] is True, got
+
+
+@needs_node
+def test_the_old_icon_name_still_reads():
+    """Both names stay: a page still serving the old one must not go blind."""
+    page = NodePage(_studio(_audio_card(icon="audio_magic_eraser")))
+    assert _go(research._check_audio_complete_dom(page)) is True
+    assert _go(research._count_nlm_audio_cards(page)) == 1
+
+
+@needs_node
+def test_other_artifacts_are_still_not_audio():
+    page = NodePage(_studio(_study_guide()))
+    assert _go(research._check_audio_complete_dom(page)) is False
+    assert _go(research._count_nlm_audio_cards(page)) == 0
+
+
+@needs_node
+def test_the_audio_menu_opens_on_the_audio_card_not_the_study_guide_above_it():
+    """The ⋮-menu scope's first rung is "an artifact item carrying the audio
+    icon". Blind to the new name, it fell to "any artifact item" (05:54:12
+    'via=artifact-item') — which, with a study guide listed first, is the
+    study guide's menu."""
+    out = run_js(_studio(_study_guide(), _audio_card()), research._NLM_OPEN_AUDIO_MENU_JS,
+                 {"scopes": research._NLM_AUDIO_MENU_SCOPES,
+                  "triggers": research._NLM_AUDIO_TRIGGER_SELS})
+    assert out["ret"]["via"] == "audio-card", out["ret"]
+    assert out["ret"]["in_audio_card"] is True and len(out["clicks"]) == 1, out
+
+
+# ── the poll loop, run for real ─────────────────────────────────────────────
+
+def _poll_loop_source() -> str:
+    """run_phase3_audio's completion poll, verbatim, as a function."""
+    src = inspect.getsource(research.run_phase3_audio)
+    a = src.index("    while True:\n        # ── Stop/Pause check per cycle ──")
+    b = src.index("    # Download audio", a)
+    body = textwrap.indent(textwrap.dedent(src[a:b]), "    ")
+    return ("async def __poll__(browser, cua_client, podcast_length, notebook_url,\n"
+            "                   verbose, poll_start):\n"
+            "    _dup_logged = False\n    audio_done = False\n"
+            + body + "    return audio_done\n")
+
+
+class _Controls:
+    """Stops the poll after `cycles` checks, so a reader that never sees the
+    finished card ends the test instead of hanging it."""
+
+    def __init__(self, cycles=8):
+        self.left = cycles
+
+    def is_stop(self):
+        self.left -= 1
+        return self.left < 0
+
+    def is_pause(self):
+        return False
+
+    async def interruptible_sleep(self, *a, **k):
+        return None
+
+
+class _FastAsyncio:
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+    @staticmethod
+    async def sleep(*a, **k):
+        return None
+
+
+def _run_poll(page, monkeypatch, cua_says="still generating"):
+    lines, cua_calls = [], []
+
+    async def _cua(*a, **k):
+        cua_calls.append(k.get("current_step"))
+        return {"text": cua_says}
+
+    async def _no(*a, **k):
+        return False
+
+    async def _nothing(*a, **k):
+        return None
+
+    monkeypatch.setattr(research, "log", lambda m, lv="INFO", *a, **k: lines.append((lv, m)))
+    ns = dict(vars(research))
+    ns.update({"_controls": _Controls(), "_shadow_observed_cua": _cua,
+               "_browser_context_is_dead": _no, "_work_tab_signed_out": _no,
+               "_dump_nlm_audio_dom": _nothing, "emit_event": lambda *a, **k: None,
+               "asyncio": _FastAsyncio(),
+               "log": lambda m, lv="INFO", *a, **k: lines.append((lv, m))})
+    exec(compile(_poll_loop_source(), "<poll>", "exec"), ns)
+    done = _go(ns["__poll__"](SimpleNamespace(page=page), object(), "long",
+                              page.url, False, research.time.time()))
+    return done, cua_calls, [m for _, m in lines]
+
+
+@needs_node
+def test_no_computer_use_look_while_the_page_says_generating(monkeypatch):
+    """The 09-30 poll: placeholder, placeholder, then the finished card. The
+    page answered every one of those polls by itself."""
+    page = NodePage(_studio(_placeholder()),                      # before the poll
+                    _studio(_placeholder()), _studio(_placeholder()),
+                    _studio(_placeholder()), _studio(_audio_card()))
+    done, cua_calls, lines = _run_poll(page, monkeypatch)
+    assert done is True
+    assert cua_calls == [], f"computer use looked {len(cua_calls)} time(s) at a generating card"
+    assert any("Audio generation complete ✓ (DOM-detected)" in m for m in lines), lines
+    assert sum("no computer-use check this round" in m for m in lines) == 3, lines
+
+
+@needs_node
+def test_computer_use_still_looks_when_the_page_shows_neither(monkeypatch):
+    """No placeholder and no finished card is not an answer — the fallback
+    stays for exactly that poll."""
+    page = NodePage(_studio(), _studio(), _studio(_audio_card()))
+    done, cua_calls, _lines = _run_poll(page, monkeypatch)
+    assert done is True and cua_calls == ["poll_audio_complete"], cua_calls
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. NotebookLM: wait for the upload control; no computer-use look at a listed set
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def asyncio(self):
+        clock = self
+
+        class _A:
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+            @staticmethod
+            async def sleep(secs=0, *a, **k):
+                clock.t += float(secs or 0)
+        return _A()
+
+
+class _Input:
+    def __init__(self):
+        self.files = []
+
+    async def set_input_files(self, files):
+        self.files.extend(files)
+
+
+class _NewNotebookPage:
+    """A fresh notebook whose Add-sources dialog mounts `mounts_at` seconds in:
+    before that there is no file input and no control matching anything."""
+
+    def __init__(self, clock, mounts_at):
+        self.clock, self.mounts_at = clock, mounts_at
+        self.input = _Input()
+        self.url = "https://notebooklm.google.com/notebook/nb-0930"
+
+    async def query_selector(self, sel):
+        if sel == 'input[type="file"]' and self.clock.t >= self.mounts_at:
+            return self.input
+        return None
+
+    async def evaluate(self, script, arg=None):
+        return None            # no control matches, nothing to unmark
+
+
+def _add_files(monkeypatch, mounts_at):
+    clock = _Clock()
+    monkeypatch.setattr(research, "asyncio", clock.asyncio())
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    page = _NewNotebookPage(clock, mounts_at)
+    browser = SimpleNamespace(set_upload_file=lambda p: None, clear_upload_file=lambda: None,
+                              _upload_queue=[])
+    ok = _go(research._nlm_dom_add_files(browser, page, ["/q/chatgpt.md", "/q/claude.md"]))
+    return ok, page, clock
+
+
+def test_the_upload_waits_for_a_dialog_that_mounts_six_seconds_in(monkeypatch):
+    """05:32:50 create, 05:32:53 'no Upload control found', 05:32:59 the
+    computer use sees the dialog with its Upload files button."""
+    ok, page, clock = _add_files(monkeypatch, mounts_at=6)
+    assert ok is True
+    assert page.input.files == ["/q/chatgpt.md", "/q/claude.md"]
+
+
+def test_the_upload_wait_is_bounded(monkeypatch):
+    ok, page, clock = _add_files(monkeypatch, mounts_at=10_000)
+    assert ok is False and page.input.files == []
+    assert 14 <= clock.t <= 18, f"waited {clock.t}s — the bound is about 15 s"
+
+
+class _DialogPage:
+    """The Add-sources dialog mounts at `mounts_at` s with an "Upload files"
+    control and no file input; pressing that control reveals the input. Page
+    JS runs for real under node against whichever page is up at that moment."""
+
+    def __init__(self, clock, mounts_at):
+        self.clock, self.mounts_at = clock, mounts_at
+        self.input, self.pressed = _Input(), []
+        self.url = "https://notebooklm.google.com/notebook/nb-0930"
+        self.marked = None
+
+    def _spec(self):
+        kids = [el("div", {"class": "source-panel"}, "", [el("p", {}, "Sources")])]
+        if self.clock.t >= self.mounts_at:
+            kids.append(el("div", {"role": "dialog", "w": "600", "h": "400"}, "", [
+                el("p", {}, "or drop your files"),
+                el("button", {"id": "upload-files"}, "", [
+                    el("mat-icon", {}, "upload"), el("span", {}, "Upload files")])]))
+        return el("body", {}, "", kids)
+
+    async def query_selector(self, sel):
+        if sel == 'input[type="file"]' and "upload-files" in self.pressed:
+            return self.input
+        return None
+
+    async def evaluate(self, script, arg=None):
+        out = run_js(self._spec(), script, arg, keep_dom=True)
+        hit = [n for n in _walk(out["dom"]) if research._SR_CLICK_MARK in n["attrs"]]
+        if hit:
+            self.marked = hit[0]["attrs"].get("id")
+        return out.get("ret")
+
+    async def click(self, sel, timeout=None):
+        self.pressed.append(self.marked)
+
+    async def hover(self, sel, timeout=None):
+        return None
+
+    def expect_file_chooser(self, timeout=None):
+        class _NoChooser:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                raise TimeoutError("no chooser — the dialog uses its hidden input")
+        return _NoChooser()
+
+
+def _walk(node):
+    yield node
+    for k in node.get("kids", []):
+        yield from _walk(k)
+
+
+@needs_node
+def test_an_upload_control_on_screen_ends_the_wait_and_is_pressed(monkeypatch):
+    """The dialog that mounted at 05:32:59 held an "Upload files" button. The
+    wait ends when it is SEEN, and that button is what gets pressed."""
+    clock = _Clock()
+    monkeypatch.setattr(research, "asyncio", clock.asyncio())
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    page = _DialogPage(clock, mounts_at=3)
+    browser = SimpleNamespace(set_upload_file=lambda p: None, clear_upload_file=lambda: None,
+                              _upload_queue=[])
+    ok = _go(research._nlm_dom_add_files(browser, page, ["/q/chatgpt.md"]))
+    assert ok is True and page.input.files == ["/q/chatgpt.md"], (page.pressed, clock.t)
+    assert page.pressed and page.pressed[0] == "upload-files", page.pressed
+    assert clock.t <= 7, f"the wait ran {clock.t}s past a control that was on screen"
+
+
+def _sources(*names, rows=True):
+    if rows:
+        kids = [el("div", {"class": "single-source-container"}, "", [
+            el("mat-icon", {}, "article"), el("span", {}, n)]) for n in names]
+    else:
+        kids = [el("p", {}, " ".join(names))]
+    return el("body", {}, "", [el("div", {"class": "source-panel"}, "", kids)])
+
+
+def _verify_sources(monkeypatch, spec):
+    cua_calls = []
+
+    async def _cua(*a, **k):
+        cua_calls.append(k.get("current_step"))
+        return {"text": "ALL OK"}
+
+    async def _nap(*a, **k):
+        return None
+
+    monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    monkeypatch.setattr(research, "asyncio", _FastAsyncio())
+    browser = SimpleNamespace(page=NodePage(spec))
+    missing = _go(research._verify_and_repair_nlm_sources(
+        browser, object(), [Path("/q/chatgpt.md"), Path("/q/claude.md")]))
+    return missing, cua_calls
+
+
+@needs_node
+def test_no_computer_use_source_check_when_every_file_is_listed(monkeypatch):
+    missing, cua_calls = _verify_sources(monkeypatch, _sources("chatgpt.md", "claude.md"))
+    assert missing == set()
+    assert cua_calls == [], "the Sources panel already listed every file"
+
+
+@needs_node
+def test_the_computer_use_check_stays_when_no_source_row_was_read(monkeypatch):
+    """Names found only in the page's text are weaker evidence than rows."""
+    missing, cua_calls = _verify_sources(
+        monkeypatch, _sources("chatgpt.md", "claude.md", rows=False))
+    assert missing == set() and cua_calls == ["verify_sources_health"], cua_calls

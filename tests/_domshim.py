@@ -141,12 +141,14 @@ def evaluate_js(fn, *, contains: str = "") -> str:
             # ⭐ 2026-09-28 — `page.evaluate(_cg_js("""…"""), …)`: ChatGPT's page
             # markers spliced in. Resolved with the module's own splice, so the
             # string returned is the one Playwright receives.
+            # ⭐ 2026-09-30 — and `_nlm_js("""…""")`: NotebookLM's audio-icon
+            # list spliced in the same way.
             elif (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
-                  and arg.func.id == "_cg_js" and len(arg.args) == 1
+                  and arg.func.id in ("_cg_js", "_nlm_js") and len(arg.args) == 1
                   and isinstance(arg.args[0], ast.Constant)
                   and isinstance(arg.args[0].value, str)
-                  and callable(getattr(owner, "_cg_js", None))):
-                value = owner._cg_js(arg.args[0].value)
+                  and callable(getattr(owner, arg.func.id, None))):
+                value = getattr(owner, arg.func.id)(arg.args[0].value)
             if value is not None:
                 if not contains or contains in value:
                     hits.append(value)
