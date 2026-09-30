@@ -29427,16 +29427,15 @@ _HOTSPOT_VISION_HINTS = {
     # via _observe_dom_success. Hints agree with make_prompt_audio_generate /
     # make_prompt_audio_download / _set_nlm_public_and_get_link.
     "p3-audio-customize": {
-        "expected_outcome": "NotebookLM's Audio Overview customize panel opens (Format + Length controls visible)",
+        "expected_outcome": "NotebookLM's 'Customise Audio Overview' window opens (Format + Length options visible)",
         "context_hint": (
-            "Open NotebookLM's Audio Overview customize panel. The target is the gear / "
-            "'Customise' arrow / pencil-edit affordance ON the Audio Overview card in the "
-            "Studio panel (right side) — a SEPARATE small control, NOT the card body. Do NOT "
-            "click the card body, its title, thumbnail, or play area (that fires NotebookLM's "
-            "one-click DEFAULT audio = an unwanted duplicate). Click ONLY the customize gear/arrow."
+            "Open NotebookLM's 'Customise Audio Overview' window. The target is the "
+            "'Audio Overview' tile in the Studio panel's grid of create tiles (right side) "
+            "— click the tile itself, ONCE; it opens the window. Do NOT click an existing "
+            "audio entry listed below the tiles (its row, title or play button)."
         ),
-        "success_signals": ["a customize panel with a Format dropdown (Deep Dive / Brief)",
-                            "a Length selector", "a Generate button inside the panel"],
+        "success_signals": ["a 'Customise Audio Overview' window with Format options (Deep dive / Brief / Critique / Debate)",
+                            "a Length row (Short / Default / Long)", "a 'Generate now' button in the window"],
     },
     "p3-audio-download": {
         "expected_outcome": "the requested audio overview's .m4a file begins downloading",
@@ -29816,27 +29815,25 @@ _HOTSPOT_VISION_HINTS = {
         ],
     },
     "audio-generate": {
-        "expected_outcome": "exactly ONE NotebookLM audio overview starts generating with the requested Format/Length (default Deep Dive / Long) — a single new audio card shows a 'Generating…' progress indicator",
+        "expected_outcome": "exactly ONE NotebookLM audio overview starts generating with the requested Format/Length (default Deep dive / Long) — a single new audio card shows a 'Generating…' progress indicator",
         "context_hint": (
             "Generate EXACTLY ONE NotebookLM Audio Overview with the requested "
-            "Format/Length (default Deep Dive / Long) in the Studio panel on the RIGHT. "
-            "If the Audio Overview customize panel is ALREADY OPEN (a Format selector "
-            "is visible), go straight to it: set the Format dropdown + the Length "
-            "dropdown, then click that panel's Generate button ONCE — this is the FINAL "
-            "click. If the panel is NOT open, first click ONLY the gear / 'Customise' "
-            "arrow / three-dot control ON the Audio Overview card to open it, confirm "
-            "the Format selector appears, then set Format/Length and Generate once. Do "
-            "NOT click the Audio Overview card body, its title text, thumbnail, or play "
-            "area; do NOT click any Generate/Create on the card before the customize "
-            "panel is open; do NOT click an already-existing audio entry's play button "
-            "or row; and after the single Generate click do NOT click ANYTHING (not the "
+            "Format/Length (default Deep dive / Long) in the Studio panel on the RIGHT. "
+            "If the 'Customise Audio Overview' window is ALREADY OPEN (Format options "
+            "are visible), go straight to it: choose the Format option, then the Length "
+            "option, then click 'Generate now' ONCE — this is the FINAL click. If the "
+            "window is NOT open, first click the 'Audio Overview' tile ONCE to open it, "
+            "confirm the Format options appear, then choose Format/Length and click "
+            "'Generate now' once. Never click 'Generate later'; do NOT click the tile a "
+            "second time; do NOT click an already-existing audio entry's play button "
+            "or row; and after 'Generate now' do NOT click ANYTHING (not the "
             "new/generating card, not a play/verify/open/Interactive-mode/Join/Share "
-            "control) — one stray click fires an undeletable DEFAULT-audio duplicate."
+            "control) — a second Generate makes an undeletable duplicate."
         ),
         "success_signals": [
             "a 'Generating…' / loading / progress indicator on a new audio card",
             "exactly ONE audio entry in the Studio panel (no duplicate default audio)",
-            "the customize panel's Generate button was clicked once, then no further clicks"
+            "the Customise window's 'Generate now' was clicked once, then no further clicks"
         ],
     },
     "audio-check": {
@@ -71629,9 +71626,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # / CUA task copy. Mirrors make_prompt_audio_generate's table.
         _variant_label = {
             "short": ("Brief", "the Brief format (no separate length step)"),
-            "default": ("Deep Dive", "Deep Dive + Default length"),
-            "long": ("Deep Dive", "Deep Dive + Long length"),
-        }.get(podcast_length, ("Deep Dive", "Deep Dive + Long length"))
+            "default": ("Deep dive", "Deep dive + Default length"),
+            "long": ("Deep dive", "Deep dive + Long length"),
+        }.get(podcast_length, ("Deep dive", "Deep dive + Long length"))
         _fmt_short, _human_desc = _variant_label
         log(f"Starting audio generation ({_human_desc})...")
         _stop, _task = start_narration_ticker(
@@ -71639,48 +71636,59 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             f"Configuring audio overview ({_human_desc}) and clicking Generate",
             interval=20)
         try:
-            # #778 PREVENTION (the deterministic dup-kill): DOM-click the
-            # Customise ARROW to open the customize panel WITHOUT ever clicking
-            # the card body. The card BODY fires NotebookLM's one-click DEFAULT
-            # audio = the duplicate; the CUA agent, hunting for the
-            # open-affordance, was the one occasionally hitting the body. With
-            # the arrow DOM-clicked first, CUA starts from an already-open panel
-            # (panel_already_open=True) and only touches Format/Length + the
-            # terminal Generate — far from the body. Fail-open: if the arrow
-            # can't be found, panel_already_open=False runs the unchanged full
-            # CUA flow (its #757-A body-misclick guardrails hold). All calls
-            # here are exception-safe, but keeping them inside the try means the
-            # narration ticker's finally always stops it.
+            # ⭐ 2026-09-30 (capture 5): the page does the whole Customise job.
+            # The Audio Overview tile opens "Customise Audio Overview"; the
+            # configured Format, then Length, are chosen and read back; then
+            # "Generate now" is pressed once. Computer use runs only when the
+            # page could not finish — with the window already open when the
+            # page got that far (panel_already_open=True), so it never opens a
+            # second one; and never once the page's press on "Generate now"
+            # landed, even when nothing has shown yet. All calls here are
+            # exception-safe, but keeping them inside the try
+            # means the narration ticker's finally always stops it.
             _panel_opened = await _open_nlm_audio_customize(browser.page)
+            _dom_gen = {}
             if _panel_opened:
-                log("[Phase3] Customize panel opened via DOM arrow-click ✓ (no card-body click)")
-                await asyncio.sleep(1.5)  # let the panel render before CUA looks
                 # One-time-per-process READ-ONLY canary: dump the OPEN customize
-                # panel so the next E2E can pin the (un-supplied) Generate +
-                # length controls AND confirm the arrow opened the right panel.
+                # window so the next E2E can confirm the tile opened the right one.
                 # Gated so a healthy run logs it at most once per worker process.
                 if "customize-open" not in _NLM_CANARY_STATE:
                     _NLM_CANARY_STATE.add("customize-open")
                     await _dump_nlm_audio_dom(browser.page, "customize-open")
                 # Track-B success-path observe (P3 customize-open). Fire-and-forget,
-                # default-OFF; boolean ground-truth (the dup-kill arrow-click is JS,
-                # no bbox — deferred to avoid touching the #778 path).
+                # default-OFF; boolean ground-truth (no bbox).
                 _observe_dom_success(browser.page, hotspot_id="p3-audio-customize", phase=3,
                                      platform="notebooklm", current_step="open_audio_customize_panel",
-                                     dom_ground_truth=_gt_from_box(None, label="Customise Audio Overview",
-                                                                   clickedTag="button"))
+                                     dom_ground_truth=_gt_from_box(None, label="Audio Overview",
+                                                                   clickedTag="div"))
+                _dom_gen = await _nlm_customise_and_generate(browser.page, podcast_length)
+                if _dom_gen.get("generated"):
+                    _chosen = " + ".join(x for x in (_dom_gen.get("format"),
+                                                      _dom_gen.get("length")) if x)
+                    log(f"[Phase3] Audio started by the page: {_chosen} read back as "
+                        f"chosen, then \"Generate now\" pressed — no computer use")
+                elif _dom_gen.get("pressed"):
+                    log(f"[Phase3] \"Generate now\" was pressed once, but "
+                        f"{_dom_gen.get('reason') or 'nothing showed yet'} — not pressing "
+                        f"it again (a second press can make a second audio that cannot "
+                        f"be deleted); the checks below keep watching for it", "WARN")
+                else:
+                    log(f"[Phase3] The page could not finish Customise "
+                        f"({_dom_gen.get('reason') or 'no reason given'}) — computer "
+                        f"use takes over with the window open", "WARN")
             else:
-                log("[Phase3] DOM arrow-click didn't find the Customise control — "
-                    "CUA will open customize itself (fail-open)", "WARN")
+                log("[Phase3] The page could not open Customise Audio Overview — "
+                    "computer use will open it from the tile", "WARN")
             _prompt = make_prompt_audio_generate(podcast_length,
                                                  panel_already_open=_panel_opened)
             _task_str = (
-                f"The Audio Overview customize panel is already OPEN. Set "
-                f"{_human_desc} in that panel, then click Generate ONCE. Say "
-                f"'generating' when started. Do NOT click the audio card body."
+                f"The Customise Audio Overview window is already OPEN. Choose "
+                f"{_human_desc} in it, then click \"Generate now\" ONCE. Say "
+                f"'generating' when started. Do NOT click the Audio Overview tile again."
             ) if _panel_opened else (
-                f"Generate ONE audio overview. Select all sources, set "
-                f"{_human_desc}, click Generate ONCE. Say 'generating' when started."
+                f"Generate ONE audio overview. Select all sources, click the Audio "
+                f"Overview tile ONCE to open Customise, choose {_human_desc}, click "
+                f"\"Generate now\" ONCE. Say 'generating' when started."
             )
             # #757 (2026-06-02): keep max_iterations at 15 — do NOT lower it to
             # "kill" the duplicate. The duplicate is a card-body misclick on the
@@ -71731,18 +71739,27 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                     log(f"[Phase3] act-net guard probe errored ({_pge}) — allowing CUA net", "WARN")
                 return None
 
-            _ag_result = await _shadow_observed_cua(
-                browser.page, hotspot_id="audio-generate", phase=3, platform="notebooklm",
-                current_step=("configure_generate_audio_panel_open" if _panel_opened
-                              else "configure_generate_audio_full"),
-                context_hint=(_task_str + " CRITICAL: only touch the Format/Length "
-                              "controls and the Generate button — NEVER the audio card "
-                              "body/title/thumbnail (that makes an undeletable duplicate)."),
-                expected_outcome="one audio overview starts generating with the requested format/length",
-                cua_coro_factory=_audio_generate_cua,
-                mission_prompt=f"{_prompt}\n\nTASK: {_task_str}",
-                act_timeout_s=180.0,
-                pre_cua_net_probe=_audio_gen_net_probe) or {}
+            if _dom_gen.get("pressed"):
+                # The page's own press on "Generate now" landed. Whether or not
+                # the audio has shown yet, a computer-use pass here could only
+                # press Generate a second time (#778). The verify, the
+                # post-generate inventory and the poll below watch for it.
+                _ag_result = {"text": "generating"}
+            else:
+                _ag_result = await _shadow_observed_cua(
+                    browser.page, hotspot_id="audio-generate", phase=3, platform="notebooklm",
+                    current_step=("configure_generate_audio_panel_open" if _panel_opened
+                                  else "configure_generate_audio_full"),
+                    context_hint=(_task_str + " CRITICAL: only the Audio Overview tile "
+                                  "(once, to open Customise), the Format/Length options and "
+                                  "\"Generate now\" — never \"Generate later\", never an "
+                                  "existing audio card, and nothing after Generate now (a "
+                                  "second Generate makes an undeletable duplicate)."),
+                    expected_outcome="one audio overview starts generating with the requested format/length",
+                    cua_coro_factory=_audio_generate_cua,
+                    mission_prompt=f"{_prompt}\n\nTASK: {_task_str}",
+                    act_timeout_s=180.0,
+                    pre_cua_net_probe=_audio_gen_net_probe) or {}
         finally:
             await stop_narration_ticker(_stop, _task)
 
@@ -72804,55 +72821,287 @@ async def _count_nlm_deep_dive_cards(page) -> int:
 _NLM_CANARY_STATE: set = set()
 
 
-async def _open_nlm_audio_customize(page) -> bool:
-    """#778 PREVENTION (the deterministic dup-kill): DOM-click the Audio
-    Overview *Customise* ARROW to open the customize panel WITHOUT ever clicking
-    the card body. Clicking the card BODY fires NotebookLM's one-click DEFAULT
-    audio = the unwanted duplicate (the confirmed dup source — the CUA agent,
-    hunting for the open-affordance, would sometimes hit the body instead of the
-    arrow). The arrow is a SEPARATE control, pinned from the user's console dump
-    (2026-06-03): `button[aria-label="Customise Audio Overview"]` (British
-    spelling; also bears data-edit-button-type="1" + class "edit", nested in
-    `basic-create-artifact-button > div[aria-label="Audio Overview"]`).
+# ── NotebookLM "Customise Audio Overview", done by the page ─────────────────
+#
+# ⭐ 2026-09-30, capture 5 (tests/fixtures/notebooklm_0930/). Clicking the
+# Studio's "Audio Overview" tile — basic-create-artifact-button >
+# div[role=button][aria-label="Audio Overview"] — opens a dialog titled
+# "Customise Audio Overview". The separate Customise arrow the #778 code aimed
+# at is gone (the tile's chevron is inside the tile and only shows on hover),
+# and the tile no longer fires a one-click default audio. The 09-30 run looked
+# for the arrow, found nothing, and spent 10 computer-use steps — four of them
+# hovering for a gear, because its prompt forbade the tile.
+#
+# In the dialog:
+#   Format  a radiogroup (aria-labelledby "showFormat-label") of four
+#           mat-radio-button rows — Deep dive, Brief, Critique, Debate — each a
+#           <label> holding a native radio and a description line. A row is
+#           chosen when its radio is `checked`: these rows carry no
+#           aria-checked, and their "checked" class lagged the click by
+#           seconds in the capture.
+#   Length  a radiogroup (aria-labelledby "episodeLength-label") of
+#           button[role=radio] read by aria-checked — Short / Default / Long
+#           for Deep dive, Short / Default for Critique and Debate, and no
+#           Length row at all for Brief. Changing the format redraws it, so the
+#           format is always chosen first.
+#   Then "Generate later" and "Generate now". "Choose language", the sources
+#   picker and the focus box are never touched.
+#
+# ASSUMED (the capture closed the window without generating): "Generate now"
+# closes the window and starts the audio.
 
-    Defensive selector chain (most→least specific), spelling/locale-tolerant.
-    Clicks the FIRST visible match. Returns True if a click landed (the caller
-    still lets the CUA prompt confirm the panel actually opened — its step 5
-    re-finds the gear if not), False if no arrow was found (caller falls open to
-    the full CUA flow, whose own #757-A guardrails forbid the card body).
+# The configured podcast length → (Format, Length) in the page's own words.
+# "short" is Brief, which has no Length row. Anything unknown is the default.
+_NLM_AUDIO_CHOICES = {
+    "short": ("Brief", None),
+    "default": ("Deep dive", "Default"),
+    "long": ("Deep dive", "Long"),
+}
 
-    READ-ONLY except for the single arrow .click(): never touches the card body,
-    never opens a menu, never deletes.
-    """
+
+def _nlm_audio_choice(podcast_length) -> tuple:
+    """(format, length) for a configured podcast length; Deep dive + Long by
+    default. `length` is None for Brief."""
+    return _NLM_AUDIO_CHOICES.get(str(podcast_length or "long").lower(),
+                                  _NLM_AUDIO_CHOICES["long"])
+
+
+# The opener. The old Customise arrow first — on a page that still has it, the
+# tile beside it may be the one-click default — then the tile itself.
+_NLM_AUDIO_OPENER_JS = r"""(P) => {
+    const vis = (el) => !!el && el.getClientRects().length > 0
+        && getComputedStyle(el).visibility !== 'hidden';
+    const arrows = [
+        'button[aria-label="Customise Audio Overview"]',
+        'button[aria-label="Customize Audio Overview"]',
+        'basic-create-artifact-button button[data-edit-button-type="1"]',
+    ];
+    for (const sel of arrows) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (!vis(el)) continue;
+            el.setAttribute(P.attr, P.value);
+            return 'the Customise arrow';
+        }
+    }
+    for (const el of document.querySelectorAll(
+            'basic-create-artifact-button [role="button"][aria-label]')) {
+        if (!vis(el)) continue;
+        if (!/^\s*audio overview\s*$/i.test(el.getAttribute('aria-label') || '')) continue;
+        el.setAttribute(P.attr, P.value);
+        return 'the Audio Overview tile';
+    }
+    return '';
+}"""
+
+# One reader for the open window. op: 'probe' (is it open), 'format' or
+# 'length' (the options, which one is chosen, and optionally mark `want`), or
+# 'generate' (mark the "Generate now" button). Never clicks.
+_NLM_CUSTOMISE_JS = r"""(P) => {
+    const vis = (el) => !!el && el.getClientRects().length > 0
+        && getComputedStyle(el).visibility !== 'hidden';
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const out = { dialog: false };
+    let dlg = null;
+    for (const d of document.querySelectorAll('mat-dialog-container, [role="dialog"]')) {
+        if (!vis(d)) continue;
+        const t = d.querySelector('h1, h2, [class*="dialog-title"]');
+        if (/audio overview/i.test(norm(t ? t.textContent : ''))) { dlg = d; break; }
+    }
+    if (!dlg) return out;
+    out.dialog = true;
+    if (P.op === 'probe') return out;
+    if (P.value) {
+        for (const el of document.querySelectorAll('[' + P.attr + ']')) el.removeAttribute(P.attr);
+    }
+    if (P.op === 'generate') {
+        const said = (b) => norm(b.innerText || b.textContent).toLowerCase();
+        const btns = Array.from(dlg.querySelectorAll('button')).filter(vis);
+        const b = btns.find((x) => said(x) === 'generate now')
+               || btns.find((x) => said(x) === 'generate');
+        out.button = b ? norm(b.innerText || b.textContent) : '';
+        if (b && !b.disabled && b.getAttribute('aria-disabled') !== 'true') {
+            b.setAttribute(P.attr, P.value);
+            out.marked = true;
+        }
+        return out;
+    }
+    let group = null;
+    for (const g of dlg.querySelectorAll('[role="radiogroup"]')) {
+        const ids = (g.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+        let name = ids.join(' ');
+        for (const id of ids) {
+            const e = document.getElementById(id);
+            if (e) name += ' ' + e.textContent;
+        }
+        if (name.toLowerCase().indexOf(P.op) !== -1) { group = g; break; }
+    }
+    out.group = !!group;
+    out.options = [];
+    if (!group) return out;
+    const rows = Array.from(group.querySelectorAll('mat-radio-button, [role="radio"]'))
+        .filter((r) => !(r.parentElement && r.parentElement.closest('mat-radio-button')));
+    const nameOf = (r) => norm(
+        (r.querySelector('.mat-button-toggle-label-content') || r).innerText || r.textContent);
+    const isOn = (r) => {
+        const radio = r.querySelector('input[type="radio"]');
+        if (radio) return !!radio.checked;
+        return r.getAttribute('aria-checked') === 'true';
+    };
+    const want = (P.want || '').toLowerCase();
+    const hits = [];
+    for (const r of rows) {
+        const name = nameOf(r);
+        const isWant = !!want && name.toLowerCase().startsWith(want);
+        if (isWant) hits.push(r);
+        out.options.push({ name: name.slice(0, 40), on: isOn(r), want: isWant });
+    }
+    if (P.value && hits.length === 1) {
+        (hits[0].querySelector('label') || hits[0]).setAttribute(P.attr, P.value);
+        out.marked = true;
+    }
+    return out;
+}"""
+
+
+async def _nlm_customise_read(page, op: str, want: str = "", value: str = "") -> dict:
+    """Run `_NLM_CUSTOMISE_JS`; {} when the page could not be read."""
     try:
-        return await page.evaluate(r"""() => {
-            const isVis = (el) => el && el.offsetParent !== null;
-            const sels = [
-                'button[aria-label="Customise Audio Overview"]',
-                'button[aria-label="Customize Audio Overview"]',
-                'basic-create-artifact-button button[data-edit-button-type="1"]',
-                'basic-create-artifact-button button.edit',
-            ];
-            for (const s of sels) {
-                const el = document.querySelector(s);
-                if (isVis(el)) { el.click(); return true; }
-            }
-            // Spelling/locale-tolerant fallback: a BUTTON (never the card body)
-            // whose aria-label names a custom* audio control. Covers
-            // "Customise"/"Customize" and minor future label tweaks.
-            const btns = document.querySelectorAll(
-                'basic-create-artifact-button button[aria-label], button[aria-label]');
-            for (const b of btns) {
-                if (!isVis(b)) continue;
-                const lab = (b.getAttribute('aria-label') || '').toLowerCase();
-                if (lab.indexOf('ustom') !== -1 && lab.indexOf('udio') !== -1) {
-                    b.click(); return true;
-                }
-            }
-            return false;
-        }""") or False
+        return await page.evaluate(_NLM_CUSTOMISE_JS, {
+            "attr": _SR_CLICK_MARK, "op": op, "want": want or "", "value": value}) or {}
+    except Exception as _e:
+        log(f"[Phase3] Customise read ({op}) failed: {type(_e).__name__}", "DEBUG")
+        return {}
+
+
+def _nlm_reads_as(options, want: str) -> bool:
+    """True when exactly one option is chosen and it is the wanted one."""
+    on = [o for o in (options or []) if o.get("on")]
+    return len(on) == 1 and bool(on[0].get("want"))
+
+
+def _nlm_chosen(options) -> str:
+    return ", ".join(o.get("name", "?") for o in (options or []) if o.get("on")) or "nothing"
+
+
+async def _open_nlm_audio_customize(page, wait_s: float = 8.0) -> bool:
+    """Open "Customise Audio Overview" by pressing the Studio's Audio Overview
+    tile once (or the old Customise arrow, on a page that still has one), and
+    wait for the window. True only when the window is open.
+
+    Presses at most one control, once — a person's click, through
+    `_sr_real_click`. Never touches an existing audio card, never opens a menu,
+    never deletes. Returns False when there is nothing to press or the window
+    did not open in `wait_s`; the caller hands the job to computer use.
+    """
+    if (await _nlm_customise_read(page, "probe")).get("dialog"):
+        log("[Phase3] Customise Audio Overview is already open")
+        return True
+    try:
+        rung = await page.evaluate(_NLM_AUDIO_OPENER_JS,
+                                   {"attr": _SR_CLICK_MARK, "value": "nlm-audio-open"})
     except Exception:
+        rung = ""
+    if not rung:
+        log("[Phase3] No Audio Overview tile on the page to open Customise from", "WARN")
         return False
+    how = await _sr_real_click(page, "nlm-audio-open", tag="[Phase3] Audio Overview")
+    if not how:
+        log(f"[Phase3] The press on {rung} did not land", "WARN")
+        return False
+    deadline = time.monotonic() + wait_s
+    while True:
+        if (await _nlm_customise_read(page, "probe")).get("dialog"):
+            log(f"[Phase3] Opened Customise Audio Overview from {rung}")
+            return True
+        if time.monotonic() >= deadline:
+            log(f"[Phase3] Pressed {rung}, but Customise Audio Overview did not open "
+                f"within {wait_s:.0f} s", "WARN")
+            return False
+        await asyncio.sleep(0.25)
+
+
+async def _nlm_customise_choose(page, op: str, want: str, wait_s: float = 4.0) -> dict:
+    """Choose `want` in the open window's `op` row ("format" or "length") and
+    read it back. Waits for the option first: the Length row is redrawn after a
+    format change. {"ok": bool, "reason": str}."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        st = await _nlm_customise_read(page, op, want)
+        opts = st.get("options") or []
+        if any(o.get("want") for o in opts):
+            break
+        if not st.get("dialog") or time.monotonic() >= deadline:
+            offered = ", ".join(o.get("name", "?") for o in opts) or "nothing"
+            return {"ok": False, "reason": f"no {want} in {op} (offered: {offered})"}
+        await asyncio.sleep(0.2)
+    if _nlm_reads_as(opts, want):
+        return {"ok": True, "reason": ""}
+    value = f"nlm-{op}"
+    if not (await _nlm_customise_read(page, op, want, value)).get("marked"):
+        return {"ok": False, "reason": f"{want} matched more than one {op} option"}
+    if not await _sr_real_click(page, value, tag=f"[Phase3] Customise {op}"):
+        return {"ok": False, "reason": f"the press on {want} did not land"}
+    deadline = time.monotonic() + 3.0
+    while True:
+        opts = (await _nlm_customise_read(page, op, want)).get("options") or []
+        if _nlm_reads_as(opts, want):
+            return {"ok": True, "reason": ""}
+        if time.monotonic() >= deadline:
+            return {"ok": False,
+                    "reason": f"{op} reads {_nlm_chosen(opts)} after choosing {want}"}
+        await asyncio.sleep(0.2)
+
+
+#: How long the page watches for its own "Generate now" to show — the window
+#: closing, or the audio generating. A slow server reply can take longer than a
+#: few seconds. Only the log line depends on it: once the press landed, nothing
+#: presses Generate a second time either way.
+_NLM_GENERATE_WATCH_S = 30.0
+
+
+async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dict:
+    """In the open Customise window: choose the configured Format, then Length,
+    read both back, and press "Generate now" — never "Generate later".
+
+    Returns {"generated", "pressed", "format", "length", "reason"}. "pressed"
+    is True once the press on "Generate now" landed; "generated" once, within
+    `_NLM_GENERATE_WATCH_S`, the window closed or the page shows the audio
+    generating. Nothing is pressed when a choice does not read back as chosen,
+    so computer use can take over the same open window without a second
+    Generate. After a landed press the caller must never ask for another.
+    """
+    fmt, length = _nlm_audio_choice(podcast_length)
+    res = {"generated": False, "pressed": False, "format": fmt, "length": length,
+           "reason": ""}
+    # The format first: it redraws the Length row. Each choice is read back
+    # before the next step, and the length's read-back is the last read before
+    # the press.
+    for op, want in (("format", fmt), ("length", length)):
+        if not want:
+            continue
+        r = await _nlm_customise_choose(page, op, want)
+        if not r["ok"]:
+            res["reason"] = r["reason"]
+            return res
+    st = await _nlm_customise_read(page, "generate", value="nlm-generate-now")
+    if not st.get("marked"):
+        res["reason"] = f"no Generate now button to press (found: {st.get('button') or 'none'})"
+        return res
+    if not await _sr_real_click(page, "nlm-generate-now", tag="[Phase3] Generate now"):
+        res["reason"] = "the press on Generate now did not land"
+        return res
+    res["pressed"] = True
+    deadline = time.monotonic() + _NLM_GENERATE_WATCH_S
+    while True:
+        if (not (await _nlm_customise_read(page, "probe")).get("dialog")
+                or await _check_audio_generating(page)):
+            res["generated"] = True
+            return res
+        if time.monotonic() >= deadline:
+            res["reason"] = (f"in {_NLM_GENERATE_WATCH_S:.0f} s the window stayed open "
+                             f"and nothing showed as generating")
+            return res
+        await asyncio.sleep(0.25)
 
 
 async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
