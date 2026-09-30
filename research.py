@@ -9725,13 +9725,43 @@ def _waiting_record_patch() -> dict:
     }
 
 
+#: ⭐ THE OWNER'S NOTE ON A "MOVE TO QUEUE", as long as the app's field lets it
+#: be (Round 2, 09-30). Contract with the app and the chat assistant: the
+#: command carries `note`; the run's research record carries `moveNote` next to
+#: `movedToQueueAt`, only when a note was written, and both go when the run
+#: starts again (or ends while it waits).
+MOVE_NOTE_MAX = 280
+
+
+def _requeue_note(data) -> str:
+    """The owner's note on a "Move to queue" command: one line, at most
+    `MOVE_NOTE_MAX` characters, or "" when there is none."""
+    raw = (data or {}).get("note")
+    if not isinstance(raw, str):
+        return ""
+    return " ".join(raw.split())[:MOVE_NOTE_MAX]
+
+
+def _moved_record_patch(data) -> dict:
+    """The record of a run the owner has just moved: waiting at the front
+    (`_waiting_record_patch`), with the owner's note when they wrote one.
+
+    ⛔ A MOVE WITHOUT A NOTE CLEARS ONE. The note is about this move; one left
+    by an earlier move whose clear never landed would be read as this one's.
+    ⛔ ONLY HERE, never in `_waiting_record_patch`: that patch is written again
+    over a run STILL waiting (the rehydrate scan), and must keep its note."""
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    note = _requeue_note(data)
+    return {**_waiting_record_patch(), "moveNote": note if note else _DF}
+
+
 def _waiting_run_stop_patch() -> dict:
     """What a waiting run that KEPT WORK says once its own person ends it: a
     stop, as the chat's own Stop of a running run is — `stopped`, with its
     steps and its work as they were. ⛔ No `cancelled` (the app's
     delete-on-close) and no `phase: 0`. ⛔ No `summary` either: a stop is a
     status, and the app keeps whatever summary is there. It no longer waits,
-    so its queue fields and `movedToQueueAt` go."""
+    so its queue fields, `movedToQueueAt` and the owner's `moveNote` go."""
     from google.cloud.firestore import DELETE_FIELD as _DF
     return {
         "status": "stopped",
@@ -9740,6 +9770,7 @@ def _waiting_run_stop_patch() -> dict:
         "queuedBehindRunId": _DF,
         "queuedBehindTitle": _DF,
         "movedToQueueAt": _DF,
+        "moveNote": _DF,
     }
 
 
@@ -10037,7 +10068,7 @@ async def _offer_waiting_run(job_queue) -> bool:
         "queuePosition": _DF, "queuedBehindRunId": _DF,
         "queuedBehindTitle": _DF, "queueTotalAhead": _DF,
         "queueAheadFromSelf": _DF, "queueAheadFromOthers": _DF,
-        "movedToQueueAt": _DF,
+        "movedToQueueAt": _DF, "moveNote": _DF,
     })
     _kick_queue_publish()
     return True
@@ -10214,7 +10245,7 @@ def _move_run_to_queue(data) -> str:
         _fb_uid = None
         _fb_research_id = None
     _forget_running_job_in_snapshot()
-    _update_research_doc(uid, rid, _waiting_record_patch())
+    _update_research_doc(uid, rid, _moved_record_patch(data))
     _keep_worker_resting(WORKER_ID)
     _note_requeue_refusal(rid, None)   # a refusal shown earlier no longer holds
     _publish_queue_positions_now()
@@ -17333,7 +17364,7 @@ def start_firestore_start_listener(job_queue, loop):
                                         "queuePosition": _DF,
                                         "queuedBehindRunId": _DF,
                                         "queuedBehindTitle": _DF,
-                                    }, movedToQueueAt=_DF))
+                                    }, movedToQueueAt=_DF, moveNote=_DF))
                             _kick_queue_publish()
                             log(f"Cancel: rid={rid[:8]}… was waiting in the queue for a "
                                 f"worker — ended as a running run is"
