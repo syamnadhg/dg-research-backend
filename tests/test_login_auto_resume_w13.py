@@ -19,6 +19,8 @@ worker queue.
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -147,6 +149,9 @@ def machine(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # ⛔ Windows' home is USERPROFILE (Python ignores HOME there since 3.8):
+    # without it this suite wrote, and then deleted, the machine's REAL marker.
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
     box = {}
     db = _EventsDb(box, research_docs={(UID, RID): {"status": "ongoing",
@@ -391,6 +396,117 @@ def test_a_live_login_is_believed_for_12_hours_not_for_ever(machine):
         _age_marker(13 * 60)
         return await _verdict_within(task, 5)
     assert asyncio.run(main()) == "resumed"
+
+
+def test_a_killed_login_s_number_given_to_a_younger_program_is_not_the_login(machine):
+    """⛔ Found in review (09-30). A killed login's pid can be given out again
+    (Windows reuses them), and a marker naming a live pid was believed for 12
+    hours. The marker now says when the login started; a process under its
+    number that started later is not the login."""
+    younger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        async def main():
+            research._write_login_marker()      # the login: this process
+            await machine.run_until_interrupted(_p3_site_raise)
+            task = machine.waiter()
+            # The login is gone and its number now belongs to `younger`.
+            _age_marker(0, pid=younger.pid)
+            return await _verdict_within(task, 5)
+        assert asyncio.run(main()) == "resumed"
+    finally:
+        younger.kill()
+        younger.wait()
+
+
+# ══ 1c. a login killed with its sign-in Chrome still open ══════════════
+def _sign_in_chrome(monkeypatch, profile):
+    """The login's sign-in Chrome, open on `profile` — a program of its own,
+    so it outlives a killed login. It stands in for the process table (no
+    other Chrome is on any profile here). Returns its switch: ["open"]."""
+    import psutil
+    state = {"open": True}
+
+    class _Chrome:
+        pid = 4_000_001
+        info = {"pid": 4_000_001, "name": "chrome",
+                "cmdline": ["chrome", f"--user-data-dir={profile}", "--no-first-run",
+                            "--no-default-browser-check", "https://chatgpt.com/"]}
+
+    monkeypatch.setattr(psutil, "process_iter",
+                        lambda *_a, **_k: iter([_Chrome()] if state["open"] else []))
+    return state
+
+
+def test_a_killed_login_s_chrome_still_open_keeps_the_run_waiting(machine, monkeypatch):
+    """⛔⛔ Found in review (09-30). A login killed where it stood (its console
+    closed with the X on Windows: no atexit, no finally) clears neither its
+    marker nor its sign-in Chrome, and the run was started again at once onto
+    the profile that Chrome still had open. It now goes on once that Chrome is
+    closed."""
+    async def main():
+        research._write_login_marker()
+        await machine.run_until_interrupted(_p3_site_raise)
+        task = machine.waiter()
+        chrome = _sign_in_chrome(monkeypatch, machine.tmp / "profile")
+        _age_marker(0, pid=_dead_pid())         # the login is killed
+        try:
+            await asyncio.wait_for(asyncio.shield(task), 1)
+            waited = False
+        except asyncio.TimeoutError:
+            waited = machine.jobs.put == []
+        chrome["open"] = False                  # the person closes it
+        return waited, await asyncio.wait_for(task, 5)
+    waited, verdict = asyncio.run(main())
+    assert waited, "the run went back on the queue while the sign-in Chrome held its profile"
+    assert verdict == "resumed"
+    assert len(machine.jobs.put) == 1
+
+
+@pytest.mark.parametrize("case", ["login-finished", "another-worker-s-profile"])
+def test_a_chrome_that_is_not_a_killed_login_s_on_this_profile_does_not_hold_the_run(
+        machine, monkeypatch, case):
+    """⭐ ACCEPT POLARITY. A login that finished closed its Chrome and cleared
+    its marker, so a Chrome on the profile after that (this worker's next run)
+    is not waited for; nor is a killed login's Chrome on another worker's
+    profile."""
+    async def main():
+        research._write_login_marker()
+        await machine.run_until_interrupted(_p3_site_raise)
+        task = machine.waiter()
+        if case == "login-finished":
+            _sign_in_chrome(monkeypatch, machine.tmp / "profile")
+            research._clear_login_marker()
+        else:
+            _sign_in_chrome(monkeypatch, machine.tmp / "profile-2")
+            _age_marker(0, pid=_dead_pid())
+        return await _verdict_within(task, 5)
+    assert asyncio.run(main()) == "resumed"
+
+
+def test_a_killed_login_s_chrome_is_waited_for_12_hours_not_for_ever(machine, monkeypatch):
+    """⭐ The same bound as a live login's: past it, the run goes on."""
+    async def main():
+        research._write_login_marker()
+        await machine.run_until_interrupted(_p3_site_raise)
+        task = machine.waiter()
+        _sign_in_chrome(monkeypatch, machine.tmp / "profile")
+        monkeypatch.setattr(research, "LOGIN_RESUME_LIVE_LOGIN_CAP_S", 0.5)
+        _age_marker(0, pid=_dead_pid())
+        return await _verdict_within(task, 5)
+    assert asyncio.run(main()) == "resumed"
+
+
+# ══ 1d. this suite keeps to its own home ═══════════════════════════════
+def test_the_suite_s_home_is_where_windows_looks_too(machine):
+    """⛔ Test isolation (review 09-30). On Windows `Path.home()` reads
+    USERPROFILE and ignores HOME, so this suite wrote — and at teardown
+    deleted — the machine's REAL login marker. Windows' own lookup (ntpath,
+    which reads the same environment on any OS) must land in the test's home
+    too."""
+    import ntpath
+    home = machine.tmp / "home"
+    assert ntpath.expanduser("~") == str(home)
+    assert research._login_marker_path().parent.parent == home
 
 
 # ══ 2. the card says so ════════════════════════════════════════════════

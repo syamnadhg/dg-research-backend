@@ -87322,8 +87322,15 @@ def _write_login_marker() -> None:
     try:
         p = _login_marker_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"ts": int(time.time() * 1000), "pid": os.getpid()}),
-                     encoding="utf-8")
+        data = {"ts": int(time.time() * 1000), "pid": os.getpid()}
+        try:
+            # When this process started: the pid alone can be given out again
+            # once a killed login is gone (`_login_interrupt_active`).
+            import psutil
+            data["started"] = psutil.Process().create_time()
+        except Exception:
+            pass
+        p.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
 
@@ -87348,7 +87355,13 @@ def _login_interrupt_active(max_age_sec: int = 30 * 60) -> bool:
     minutes. The marker records the --login process pid (_write_login_marker);
     a recorded-but-dead pid means no login is in flight. Same liveness
     pattern as _enumerate_ongoing_runs' worker-lock check. Legacy/pid-less
-    markers keep the pure age check."""
+    markers keep the pure age check.
+
+    ⛔ A live pid is the login only if it is the same process: a killed
+    login's number can be given out again to a younger program (Windows reuses
+    them), which kept a paused run waiting up to 12 hours. The marker records
+    when the login started (`started`); a process under that pid that started
+    later is not the login. Markers without it keep the pid check alone."""
     try:
         p = _login_marker_path()
         if not p.exists():
@@ -87364,7 +87377,16 @@ def _login_interrupt_active(max_age_sec: int = 30 * 60) -> bool:
                 if not psutil.pid_exists(pid):
                     return False
             except Exception:
-                pass  # psutil unavailable → degrade to the age-only check
+                return True  # psutil unavailable → degrade to the age-only check
+            started = float(data.get("started") or 0)
+            if started > 0:
+                try:
+                    if psutil.Process(pid).create_time() > started + 1:
+                        return False
+                except psutil.NoSuchProcess:
+                    return False
+                except Exception:
+                    pass
         return True
     except Exception:
         return False
@@ -87466,16 +87488,47 @@ def _login_still_running() -> bool:
         max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S if vouched else 30 * 60)
 
 
+async def _login_left_chrome_open(profile_dir: str, since: float) -> bool:
+    """Did a login that ended without clearing its marker leave its sign-in
+    Chrome open on this profile?
+
+    ⛔⛔ FOUND IN REVIEW (09-30). A login killed where it stood — its console
+    closed with the X on Windows, where nothing in the process runs on the way
+    out — clears neither its marker nor its sign-in Chrome, and that Chrome
+    (a program of its own) stays open on the worker's profile. The run was
+    started again at once, onto a profile a Chrome still held. A login that
+    ends normally closes its Chrome and then clears its marker, so this asks
+    only while the marker is still on disk; and not for longer than
+    `LOGIN_RESUME_LIVE_LOGIN_CAP_S` from `since`."""
+    if not _login_marker_path().exists():
+        return False
+    if time.time() - since >= LOGIN_RESUME_LIVE_LOGIN_CAP_S:
+        return False
+    return bool(await asyncio.to_thread(_chrome_procs_for_profile, profile_dir))
+
+
 async def _resume_after_login(plan: dict) -> str:
     """Wait for the login command to finish, then resume the run it paused.
 
     The login is over when its marker is gone (the login command clears it as
     it exits) or no longer counts (its process died, or the marker outlived its
-    cap) — `_login_still_running`. Returns what happened: "resumed", or the
-    verdict that kept the run where it is."""
+    cap) — `_login_still_running` — and, for a login that died without
+    clearing its marker, once no Chrome is left open on the run's own worker
+    profile (`_login_left_chrome_open`). Returns what happened: "resumed", or
+    the verdict that kept the run where it is."""
     with _machine_log_scope():
         rid8 = plan["research_id"][:8]
-        while _login_still_running():
+        profile = str(_profile_dir(plan["worker_id"]))
+        since, told = time.time(), False
+        while True:
+            if not _login_still_running():
+                if not await _login_left_chrome_open(profile, since):
+                    break
+                if not told:
+                    told = True
+                    log(f"[login-resume] {rid8}… the login ended with its Chrome still "
+                        f"open on this run's profile — continuing once it is closed",
+                        "INFO")
             await asyncio.sleep(LOGIN_RESUME_POLL_SEC)
         verdict = "unreadable"
         for _ in range(LOGIN_RESUME_READ_TRIES):
