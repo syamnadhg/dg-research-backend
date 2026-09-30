@@ -20,6 +20,16 @@
        step at once and the report goes out with the notebook link — never the
        "Chrome kept closing" card with nothing delivered (cross-verify, 09-29).
        The login command's close spends none of that budget and still pauses.
+  W* — the w13 integrated review (09-29): the checkpoint records WHICH worker
+       made the notebook, and a resume carries on in it only on that worker —
+       a moved run resumes on another worker's Chrome profile, maybe another
+       Google account, and makes its own notebook there, as before wave 13. A
+       checkpoint that does not say which worker made it is another worker's.
+  P* — a resume past Phase 1 writes Phase 1's Firestore half again from
+       brief.md: the brief document, the "Read Brief report" link, the
+       record's brief slot and Phase 1 complete. A move in Phase 1's last
+       seconds (or a crash between the two halves) left only the disk half,
+       and the resume trusts the disk. No brief on disk, nothing is written.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET. Every mutant here must die on behaviour:
 the REAL `run_pipeline` driven from a resume directory into Phase 3, the real
@@ -46,13 +56,18 @@ ROOT = Path(__file__).resolve().parents[1]
 RESEARCH = "research.py"
 
 TESTS = ["tests/test_p3_resume_reuses_notebook_w13.py"]
+
+WORKER_GATE = ("    if isinstance(made_on, int) and not isinstance(made_on, bool) "
+               "and made_on == WORKER_ID:\n        return url\n")
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 MUTANTS = [
     # ═══ R — the resume goes back to its own notebook ═══════════════════════
     ("R1", RESEARCH, "⛔⛔ the resume is not told which notebook it made — a new "
      "notebook and a new podcast on every Chrome death",
-     [("            _p3_recorded_nb = cp.get(\"notebook_url\") or \"\"",
+     # ⚠ RE-AIMED 2026-09-29 (w13 integrated review): the checkpoint's notebook
+     # now comes through `_p3_notebook_to_reopen`.
+     [("            _p3_recorded_nb = _p3_notebook_to_reopen(cp)",
        "            _p3_recorded_nb = \"\"")]),
     ("R2", RESEARCH, "⛔⛔ the notebook is reopened and then a new one is made anyway",
      [("        if await _p3_reopen_recorded_notebook(browser, recorded_notebook_url, md_files):",
@@ -184,6 +199,55 @@ MUTANTS = [
     ("C7", RESEARCH, "the log says \"after 3 auto-retries\" about retries that never ran",
      [("                    if _p3_chrome_spent:\n",
        "                    if False:\n")]),
+    # ═══ W — only the worker that made the notebook carries on in it ═════════
+    ("W1", RESEARCH, "⛔⛔ another worker's notebook is carried on in, on this worker's "
+     "profile — maybe another Google account's",
+     [("            _p3_recorded_nb = _p3_notebook_to_reopen(cp)",
+       "            _p3_recorded_nb = cp.get(\"notebook_url\") or \"\"")]),
+    ("W2", RESEARCH, "⛔ any recorded worker is taken for this one",
+     [(WORKER_GATE, WORKER_GATE.replace(" and made_on == WORKER_ID:", ":"))]),
+    ("W3", RESEARCH, "⛔ a checkpoint that does not name the worker is taken for this one's",
+     [('    made_on = (cp or {}).get("notebook_worker")\n',
+       '    made_on = (cp or {}).get("notebook_worker", WORKER_ID)\n')]),
+    ("W4", RESEARCH, "⛔⛔ the worker is never recorded — no resume ever carries on in its "
+     "own notebook again",
+     [('    if cp.get("notebook_url") and "notebook_worker" not in cp:\n'
+       '        cp["notebook_worker"] = WORKER_ID\n', "")]),
+    ("W5", RESEARCH, "the checkpoint names the worker that made the OLD notebook after a "
+     "new one was made here",
+     [('    if cp.get("notebook_url") and "notebook_worker" not in cp:\n'
+       '        cp["notebook_worker"] = WORKER_ID\n',
+       '    if cp.get("notebook_url") and "notebook_worker" not in cp:\n'
+       '        cp["notebook_worker"] = (load_checkpoint(queue_dir) or {}).get(\n'
+       '            "notebook_worker", WORKER_ID)\n')]),
+
+    # ═══ P — a resume past Phase 1 writes the brief to the app again ══════════
+    ("P1", RESEARCH, "⛔⛔ the resume trusts brief.md and never writes the brief to the app",
+     [("                    _resave_phase1_on_resume(raw)\n", "")]),
+    ("P2", RESEARCH, "⛔ no brief on the Documents page",
+     [('    save_document_to_firestore("brief", brief_md, "Research Brief")\n'
+       '    url = in_app_document_url("brief")\n',
+       '    url = in_app_document_url("brief")\n')]),
+    ("P3", RESEARCH, "⛔ no Read Brief report link on the resumed run",
+     [('    _update_firestore_research({"links.phase1": [\n',
+       '    (lambda *_a: None)({"links.phase1": [\n')]),
+    ("P4", RESEARCH, "⛔ Phase 1 is never marked complete after a reload",
+     [('        {"label": "Read Brief report", "url": url, "verified": True, "primary": True}]})\n'
+       '    _write_phase_terminal_status(1, "complete")\n',
+       '        {"label": "Read Brief report", "url": url, "verified": True, "primary": True}]})\n')]),
+    ("P5", RESEARCH, "the record's brief slot is left empty for the Doc and the video",
+     [("    url = in_app_document_url(\"brief\")\n    _record_brief_in_aggregate(url)\n",
+       "    url = in_app_document_url(\"brief\")\n")]),
+    ("P6", RESEARCH, "⛔ the link goes out under a label the app's backfill does not make — "
+     "the brief row shows twice",
+     [('        {"label": "Read Brief report", "url": url, "verified": True, "primary": True}]})\n'
+       '    _write_phase_terminal_status(1, "complete")\n',
+       '        {"label": "Read brief", "url": url, "verified": True, "primary": True}]})\n'
+       '    _write_phase_terminal_status(1, "complete")\n')]),
+    ("P7", RESEARCH, "⛔ an empty brief on disk is called Phase 1 complete, with a link to "
+     "nothing",
+     [('    if not (brief_md or "").strip():\n        return\n    save_document_to_firestore(',
+       '    save_document_to_firestore(')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

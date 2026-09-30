@@ -43,6 +43,21 @@
        writes the same); a run ended for good stops waiting; a resting
        worker's queued jobs wait behind, exactly as they were queued; the
        claim survives a leftover taken marker on Windows.
+  Q* — the w13 integrated review (09-29): a queue renumber leaves out the batch
+       of an account the device document positively does not list — both
+       renumbers, the paired account costing no read and the document read
+       once per renumber — so a removed sharer's run no longer spends the
+       re-mint every research write shares; a membership nobody could read is
+       written through the heal as before.
+  S* — the run's own person ending a waiting run that KEPT WORK (moved, put
+       back at boot with steps done, or taken and not started) is a stop:
+       stopped, no `cancelled`, no `phase`, no `summary`; an ordinary queued
+       run's own cancel, and the owner's Stop and Cancel, are unchanged.
+  D* — a waiting run dropped at pickup leaves the published order: a claim
+       that takes nothing publishes when it dropped one; a claim that takes a
+       run leaves the one publish to after the run is in the line.
+  B* — the boot restore's one publish after the last park runs on its own
+       thread, never on the event loop.
 
 ⛔ NO SOURCE PIN SITS IN THE TEST SET's KILLS. Every mutant here dies on
 behaviour: the real device-command listener, the real idle rescan and worker
@@ -68,7 +83,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 RESEARCH = "research.py"
 
-TESTS = ["tests/test_requeue_w13.py"]
+TESTS = ["tests/test_requeue_w13.py", "tests/test_requeue_repair_w13.py"]
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # ── anchors used by more than one mutant ─────────────────────────────────────
@@ -126,6 +141,16 @@ MOVED_CANCEL = ('                                        "summary": "Cancelled",
                 '                                    }, movedToQueueAt=_DF))\n')
 STOP_TOUCH = ('        try:\n            (d / ".stop").touch()\n        except Exception as e:\n'
               '            log(f"[moved-run] could not end {d.name}: {e}", "WARN")\n')
+OWN_STOP = ('    return {\n        "status": "stopped",\n'
+            '        "stoppedAt": int(time.time() * 1000),\n'
+            '        "queuePosition": _DF,\n        "queuedBehindRunId": _DF,\n'
+            '        "queuedBehindTitle": _DF,\n        "movedToQueueAt": _DF,\n    }\n')
+OWN_STOP_GATE = ("                        if (not _owner_control_patch(oc, running=True)\n"
+                 "                                and (_waiting_kept_work(_waiting_rec)\n"
+                 "                                     if _waiting_rec is not None "
+                 "else removed_taken_kept)):\n")
+RENUMBER_SKIP = ("            if _known_not_a_member(uid_s, members):\n"
+                 '                log(f"[queue-pos] not renumbering {len(chunk)} queued run(s) of "\n')
 IN_USE_LOCK = ('                alive = bool(data.get("pid")) and _ps.pid_exists(int(data["pid"]))\n')
 
 MUTANTS = [
@@ -409,10 +434,14 @@ MUTANTS = [
      [('        if (run_dir is not None and not (run_dir / ".stop").exists()\n'
        '                and _no_auto_retry_marked(run_dir)):',
        '        if (run_dir is not None\n                and _no_auto_retry_marked(run_dir)):')]),
-    ("R13", RESEARCH, "the Resume card is written and the queue order is not re-published",
-     [('                f"offered to its person to resume instead", "INFO")\n'
-       '            _kick_queue_publish()\n',
-       '                f"offered to its person to resume instead", "INFO")\n')]),
+    # ⚠ RE-AIMED 2026-09-29 (w13 integrated review): the publish after a refusal
+    # is no longer only the out-of-attempts branch's — every refusal publishes.
+    ("R13", RESEARCH, "a run the funnel refuses at pickup stays in the published order "
+     "(the Resume card's too)",
+     [("        # claim left publishing to here (w13 integrated review).\n"
+       "        _kick_queue_publish()\n        return False\n",
+       "        # claim left publishing to here (w13 integrated review).\n"
+       "        return False\n")]),
     # a waiting run ended for good
     ("R14", RESEARCH, "⛔⛔ a run ended for good stays #1 and holds every new start back",
      [('            if (d / ".stop").exists():\n                _retire_waiting_marker(marker)\n'
@@ -451,9 +480,11 @@ MUTANTS = [
     ("R26", RESEARCH, "⛔ the owner's cancel resets the steps of a run with work in it",
      [("                                    _owner_control_patch(oc, running=True) or {\n",
        "                                    _owner_control_patch(oc, running=False) or {\n")]),
+    # ⚠ RE-AIMED 2026-09-29 (w13 integrated review): the person's own cancel of a
+    # waiting run with work done is written by `_waiting_run_stop_patch` now.
     ("R27", RESEARCH, "⛔ the person's own cancel resets the steps of a run with work in it",
-     [(MOVED_CANCEL, MOVED_CANCEL.replace('"summary": "Cancelled",\n',
-                                          '"summary": "Cancelled",\n"phase": 0,\n'))]),
+     [(OWN_STOP, OWN_STOP.replace('        "status": "stopped",\n',
+                                  '        "status": "stopped",\n        "phase": 0,\n'))]),
     # the claim and the park
     ("R28", RESEARCH, "⛔ Windows: a leftover taken marker stalls this worker for good",
      [("            os.replace(d / WAITING_MARKER, taken)\n",
@@ -490,10 +521,101 @@ MUTANTS = [
        "    jobs = list(_UNREAD_RESTORES)\n")]),
     ("R41", RESEARCH, "⛔ after a boot that parked several runs, the published order is "
      "whatever the first background publish saw",
-     [("    if parked:\n        _publish_queue_positions_now()\n", "")]),
+     # ⚠ RE-AIMED 2026-09-29 (w13 integrated review): it runs on its own thread.
+     [("    if parked:\n        try:\n"
+       "            _threading.Thread(target=_publish_queue_positions_now, daemon=True,\n",
+       "    if False:\n        try:\n"
+       "            _threading.Thread(target=_publish_queue_positions_now, daemon=True,\n")]),
     ("R40", RESEARCH, "Clear Local Storage deletes the boot entries still to be checked",
      [('    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref"))) + list(_UNREAD_RESTORES)\n',
        '    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref")))\n')]),
+
+    # ═══ Q — a removed sharer's run in a renumber (w13 integrated review) ═════
+    ("Q1", RESEARCH, "⛔⛔ the queue publisher's renumber writes a removed sharer's batch "
+     "through the heal — the owner's next write finds no re-mint",
+     [("    for uid_b, i, chunk in _renumber_batches(patches):\n        def _commit_chunk(",
+       "    for uid_b, i, chunk in _queue_pos_batches(patches):\n        def _commit_chunk(")]),
+    ("Q2", RESEARCH, "⛔⛔ the worker's own renumber writes a removed sharer's batch through "
+     "the heal",
+     [("        for uid_b, i, chunk in _renumber_batches(patches):\n",
+       "        for uid_b, i, chunk in _queue_pos_batches(patches):\n")]),
+    ("Q3", RESEARCH, "⛔⛔ no account is ever known gone — every batch is written",
+     [(RENUMBER_SKIP, RENUMBER_SKIP.replace("if _known_not_a_member(uid_s, members):",
+                                            "if False:"))]),
+    ("Q4", RESEARCH, "the device document is never read — nobody is known gone",
+     [("                members = _device_members()\n            if _known_not_a_member(",
+       "                members = None\n            if _known_not_a_member(")]),
+    ("Q5", RESEARCH, "⛔ a membership nobody could read skips the batch — a blip at boot "
+     "freezes a member's position",
+     [(RENUMBER_SKIP, RENUMBER_SKIP.replace(
+         "if _known_not_a_member(uid_s, members):",
+         "if members is None or _known_not_a_member(uid_s, members):"))]),
+    ("Q6", RESEARCH, "⛔⛔ every other account's batch is skipped — a member's position "
+     "and ETA freeze",
+     [(RENUMBER_SKIP, RENUMBER_SKIP.replace("if _known_not_a_member(uid_s, members):",
+                                            "if True:"))]),
+    ("Q7", RESEARCH, "the device document is read again for every account in a renumber",
+     [("            if members is _MEMBERS_UNREAD:\n                members = _device_members()\n",
+       "            if True:\n                members = _device_members()\n")]),
+    ("Q8", RESEARCH, "the paired account's own renumber reads the device document",
+     [("        if uid_s and uid_s != paired:\n            if members is _MEMBERS_UNREAD:\n",
+       "        if uid_s:\n            if members is _MEMBERS_UNREAD:\n")]),
+
+    # ═══ S — the run's own person stops a waiting run that kept work ══════════
+    ("S1", RESEARCH, "⛔⛔ the person's own cancel of a run with work done is a cancel — "
+     "deleted with its reports when the chat closes",
+     [(OWN_STOP_GATE, OWN_STOP_GATE.replace("if (not _owner_control_patch",
+                                            "if False and (not _owner_control_patch"))]),
+    ("S2", RESEARCH, "⛔ the owner's Stop or Cancel is written as the person's own stop",
+     [(OWN_STOP_GATE, OWN_STOP_GATE.replace(
+         "if (not _owner_control_patch(oc, running=True)\n                                and (",
+         "if (True\n                                and ("))]),
+    ("S3", RESEARCH, "⛔ every waiting run's own cancel is a stop — a new run that never "
+     "started is kept for ever",
+     [(OWN_STOP_GATE, OWN_STOP_GATE.replace("_waiting_kept_work(_waiting_rec)", "True"))]),
+    ("S4", RESEARCH, "a moved run taken into the line, its marker gone, is cancelled",
+     [(OWN_STOP_GATE, OWN_STOP_GATE.replace("else removed_taken_kept)", "else False)"))]),
+    ("S5", RESEARCH, "a NEW run taken into the line, its marker gone, is kept as a stop",
+     [("                        removed_taken_kept = any(_cancels(j) and j.get(\"moved_run\")\n"
+       "                                                 and j.get(\"kept_work\") for j in dq)\n",
+       "                        removed_taken_kept = any(_cancels(j) and j.get(\"moved_run\")\n"
+       "                                                 for j in dq)\n")]),
+    ("S6", RESEARCH, "⛔⛔ the person's stop carries `cancelled` — the delete-on-close",
+     [(OWN_STOP, OWN_STOP.replace('        "status": "stopped",\n',
+                                  '        "status": "stopped",\n        "cancelled": True,\n'))]),
+    ("S7", RESEARCH, "a stopped waiting run still reads as moved to the queue",
+     [(OWN_STOP, OWN_STOP.replace('        "movedToQueueAt": _DF,\n', ""))]),
+    ("S8", RESEARCH, "the stopped waiting run stays the amber #1",
+     [("                                _update_research_doc(u, rid, _waiting_run_stop_patch())\n"
+       "                            _kick_queue_publish()\n",
+       "                                _update_research_doc(u, rid, _waiting_run_stop_patch())\n")]),
+    ("S9", RESEARCH, "the person's stop leaves the command behind — every worker runs it again",
+     [('                                f"everything it did is kept", "INFO")\n'
+       "                            try:\n                                dref.delete()\n",
+       '                                f"everything it did is kept", "INFO")\n'
+       "                            try:\n                                pass\n")]),
+    ("S10", RESEARCH, "the person's stop writes a summary over the research's own",
+     [(OWN_STOP, OWN_STOP.replace('        "status": "stopped",\n',
+                                  '        "status": "stopped",\n        "summary": "Cancelled",\n'))]),
+
+    # ═══ D — a waiting run dropped at pickup leaves the published order ═══════
+    ("D1", RESEARCH, "⛔ a dropped waiting run stays the amber #1",
+     [("            _drop_waiting_claim(d, worker_id)\n            dropped = True\n",
+       "            _drop_waiting_claim(d, worker_id)\n")]),
+    ("D2", RESEARCH, "⛔ a claim that took nothing never publishes what it dropped",
+     [("    if dropped:\n        _kick_queue_publish()\n    return None\n", "    return None\n")]),
+    ("D3", RESEARCH, "⛔ a publish at every drop races the take — the taken run drops out "
+     "of the published order",
+     [("            _drop_waiting_claim(d, worker_id)\n            dropped = True\n",
+       "            _drop_waiting_claim(d, worker_id)\n            dropped = True\n"
+       "            _kick_queue_publish()\n")]),
+
+    # ═══ B — the boot restore's publish, off the event loop ═══════════════════
+    ("B1", RESEARCH, "⛔ the boot restore publishes on the event loop, before the server "
+     "listens",
+     [("            _threading.Thread(target=_publish_queue_positions_now, daemon=True,\n"
+       '                              name="queueowners-boot-park").start()\n',
+       "            _publish_queue_positions_now()\n")]),
 
     # ═══ Y — the capability ═══════════════════════════════════════════════════
     ("Y1", RESEARCH, "⛔ the capability is never published — the app never shows the chip",

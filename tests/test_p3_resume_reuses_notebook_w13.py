@@ -962,11 +962,15 @@ def test_a_resume_past_phase_1_writes_the_brief_to_the_app_again(
     assert w["slot"] == [page], "the record's brief slot was not filled"
 
 
-def test_a_resume_with_no_brief_on_disk_writes_no_brief(resumed, monkeypatch):
+@pytest.mark.parametrize("brief", ["missing", "empty"])
+def test_a_resume_with_no_brief_on_disk_writes_no_brief(resumed, monkeypatch, brief):
     """The control: Phase 1 made no brief (skipped after an error), so there is
     nothing to write again — and Phase 1 is not called complete."""
     run, _nb, queue_dir, _seen = resumed
-    (queue_dir / "documents" / "brief.md").unlink()
+    if brief == "missing":
+        (queue_dir / "documents" / "brief.md").unlink()
+    else:
+        (queue_dir / "documents" / "brief.md").write_text("", encoding="utf-8")
     w = _phase1_writes(monkeypatch)
     run(_stop_here)
 

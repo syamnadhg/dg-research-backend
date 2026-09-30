@@ -446,20 +446,28 @@ def test_the_runs_own_person_ending_a_waiting_run_with_work_done_stops_it(
     assert lis.incoming == ["incoming"], "the command was not taken away"
 
 
-def test_a_new_run_taken_from_the_queue_is_still_cancelled_before_starting(
-        monkeypatch, tmp_path):
+@pytest.mark.parametrize("marker, written", [
+    (True, {"status": "stopped", "phase": 0, "summary": "Cancelled before starting",
+            "cancelled": True}),
+    # Its marker gone, the job alone speaks for it — as it did before.
+    (False, {"status": "stopped", "summary": "Cancelled", "cancelled": True}),
+], ids=["marker-on-disk", "marker-gone"])
+def test_a_new_run_taken_from_the_queue_is_still_cancelled(
+        monkeypatch, tmp_path, marker, written):
     """The control: a NEW run a resting worker had only queued, taken into this
     worker's line and not started, has nothing to keep. Its own person's cancel
-    stays the ordinary one."""
+    stays a cancel."""
     folder = tmp_path / "queues" / f"Queued_{T._stamp()}"
     folder.mkdir(parents=True)
     job = _queued_resume_marker(folder, worker=1, resume=False)
+    if not marker:
+        for m in folder.glob(f"{T.MARKER}*"):
+            m.unlink()
     lis, _p = T._cancel_listener(monkeypatch, tmp_path,
                                  deque_jobs=[dict(job, moved_run=True, kept_work=False)])
     lis.feed(action="cancel", uid=T.SHARER, submittedBy=T.SHARER, researchId=T.RID)
-    assert [T._as_written(p) for _u, r, p in lis.writes if r == T.RID] == [
-        {"status": "stopped", "phase": 0, "summary": "Cancelled before starting",
-         "cancelled": True}]
+    assert [T._as_written(p) for _u, r, p in lis.writes if r == T.RID] == [written]
+    assert list(lis.jobs._queue) == []
 
 
 # ══ 3. a waiting run dropped at pickup leaves the published order ════════════
