@@ -59,9 +59,11 @@ ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 # ── anchors: a job queued for an old run carries its own clock ─────────────
 AGE_CLOCK = "        seen.append(clock / 1000)"
-RESUME_CLOCK = ("                            # ⛔ ITS OWN CLOCK: the run id and the folder are\n"
-                "                            # as old as the run — see `_job_age_s`.\n"
-                '                            "queued_at_ms": int(time.time() * 1000),\n')
+# ⭐ Re-aimed 2026-09-30 (wave 13): the Resume branch's tail moved into
+# `_resume_from_checkpoint`, which the login auto-resume shares.
+RESUME_CLOCK = ("                # ⛔ ITS OWN CLOCK: the run id and the folder are\n"
+                "                # as old as the run — see `_job_age_s`.\n"
+                '                "queued_at_ms": int(time.time() * 1000),\n')
 AUTO_RESUME_CLOCK = ("                                    # ⛔ ITS OWN CLOCK: the run id and the folder\n"
                      "                                    # are as old as the run — see `_job_age_s`.\n"
                      '                                    "queued_at_ms": int(time.time() * 1000),\n')

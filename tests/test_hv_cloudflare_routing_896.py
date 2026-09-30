@@ -51,9 +51,15 @@ def test_cloudflare_copy_is_short_hands_off_and_login_free():
     # 2026-07-09 (user): the Cloudflare HV copy is short + to the point, says
     # the wall can't be cleared from here, and does NOT mention the login
     # command (it isn't the right fix for a Cloudflare wall).
+    # ⭐ 2026-09-30 (owner) adds ONE line after it: the login window can clear
+    # the wall, and the run continues by itself when the login finishes
+    # (`HV_LOGIN_LINE`, pinned in tests/test_login_auto_resume_w13.py). The
+    # sentence before that line is held to the 07-09 rule as it was.
     title, details = research._hv_fail_copy("Claude", "Cloudflare")
+    assert details.endswith(research.HV_LOGIN_LINE)
+    details = details[:-len(research.HV_LOGIN_LINE)]
     assert "Cloudflare" in title
-    assert "login command" not in details.lower()
+    assert "login" not in details.lower()
     assert "cleared from here" in details, "state it can't be solved in the automation window"
     assert "resumes automatically" in details
     assert len(details) < 200, "keep it to the point"

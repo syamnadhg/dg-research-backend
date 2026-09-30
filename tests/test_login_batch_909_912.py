@@ -219,7 +219,9 @@ def test_login_interrupt_card_marks_delivery_paused():
     # + Gate 2 read.
     _blk_at = _SRC.index("Paused by the login command")
     _blk = _SRC[_blk_at - 1800:_blk_at]
-    assert 'update_delivery(status="paused")' in _blk
+    # Wave 13: the same write now also carries the pause's token
+    # (`loginPause`); tests/test_login_auto_resume_w13.py drives it.
+    assert 'update_delivery(status="paused",' in _blk
 
 
 # ── #911: short card + durable mirror for the quiet login card ──────────────
