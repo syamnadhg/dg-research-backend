@@ -33973,6 +33973,101 @@ _CHATGPT_SIDE_PANEL_JS = _cg_js("""() => {
 }""")
 
 
+# ⛔⛔ 2026-09-29 — THE NEW PAGE'S STEP LIST, OPEN, READ AS CLOSED. While ChatGPT
+# thinks, the new page shows a "Thinking ▾" line with the model's steps listed
+# under it ("Validated financial claims", "Searched 69 websites", ...), and the
+# list is ALREADY OPEN. Nothing here could see it: no side panel, no region
+# named "thought"/"activity", no hostname chips. So Phase 1 read it as closed
+# and pressed the line every ~30 s — a toggle — folding the list shut and open
+# again in the person's tab, and paid the vision step up to three times a brief
+# to open a list that was open. The vision step saw it happen (10:10:18):
+# "clicking on "Thinking ▾" collapsed the activity list (it was previously
+# expanded showing the steps) … I accidentally closed what was already open."
+#
+# Measured, from that day's own panel-miss snapshot rows (0.1.13's census of the
+# live page; first class token in brackets):
+#   * the line: SPAN[inline-flex] whose text is the label TWICE ("Thinking\n
+#     Thinking" — one copy is a SPAN[cadencedShimmerSweep-…]), in every capture
+#     whatever the label said ("Searching the web", "Extracting Credit Map …");
+#   * the list directly under it: DIV[-ms-2], its rows DIV[MarkdownRoot-…] or
+#     DIV[min-w-0], one step per row; their container's text is the line and
+#     then the list ("Thinking\nThinking\n\nCrafted a refined research brief…");
+#   * finished, the line reads "Worked for 7m 23s", once, and the list is gone.
+# So "open" is: a line whose label is drawn twice, followed by a shown element
+# with words in it. The doubled label is what keeps this off the OLD page, whose
+# status line is drawn once.
+# ⛔ 2026-09-29 (review) — WHAT COMES "AFTER THE LINE" IS NOT ALWAYS ITS NEXT
+# ELEMENT. The snapshot skips any element with more than two children, so it
+# cannot see a row that holds the two copies AND an icon and the chevron the
+# vision step saw ("Thinking ▾", a globe icon while searching), nor a chevron
+# inside SPAN[inline-flex] with the copies stacked one level down. Both give
+# exactly that day's snapshot rows, and in both the element holding the copies
+# is followed by the chevron, not the list — the first version read the open
+# list as closed there and Phase 1 pressed it as before. So the look for the
+# list starts at the element holding the copies and moves out through what is
+# around it while that holds no other words (the row, a wrapper), and the list
+# is the first thing after it with words. It stops at the reply's own heading:
+# a folded list taken off the page leaves the line alone in its block, and the
+# look must not carry on past the block and take the reply for the list.
+# Its own probe, not a field of `_CHATGPT_INLINE_ACTIVITY_JS`: that
+# walker returns nothing at all when it finds no turn, and whether the reply's
+# unit exists before any reply text is not known (no capture of the thinking
+# phase's markup exists) — the line must be seen either way.
+# ⚠ ASSUMED: that a closed list is hidden or removed (the vision step saw it
+# fold; the markup of the folded state was never captured).
+_CHATGPT_STEP_LIST_JS = _cg_js("""() => {
+    const out = { open: false, rows: 0, label: '' };
+    const main = document.querySelector('main') || document.body;
+    const lines = (n) => (n.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+    const shown = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    let all;
+    try { all = main.querySelectorAll('*'); } catch (e) { return out; }
+    if (all.length > 8000) return out;
+    for (const h of all) {
+        // Cheap first: only a short element can be the line.
+        const tc = h.textContent || '';
+        if (tc.length < 6 || tc.length > 250) continue;
+        // The line: the element holding its label twice — two children with
+        // words, the same words. (Not one that merely CONTAINS the line: with
+        // the list folded, the block's own text is the label twice too.)
+        const texts = [...h.children].map(c => lines(c).join(' ')).filter(Boolean);
+        if (texts.length !== 2 || texts[0] !== texts[1]) continue;
+        // Never the person's message, the message box, or the reply itself.
+        if (h.closest('__CG_REPLY_TEXT__')) continue;
+        if (h.closest('__CG_USER__')) continue;
+        if (h.closest('form, __CG_COMPOSER__')) continue;
+        // What it opens: the first thing after the line with words in it
+        // (past anything with none, such as an icon or a chevron), shown.
+        // The two copies may sit inside a row with such things — an icon
+        // before them, the chevron after, a wrapper around them — so the look
+        // starts at the element holding the copies and moves out through each
+        // element around it that holds no other words.
+        const words = (n) => (n.textContent || '').trim();
+        const own = words(h);
+        let list = null;
+        for (let n = h; n && n !== main; n = n.parentElement) {
+            if (words(n) !== own) break;
+            let s = n.nextElementSibling;
+            while (s && !words(s)) s = s.nextElementSibling;
+            if (s) { list = s; break; }
+        }
+        // ⛔ Never the reply. A folded list taken off the page leaves the line
+        // alone in its block, and the look then carries on past the block: if
+        // what it meets is the reply ("ChatGPT said:"), there is no list.
+        if (!list || list.matches('[data-conversation-role]')
+                || list.querySelector('[data-conversation-role]')) continue;
+        if (!shown(list)) continue;
+        const steps = lines(list);
+        if (!steps.length) continue;
+        out.open = true;
+        out.rows = steps.length;
+        out.label = texts[0].slice(0, 60);
+        break;
+    }
+    return out;
+}""")
+
+
 async def _chatgpt_activity_state(page):
     """#913: shape-agnostic ChatGPT activity state — what is open RIGHT NOW.
 
@@ -33994,7 +34089,10 @@ async def _chatgpt_activity_state(page):
            # folded into `inline_expanded`. `_chatgpt_p1_activity_open` is the
            # only thing that treats it as open; P2's call sites read it in the
            # log and act on nothing. See `_CHATGPT_INLINE_ACTIVITY_JS`.
-           "inline_chip_row": False, "inline_chips": 0}
+           "inline_chip_row": False, "inline_chips": 0,
+           # 2026-09-29: the new page's step list under "Thinking ▾", open — P1
+           # only, like the chip row. See `_CHATGPT_STEP_LIST_JS`.
+           "inline_step_list": False, "inline_step_rows": 0}
     try:
         _hit = await page.evaluate(_CHATGPT_SIDE_PANEL_JS)
         if _hit:
@@ -34010,6 +34108,13 @@ async def _chatgpt_activity_state(page):
             out["thread_len"] = int(il.get("partial_text_len", 0) or 0)
             out["inline_chips"] = int(il.get("chips", 0) or 0)
             out["inline_chip_row"] = bool(il.get("chip_row"))
+    except Exception:
+        pass
+    try:
+        sl = await page.evaluate(_CHATGPT_STEP_LIST_JS)
+        if isinstance(sl, dict) and sl.get("open"):
+            out["inline_step_list"] = True
+            out["inline_step_rows"] = int(sl.get("rows", 0) or 0)
     except Exception:
         pass
     if not out["side_panel"]:
@@ -34060,10 +34165,14 @@ def _chatgpt_p1_activity_open(st):
     small in-turn node and never click its strip — the 2026-08-06 regression that
     cost a phase its entire narration. So P2 keeps the strict pair, P1 adds the
     chip row, and the chip count travels in the log either way.
+
+    2026-09-29: and the new page's step list under "Thinking ▾", for the same
+    reason — it was open, read as closed, and pressed shut every ~30 s. See
+    `_CHATGPT_STEP_LIST_JS`.
     """
     st = st or {}
     return bool(st.get("side_panel") or st.get("inline_expanded")
-                or st.get("inline_chip_row"))
+                or st.get("inline_chip_row") or st.get("inline_step_list"))
 
 
 def _chatgpt_open_shape(st):
@@ -34080,6 +34189,8 @@ def _chatgpt_open_shape(st):
         return "inline"
     if st.get("inline_chip_row"):
         return "chips"
+    if st.get("inline_step_list"):
+        return "steps"
     return "none"
 
 
@@ -40177,6 +40288,28 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 pass
         return await browser.screenshot()
 
+    # ⛔⛔ 2026-09-29 — AN EMPTY PICTURE ENDS THE WHOLE STEP. A busy ChatGPT tab
+    # (writing a long answer) timed out both of `Browser.screenshot`'s tries, and
+    # the "" it returned went into the next tool result as an image. Anthropic
+    # refuses the WHOLE request for that ("image.source.base64: image cannot be
+    # empty", 400) and this loop treats a 400 as the end: the vision step failed
+    # outright instead of looking again (10:07:03 → 10:07:21, the second of three
+    # tries at ChatGPT's activity). Every picture after the first goes through
+    # here: an empty one is taken once more, and if that fails too the model is
+    # told in words. Only the first screenshot keeps its own guard below.
+    async def _screen_block(ss=None):
+        if ss is None:
+            ss = await _anchored_screenshot()
+        if not ss:
+            ss = await _anchored_screenshot()
+        if ss:
+            return {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                "data": ss}}
+        log("[cua] The page did not give a screenshot twice in a row (it is busy) — "
+            "telling the vision model in words instead of sending an empty picture", "WARN")
+        return {"type": "text", "text": "The screenshot could not be taken because the page "
+                "is busy. Wait a moment, then take another screenshot."}
+
     initial_ss = await _anchored_screenshot()
     if not initial_ss:
         return {"status": "error", "text": "Could not take initial screenshot"}
@@ -40400,15 +40533,14 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 log("Stuck — same action 5x. Injecting hint.", "WARN")
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": "You seem stuck. Try a different approach."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": await _anchored_screenshot()}},
+                    await _screen_block(),
                 ]})
                 recent_actions.clear()
                 continue
 
             if act == "screenshot":
-                ss = await _anchored_screenshot()
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id,
-                    "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}}]})
+                    "content": [await _screen_block()]})
             elif refused := _cua_refusal(act, tb.input, allow):
                 _may = ", ".join(sorted(allow))
                 log(f"[cua] REFUSED {refused} — this task may only use: {_may}; "
@@ -40416,8 +40548,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": f"Action '{act}' was NOT carried out: this task "
                      f"may only use: {_may}. Do not type or press Enter."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                                 "data": await _anchored_screenshot()}},
+                    await _screen_block(),
                 ]})
             elif (never_click and act == "left_click"
                     and await _cua_click_lands_on(browser, tb.input, never_click)):
@@ -40426,8 +40557,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": "That click was NOT carried out: it would have "
                      "clicked Send. Click inside the message box itself, never on Send."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                                 "data": await _anchored_screenshot()}},
+                    await _screen_block(),
                 ]})
             else:
                 ss = await execute_action(browser, act, tb.input)
@@ -40440,7 +40570,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                         pass
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": f"Action '{act}' executed."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}},
+                    await _screen_block(ss),
                 ]})
             # Emit CUA action event for frontend visibility
             if agent_name and act != "screenshot":
@@ -40872,6 +41002,90 @@ async def verify_claude_generating(page) -> bool:
         }""")
     except Exception:
         return False
+
+
+# ⛔⛔ 2026-09-16 — CLAUDE SAID IT WAS OUT OF MESSAGES, AND THE CARD SAID "DIDN'T
+# START". The account had hit its weekly usage limit. Claude's page said so
+# ("Usage limit reached · Resets Sep 20 at 1:00 AM", and a "Need more usage?"
+# dialog), the vision step read it out loud three times in each of that day's
+# two runs, and all of it was thrown away: the person got "Claude didn't start —
+# Retry or Skip", Retry could not have worked, nobody answered, and Claude was
+# skipped ten minutes later with nothing saying why.
+#
+# So the Claude launch now reads the page itself while it waits for Claude to
+# start, and a limit it sees is what the card says, with the reset time in the
+# page's own words.
+#
+# ⚠ The words are the ones the vision step quoted from the page on 09-16; no
+# capture of the page's markup exists. "limit reached" also covers a "Weekly" or
+# "Session" limit — assumed to be worded the same way, not measured.
+#: Claude's words for a limit that has been REACHED (never "approaching").
+_CLAUDE_LIMIT_RE = re.compile(r"\blimit reached\b|\bhit your limit\b|\bneed more usage\?", re.I)
+#: When it ends: "Resets Sep 20 at 1:00 AM", "Limits will reset Sep 20 at 1:00 AM."
+_CLAUDE_LIMIT_RESET_RE = re.compile(r"\bresets?[^\S\n]+(?:on[^\S\n]+)?([^\n·•]{1,60})", re.I)
+
+#: Claude's page text, minus what the program typed (the message box) and the
+#: sidebar's chat titles — a brief or a chat ABOUT usage limits is not a limit.
+_CLAUDE_PAGE_TEXT_JS = """() => {
+    let text = (document.body && document.body.innerText) || '';
+    for (const c of document.querySelectorAll(
+            'div[contenteditable="true"], .ProseMirror, textarea, nav, aside')) {
+        const t = ((c.innerText || c.value) || '').trim();
+        if (t.length > 3) text = text.split(t).join('\\n');
+    }
+    return text.slice(0, 50000);
+}"""
+
+
+def _claude_usage_limit(text) -> "dict | None":
+    """Claude's own "you are out of messages", read off its page text.
+
+    Returns ``{"line": <the page's line>, "resets": <when, in its words, or "">}``
+    or None. The reset time is looked for on the limit's line and the two after
+    it, and only kept when it names a date or a time (it holds a digit).
+    """
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if not _CLAUDE_LIMIT_RE.search(ln):
+            continue
+        resets = ""
+        for near in lines[i:i + 3]:
+            m = _CLAUDE_LIMIT_RESET_RE.search(near)
+            if not m:
+                continue
+            when = re.split(r"\.(?:\s|$)", m.group(1))[0].strip(" .,;:")
+            if re.search(r"\d", when):
+                resets = when[:40]
+                break
+        return {"line": ln[:160], "resets": resets}
+    return None
+
+
+async def _note_claude_usage_limit(page, note: dict, label: str = "2B") -> None:
+    """Record Claude's usage limit in `note` the first time the page shows it.
+    Never raises."""
+    if note or page is None:
+        return
+    try:
+        seen = _claude_usage_limit(await page.evaluate(_CLAUDE_PAGE_TEXT_JS))
+    except Exception:
+        return
+    if seen:
+        note.update(seen)
+        log(f"[{label}] Claude's page shows its usage limit: \"{seen['line']}\" — "
+            "nothing can be sent to Claude until it resets", "WARN")
+
+
+def _claude_limit_card(resets: str) -> "tuple[str, str]":
+    """The card's title and body for Claude's usage limit."""
+    if resets:
+        return (f"Claude's usage limit is reached — it resets {resets}",
+                f"Claude's page says its usage limit resets {resets}. Retry won't work "
+                "before then, so Skip Claude for this run. The other agents carry on.")
+    return ("Claude's usage limit is reached",
+            "Claude's page says this account has used up its messages for now. Retry "
+            "won't work until the limit resets, so Skip Claude for this run. The other "
+            "agents carry on.")
 
 
 async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=None,
@@ -42566,6 +42780,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             log(f"[{label}] activity already open (shape={_shape}"
                                 + (f", {_st_pre.get('inline_chips', 0)} chips"
                                    if _shape == "chips" else "")
+                                + (f", {_st_pre.get('inline_step_rows', 0)} step lines showing"
+                                   if _shape == "steps" else "")
                                 + f") at elapsed={elapsed_sec}s — no click needed")
                             res = None
                         else:
@@ -42669,19 +42885,28 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                     # verifiers disagreed about the same open drawer.
                                     # Telling the model to expect a panel that cannot
                                     # appear is an instruction to keep clicking.
+                                    # ⛔ 2026-09-29 — AND AGAIN FOR THE NEW PAGE. The
+                                    # list under "Thinking ▾" is the model's STEPS, not
+                                    # website chips, and it is usually open already;
+                                    # told to expect chips, the vision step pressed it
+                                    # shut (10:10:18). It now looks for the list first.
                                     "Open the research activity for the latest response in "
-                                    "this ChatGPT Pro/Thinking conversation: click the "
-                                    "shimmering status line directly below the last sent "
-                                    "message — whatever its wording, the shimmer is the "
-                                    "target. ONE click only — it is a toggle. Expected "
-                                    "result: a row of small website chips (favicon + "
-                                    "domain, e.g. a few site names side by side, possibly "
-                                    "ending in an 'N more' chip) appears INLINE directly "
-                                    "under that line. If those chips are ALREADY showing, "
-                                    "it is already open — do not click at all. A right-"
-                                    "side panel is a valid outcome too but is not what "
-                                    "this mode does any more. Never click 'Answer now', "
-                                    "the X, or a chip.",
+                                    "this ChatGPT Pro/Thinking conversation. The target is "
+                                    "the line directly below the last sent message — on "
+                                    "the newer page a line such as 'Thinking ▾' or "
+                                    "'Searching the web ▾', otherwise a shimmering status "
+                                    "line; whatever its wording, that line is the target. "
+                                    "ONE click only — it is a toggle. LOOK FIRST: if a "
+                                    "list of the model's steps (short lines such as "
+                                    "'Searched 48 websites' or 'Validated financial "
+                                    "claims') is ALREADY showing directly under that line, "
+                                    "or a row of small website chips (favicon + domain), "
+                                    "it is already open — do not click at all. Otherwise "
+                                    "click the line once; expected result: that list of "
+                                    "steps appears directly under it (on the older page, a "
+                                    "row of website chips). A right-side panel is a valid "
+                                    "outcome too but is not what this mode does any more. "
+                                    "Never click 'Answer now', the X, a step or a chip.",
                                     model=CUA_MODEL, max_iterations=5,
                                     verbose=verbose, target_page=page),
                                 timeout=120.0)
@@ -65240,6 +65465,18 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # #929: launch-site persisted-status reset — see the 2A note.
         _write_agent_terminal_status("claude", "running", force=True)
         _p2_mark_agent_done(_p2_run_dir(), "claude", False)  # wave 10.9 — see 2A
+        # What Claude's own page said about its usage limit during THIS launch —
+        # read on every check while we wait for Claude to start (09-16: by the
+        # time the launch gave up, the page had gone blank). See
+        # `_claude_usage_limit`.
+        _cl_limit: dict = {}
+
+        async def _verify_claude_2b(p):
+            if await verify_claude_generating(p):
+                return True
+            await _note_claude_usage_limit(p, _cl_limit)
+            return False
+
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -65256,9 +65493,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             if not _claude_setup_ok:
                 verified_c = False
                 break
-            verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2B",
+            verified_c = await wait_until_verified(_verify_claude_2b, claude_page, "2B",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
-            if verified_c:
+            # A fresh tab cannot get past a usage limit either.
+            if verified_c or _cl_limit:
                 break
         # #905: research start = submit time (see the ChatGPT note above).
         agents["Claude"] = {"page": claude_page, "verified": verified_c,
@@ -65317,12 +65555,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 else:
                     # #893: stale-cookie login wall → honest signed-out card.
                     _cl_wall = await _page_shows_login_wall(claude_page)
+                    await _note_claude_usage_limit(claude_page, _cl_limit)
                     if _cl_wall:
                         _controls.cookie_trust_broken.add("claude")
                         log(f"[2B] Claude shows {_cl_wall} — session expired (stale cookie)", "WARN")
                         fail_agent("claude", "Claude looks signed out",
                                    "Claude is showing its sign-in page — the saved session expired. "
                                    "Sign in using the open browser (or run the login command on the device), then Retry.")
+                    elif _cl_limit:
+                        _cl_title, _cl_body = _claude_limit_card(_cl_limit.get("resets", ""))
+                        log("[2B] Claude could not start because its usage limit is "
+                            "reached — the card says so and when it resets", "WARN")
+                        fail_agent("claude", _cl_title, _cl_body,
+                                   raw_err=_cl_limit.get("line", ""))
                     elif _cl_specific_already:
                         # See the 2A twin — don't clobber the specific card
                         # (snapshot taken before the probes above).
