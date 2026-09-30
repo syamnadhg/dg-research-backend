@@ -9949,7 +9949,57 @@ def _requeue_target_worker(data) -> int:
     return n if 1 <= n <= fleet else 1
 
 
+#: ⭐ WHY A "MOVE TO QUEUE" WAS REFUSED, as the app is told it — the handler's
+#: own word on the left, the fixed code the app shows on the right. A refused
+#: move used to leave the worker off (the app rests it before it sends the
+#: command) with nothing on the screen to say why the run kept going.
+#: ⛔ CONTRACT WITH THE APP (its rules clause and its popup): the device
+#: document's `requeueRefusal` = {runId, workerId, reason, at}, `at` in epoch
+#: milliseconds, `reason` one of these six values. "exiting" is not here: a
+#: second press while the worker is already leaving is the move succeeding.
+_REQUEUE_REFUSAL_REASONS = {
+    "not-owner": "not-owner",
+    "not-running-here": "not-running-here",
+    "keeps-nothing": "private-run",
+    "handed-off": "in-the-cloud",
+    "not-supervised": "not-on-startup",
+    "not-saved": "nothing-saved",
+}
+
+
+def _note_requeue_refusal(rid: str, reason: "str | None") -> None:
+    """Tell the app why this worker refused a move (`reason`, a code from
+    `_REQUEUE_REFUSAL_REASONS`), or clear an earlier refusal (`None`).
+
+    ⛔ IN AN UPDATE OF ITS OWN, like `capabilities`: `hasOnly` refuses a whole
+    update over one key the deployed rules do not admit yet, and this key must
+    never cost the rest-the-worker write beside it. Best-effort: a refusal the
+    app cannot be told is still logged in one line by the handler."""
+    try:
+        did = load_device_id()
+        if _firebase_db is None or not did:
+            return
+        value = (_crun_delete_field() if reason is None else {
+            "runId": rid, "workerId": int(WORKER_ID), "reason": reason,
+            "at": int(time.time() * 1000)})
+        _firebase_db.collection("devices").document(did).update(
+            {"requeueRefusal": value})
+    except Exception as e:
+        log(f"[device-cmds] REQUEUE: could not tell the app ({reason or 'clear'}): "
+            f"{e}", "DEBUG")
+
+
 def _handle_requeue_command(data) -> str:
+    """"Move to queue", on the worker the command names — and, when it is
+    refused, the reason written where the app can show it."""
+    outcome = _move_run_to_queue(data)
+    reason = _REQUEUE_REFUSAL_REASONS.get(outcome)
+    if reason:
+        _note_requeue_refusal(str((data or {}).get("researchId") or "").strip(), reason)
+    return outcome
+
+
+def _move_run_to_queue(data) -> str:
     """"Move to queue", on the worker the command names. What it did, as one
     word — the tests and the log both read it.
 
@@ -10006,6 +10056,7 @@ def _handle_requeue_command(data) -> str:
     _forget_running_job_in_snapshot()
     _update_research_doc(uid, rid, _waiting_record_patch())
     _keep_worker_resting(WORKER_ID)
+    _note_requeue_refusal(rid, None)   # a refusal shown earlier no longer holds
     _publish_queue_positions_now()
     try:
         left = _wait_for_uploads_to_settle(max_wait_s=5.0)
