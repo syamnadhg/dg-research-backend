@@ -30,6 +30,7 @@ real website.
 """
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -50,6 +51,7 @@ SOURCES = ("chatgpt.md", "gemini.md")
 
 _REAL_RUN_PHASE3_AUDIO = research.run_phase3_audio
 _REAL_PLAN = research._plan_pipeline_auto_retry
+_REAL_P3_PUBLISH = research._p3_publish_audio
 
 
 class _Reached(Exception):
@@ -637,6 +639,58 @@ def test_the_next_crash_resumes_into_the_same_notebook_again(resumed):
     assert _checkpoint(queue_dir)["notebook_url"] == NB_URL
 
 
+# ── …and only on the worker that made it (w13 integrated review, 09-29) ──
+
+def _recorded_on(monkeypatch, queue_dir, worker):
+    """The first attempt recorded its notebook on `worker` (None: a checkpoint
+    that does not say which)."""
+    if worker is None:
+        cp = _checkpoint(queue_dir)
+        cp.pop("notebook_worker", None)
+        (queue_dir / "checkpoint.json").write_text(json.dumps(cp), encoding="utf-8")
+        return
+    monkeypatch.setattr(research, "WORKER_ID", worker)
+    research.save_checkpoint(queue_dir, 3, topic="Grid storage", brief_url="",
+                             notebook_url=NB_URL)
+
+
+@pytest.mark.parametrize("made_on, resumed_on", [(2, 1), (1, 2), (None, 1)],
+                         ids=["worker-2-then-1", "worker-1-then-2", "worker-not-recorded"])
+def test_a_notebook_another_worker_made_is_not_carried_on_in(
+        resumed, monkeypatch, made_on, resumed_on):
+    """⛔⛔ A MOVE ALWAYS RESUMES THE RUN ON ANOTHER WORKER — another Chrome
+    profile, and maybe another Google account. The notebook was made public
+    before it was recorded, so there it opens view-only and passes the reopen's
+    checks; the podcast step then ran in a notebook this account may not be
+    able to use. A new notebook is made instead, as before wave 13, and the
+    checkpoint then names it and this worker."""
+    run, nb, queue_dir, _seen = resumed
+    nb.ready = 1
+    _recorded_on(monkeypatch, queue_dir, made_on)
+    monkeypatch.setattr(research, "WORKER_ID", resumed_on)
+    seen = run(_stop_here)
+
+    assert NB_URL not in _FakeBrowser.instances[0].opened, (
+        "another worker's notebook was opened on this worker's profile")
+    assert seen["created"] == 1
+    assert seen["audio"] and seen["audio"][0]["url"] == NEW_NB_URL
+    cp = _checkpoint(queue_dir)
+    assert (cp["notebook_url"], cp["notebook_worker"]) == (NEW_NB_URL, resumed_on)
+
+
+def test_the_worker_that_made_the_notebook_carries_on_in_it(resumed, monkeypatch):
+    """The control: a crash relaunch on the same worker — the same profile —
+    goes back to its notebook, whichever worker that is."""
+    run, nb, queue_dir, _seen = resumed
+    nb.ready = 1
+    _recorded_on(monkeypatch, queue_dir, 2)
+    seen = run(_stop_here)
+
+    assert seen["created"] == 0
+    assert seen["audio"] and seen["audio"][0]["url"] == NB_URL
+    assert _checkpoint(queue_dir)["notebook_worker"] == 2
+
+
 # ══ 3. a dead browser is never "retried" on ═══════════════════════════════
 
 def test_chrome_dying_under_the_download_is_not_retried_on_the_dead_browser(resumed):
@@ -852,3 +906,310 @@ def test_the_login_command_still_pauses_the_run_once_the_relaunches_are_spent(
 
     assert "login_interrupt" in seen["plan"]
     assert not handed_off, "the run was ended without the podcast during a sign-in"
+
+
+# ══ 5. a resume past Phase 1 writes the brief to the app again ══════════════
+#
+# ⛔⛔ THE w13 INTEGRATED REVIEW (09-29). Phase 1 ends in two halves: brief.md
+# and the checkpoint on disk, then the brief document, the "Read Brief report"
+# link and Phase 1's "complete" in Firestore. A Move to queue cuts the run's
+# Firestore writes off and keeps the pipeline running for its exit window, so a
+# brief that arrived in that window reached the disk and nothing else — and the
+# resume trusts the disk: it starts at Phase 2 and never wrote the brief again.
+# A crash between the two halves leaves the same gap.
+
+def _phase1_writes(monkeypatch):
+    """Phase 1's Firestore half, as the real writers are asked for it."""
+    w = {"documents": [], "record": [], "phases": [], "slot": []}
+    monkeypatch.setattr(research, "save_document_to_firestore",
+                        lambda kind, content, name=None:
+                        w["documents"].append((kind, content, name)) or True)
+    monkeypatch.setattr(research, "_update_firestore_research",
+                        lambda updates: w["record"].append(dict(updates)))
+    monkeypatch.setattr(research, "_write_phase_terminal_status",
+                        lambda phase, status: w["phases"].append((phase, status)))
+    monkeypatch.setattr(research, "_record_brief_in_aggregate",
+                        lambda url: w["slot"].append(url))
+    return w
+
+
+def _stop_at_phase_2(monkeypatch):
+    """End the run where Phase 2 starts: this is about what came before it."""
+    def _emit(event_type, phase=None, agent=None, **data):
+        if event_type == "phase_start" and phase == 2:
+            raise _Reached()
+    monkeypatch.setattr(research, "emit_event", _emit)
+
+
+@pytest.mark.parametrize("start", [2, 3], ids=["resumed-at-phase-2", "resumed-at-phase-3"])
+def test_a_resume_past_phase_1_writes_the_brief_to_the_app_again(
+        resumed, monkeypatch, start):
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_research_id", "chat_1759200000000_brief")
+    if start == 2:
+        (queue_dir / "links.json").unlink()
+        _stop_at_phase_2(monkeypatch)
+    assert research.detect_resume_phase(queue_dir)[0] == start, "precondition"
+    w = _phase1_writes(monkeypatch)
+    run(_stop_here)
+
+    brief_md = (queue_dir / "documents" / "brief.md").read_text(encoding="utf-8")
+    page = "/documents?open=chat_1759200000000_brief:brief"
+    assert w["documents"].count(("brief", brief_md, "Research Brief")) == 1, (
+        "the brief document was not written again from brief.md")
+    assert {"links.phase1": [{"label": "Read Brief report", "url": page,
+                              "verified": True, "primary": True}]} in w["record"], (
+        "no Read Brief report link on the resumed run")
+    assert (1, "complete") in w["phases"], "Phase 1 never marked complete"
+    assert w["slot"] == [page], "the record's brief slot was not filled"
+
+
+@pytest.mark.parametrize("brief", ["missing", "empty"])
+def test_a_resume_with_no_brief_on_disk_writes_no_brief(resumed, monkeypatch, brief):
+    """The control: Phase 1 made no brief (skipped after an error), so there is
+    nothing to write again — and Phase 1 is not called complete."""
+    run, _nb, queue_dir, _seen = resumed
+    if brief == "missing":
+        (queue_dir / "documents" / "brief.md").unlink()
+    else:
+        (queue_dir / "documents" / "brief.md").write_text("", encoding="utf-8")
+    w = _phase1_writes(monkeypatch)
+    run(_stop_here)
+
+    assert not [d for d in w["documents"] if d[0] == "brief"]
+    assert (1, "complete") not in w["phases"]
+    assert not [u for u in w["record"] if "links.phase1" in u]
+
+
+# ══ 6. a resume past Phase 3 publishes the podcast on disk again ════════════
+#
+# ⛔⛔ THE w13 INTEGRATED REVIEW, SECOND ROUND (09-30) — Phase 1's gap has a
+# Phase 3 twin. The podcast lands in podcasts/, then `_p3_publish_audio` uploads
+# it and writes the `audios` row and `links.audio_file`. A Move to queue cuts
+# the run's record off and gives an upload in flight five seconds: the upload
+# is cut off, or it finishes and its two writes are skipped. The resume trusted
+# the disk — "Phase 3 done" — and never published it: no Podcasts entry, no
+# Play in the chat, no "Podcast ready", and the cloud's video step found no
+# podcast. A crash between the download and the publish left the same gap.
+
+RID = "chat_1759200000000_p3end"
+UID = "sharer-uid"
+STORED = "https://firebasestorage.example/podcast.mp3"
+
+
+def _the_real_publish(monkeypatch, *, upload_ok=True):
+    """The REAL `_p3_publish_audio`. Its upload answers the URL (even with the
+    record cut off: the upload read the record when it began), and its two
+    writes land under the record the globals name when each is made — a write
+    made with them unset is dropped, as both real writers drop it."""
+    w = {"uploaded": [], "rows": [], "links": []}
+    monkeypatch.setattr(research, "_p3_publish_audio", _REAL_P3_PUBLISH)
+
+    def _upload(path):
+        w["uploaded"].append(path.name)
+        return STORED if upload_ok else None
+    monkeypatch.setattr(research, "upload_audio_to_storage", _upload)
+
+    def _landed(key, *row):
+        if research._fb_uid and research._fb_research_id:
+            w[key].append((*row, research._fb_uid, research._fb_research_id))
+    monkeypatch.setattr(research, "save_audio_to_firestore",
+                        lambda audio_id, _name, _dur, url: _landed("rows", audio_id, url))
+    monkeypatch.setattr(research, "update_link_in_firestore",
+                        lambda kind, url, **_f: _landed("links", kind, url)
+                        if kind == "audio_file" else None)
+    monkeypatch.setattr(research, "_audio_duration_sec", lambda _p: 600)
+    monkeypatch.setattr(research, "smart_title", lambda s: s)
+    return w
+
+
+def _watch_in_order(monkeypatch):
+    """Every event and the hand-off's kick, in the order they happened."""
+    seen = []
+    monkeypatch.setattr(research, "emit_event",
+                        lambda event_type, phase=None, agent=None, **data:
+                        seen.append((event_type, phase, data)))
+    monkeypatch.setattr(research, "_post_fe_p4p5_trigger",
+                        lambda uid, rid: seen.append(("hand-off", uid, rid)))
+    return seen
+
+
+def _published(w):
+    """The run's podcast reached the app, under this research."""
+    return (w["rows"] and all(r[1:] == (STORED, UID, RID) for r in w["rows"])
+            and ("audio_file", STORED, UID, RID) in w["links"])
+
+
+def _podcast(queue_dir, name="Grid_storage.m4a", body=b"\x00" * 4096):
+    pod = queue_dir / "podcasts"
+    pod.mkdir(exist_ok=True)
+    (pod / name).write_bytes(body)
+    return pod / name
+
+
+@pytest.mark.parametrize("where", ["checkpoint", "folder"],
+                         ids=["named-by-the-checkpoint", "in-the-folder-only"])
+def test_a_resume_past_phase_3_publishes_the_podcast_on_disk_again(
+        resumed, monkeypatch, where):
+    """The owner's case is `in-the-folder-only`: the move cut the upload off,
+    so the checkpoint never named the file. `named-by-the-checkpoint` is a crash
+    after a publish whose writes the move skipped."""
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    audio = _podcast(queue_dir, "Grid_storage.mp3")
+    if where == "checkpoint":
+        research.save_checkpoint(queue_dir, 3, topic="Grid storage", brief_url="",
+                                 notebook_url=NB_URL, audio_path=str(audio))
+    assert research.detect_resume_phase(queue_dir)[0] == 4, "precondition"
+    w = _the_real_publish(monkeypatch)
+    order = _watch_in_order(monkeypatch)
+    run(_stop_here)
+
+    assert w["uploaded"] == ["Grid_storage.mp3"], "the podcast on disk was not uploaded"
+    assert _published(w), f"the podcast never reached the app: {w}"
+    kinds = [(e[0], e[1]) for e in order]
+    assert ("phase_complete", 3) in kinds, "Phase 3 was never completed on the podcast"
+    assert ("hand-off", UID, RID) in order, "the run was not handed off"
+    assert kinds.index(("phase_complete", 3)) < order.index(("hand-off", UID, RID)), (
+        "the podcast was published after the hand-off")
+
+
+def test_a_transcode_cut_off_is_finished_before_the_podcast_is_published(
+        resumed, monkeypatch):
+    """The mp3 transcode deletes its original only once it finished, so an
+    original beside an mp3 is a transcode that did not — and that mp3 may be
+    half written. The original is transcoded again and the result published."""
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    original = _podcast(queue_dir, "Grid_storage.m4a")
+    half = _podcast(queue_dir, "Grid_storage.mp3", b"\x00" * 16)
+    os.utime(original, (1_759_000_000, 1_759_000_000))   # the mp3 came after it
+    asked = []
+
+    def _transcode(src):
+        asked.append(src.name)
+        if src.suffix == ".mp3":
+            return src
+        half.write_bytes(b"\x00" * 4096)
+        src.unlink()
+        return half
+    monkeypatch.setattr(research, "_transcode_audio_to_mp3", _transcode)
+    w = _the_real_publish(monkeypatch)
+    _watch_in_order(monkeypatch)
+    run(_stop_here)
+
+    assert asked == [original.name], "the unfinished transcode was not run again"
+    assert w["uploaded"] == ["Grid_storage.mp3"]
+    assert _published(w)
+
+
+def test_the_podcast_the_checkpoint_names_is_the_one_published(resumed, monkeypatch):
+    """The checkpoint names the podcast Phase 3 completed on. Another file in
+    the folder, even a newer one, is not published in its place."""
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    ours = _podcast(queue_dir, "Grid_storage.mp3")
+    _podcast(queue_dir, "Other_topic.mp3")
+    os.utime(ours, (1_759_000_000, 1_759_000_000))
+    research.save_checkpoint(queue_dir, 3, topic="Grid storage", brief_url="",
+                             notebook_url=NB_URL, audio_path=str(ours))
+    w = _the_real_publish(monkeypatch)
+    _watch_in_order(monkeypatch)
+    run(_stop_here)
+
+    assert w["uploaded"] == ["Grid_storage.mp3"]
+    assert _published(w)
+
+
+def test_a_podcast_that_does_not_reach_the_app_completes_nothing(resumed, monkeypatch):
+    """The control: the upload fails, so there is no podcast in the app — and
+    no Phase 3 "complete" or "Podcast ready" for one. The run is handed off
+    without it, as before."""
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    _podcast(queue_dir, "Grid_storage.mp3")
+    w = _the_real_publish(monkeypatch, upload_ok=False)
+    order = _watch_in_order(monkeypatch)
+    run(_stop_here)
+
+    assert w["uploaded"] == ["Grid_storage.mp3"]
+    assert not w["rows"] or all(r[1] is None for r in w["rows"])
+    assert not [e for e in order if e[:2] == ("phase_complete", 3)]
+    assert ("hand-off", UID, RID) in order
+
+
+def test_a_stray_file_in_the_podcast_folder_is_not_published(resumed, monkeypatch):
+    """The control: `detect_resume_phase` reads any file in podcasts/ as Phase 3
+    done. A file that is not a podcast is not uploaded as one."""
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    _podcast(queue_dir, "notes.txt", b"not a podcast")
+    assert research.detect_resume_phase(queue_dir)[0] == 4, "precondition"
+    w = _the_real_publish(monkeypatch)
+    order = _watch_in_order(monkeypatch)
+    run(_stop_here)
+
+    assert w["uploaded"] == [] and not w["rows"] and not w["links"]
+    assert not [e for e in order if e[:2] == ("phase_complete", 3)]
+    assert ("hand-off", UID, RID) in order
+
+
+@pytest.mark.parametrize("marker", ["waiting", "taken"],
+                         ids=["waiting-in-the-queue", "taken-by-another-worker"])
+def test_a_run_moved_as_its_podcast_upload_finishes_is_published_by_the_next_worker(
+        resumed, monkeypatch, marker):
+    """⛔⛔ END TO END. The move lands during the podcast upload, and the upload
+    finishes inside the move's five-second wait: its two writes are skipped,
+    because the move cut the record off, and the pipeline runs on to the
+    hand-off in its last second. The hand-off used to be written to disk there,
+    so the worker that took the run read "handed off" and only re-sent the
+    kick: the podcast never reached the app. Now the moved run hands nothing
+    off, and the worker that takes it publishes the podcast and hands it off."""
+    run, nb, queue_dir, _seen = resumed
+    nb.ready = 1
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    w = _the_real_publish(monkeypatch)
+    order = _watch_in_order(monkeypatch)
+
+    async def _moved_during_the_upload(_browser, _url, _prefer):
+        audio = _podcast(queue_dir, "Grid_storage.mp3")
+        # `_handle_requeue_command`, on the device-command thread meanwhile:
+        # the run's marker goes into its folder, then the record is cut off.
+        assert research._park_waiting_run(
+            {"resume_dir": str(queue_dir), "uid": UID, "research_id": RID,
+             "topic": "Grid storage"}, from_worker=1) == queue_dir
+        research._fb_uid = None
+        research._fb_research_id = None
+        if marker == "taken":
+            # Another awake worker's claim renames the marker; it puts it back
+            # once it sees this worker's lock — here, in this last second.
+            os.replace(queue_dir / research.WAITING_MARKER,
+                       queue_dir / research._waiting_taken_name(2))
+        stored = await research._p3_publish_audio(audio, RID)
+        return {"audio_path": audio, "audio_stored_url": stored}
+    run(_moved_during_the_upload)
+
+    assert w["uploaded"] == ["Grid_storage.mp3"] and not w["rows"] and not w["links"], (
+        "precondition: the move's cut-off skipped the podcast's writes")
+    assert not [e for e in order if e[0] == "hand-off"], "the moved run handed off"
+    assert not research._handed_off_to_cloud(queue_dir), (
+        "the moved run wrote its hand-off to disk — the next worker would only "
+        "re-send the kick")
+    assert research.detect_resume_phase(queue_dir)[0] == 4
+
+    # The next worker takes it: the marker goes, the record is this run's again.
+    for m in queue_dir.glob(research.WAITING_MARKER + "*"):
+        m.unlink()
+    monkeypatch.setattr(research, "_fb_uid", UID)
+    monkeypatch.setattr(research, "_fb_research_id", RID)
+    del order[:]
+    run(_stop_here)
+
+    assert _published(w), f"the podcast never reached the app: {w}"
+    assert ("hand-off", UID, RID) in order

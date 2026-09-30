@@ -248,6 +248,47 @@ def test_the_known_stale_list_only_shrinks():
     )
 
 
+# ⛔ ONE ID, ONE MUTANT (w13 integrated review, 09-30). The Move-to-queue harness
+# gained a second S1, S2 and S3: `harness.py S1` ran both, a survivor line saying
+# "S1" no longer said which mutant, and this sweep keys what it finds by
+# (harness, id), so an entry for one hid the other. The same closed ratchet as
+# KNOWN_STALE: what was already there when this check landed may only shrink.
+KNOWN_DUPLICATE_IDS: "set[tuple[str, str]]" = {
+    ("wave1010_models_mutants.py", mid) for mid in ("P1", "P2", "P3", "P4", "T1", "T2")
+}
+
+
+def _duplicate_ids():
+    """(harness, id) for every id two mutants of one harness share."""
+    out = set()
+    for path in _sweep_module().harnesses():
+        name = os.path.basename(path)
+        mod_name = "_ids_" + name[:-3].replace("-", "_")
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            continue  # the sweep reports a harness that will not import
+        ids = [entry[0] for entry in (getattr(mod, "MUTANTS", None) or []) if entry]
+        out |= {(name, mid) for mid in ids if ids.count(mid) > 1}
+    return out
+
+
+def test_no_harness_gives_two_mutants_one_id():
+    dup = _duplicate_ids()
+    new = dup - KNOWN_DUPLICATE_IDS
+    assert not new, (
+        "two mutants of one harness share an id, so selecting it runs both and a "
+        f"result naming it names neither — rename one: {sorted(new)}"
+    )
+    fixed = KNOWN_DUPLICATE_IDS - dup
+    assert not fixed, (
+        "good news — these ids are no longer shared. Remove them from "
+        f"KNOWN_DUPLICATE_IDS so the ratchet keeps its grip: {sorted(fixed)}"
+    )
+
+
 def test_every_harness_is_swept():
     """A harness that fails to import is invisible to the sweep, which would
     make an empty result look like a clean one."""

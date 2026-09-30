@@ -838,6 +838,15 @@ def test_a_run_waiting_in_the_queue_is_left_there_even_by_an_awake_worker(
 
 # ══ 6. boot: the disk snapshot ════════════════════════════════════════════════
 
+def _boot_publish_done():
+    """Wait for the boot restore's one publish after the last park. It runs on
+    its own thread (w13 integrated review): boot calls the restore on the event
+    loop, and the publish is a whole renumber."""
+    for t in threading.enumerate():
+        if t.name == "queueowners-boot-park":
+            t.join(15)
+
+
 def _snapshot(tmp_path, current, pending=()):
     path = tmp_path / "queues" / "_pending_queue.json"
     path.write_text(json.dumps({"ts_ms": 1, "current": current, "pending": list(pending)}),
@@ -904,6 +913,7 @@ def test_a_resting_workers_interrupted_run_in_the_snapshot_waits_in_the_queue(
         path = _snapshot(base, _job(SHARER, RID, run_id), [other])
         q = _Q()
         research._restore_pending_queue_snapshot(path, q, set())
+        _boot_publish_done()
         assert [j["research_id"] for j in q._queue] == expect, (resting, m.lines)
         assert (folder / MARKER).exists() is resting
         assert (other_folder / MARKER).exists() is resting, "the queued job is not behind it"
@@ -1400,8 +1410,12 @@ def _cancel_listener(monkeypatch, tmp_path, *, deque_jobs=None):
 
 
 CANCELS = {
-    "own-cancel": ({"submittedBy": SHARER}, {"status": "stopped", "summary": "Cancelled",
-                                             "cancelled": True}),
+    # ⛔⛔ THE RUN'S OWN PERSON STOPS IT (w13 integrated review, 09-29). This was
+    # a running run's CANCEL — `cancelled: true`, the app's delete-on-close — and
+    # the person's chat shows every queued run as "queued — Cancel", so the
+    # research and its reports went when the chat closed. A waiting run with work
+    # done is written as a stop: no `cancelled`, no `phase`, no `summary`.
+    "own-cancel": ({"submittedBy": SHARER}, {"status": "stopped"}),
     "owner-cancel": ({"submittedBy": OWNER, "ownerControl": "cancel"},
                      {"status": "stopped", "summary": "Cancelled by the device owner",
                       "stoppedBy": "owner_cancel", "cancelled": True}),
@@ -1423,7 +1437,8 @@ def test_a_waiting_run_is_stopped_or_cancelled_as_a_running_run_is(monkeypatch, 
     steps, the owner's Stop was dropped (and the run ran later), and its marker
     kept it the amber #1. Now it is ended for good (`.stop`, its marker retired)
     and written as a RUNNING run's stop or cancel is: its steps never reset, the
-    owner's Stop keeps everything, and it no longer reads as moved."""
+    owner's Stop keeps everything, and it no longer reads as moved. Its own
+    person's cancel is a stop (w13 integrated review): see CANCELS."""
     over, expect = CANCELS[who]
     _r, folder = _run_folder(tmp_path, RID, uid=SHARER)
     (folder / "phase2_complete.marker").write_text("x", encoding="utf-8")
@@ -1460,7 +1475,7 @@ def test_a_taken_run_not_yet_started_here_is_cancelled_as_a_running_run_is(
         monkeypatch, tmp_path):
     """This worker took the moved run into its line and has not started it.
     The cancel takes it out of the line — and it is still a run with work in
-    it, not one that never started."""
+    it, not one that never started: its own person's cancel keeps the work."""
     _r, folder = _run_folder(tmp_path, RID, uid=SHARER)
     _moved_marker(folder, SHARER, RID, worker=1)
     taken = _job(SHARER, RID, folder.name, resume_dir=str(folder), moved_run=True)
@@ -1572,6 +1587,7 @@ def test_after_a_move_on_a_one_worker_computer_the_worker_that_is_off_starts_not
     monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", line)
     before = len(m.store.device_updates)
     research._restore_pending_queue_snapshot(path, line, set())
+    _boot_publish_done()
     assert list(line._queue) == [], "the worker that is off was given a run to start"
 
     published = [u["queueOwners"] for u in m.store.device_updates[before:]
@@ -1718,6 +1734,7 @@ def test_a_queued_resume_a_resting_worker_puts_back_is_marked_moved_and_stops_wi
         _job(OWNER, NEW_RID, new_id, brief_text="a new run")])
 
     research._restore_pending_queue_snapshot(path, _Q(), set())
+    _boot_publish_done()
 
     owners = [u["queueOwners"] for u in store.device_updates if "queueOwners" in u][-1]
     assert owners == [

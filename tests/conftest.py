@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import tokenize
 from datetime import datetime
 from pathlib import Path
@@ -460,6 +461,22 @@ def _no_boot_entry_is_held_from_another_test(monkeypatch):
     monkeypatch.setattr(research, "_UNREAD_RESTORES", [], raising=True)
     monkeypatch.setattr(research, "_RESUMED_HERE", set(), raising=True)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_boot_publish_outlives_its_test(monkeypatch):
+    """⛔⛔ The boot restore's one publish after the last park runs on a thread
+    of its own (w13 integrated review: boot calls the restore on the event
+    loop). That thread reads Firestore and the device id from the module's
+    globals WHEN IT WRITES — so one still running after its test wrote into
+    whatever the next test had patched in, or failed on the None monkeypatch
+    put back (the full suite printed exactly that). Joined here, before this
+    test's patches are undone: it depends on `monkeypatch`, so it is torn down
+    first."""
+    yield
+    for t in threading.enumerate():
+        if t.name == "queueowners-boot-park":
+            t.join(15)
 
 
 @pytest.fixture(scope="session")

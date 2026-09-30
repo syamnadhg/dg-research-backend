@@ -7957,11 +7957,12 @@ def _waiting_position_patches(front) -> "list[tuple[str, str, dict]]":
 
 def _commit_queue_position_patches(patches) -> None:
     """Commit `(uid, research id, patch)` renumber writes, one batch per
-    account, each through the heal."""
+    account, each through the heal — except an account this computer is no
+    longer shared with (`_renumber_batches`)."""
     if not patches:
         return
 
-    for uid_b, i, chunk in _queue_pos_batches(patches):
+    for uid_b, i, chunk in _renumber_batches(patches):
         def _commit_chunk(chunk=chunk):
             batch = _firebase_db.batch()
             for uid_v, rid_v, patch in chunk:
@@ -8613,6 +8614,40 @@ def _queue_pos_batches(patches, chunk: int = 450):
             yield uid_v, i, mine[i:i + chunk]
 
 
+def _renumber_batches(patches):
+    """`_queue_pos_batches`, less every batch of an account this computer is
+    POSITIVELY no longer shared with — both renumbers commit what this yields.
+
+    ⛔⛔ THAT ACCOUNT'S BATCH SPENT EVERYBODY'S SAFETY NET (w13 integrated
+    review, 09-29). A removed sharer's run waiting in the queue, or a start
+    document they left behind, is in every renumber — at each phase start,
+    claim, finish, park and move. The rules refuse its records for good
+    (`deviceOwnership`), and each refusal went through the full heal: the
+    re-mint and its 30-second cooldown, which are one per process, and a step
+    toward the latch. So the owner's own "queued at #1" write after a move, or
+    boot's first write after the put-back, found no re-mint left and was
+    dropped; three such renumbers latched STRUCTURAL for every account.
+    ⭐ Skipped, not written with `heal=False`: the same device document the
+    rules read says they are not a member, so the write can only be refused.
+    ⭐ "CAN'T TELL" IS AS TODAY. A device read that fails is no evidence
+    (`_device_members`), so the batch is written through the heal as before.
+    ⭐ The paired account's batches cost no read; the device document is read
+    once per renumber, and only when another account's run is in it."""
+    paired = str(load_paired_uid() or "").strip()
+    members = _MEMBERS_UNREAD
+    for uid_b, i, chunk in _queue_pos_batches(patches):
+        uid_s = str(uid_b or "").strip()
+        if uid_s and uid_s != paired:
+            if members is _MEMBERS_UNREAD:
+                members = _device_members()
+            if _known_not_a_member(uid_s, members):
+                log(f"[queue-pos] not renumbering {len(chunk)} queued run(s) of "
+                    f"{uid_s[:8]}…: that account is no longer shared on this "
+                    f"computer, so its records refuse this computer's writes", "DEBUG")
+                continue
+        yield uid_b, i, chunk
+
+
 def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
                           heal: bool = True):
     """Run a gRPC user-tree write `op` (a zero-arg callable). On a synth-user
@@ -8640,8 +8675,10 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
     older logs, and once on worker 2 a minute after it started. Such a write
     gets the free same-token retry below and nothing else: no force-refresh, no
     cooldown stamp, no count toward the latch, no line blaming the pairing.
-    (A success still clears the latch, as every successful write does — the
-    heartbeat among them; landing proves the credential works.)"""
+    (A success still clears the latch, as every write that lands THROUGH THIS
+    FUNCTION does; landing proves the credential works. ⛔ The heartbeat does
+    not: it writes the device document directly, so a latch stays set until a
+    research write through here lands.)"""
     global _grpc_heal_last_ts, _grpc_heal_consec_fail, _grpc_heal_structural
     try:
         result = op()
@@ -9528,6 +9565,24 @@ def _waiting_record_patch() -> dict:
     }
 
 
+def _waiting_run_stop_patch() -> dict:
+    """What a waiting run that KEPT WORK says once its own person ends it: a
+    stop, as the chat's own Stop of a running run is — `stopped`, with its
+    steps and its work as they were. ⛔ No `cancelled` (the app's
+    delete-on-close) and no `phase: 0`. ⛔ No `summary` either: a stop is a
+    status, and the app keeps whatever summary is there. It no longer waits,
+    so its queue fields and `movedToQueueAt` go."""
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    return {
+        "status": "stopped",
+        "stoppedAt": int(time.time() * 1000),
+        "queuePosition": _DF,
+        "queuedBehindRunId": _DF,
+        "queuedBehindTitle": _DF,
+        "movedToQueueAt": _DF,
+    }
+
+
 def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None":
     """Put `job`'s run at the front of this computer's queue: write its marker,
     naming the whole job, so whichever worker takes it can resume it without
@@ -9666,7 +9721,15 @@ def _claim_waiting_run(worker_id) -> "dict | None":
     ⭐ "ONGOING" WITH NOBODY HOLDING IT IS TAKEN, not dropped: it is the record
     whose "queued" write never landed (a Firestore blip at the move), or that
     the old worker's last second wrote over. Dropped, the run would be lost —
-    its record saying it runs while nothing runs it."""
+    its record saying it runs while nothing runs it.
+
+    ⛔ A RUN DROPPED HERE LEAVES THE PUBLISHED ORDER (w13 integrated review):
+    it stayed the amber #1 in `queueOwners`, and every other run one place
+    lower, until something else published. When this takes nothing it
+    publishes; when it takes a run, the caller publishes once that run is in
+    its worker's line — a publish started here would find that run in neither
+    place, and the caller's, finding one running, would be skipped."""
+    dropped = False
     for rec in _waiting_runs():
         d = rec["_dir"]
         uid = str(rec.get("uid") or "")
@@ -9697,6 +9760,7 @@ def _claim_waiting_run(worker_id) -> "dict | None":
                 log(f"[moved-run] {rid[:8]}… is {status} now — it is no longer "
                     f"waiting in the queue", "INFO")
             _drop_waiting_claim(d, worker_id)
+            dropped = True
             continue
         queued_job = rec.get("queued_job")
         if isinstance(queued_job, dict):
@@ -9724,6 +9788,8 @@ def _claim_waiting_run(worker_id) -> "dict | None":
             # It was running: until it starts here its pill says so (`moved`).
             "kept_work": True,
         }
+    if dropped:
+        _kick_queue_publish()
     return None
 
 
@@ -9801,7 +9867,9 @@ async def _offer_waiting_run(job_queue) -> bool:
                                     _restart_recovery_patch(rid))
             log(f"[moved-run] {rid[:8]}… has used up its automatic attempts — "
                 f"offered to its person to resume instead", "INFO")
-            _kick_queue_publish()
+        # ⛔ Whatever the funnel refused, it no longer waits anywhere — and the
+        # claim left publishing to here (w13 integrated review).
+        _kick_queue_publish()
         return False
     from google.cloud.firestore import DELETE_FIELD as _DF
     await asyncio.to_thread(_update_research_doc, job["uid"], job["research_id"], {
@@ -16044,6 +16112,79 @@ async def _p3_publish_audio(audio_path, research_id) -> str:
     return ""
 
 
+#: The podcast files a run's `podcasts/` folder can hold — the suffixes the
+#: download fallback in `run_phase3_audio` keeps a file under.
+_P3_PODCAST_SUFFIXES = (".m4a", ".m4b", ".mp3", ".wav", ".webm", ".ogg")
+
+
+def _p3_podcast_on_disk(queue_dir, cp) -> "Path | None":
+    """The podcast a run resumed past Phase 3 already has on disk, or None.
+
+    The checkpoint's `audio_path` when that file is there. Otherwise the newest
+    podcast in `podcasts/`, which is what `detect_resume_phase` read when it
+    answered "Phase 3 done": the file lands there before the publish runs, and
+    the checkpoint names it only after the publish returned.
+
+    ⛔ AN ORIGINAL BESIDE AN MP3 IS TAKEN, NOT THE MP3. The mp3 transcode deletes
+    its source only once it finished, so the pair means it did not — and that
+    mp3 may be half written. The caller runs the transcode again on it."""
+    p = str((cp or {}).get("audio_path") or "")
+    if p and Path(p).is_file():
+        return Path(p)
+    try:
+        found = [f for f in (Path(queue_dir) / "podcasts").iterdir()
+                 if f.is_file() and f.suffix.lower() in _P3_PODCAST_SUFFIXES]
+    except OSError:
+        return None
+    if not found:
+        return None
+    originals = [f for f in found if f.suffix.lower() != ".mp3"]
+    return max(originals or found, key=lambda f: f.stat().st_mtime)
+
+
+async def _p3_publish_on_resume(queue_dir, cp, research_id) -> "tuple[Path | None, str]":
+    """A run resumed PAST Phase 3 publishes the podcast on disk again, and
+    answers `(the podcast, its Storage URL)` — `(None, "")` with none there.
+
+    ⛔⛔ PHASE 3'S END IS TWO HALVES, AND ONLY THE DISK HALF DECIDES THE RESUME
+    (w13 integrated review, 09-30) — the twin of `_resave_phase1_on_resume`. The
+    podcast lands in `podcasts/`, then `_p3_publish_audio` uploads it and writes
+    the `audios` row and `links.audio_file`. A Move to queue unsets the record
+    globals and gives an upload in flight five seconds, so the upload was cut
+    off, or finished and its two writes were skipped. A crash between the two
+    halves does the same. The next worker saw the file, resumed at Phase 4 and
+    only read the checkpoint back: no Podcasts entry, no Play in the chat, no
+    "Podcast ready", and the cloud's video step found no podcast to use.
+
+    ⭐ SAFE TO REPEAT. The Storage object and the `audios` row are keyed by the
+    file's name, and `links.audio_file` is a merge — so a resume after a publish
+    that did land costs one upload and changes nothing.
+
+    ⭐ PHASE 3 IS COMPLETE ON THE PUBLISHED PODCAST, as at Phase 3's end: the
+    same `phase_complete:3` goes out when the publish answers with a URL (its
+    notice is keyed by the research, so it is never shown twice). When the
+    publish fails the resume goes on without it, as it did before."""
+    audio_path = _p3_podcast_on_disk(queue_dir, cp)
+    if audio_path is None:
+        return None, ""
+    # An mp3 comes back untouched; an original is the transcode that did not
+    # finish (or a computer with no ffmpeg, which delivers it as it is).
+    audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)
+    stored = await _p3_publish_audio(audio_path, research_id)
+    if not stored:
+        log(f"Phase 3: the podcast on disk ({audio_path.name}) did not reach the app "
+            f"on this resume — going on without it", "WARN")
+        return audio_path, ""
+    nb = str((cp or {}).get("notebook_url") or "")
+    links = ([{"label": "NotebookLM Notebook", "url": nb, "verified": True}]
+             if nb and validate_link("notebooklm", nb) else [])
+    emit_event("phase_complete", phase=3, durationSec=0, links=links,
+               summary="NotebookLM notebook created, audio generated"
+                       + (", notebook link recorded" if links else ""))
+    log(f"Phase 3: the podcast on disk ({audio_path.name}) is in the app again")
+    return audio_path, stored
+
+
 #: What phase 3 tells the person when it ends holding no podcast for a run that
 #: keeps nothing — the tile's line and the notice's line.
 #:
@@ -16623,6 +16764,9 @@ def start_firestore_start_listener(job_queue, loop):
                         # One this worker took from the queue for a worker and
                         # has not started yet (wave 13) — see below.
                         removed_taken = any(_cancels(j) and j.get("moved_run") for j in dq)
+                        # …and whether that run had work done (`kept_work`).
+                        removed_taken_kept = any(_cancels(j) and j.get("moved_run")
+                                                 and j.get("kept_work") for j in dq)
                         dq.clear()
                         for j in kept:
                             dq.append(j)
@@ -16695,6 +16839,30 @@ def start_firestore_start_listener(job_queue, loop):
                         _waiting_rec = (_end_waiting_run(u, rid)
                                         if _start_doc_id is None and (removed_taken or not removed)
                                         else None)
+                        # ⭐⭐ THE RUN'S OWN PERSON, ON A WAITING RUN THAT KEPT
+                        # WORK, IS STOPPING IT (w13 integrated review, 09-29).
+                        # Their chat shows any queued run as "queued — Cancel",
+                        # so a run moved after an hour of research, or put back
+                        # at boot with its steps done, was written as a cancel:
+                        # `cancelled: true`, and the app deleted the research
+                        # and its reports when the chat closed. It is written as
+                        # a stop now — work kept, steps as they were — whatever
+                        # the chat called it. An ordinary queued run's own cancel
+                        # is still "Cancelled before starting", below.
+                        if (not _owner_control_patch(oc, running=True)
+                                and (_waiting_kept_work(_waiting_rec)
+                                     if _waiting_rec is not None else removed_taken_kept)):
+                            if _firebase_db:
+                                _update_research_doc(u, rid, _waiting_run_stop_patch())
+                            _kick_queue_publish()
+                            log(f"Cancel: rid={rid[:8]}… was waiting in the queue for a "
+                                f"worker with work done — its person stopped it, and "
+                                f"everything it did is kept", "INFO")
+                            try:
+                                dref.delete()
+                            except Exception:
+                                pass
+                            return
                         if _waiting_rec is not None and _waiting_rec.get("queued_job") is not None:
                             removed = True
                             _kick_queue_publish()
@@ -19005,8 +19173,17 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     # Each park kicks the queue order in the background, and a kick that finds
     # a publish already running skips — so a restore that parked the run and the
     # jobs behind it published whatever the first scan happened to see.
+    # ⛔ ON ITS OWN THREAD (w13 integrated review): boot calls this restore on
+    # the event loop, before the server listens, and the publish is a whole
+    # renumber — a queue scan, a device read and a batch per account through
+    # the heal, after waiting up to 10 s for the park's own kick. A slow
+    # Firestore at boot froze the loop for all of it.
     if parked:
-        _publish_queue_positions_now()
+        try:
+            _threading.Thread(target=_publish_queue_positions_now, daemon=True,
+                              name="queueowners-boot-park").start()
+        except Exception as e:
+            log(f"[pending_queue] queue publish launch failed (non-fatal): {e}", "DEBUG")
     # ⛔⛔ A HELD ENTRY IS ASKED ABOUT AGAIN, IN THIS PROCESS (wave 10.10
     # leftovers). Kept for the next boot and nothing more, it waited for a
     # restart that might be days away while its person watched a tile that
@@ -26842,6 +27019,33 @@ def _record_brief_in_aggregate(url: str) -> None:
                                  phase=1, verified=True)
     except Exception:
         pass
+
+
+def _resave_phase1_on_resume(brief_md: str) -> None:
+    """A run resumed PAST Phase 1 writes Phase 1's Firestore half again from
+    the brief on disk: the brief document, the "Read Brief report" link, the
+    record's `brief` slot and Phase 1's "complete". Every write is safe to
+    repeat, and all are best-effort, as they are at Phase 1's end.
+
+    ⛔⛔ PHASE 1'S END IS TWO HALVES, AND ONLY THE DISK HALF DECIDES THE RESUME
+    (w13 integrated review, 09-29). brief.md and the checkpoint are written, then
+    the Firestore brief, `links.phase1` and phases[1] — each of which returns
+    early, silently, while the run's record globals are unset. A Move to queue
+    unsets them and keeps the pipeline running for its exit window (2-4 s, up to
+    ~17 s); a brief read that returned in that window landed on disk and nowhere
+    else. The next worker saw brief.md, resumed at Phase 2 and never wrote it
+    again: no brief on the Documents page, no Read Brief report link, Phase 1
+    never complete after a reload, and the summary read an empty brief. A crash
+    between the two halves leaves the same gap."""
+    if not (brief_md or "").strip():
+        return
+    save_document_to_firestore("brief", brief_md, "Research Brief")
+    url = in_app_document_url("brief")
+    _record_brief_in_aggregate(url)
+    # #746: the label the app's reopen backfill synthesizes — see Phase 1's end.
+    _update_firestore_research({"links.phase1": [
+        {"label": "Read Brief report", "url": url, "verified": True, "primary": True}]})
+    _write_phase_terminal_status(1, "complete")
 
 
 def emit_validated_link(phase: int, agent: str, url: str, label: str, link_kind: str = ""):
@@ -68999,6 +69203,31 @@ def _p3_browser_gone(where: str) -> RuntimeError:
     return RuntimeError(f"research browser died {where} (browser crash)")
 
 
+def _p3_notebook_to_reopen(cp) -> str:
+    """The notebook a resumed Phase 3 may carry on in: the checkpoint's, when
+    THIS worker made it — else "", and a new one is made, as before wave 13.
+
+    ⛔⛔ EACH WORKER IS ITS OWN CHROME PROFILE, AND ITS OWN GOOGLE ACCOUNT
+    (w13 integrated review, 09-29). A Move to queue always resumes the run on
+    another worker. The notebook was made public before it was recorded, so on
+    another account it opens view-only — and the reopen's checks (same notebook,
+    sources or a podcast showing) pass for a viewer. The podcast step then ran
+    in a notebook this account may not be able to generate or download in.
+    ⭐ A checkpoint that does not say which worker made it is treated as
+    another worker's: nothing proves it was this one."""
+    url = str((cp or {}).get("notebook_url") or "")
+    if not url:
+        return ""
+    made_on = (cp or {}).get("notebook_worker")
+    if isinstance(made_on, int) and not isinstance(made_on, bool) and made_on == WORKER_ID:
+        return url
+    log(f"[Phase3] this run's notebook was made on "
+        f"{f'worker {made_on}' if made_on is not None else 'a worker it did not record'}, "
+        f"and this is worker {WORKER_ID} — its Chrome profile may be another Google "
+        f"account, so a new notebook is made here", "INFO")
+    return ""
+
+
 async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
     """Open the notebook this research already made. True means carry on in it.
 
@@ -71522,6 +71751,11 @@ def save_checkpoint(queue_dir, phase, **kwargs):
     """Save pipeline checkpoint after completing a phase."""
     cp = {"last_completed_phase": phase, "timestamp": datetime.now().isoformat()}
     cp.update(kwargs)
+    # ⛔ WHOSE NOTEBOOK IT IS (w13 integrated review): the worker whose Chrome
+    # profile — whose Google account — made or reopened it. A resume reopens it
+    # only on that worker; see `_p3_notebook_to_reopen`.
+    if cp.get("notebook_url") and "notebook_worker" not in cp:
+        cp["notebook_worker"] = WORKER_ID
     # Enrichment (2026-04-28, Commit 1 of error-redesign): persist tier
     # escalation history, per-agent state, and last_event_id so a Phoenix
     # restart can resume retry budgets fairly + dedupe replayed events.
@@ -76454,6 +76688,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if bp.exists():
                     raw = bp.read_text(encoding="utf-8")
                     brief_text = raw.replace("# Research Brief\n\n", "", 1)
+                    # ⛔⛔ AND ITS FIRESTORE HALF IS WRITTEN AGAIN, every time —
+                    # see `_resave_phase1_on_resume`.
+                    _resave_phase1_on_resume(raw)
                     break
             log(f"Phase 1: Loaded existing brief ({len(brief_text)} chars)")
 
@@ -77497,7 +77734,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # instead of making a second notebook and a second podcast. Only the
             # FIRST upload gets it: the re-upload below runs because the notebook
             # we had is not usable. (A fresh run's checkpoint is empty.)
-            _p3_recorded_nb = cp.get("notebook_url") or ""
+            # ⛔ And only on the worker that made it — see the helper.
+            _p3_recorded_nb = _p3_notebook_to_reopen(cp)
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(
@@ -78192,9 +78430,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             links_file = queue_dir / "links.json"
             if links_file.exists():
                 links = json.loads(links_file.read_text(encoding="utf-8"))
-            audio_str = cp.get("audio_path", "")
-            if audio_str and Path(audio_str).exists():
-                audio_path = Path(audio_str)
+            # ⛔⛔ AND THE PODCAST ON DISK IS PUBLISHED AGAIN, every time — see
+            # `_p3_publish_on_resume`. It used to be read back from the
+            # checkpoint only, which names it only after a publish that ran.
+            audio_path, _ = await _p3_publish_on_resume(queue_dir, cp, _fb_research_id)
             log(f"Phase 3: Loaded existing (links={len(links)}, audio={'yes' if audio_path else 'no'})")
 
         if _controls.is_stop_or_pause():
@@ -78257,6 +78496,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # FE "Paused" — P4/P5 are FE-owned, so the BE emits nothing more and no
         # later BE resume is coming. Emit pipeline_resumed so the FE clears its
         # paused chrome if a pause somehow survived to completion.
+        #
+        # ⛔⛔ A RUN MOVED TO THE QUEUE WHILE IT RAN HANDS NOTHING OFF (w13
+        # integrated review, 09-30). The move waits up to five seconds for an
+        # upload in flight, so a podcast upload that finished in that wait came
+        # straight here: the podcast's `audios` row and `links.audio_file` were
+        # skipped (the move had cut the record off), and the hand-off below was
+        # written to disk only. The worker that took the run then read "handed
+        # off" and only re-sent the kick, so the podcast never reached the app.
+        # A moved run's folder holds its queue marker, and nothing else puts one
+        # in a folder while its run is running; the worker that takes it resumes
+        # past Phase 3, publishes the podcast again and hands it off itself.
+        if _run_dir_held_by_queue(queue_dir):
+            log("Moved to the queue before its hand-off — the worker that takes it "
+                "hands it off", "WARN")
+            return
         try:
             if _controls.is_pause():
                 _controls.request_resume()
@@ -80705,7 +80959,9 @@ async def run_server(port=8000):
                     "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 }
             patches.append((uid_v, rid_v, patch))
-        for uid_b, i, chunk in _queue_pos_batches(patches):
+        # ⛔ Not an account this computer is no longer shared with: its batch
+        # can only be refused, and the heal would spend everybody's re-mint.
+        for uid_b, i, chunk in _renumber_batches(patches):
             def _commit_chunk(chunk=chunk):
                 batch = _firebase_db.batch()
                 for uid_v, rid_v, patch in chunk:
