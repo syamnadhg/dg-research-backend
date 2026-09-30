@@ -303,7 +303,7 @@ def test_live_phase1_takes_the_long_brief_from_the_copy_button(chrome, page, p1,
     assert cf._clicked(chrome, page) == ["Copy"]
     assert cf._lines(logs, "Phase 1: brief taken from ChatGPT's Copy button ("), logs
     text = out["text"]
-    assert text == cf._clip(chrome, page).strip() and len(text) > 35000
+    assert text == cf._copied(chrome, page).strip() and len(text) > 35000
     assert research._chatgpt_copy_verdict(text, "m", (base.PROMPT,)) == ""
     assert chrome.run(research._chatgpt_copy_on_page(page, text))
     shown = chrome.run(page.evaluate(_SHOWN_JS))
@@ -353,7 +353,8 @@ def _cua_long_page(chrome, page, p1, *, table_label=None):
         await page.add_style_tag(content=cf.PIN_ROW_CSS)
         await page.evaluate("() => document.querySelector('[data-sr-act=\"copy\"]')"
                             ".setAttribute('aria-label', 'Copy response')")
-        await page.evaluate(TABLE_COPY_JS)
+        # The page's own code (its script world), as ChatGPT's Copy table is.
+        await page.add_script_tag(content=f"({TABLE_COPY_JS})();")
         for name, s, i, left in (("table", 'button[aria-label="Copy table"]', 3, 600),
                                  ("expand", 'button[aria-label="Expand table"]', 1, 700),
                                  ("message", 'button[aria-label="Copy message"]', 0, 800)):
@@ -413,7 +414,7 @@ def test_live_p1_the_cua_is_held_off_every_other_copy_on_the_page(chrome, page, 
     assert cua.missions == ["copy"]
     assert len(cf._lines(logs, REFUSED)) == 3, logs
     text = out["text"]
-    assert text == cf._clip(chrome, page).strip() and len(text) > 35000, logs
+    assert text == cf._copied(chrome, page).strip() and len(text) > 35000, logs
     assert cf._lines(logs, "brief taken from ChatGPT's Copy button, clicked by the CUA ("), logs
 
 
@@ -427,7 +428,7 @@ def test_live_p1_a_table_copied_under_another_label_is_still_not_the_brief(
     cua = cf._CopyCua(lambda: [cf._click(p1, "table")])
     out = p1.run(cua)
     assert cf._clicked(chrome, page) == ["Copy", "Copy", "Copy"]     # it WAS pressed
-    assert cf._clip(chrome, page).startswith("| ")                  # and copied its table
+    assert cf._copied(chrome, page).startswith("| ")                # and copied its table
     assert out["text"] == "", logs
     assert len(cf._lines(logs, "was not used — it does not read like a brief")) == 3, logs
 
