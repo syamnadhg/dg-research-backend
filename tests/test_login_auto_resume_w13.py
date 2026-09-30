@@ -18,7 +18,9 @@ worker queue.
 """
 import asyncio
 import json
+import os
 import threading
+import time
 
 import pytest
 
@@ -44,16 +46,47 @@ class _FakeBrowser:
 
 
 class _Jobs:
-    """One worker's job queue — what the resume put on it."""
+    """One worker's job queue — what the resume put on it. `timeline`, when
+    given, is shared with the research's events, so a test can tell which
+    reached the machine's outside first."""
 
-    def __init__(self):
+    def __init__(self, timeline=None):
         self.put = []
+        self._timeline = timeline
 
     def put_nowait(self, job):
         self.put.append(job)
+        if self._timeline is not None:
+            self._timeline.append(("job", job.get("run_id")))
 
     def qsize(self):
         return 0
+
+
+class _EventsCol:
+    """`users/{uid}/researches/{rid}/pipeline_events` — what was written there."""
+
+    def __init__(self, db, path):
+        self._db = db
+        self._path = path
+
+    def add(self, data):
+        self._db.events.append({"uid": self._path[1], "rid": self._path[3], **data})
+        self._db.timeline.append(("event", data.get("type")))
+
+
+class _EventsDb(FakeDb):
+    """The listener suite's fake Firestore, plus a research's event timeline."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.events: list = []
+        self.timeline: list = []
+
+    def _route(self, path):
+        if len(path) == 5 and path[-1] == "pipeline_events":
+            return _EventsCol(self, path)
+        return super()._route(path)
 
 
 class _ClosedTab:
@@ -102,8 +135,8 @@ def machine(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))
     box = {}
-    db = FakeDb(box, research_docs={(UID, RID): {"status": "ongoing",
-                                                 "backendRunId": RUN}})
+    db = _EventsDb(box, research_docs={(UID, RID): {"status": "ongoing",
+                                                    "backendRunId": RUN}})
     monkeypatch.setattr(research, "_firebase_db", db)
     monkeypatch.setattr(research, "load_paired_uid", lambda: UID)
     monkeypatch.setattr(research, "load_device_id", lambda: "dev-abcdef")
@@ -113,7 +146,7 @@ def machine(tmp_path, monkeypatch):
         writes.append((uid, rid, dict(updates)))
         return True
     monkeypatch.setattr(research, "_update_research_doc", _record)
-    jobs = _Jobs()
+    jobs = _Jobs(db.timeline)
     monkeypatch.setitem(research._QUEUE_STATE, "queue_ref", jobs)
     monkeypatch.setattr(research, "_LOGIN_RESUME_WAITERS", {})
     monkeypatch.setattr(research, "LOGIN_RESUME_POLL_SEC", 0.01)
@@ -200,6 +233,54 @@ async def _settle():
         await asyncio.sleep(0)
 
 
+def _dead_pid():
+    import psutil
+    dead = 999_999
+    while psutil.pid_exists(dead):
+        dead += 1
+    return dead
+
+
+def _age_marker(minutes, **fields):
+    """The login marker, stamped `minutes` ago (and any field changed)."""
+    p = research._login_marker_path()
+    d = json.loads(p.read_text(encoding="utf-8"))
+    d["ts"] = int((time.time() - minutes * 60) * 1000)
+    d.update(fields)
+    p.write_text(json.dumps(d), encoding="utf-8")
+
+
+async def _verdict_within(task, seconds):
+    """What the waiter decided within `seconds`, or "still waiting"."""
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), seconds)
+    except asyncio.TimeoutError:
+        task.cancel()
+        return "still waiting"
+
+
+async def _continued_by_itself(machine):
+    """The login pauses the run; the login finishes; the waiter resumes it."""
+    research._write_login_marker()
+    qd = await machine.run_until_interrupted(_p3_site_raise)
+    research._clear_login_marker()
+    assert await asyncio.wait_for(machine.waiter(), 5) == "resumed"
+    await _settle()
+    return qd
+
+
+def _retry(monkeypatch, tmp_path, **held):
+    """The card's Retry, through the REAL start listener. Its queue is a
+    process of its own — a sibling worker's — unless `held` says what that
+    process already holds (`deque_jobs`, `current_job`)."""
+    lst = Listener(monkeypatch, tmp_path, owner=UID,
+                   research_docs={(UID, RID): {"status": "ongoing",
+                                               "backendRunId": RUN}}, **held)
+    lst.feed(action="resume", uid=UID, submittedBy=UID, researchId=RID,
+             backendRunId=RUN, email="alice@example.com")
+    return lst
+
+
 # ══ 1. the run continues by itself when the login finishes ═════════════
 @pytest.mark.parametrize("site", [_p2_sweep_raise, _p3_site_raise],
                          ids=["phase2-sweep", "phase3-podcast"])
@@ -253,6 +334,49 @@ def test_a_login_that_was_killed_lets_the_run_go_on(machine):
         await _settle()
     asyncio.run(main())
     assert len(machine.jobs.put) == 1
+
+
+# ══ 1b. a login left open a long time ══════════════════════════════════
+def test_a_login_still_open_after_30_minutes_keeps_the_run_waiting(machine):
+    """⛔⛔ Found in review (09-30). The marker's 30-minute cap is for a login
+    that was killed and left its marker behind, and it applied even while the
+    login's process was alive. So a login left open longer — a Cloudflare loop
+    worked through by hand, a terminal left at "add another profile?" — counted
+    as finished, and the run was started again on the profile the login window
+    still had open."""
+    async def main():
+        research._write_login_marker()          # it names this live process
+        await machine.run_until_interrupted(_p3_site_raise)
+        task = machine.waiter()
+        _age_marker(31)
+        return await _verdict_within(task, 1)
+    assert asyncio.run(main()) == "still waiting"
+    assert machine.jobs.put == []
+
+
+def test_a_marker_that_names_no_process_keeps_the_30_minute_cap(machine):
+    """⭐ ACCEPT POLARITY. A marker no process vouches for (an older login
+    command wrote no pid) is believed for 30 minutes, as before."""
+    async def main():
+        research._write_login_marker()
+        await machine.run_until_interrupted(_p3_site_raise)
+        task = machine.waiter()
+        _age_marker(31, pid=0)
+        return await _verdict_within(task, 5)
+    assert asyncio.run(main()) == "resumed"
+
+
+def test_a_live_login_is_believed_for_12_hours_not_for_ever(machine):
+    """⭐ The bound on a live process: after 12 hours the number more likely
+    belongs to another program (a killed login's pid given out again), and the
+    run must not wait on it for good."""
+    async def main():
+        research._write_login_marker()
+        await machine.run_until_interrupted(_p3_site_raise)
+        task = machine.waiter()
+        _age_marker(13 * 60)
+        return await _verdict_within(task, 5)
+    assert asyncio.run(main()) == "resumed"
 
 
 # ══ 2. the card says so ════════════════════════════════════════════════
@@ -461,6 +585,120 @@ def test_a_later_pause_of_another_kind_is_not_the_login_pause(machine):
         return await asyncio.wait_for(task, 5)
     assert asyncio.run(main()) == "moved_on"
     assert len(machine.jobs.put) == 1
+
+
+# ══ 4b. a Retry after the run already continued by itself ══════════════
+def test_a_retry_after_the_run_continued_by_itself_is_not_a_second_resume(
+        machine, monkeypatch, tmp_path):
+    """⛔⛔ Found in review (09-30). The login finished and the run went back on
+    worker 1's queue — where it can wait hours behind another run — while its
+    card and Retry stayed up. A Retry pressed then went to an idle sibling (the
+    listener below has a queue of its own), which started the run at once, and
+    worker 1 later ran its own copy too: two browsers on one run folder."""
+    async def main():
+        await _continued_by_itself(machine)
+        return _retry(monkeypatch, tmp_path)
+    lst = asyncio.run(main())
+    assert len(machine.jobs.put) == 1
+    assert lst.enqueued == [], "the same run was put on a queue a second time"
+    assert lst.writes == [], "the refused Retry must leave the record alone"
+    assert lst.incoming == ["incoming"], "the refused Retry must not replay at the next start"
+
+
+def test_a_retry_while_this_worker_already_has_the_run_queued_is_refused(
+        machine, monkeypatch, tmp_path):
+    """⛔ The same on the worker that holds the waiting job, whatever the disk
+    says: a second resume of a run already on its queue is a second browser."""
+    qd = machine.run_dir()
+    (qd / "delivery.json").write_text(json.dumps({"status": "paused"}), encoding="utf-8")
+    waiting = {"run_id": RUN, "uid": UID, "research_id": RID, "resume_dir": str(qd)}
+    lst = _retry(monkeypatch, tmp_path, deque_jobs=[waiting])
+    assert lst.enqueued == []
+
+
+def test_a_retry_while_this_worker_is_letting_go_of_the_run_goes_through(
+        machine, monkeypatch, tmp_path):
+    """⭐ ACCEPT POLARITY. A run that has just paused is still its worker's
+    `current_job` for up to ten seconds (the worker looks in on its run every
+    ten). A Retry on its card then is the only resume and must go through."""
+    qd = machine.run_dir()
+    (qd / "delivery.json").write_text(json.dumps({"status": "paused"}), encoding="utf-8")
+    just_paused = {"run_id": RUN, "uid": UID, "research_id": RID, "resume_dir": str(qd)}
+    lst = _retry(monkeypatch, tmp_path, current_job=just_paused)
+    assert len(lst.enqueued) == 1
+
+
+@pytest.mark.parametrize("gone", ["pid-gone", "pid-reused"])
+def test_a_note_left_by_a_worker_that_is_gone_does_not_block_a_retry(
+        machine, monkeypatch, tmp_path, gone):
+    """⭐ ACCEPT POLARITY. The queued job lives in the memory of the worker that
+    queued it; after a restart it is gone, and the note on disk must not keep
+    the run's Retry refused. A number now held by a process younger than the
+    note is not that worker either."""
+    async def main():
+        qd = await _continued_by_itself(machine)
+        d = machine.delivery()
+        note = d["loginResumeQueued"]
+        assert note["pid"] == os.getpid()
+        if gone == "pid-gone":
+            note["pid"] = _dead_pid()
+        else:
+            note["at"] = 1000                   # 1970: before this process began
+        (qd / "delivery.json").write_text(json.dumps(d), encoding="utf-8")
+        return _retry(monkeypatch, tmp_path)
+    lst = asyncio.run(main())
+    assert len(lst.enqueued) == 1
+
+
+def test_the_resumed_run_spends_the_note(machine, monkeypatch, tmp_path):
+    """⭐ ACCEPT POLARITY. Once worker 1 starts the queued job (the REAL
+    `run_pipeline`, resuming), the note is spent: when the login closes this
+    attempt's browser too, a Retry on the new card must go through."""
+    async def main():
+        await _continued_by_itself(machine)
+        research._write_login_marker()
+        await machine.run_until_interrupted(_p3_site_raise)
+        assert "loginResumeQueued" not in machine.delivery()
+        lst = _retry(monkeypatch, tmp_path)
+        research._clear_login_marker()
+        assert await asyncio.wait_for(machine.waiter(), 5) == "moved_on"
+        return lst
+    lst = asyncio.run(main())
+    assert len(lst.enqueued) == 1
+    assert len(machine.jobs.put) == 1
+
+
+def test_the_card_comes_down_when_the_run_continues_by_itself(machine, monkeypatch):
+    """⛔ Found in review (09-30). The login card, Retry and all, stayed up
+    until the resumed job started — hours, if the worker was busy — over a run
+    already queued. It comes down as the job is queued: the record's copy of
+    the card goes in the same write that says "ongoing", and the research's
+    timeline gets what the resumed start sends (resumed, then the phase
+    starting over), BEFORE the job reaches the queue. ⛔ Written to the run's
+    own research, not to whichever run this worker's globals name by then."""
+    from google.cloud.firestore import DELETE_FIELD
+
+    async def main():
+        research._write_login_marker()
+        qd = await machine.run_until_interrupted(_p3_site_raise)
+        # The worker has meanwhile started somebody else's run.
+        monkeypatch.setattr(research, "_fb_uid", "uid-bob")
+        monkeypatch.setattr(research, "_fb_research_id", "chat_1759200000000_9")
+        research._clear_login_marker()
+        assert await asyncio.wait_for(machine.waiter(), 5) == "resumed"
+        await _settle()
+        return qd
+    qd = asyncio.run(main())
+    flip = machine.status_writes()[-1]
+    assert flip["status"] == "ongoing" and flip["pendingDecision"] is DELETE_FIELD
+    phase = research.detect_resume_phase(qd)[0]
+    assert 0 <= phase <= 3
+    assert [(e["type"], e.get("phase"), e["uid"], e["rid"]) for e in machine.db.events] == [
+        ("pipeline_resumed", phase, UID, RID), ("phase_restart", phase, UID, RID)]
+    assert machine.db.events[1]["data"]["full"] is True
+    assert machine.db.events[0]["seq"] < machine.db.events[1]["seq"]
+    assert machine.db.timeline == [("event", "pipeline_resumed"),
+                                   ("event", "phase_restart"), ("job", RUN)]
 
 
 # ══ 5. a human check the login clears ══════════════════════════════════

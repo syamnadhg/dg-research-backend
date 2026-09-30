@@ -16450,6 +16450,102 @@ def _login_pause_holds(queue_dir, token: str) -> bool:
     return d.get("status") == "paused" and bool(token) and d.get("loginPause") == token
 
 
+#: The note a run's delivery.json carries from the moment the login's
+#: auto-resume puts it on a queue until that job starts: which process holds it.
+LOGIN_RESUME_NOTE = "loginResumeQueued"
+
+
+def _login_resume_note_holds(delivery: dict) -> bool:
+    """Is the auto-resume's job still waiting in a live worker?
+
+    The job lives in the memory of the worker that queued it, so the note holds
+    only while that process does — a restart took the job with it. ⛔ And only
+    the process that was there when the note was written: a number given out
+    again to a younger program is not that worker. Anything that cannot be told
+    lets go, so a run is never stranded behind its note."""
+    note = delivery.get(LOGIN_RESUME_NOTE)
+    if not isinstance(note, dict):
+        return False
+    try:
+        import psutil
+        pid = int(note.get("pid") or 0)
+        return pid > 0 and (psutil.Process(pid).create_time()
+                            <= float(note.get("at") or 0) / 1000 + 1)
+    except Exception:
+        return False
+
+
+def _run_already_queued(queue_dir, job_queue) -> bool:
+    """Is this run already on a queue, so that a Retry would start it twice?
+
+    ⛔⛔ FOUND IN REVIEW (09-30). The login finished and the run went back on its
+    worker's queue — where it can wait hours behind another run — while the
+    card's Retry was still up. A Retry then, taken by an idle sibling, started
+    the run at once, and the first worker later ran its own copy as well: two
+    browsers on one run folder. Two answers: the auto-resume's note on disk,
+    which every worker reads, and this process's own waiting jobs.
+
+    ⛔ THE WAITING JOBS, NOT `current_job` (so not `_jobs_held_locally`). A run
+    that has just paused is still its worker's current job for up to ten
+    seconds — the worker looks in on its run every ten — and a Retry on its
+    card then is the only resume."""
+    try:
+        d = json.loads((Path(queue_dir) / "delivery.json").read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    if _login_resume_note_holds(d):
+        return True
+    try:
+        waiting = list(job_queue._queue)
+    except Exception:
+        waiting = []
+    name = Path(queue_dir).name
+    return any(getattr(_job_run_dir(j), "name", None) == name for j in waiting)
+
+
+def _spend_login_resume_note(queue_dir) -> None:
+    """The job the auto-resume queued has started: its note is spent."""
+    p = Path(queue_dir) / "delivery.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if LOGIN_RESUME_NOTE in d:
+            d.pop(LOGIN_RESUME_NOTE)
+            p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _send_login_card_down(uid: str, research_id: str, queue_dir) -> None:
+    """Take the login card down on the run's own timeline: what the resumed
+    start sends first (`run_pipeline`'s resume entry) — resumed, then the phase
+    starting over, which is what clears a phase's card in an open tab.
+
+    ⛔⛔ BY THE RUN'S IDS, NOT `emit_event`. That writes where the run globals
+    point, and by the time a login finishes this worker may be running
+    somebody else's research."""
+    from datetime import timedelta, timezone
+    phase, reason = detect_resume_phase(queue_dir)
+    events = [("pipeline_resumed", {"resumeReason": reason})]
+    if isinstance(phase, int) and 0 <= phase <= 3:
+        events.append(("phase_restart", {"reason": "resume_from_checkpoint", "full": True}))
+    base = int(time.time() * 1000)
+    for i, (etype, data) in enumerate(events):
+        doc = {"type": etype, "timestamp": base + i, "phase": phase, "data": data,
+               "seq": base + i,
+               "expireAt": (_incognito_expire_at(research_id)
+                            or datetime.now(timezone.utc) + timedelta(days=30))}
+        try:
+            _grpc_write_with_heal(
+                lambda d=doc: _firebase_db.collection("users").document(uid)
+                    .collection("researches").document(research_id)
+                    .collection("pipeline_events").add(_be_payload(d)),
+                what="emit_event", uid=uid)
+        except Exception as ex:
+            log(f"Resume: the login card could not be taken down ({type(ex).__name__}) "
+                f"— it goes when the run starts", "WARN")
+            return
+
+
 def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: str,
                             email: str, job_queue, loop, worker_id: int,
                             config=None, topic_hint: str = "", queue_doc=None,
@@ -16463,13 +16559,24 @@ def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: st
 
     `login_pause` is the token of the login pause the caller is resuming; when
     it is given, the run is resumed only if that pause still holds (see
-    `_login_pause_holds`). `queue_doc` is the Retry's queue document, deleted
-    at the same point it always was."""
+    `_login_pause_holds`). Without it — a Retry — the run is resumed only if it
+    is not already queued to continue (`_run_already_queued`). `queue_doc` is
+    the Retry's queue document, deleted at the same point it always was."""
     queue_dir = Path(queue_dir)
     # Merge config into config.json if provided.
     payload_config = config or {}
     with _RESUME_FLIP_LOCK:
         if login_pause and not _login_pause_holds(queue_dir, login_pause):
+            return False
+        # ⛔⛔ A RETRY ON A RUN ALREADY QUEUED TO CONTINUE is a second browser on
+        # one run folder (`_run_already_queued`). The Retry's document goes, so
+        # it does not replay at the next start.
+        if not login_pause and _run_already_queued(queue_dir, job_queue):
+            log(f"Resume: {run_id} is already queued to continue — not starting it "
+                f"a second time", "INFO")
+            if queue_doc is not None:
+                try: queue_doc.delete()
+                except Exception: pass
             return False
         if payload_config:
             config_path = queue_dir / "config.json"
@@ -16490,6 +16597,10 @@ def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: st
                     if d.get("status") == "paused":
                         d["status"] = "ongoing"
                         d.pop("loginPause", None)
+                        # ⭐ The auto-resume leaves its note: this run is queued.
+                        if login_pause and fname == "delivery.json":
+                            d[LOGIN_RESUME_NOTE] = {"pid": os.getpid(),
+                                                    "at": int(time.time() * 1000)}
                         fpath.write_text(json.dumps(d, indent=2), encoding="utf-8")
                 except Exception:
                     pass
@@ -16526,15 +16637,22 @@ def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: st
     # a Resume card over it. See `_run_taken_since_boot`.
     _RESUMED_HERE.add((uid, research_id))
     from google.cloud.firestore import DELETE_FIELD as _DF_RESUME
+    # ⭐ WAVE 13 (found in review, 09-30): a run continuing by itself takes its
+    # login card down NOW, not when the job starts — which can be hours on a
+    # busy worker, with a live Retry over a queued run. The record's copy goes
+    # in this write; the open tab's, just below, before the job is queued.
     _update_research_doc(uid, research_id,
                          {"status": "ongoing", "assignedWorker": worker_id,
                           "resumeDropReason": _DF_RESUME,
-                          "resumeDropAt": _DF_RESUME})
+                          "resumeDropAt": _DF_RESUME,
+                          **({"pendingDecision": _DF_RESUME} if login_pause else {})})
     # Delete the queue doc — Firestore's onSnapshot replays it
     # otherwise, double-enqueueing on every BE restart.
     if queue_doc is not None:
         try: queue_doc.delete()
         except Exception: pass
+    if login_pause:
+        _send_login_card_down(uid, research_id, queue_dir)
     # Enqueue with resume_dir. We've already validated existence,
     # so put_nowait directly bypasses _safe_enqueue's status check
     # (which can race with our just-written "ongoing" flip).
@@ -75167,6 +75285,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Resume dir not found: {queue_dir}", "ERROR")
             return
         (queue_dir / "documents").mkdir(exist_ok=True)
+        # ⭐ WAVE 13: if the login's auto-resume queued this job, it has now
+        # started — its note, which kept a Retry from queueing the run a second
+        # time, is spent (`_run_already_queued`).
+        _spend_login_resume_note(queue_dir)
         # Set the active-run global as early as possible so the
         # `clear_local_storage` device-command handler treats this dir
         # as protected. Without this, a clear fired during the lengthy
@@ -84750,6 +84872,10 @@ LOGIN_PAUSE_CONTINUES_COPY = (
 #: A record that cannot be read right after the login is asked again this many
 #: times, one poll apart, before the waiter gives up and leaves the card's Retry.
 LOGIN_RESUME_READ_TRIES = 12
+#: How long the waiter believes a login whose process is still alive. Past
+#: this, the number more likely belongs to another program (a killed login's
+#: pid given out again), and the run must not wait on it for good.
+LOGIN_RESUME_LIVE_LOGIN_CAP_S = 12 * 3600
 #: This process's waiters by run folder. ⭐ A strong reference, or the loop may
 #: drop the task while it sleeps.
 _LOGIN_RESUME_WAITERS: "dict[str, asyncio.Task]" = {}
@@ -84802,16 +84928,38 @@ def _login_resume_verdict(plan: dict) -> str:
     return "go"
 
 
+def _login_still_running() -> bool:
+    """Is the login command still running, as the waiter must judge it?
+
+    ⛔⛔ NOT `_login_interrupt_active()` AS IT STANDS (found in review, 09-30).
+    Its 30-minute cap is for a login that was killed and left its marker
+    behind, and it applies even while the login's process is alive — so a
+    login left open longer (a Cloudflare loop worked through by hand, a
+    terminal left at "add another profile?") counted as finished, and the run
+    was started again on the profile the login window still had open. A marker
+    naming a process is believed while that process lives, up to
+    `LOGIN_RESUME_LIVE_LOGIN_CAP_S`; one naming none, or read where psutil is
+    missing (no liveness to ask), keeps the 30 minutes."""
+    try:
+        data = json.loads(_login_marker_path().read_text(encoding="utf-8"))
+        vouched = int(data.get("pid", 0) or 0) > 0
+        import psutil  # noqa: F401 — what `_login_interrupt_active` asks liveness of
+    except Exception:
+        vouched = False
+    return _login_interrupt_active(
+        max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S if vouched else 30 * 60)
+
+
 async def _resume_after_login(plan: dict) -> str:
     """Wait for the login command to finish, then resume the run it paused.
 
     The login is over when its marker is gone (the login command clears it as
-    it exits) or no longer counts (its process died, or it is older than the
-    marker's 30-minute cap) — `_login_interrupt_active`. Returns what happened:
-    "resumed", or the verdict that kept the run where it is."""
+    it exits) or no longer counts (its process died, or the marker outlived its
+    cap) — `_login_still_running`. Returns what happened: "resumed", or the
+    verdict that kept the run where it is."""
     with _machine_log_scope():
         rid8 = plan["research_id"][:8]
-        while _login_interrupt_active():
+        while _login_still_running():
             await asyncio.sleep(LOGIN_RESUME_POLL_SEC)
         verdict = "unreadable"
         for _ in range(LOGIN_RESUME_READ_TRIES):
