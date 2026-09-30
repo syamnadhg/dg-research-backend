@@ -51638,7 +51638,9 @@ _doc_img_converter_classes: dict = {}
 
 
 def _doc_img_converter_cls(base):
-    """markdownify's converter with `convert_img` replaced.
+    """markdownify's converter with `convert_img` replaced — and, since wave 13,
+    ChatGPT's own marks read on its new page (a source chip's site icon, inline
+    code written as a span).
 
     ⛔ Not `keep_inline_images_in`: markdownify's own `convert_img` returns the bare
     alt for an image inside a heading or table cell unless its DIRECT parent is
@@ -51648,11 +51650,27 @@ def _doc_img_converter_cls(base):
     if cls is None:
         class _DocImageConverter(base):
             def convert_img(self, el, text, parent_tags):
+                # ⭐ Wave 13: the site icon inside a ChatGPT source chip
+                # (a[data-testid="chatgpt-citation"], the owner's capture of a
+                # finished brief) is decorative wherever it is served from — the
+                # chip is a link to the source, never a picture.
+                if el.find_parent("a", attrs={"data-testid": "chatgpt-citation"}) is not None:
+                    _doc_img_note_decorative()
+                    return ""
                 out = _doc_img_markdown_for_tag(dict(el.attrs))
                 if out is None:
                     _doc_img_note_decorative()
                     return ""
                 return out
+
+            def convert_span(self, el, text, parent_tags):
+                # ⭐ Wave 13: ChatGPT's new page writes inline code as a span it
+                # marks for its own copy (data-markdown-copy="inline-code"), not
+                # <code>. Written as code from its own letters: `text` has had
+                # its underscores and asterisks escaped as prose.
+                if el.get("data-markdown-copy") == "inline-code":
+                    return self.convert_code(el, el.get_text(), parent_tags)
+                return text
         cls = _doc_img_converter_classes[base] = _DocImageConverter
     return cls
 
