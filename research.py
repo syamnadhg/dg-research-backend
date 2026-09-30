@@ -9476,11 +9476,13 @@ def _waiting_owner_entry(uid, run_id, position, *, kept_work: bool) -> dict:
     """One `queueOwners` entry. ⭐ `moved: true` only on a run with work done
     waiting for a worker (see `_waiting_kept_work`); an ordinary queued run
     carries no `moved` key at all. On the device document, because the owner
-    cannot read a sharer's research record."""
-    entry = {"uid": uid, "runId": run_id, "position": position}
+    cannot read a sharer's research record.
+
+    ⭐ Two whole literals, not a key added after: the web reads this file for
+    an entry naming its `runId` beside `"moved": True` (`moveToQueueWire`)."""
     if kept_work:
-        entry["moved"] = True
-    return entry
+        return {"uid": uid, "runId": run_id, "position": position, "moved": True}
+    return {"uid": uid, "runId": run_id, "position": position}
 
 
 def _waiting_record_patch() -> dict:
