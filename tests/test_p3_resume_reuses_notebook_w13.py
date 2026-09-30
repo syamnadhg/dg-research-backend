@@ -637,6 +637,58 @@ def test_the_next_crash_resumes_into_the_same_notebook_again(resumed):
     assert _checkpoint(queue_dir)["notebook_url"] == NB_URL
 
 
+# ── …and only on the worker that made it (w13 integrated review, 09-29) ──
+
+def _recorded_on(monkeypatch, queue_dir, worker):
+    """The first attempt recorded its notebook on `worker` (None: a checkpoint
+    that does not say which)."""
+    if worker is None:
+        cp = _checkpoint(queue_dir)
+        cp.pop("notebook_worker", None)
+        (queue_dir / "checkpoint.json").write_text(json.dumps(cp), encoding="utf-8")
+        return
+    monkeypatch.setattr(research, "WORKER_ID", worker)
+    research.save_checkpoint(queue_dir, 3, topic="Grid storage", brief_url="",
+                             notebook_url=NB_URL)
+
+
+@pytest.mark.parametrize("made_on, resumed_on", [(2, 1), (1, 2), (None, 1)],
+                         ids=["worker-2-then-1", "worker-1-then-2", "worker-not-recorded"])
+def test_a_notebook_another_worker_made_is_not_carried_on_in(
+        resumed, monkeypatch, made_on, resumed_on):
+    """⛔⛔ A MOVE ALWAYS RESUMES THE RUN ON ANOTHER WORKER — another Chrome
+    profile, and maybe another Google account. The notebook was made public
+    before it was recorded, so there it opens view-only and passes the reopen's
+    checks; the podcast step then ran in a notebook this account may not be
+    able to use. A new notebook is made instead, as before wave 13, and the
+    checkpoint then names it and this worker."""
+    run, nb, queue_dir, _seen = resumed
+    nb.ready = 1
+    _recorded_on(monkeypatch, queue_dir, made_on)
+    monkeypatch.setattr(research, "WORKER_ID", resumed_on)
+    seen = run(_stop_here)
+
+    assert NB_URL not in _FakeBrowser.instances[0].opened, (
+        "another worker's notebook was opened on this worker's profile")
+    assert seen["created"] == 1
+    assert seen["audio"] and seen["audio"][0]["url"] == NEW_NB_URL
+    cp = _checkpoint(queue_dir)
+    assert (cp["notebook_url"], cp["notebook_worker"]) == (NEW_NB_URL, resumed_on)
+
+
+def test_the_worker_that_made_the_notebook_carries_on_in_it(resumed, monkeypatch):
+    """The control: a crash relaunch on the same worker — the same profile —
+    goes back to its notebook, whichever worker that is."""
+    run, nb, queue_dir, _seen = resumed
+    nb.ready = 1
+    _recorded_on(monkeypatch, queue_dir, 2)
+    seen = run(_stop_here)
+
+    assert seen["created"] == 0
+    assert seen["audio"] and seen["audio"][0]["url"] == NB_URL
+    assert _checkpoint(queue_dir)["notebook_worker"] == 2
+
+
 # ══ 3. a dead browser is never "retried" on ═══════════════════════════════
 
 def test_chrome_dying_under_the_download_is_not_retried_on_the_dead_browser(resumed):
@@ -852,3 +904,72 @@ def test_the_login_command_still_pauses_the_run_once_the_relaunches_are_spent(
 
     assert "login_interrupt" in seen["plan"]
     assert not handed_off, "the run was ended without the podcast during a sign-in"
+
+
+# ══ 5. a resume past Phase 1 writes the brief to the app again ══════════════
+#
+# ⛔⛔ THE w13 INTEGRATED REVIEW (09-29). Phase 1 ends in two halves: brief.md
+# and the checkpoint on disk, then the brief document, the "Read Brief report"
+# link and Phase 1's "complete" in Firestore. A Move to queue cuts the run's
+# Firestore writes off and keeps the pipeline running for its exit window, so a
+# brief that arrived in that window reached the disk and nothing else — and the
+# resume trusts the disk: it starts at Phase 2 and never wrote the brief again.
+# A crash between the two halves leaves the same gap.
+
+def _phase1_writes(monkeypatch):
+    """Phase 1's Firestore half, as the real writers are asked for it."""
+    w = {"documents": [], "record": [], "phases": [], "slot": []}
+    monkeypatch.setattr(research, "save_document_to_firestore",
+                        lambda kind, content, name=None:
+                        w["documents"].append((kind, content, name)) or True)
+    monkeypatch.setattr(research, "_update_firestore_research",
+                        lambda updates: w["record"].append(dict(updates)))
+    monkeypatch.setattr(research, "_write_phase_terminal_status",
+                        lambda phase, status: w["phases"].append((phase, status)))
+    monkeypatch.setattr(research, "_record_brief_in_aggregate",
+                        lambda url: w["slot"].append(url))
+    return w
+
+
+def _stop_at_phase_2(monkeypatch):
+    """End the run where Phase 2 starts: this is about what came before it."""
+    def _emit(event_type, phase=None, agent=None, **data):
+        if event_type == "phase_start" and phase == 2:
+            raise _Reached()
+    monkeypatch.setattr(research, "emit_event", _emit)
+
+
+@pytest.mark.parametrize("start", [2, 3], ids=["resumed-at-phase-2", "resumed-at-phase-3"])
+def test_a_resume_past_phase_1_writes_the_brief_to_the_app_again(
+        resumed, monkeypatch, start):
+    run, _nb, queue_dir, _seen = resumed
+    monkeypatch.setattr(research, "_fb_research_id", "chat_1759200000000_brief")
+    if start == 2:
+        (queue_dir / "links.json").unlink()
+        _stop_at_phase_2(monkeypatch)
+    assert research.detect_resume_phase(queue_dir)[0] == start, "precondition"
+    w = _phase1_writes(monkeypatch)
+    run(_stop_here)
+
+    brief_md = (queue_dir / "documents" / "brief.md").read_text(encoding="utf-8")
+    page = "/documents?open=chat_1759200000000_brief:brief"
+    assert w["documents"].count(("brief", brief_md, "Research Brief")) == 1, (
+        "the brief document was not written again from brief.md")
+    assert {"links.phase1": [{"label": "Read Brief report", "url": page,
+                              "verified": True, "primary": True}]} in w["record"], (
+        "no Read Brief report link on the resumed run")
+    assert (1, "complete") in w["phases"], "Phase 1 never marked complete"
+    assert w["slot"] == [page], "the record's brief slot was not filled"
+
+
+def test_a_resume_with_no_brief_on_disk_writes_no_brief(resumed, monkeypatch):
+    """The control: Phase 1 made no brief (skipped after an error), so there is
+    nothing to write again — and Phase 1 is not called complete."""
+    run, _nb, queue_dir, _seen = resumed
+    (queue_dir / "documents" / "brief.md").unlink()
+    w = _phase1_writes(monkeypatch)
+    run(_stop_here)
+
+    assert not [d for d in w["documents"] if d[0] == "brief"]
+    assert (1, "complete") not in w["phases"]
+    assert not [u for u in w["record"] if "links.phase1" in u]

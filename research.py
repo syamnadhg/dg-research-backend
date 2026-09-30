@@ -26881,6 +26881,33 @@ def _record_brief_in_aggregate(url: str) -> None:
         pass
 
 
+def _resave_phase1_on_resume(brief_md: str) -> None:
+    """A run resumed PAST Phase 1 writes Phase 1's Firestore half again from
+    the brief on disk: the brief document, the "Read Brief report" link, the
+    record's `brief` slot and Phase 1's "complete". Every write is safe to
+    repeat, and all are best-effort, as they are at Phase 1's end.
+
+    ⛔⛔ PHASE 1'S END IS TWO HALVES, AND ONLY THE DISK HALF DECIDES THE RESUME
+    (w13 integrated review, 09-29). brief.md and the checkpoint are written, then
+    the Firestore brief, `links.phase1` and phases[1] — each of which returns
+    early, silently, while the run's record globals are unset. A Move to queue
+    unsets them and keeps the pipeline running for its exit window (2-4 s, up to
+    ~17 s); a brief read that returned in that window landed on disk and nowhere
+    else. The next worker saw brief.md, resumed at Phase 2 and never wrote it
+    again: no brief on the Documents page, no Read Brief report link, Phase 1
+    never complete after a reload, and the summary read an empty brief. A crash
+    between the two halves leaves the same gap."""
+    if not (brief_md or "").strip():
+        return
+    save_document_to_firestore("brief", brief_md, "Research Brief")
+    url = in_app_document_url("brief")
+    _record_brief_in_aggregate(url)
+    # #746: the label the app's reopen backfill synthesizes — see Phase 1's end.
+    _update_firestore_research({"links.phase1": [
+        {"label": "Read Brief report", "url": url, "verified": True, "primary": True}]})
+    _write_phase_terminal_status(1, "complete")
+
+
 def emit_validated_link(phase: int, agent: str, url: str, label: str, link_kind: str = ""):
     """Emit a link_extracted event ONLY if the URL passes validation.
     Returns True if emitted, False if rejected. Also writes to the research
@@ -69036,6 +69063,31 @@ def _p3_browser_gone(where: str) -> RuntimeError:
     return RuntimeError(f"research browser died {where} (browser crash)")
 
 
+def _p3_notebook_to_reopen(cp) -> str:
+    """The notebook a resumed Phase 3 may carry on in: the checkpoint's, when
+    THIS worker made it — else "", and a new one is made, as before wave 13.
+
+    ⛔⛔ EACH WORKER IS ITS OWN CHROME PROFILE, AND ITS OWN GOOGLE ACCOUNT
+    (w13 integrated review, 09-29). A Move to queue always resumes the run on
+    another worker. The notebook was made public before it was recorded, so on
+    another account it opens view-only — and the reopen's checks (same notebook,
+    sources or a podcast showing) pass for a viewer. The podcast step then ran
+    in a notebook this account may not be able to generate or download in.
+    ⭐ A checkpoint that does not say which worker made it is treated as
+    another worker's: nothing proves it was this one."""
+    url = str((cp or {}).get("notebook_url") or "")
+    if not url:
+        return ""
+    made_on = (cp or {}).get("notebook_worker")
+    if isinstance(made_on, int) and not isinstance(made_on, bool) and made_on == WORKER_ID:
+        return url
+    log(f"[Phase3] this run's notebook was made on "
+        f"{f'worker {made_on}' if made_on is not None else 'a worker it did not record'}, "
+        f"and this is worker {WORKER_ID} — its Chrome profile may be another Google "
+        f"account, so a new notebook is made here", "INFO")
+    return ""
+
+
 async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
     """Open the notebook this research already made. True means carry on in it.
 
@@ -71559,6 +71611,11 @@ def save_checkpoint(queue_dir, phase, **kwargs):
     """Save pipeline checkpoint after completing a phase."""
     cp = {"last_completed_phase": phase, "timestamp": datetime.now().isoformat()}
     cp.update(kwargs)
+    # ⛔ WHOSE NOTEBOOK IT IS (w13 integrated review): the worker whose Chrome
+    # profile — whose Google account — made or reopened it. A resume reopens it
+    # only on that worker; see `_p3_notebook_to_reopen`.
+    if cp.get("notebook_url") and "notebook_worker" not in cp:
+        cp["notebook_worker"] = WORKER_ID
     # Enrichment (2026-04-28, Commit 1 of error-redesign): persist tier
     # escalation history, per-agent state, and last_event_id so a Phoenix
     # restart can resume retry budgets fairly + dedupe replayed events.
@@ -76491,6 +76548,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if bp.exists():
                     raw = bp.read_text(encoding="utf-8")
                     brief_text = raw.replace("# Research Brief\n\n", "", 1)
+                    # ⛔⛔ AND ITS FIRESTORE HALF IS WRITTEN AGAIN, every time —
+                    # see `_resave_phase1_on_resume`.
+                    _resave_phase1_on_resume(raw)
                     break
             log(f"Phase 1: Loaded existing brief ({len(brief_text)} chars)")
 
@@ -77534,7 +77594,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # instead of making a second notebook and a second podcast. Only the
             # FIRST upload gets it: the re-upload below runs because the notebook
             # we had is not usable. (A fresh run's checkpoint is empty.)
-            _p3_recorded_nb = cp.get("notebook_url") or ""
+            # ⛔ And only on the worker that made it — see the helper.
+            _p3_recorded_nb = _p3_notebook_to_reopen(cp)
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(
