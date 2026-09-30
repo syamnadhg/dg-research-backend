@@ -25,6 +25,7 @@ browser test loads the local fixture into headless Chrome.
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import inspect
 import textwrap
 from pathlib import Path
@@ -456,3 +457,116 @@ def test_the_computer_use_check_stays_when_no_source_row_was_read(monkeypatch):
     missing, cua_calls = _verify_sources(
         monkeypatch, _sources("chatgpt.md", "claude.md", rows=False))
     assert missing == set() and cua_calls == ["verify_sources_health"], cua_calls
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. ChatGPT Phase 2: the new "+" marker; New chat waits for the old thread
+# ═════════════════════════════════════════════════════════════════════════════
+
+FIX = Path(__file__).parent / "fixtures" / "chatgpt_0928"
+
+
+@pytest.fixture(scope="module")
+def chrome():
+    try:
+        from patchright.async_api import async_playwright
+    except Exception as e:                                    # pragma: no cover
+        pytest.skip(f"patchright unavailable: {e}")
+    loop = asyncio.new_event_loop()
+
+    async def _start():
+        pw = await async_playwright().start()
+        try:
+            b = await pw.chromium.launch(channel="chrome", headless=True)
+        except Exception:
+            await pw.stop()
+            raise
+        return pw, b, await b.new_context(viewport={"width": 1280, "height": 900})
+
+    try:
+        pw, b, ctx = loop.run_until_complete(_start())
+    except Exception as e:                                    # pragma: no cover
+        loop.close()
+        pytest.skip(f"system Chrome unavailable: {e}")
+    yield SimpleNamespace(run=loop.run_until_complete, ctx=ctx)
+    loop.run_until_complete(b.close())
+    loop.run_until_complete(pw.stop())
+    loop.close()
+
+
+def test_live_the_plus_is_found_by_its_marker_when_its_label_changes(chrome, monkeypatch):
+    """The captured "+" ('Add files and more', data-composer-navigation-target=
+    "add-context"), with its label in another wording. The label patterns miss
+    it; the durable marker must not."""
+    src = (FIX / "new_page.html").read_text(encoding="utf-8")
+    old = 'aria-label="Add files and more"'
+    assert src.count(old) == 1, "the captured + button moved in the fixture"
+    src = src.replace(old, 'aria-label="' + _html.escape("Ajouter des fichiers et plus") + '"')
+    lines = []
+    monkeypatch.setattr(research, "log", lambda m, lv="INFO", *a, **k: lines.append(str(m)))
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "asyncio", _FastAsyncio())
+    page = chrome.run(chrome.ctx.new_page())
+    try:
+        chrome.run(page.set_content(src))
+        chrome.run(page.evaluate(
+            "() => document.addEventListener('click', e => {"
+            " const b = e.target.closest('button');"
+            " (window.__pressed = window.__pressed || []).push("
+            "   b ? (b.getAttribute('data-composer-navigation-target') || b.getAttribute('aria-label') || '?') : '-');"
+            "}, true)"))
+        chrome.run(research.setup_chatgpt_dr(page))
+        pressed = chrome.run(page.evaluate("() => window.__pressed || []"))
+    finally:
+        chrome.run(page.close())
+    assert pressed and pressed[0] == "add-context", (pressed, lines)
+    assert any('Step 1 OK: opened tools menu via '
+               'button[data-composer-navigation-target="add-context"]' in m for m in lines), lines
+
+
+class _NewChatPage:
+    """A ChatGPT conversation tab. After New chat the address moves at once,
+    and the old question and reply stay mounted until `clears_at` seconds."""
+
+    def __init__(self, clock, clears_at):
+        self.clock, self.clears_at = clock, clears_at
+        self.url = "https://chatgpt.com/c/6a72ce1e-2284-83ea"
+        self.pressed_at = None
+
+    async def evaluate(self, script, arg=None):
+        if arg == research._SR_CLICK_MARK:                 # the marker pass
+            return 'button[aria-label*="New chat" i]'
+        old_still_there = self.pressed_at is None or (
+            self.clock.t - self.pressed_at < self.clears_at)
+        return {"composer": True, "msgs": 2 if old_still_there else 0}
+
+
+def _new_chat(monkeypatch, clears_at):
+    clock = _Clock()
+    page = _NewChatPage(clock, clears_at)
+
+    async def _press(p, value, *, tag, **kw):
+        p.url = "https://chatgpt.com/"
+        p.pressed_at = clock.t
+        return "pointer"
+
+    lines = []
+    monkeypatch.setattr(research, "asyncio", clock.asyncio())
+    monkeypatch.setattr(research, "_sr_real_click", _press)
+    monkeypatch.setattr(research, "log", lambda m, lv="INFO", *a, **k: lines.append((lv, m)))
+    return _go(research._chatgpt_force_new_chat(page, "2A")), clock, lines
+
+
+def test_a_new_chat_whose_old_thread_clears_at_three_seconds_is_a_new_chat(monkeypatch):
+    """05:08:40 pressed, 05:08:42 'thread already holds 2 message(s) — NOT a
+    fresh chat', 05:08:52 ready after a reload. The chat was new."""
+    ok, clock, lines = _new_chat(monkeypatch, clears_at=3)
+    assert ok is True, lines
+    assert not [m for lv, m in lines if "NOT a fresh chat" in m], lines
+
+
+def test_a_thread_that_never_clears_is_still_refused_within_about_five_seconds(monkeypatch):
+    ok, clock, lines = _new_chat(monkeypatch, clears_at=10_000)
+    assert ok is False
+    assert 4.5 <= clock.t <= 6, f"waited {clock.t}s"
+    assert [m for lv, m in lines if lv == "WARN" and "NOT a fresh chat" in m], lines

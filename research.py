@@ -57904,8 +57904,14 @@ async def setup_chatgpt_dr(page, allow_model_pick=False, *,
         except Exception:
             _seen_rows = []
 
+        # ⭐ 2026-09-30 — the 09-28 page's "+" has no test id any more; its
+        # durable marker is `data-composer-navigation-target="add-context"`
+        # (tests/fixtures/chatgpt_0928/new_page.html, captured). It goes right
+        # after the old id, ahead of the label patterns, so a reworded or
+        # translated label cannot send Step 1 to another button.
         menu_sel = None
         for sel in ['button[data-testid="composer-plus-btn"]',
+                    'button[data-composer-navigation-target="add-context"]',
                     'button[aria-label*="Add files" i]',
                     'button[aria-label*="Use a tool" i]',
                     'button[aria-label*="Attach" i]',
@@ -64718,6 +64724,11 @@ _CHATGPT_NEW_CHAT_STATE_JS = _cg_js(
     " msgs: document.querySelectorAll('__CG_ANY_MSG__').length })")
 
 
+#: How long `_chatgpt_force_new_chat` waits, after pressing New chat, for the
+#: old conversation to leave the page before calling the new chat a miss.
+_CHATGPT_NEW_CHAT_SETTLE_S = 5.0
+
+
 async def _chatgpt_force_new_chat(page, label) -> bool:
     """Client-side "New chat" on an already-open chatgpt.com tab (2A warm-tab
     reuse, 2026-07-06 bot-score work). Returns True when the tab lands on a
@@ -64758,6 +64769,14 @@ async def _chatgpt_force_new_chat(page, label) -> bool:
                 f"holds {st.get('msgs')} message(s) — NOT a fresh chat", "WARN")
             return False
         return True
+
+    async def _thread_cleared() -> bool:
+        """The same read as `_composer_present`, asked quietly while waiting."""
+        try:
+            st = await page.evaluate(_CHATGPT_NEW_CHAT_STATE_JS) or {}
+        except Exception:
+            return False
+        return bool(st.get("composer")) and int(st.get("msgs") or 0) == 0
 
     try:
         cur = (page.url or "").lower()
@@ -64817,8 +64836,20 @@ async def _chatgpt_force_new_chat(page, label) -> bool:
         if not how:
             return False
         log(f"[{label}] New-chat pressed via {how} (matched {marked})", "INFO")
-        await asyncio.sleep(2)
-        cur2 = (page.url or "").lower()
+        # ⭐⭐ 2026-09-30 — WAIT FOR THE OLD THREAD TO CLEAR, up to about
+        # `_CHATGPT_NEW_CHAT_SETTLE_S`. This read the page ONCE, 2 s after the
+        # press. On the 09-28 page the address had already moved to
+        # chatgpt.com/ by then but the old question and reply were still on
+        # screen, so a new chat that DID land read "the thread already holds 2
+        # message(s) — NOT a fresh chat" and the run reloaded the tab (05:08:42,
+        # 17 s lost). Now: look every half second until the address has left
+        # the conversation and the thread is empty, and only then decide.
+        cur2 = ""
+        for _ in range(int(_CHATGPT_NEW_CHAT_SETTLE_S / 0.5)):
+            await asyncio.sleep(0.5)
+            cur2 = (page.url or "").lower()
+            if "/c/" not in cur2 and await _thread_cleared():
+                break
         log(f"[{label}] New-chat check: url after press={cur2}", "INFO")
         if "/c/" in cur2:
             return False  # SPA never left the conversation
