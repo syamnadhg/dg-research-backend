@@ -18,6 +18,10 @@
        mission (a second press can make an audio that cannot be deleted); when
        the page could not finish, computer use gets the SAME open window.
   P* — the computer-use prompt and the vision hints open Customise from the tile.
+  S* — short is Deep dive + Short in the rest of the step too: the words
+       computer use is handed, the completion check, the download and its
+       pick (the LAST Deep dive card, as for default and long — never the
+       Brief). tests/test_nlm_short_deep_dive_0930.py.
 
 ⛔ The browser tests need patchright and Chrome; where they SKIP the baseline is
 not a measurement, so the runner refuses to score a skipped baseline.
@@ -41,7 +45,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RESEARCH = "research.py"
 PROMPTS = "prompts.py"
 
-TESTS = ["tests/test_nlm_customise_0930.py", "tests/test_nlm_dup_audio_778.py"]
+TESTS = ["tests/test_nlm_customise_0930.py", "tests/test_nlm_dup_audio_778.py",
+         "tests/test_nlm_short_deep_dive_0930.py"]
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 MUTANTS = [
@@ -164,6 +169,48 @@ MUTANTS = [
     ("P5", RESEARCH, "the vision hint aims at the gear again",
      [('            "\'Audio Overview\' tile in the Studio panel\'s grid of create tiles (right side) "',
        '            "gear / \'Customise\' arrow ON the Audio Overview card (right side) "')]),
+
+    # ═══ S — short is Deep dive + Short in the rest of the step ═════════════
+    ("S1", RESEARCH, "⛔⛔ the download pick keeps the non-Deep-dive cards for "
+     "short — a Brief beside the Deep dive is downloaded",
+     [('    deep = [c for c in cpool if c.get("isDeepDive")]\n',
+       '    deep = [c for c in cpool if bool(c.get("isDeepDive")) != (length == "short")]\n')]),
+    ("S2", RESEARCH, "the download pick takes the FIRST card for short, as when "
+     "short was Brief",
+     [('    target = cand[-1]\n    reason = f"{length}→last deep-dive card"',
+       '    target = cand[0] if length == "short" else cand[-1]\n'
+       '    reason = f"{length}→last deep-dive card"')]),
+    ("S3", RESEARCH, "computer use, handed the open window, is told to choose "
+     "the Brief format",
+     [('            "short": ("Deep dive", "Deep dive + Short length"),',
+       '            "short": ("Brief", "the Brief format (no separate length step)"),')]),
+    ("S4", PROMPTS, "⛔ the computer-use generate mission asks for FORMAT=Brief "
+     "on short",
+     [('    "short": {"format": "Deep dive", "length": "Short",',
+       '    "short": {"format": "Brief", "length": "Short",')]),
+    ("S5", PROMPTS, "step 5 of the short mission chooses Brief and skips the "
+     "Length row",
+     [('\'Choose FORMAT = "Deep dive" first (never "Brief"), then LENGTH = "Short" '
+       '(changing the format redraws the Length row). Both must show as selected '
+       'before "Generate now".\'',
+       '\'Choose FORMAT = "Brief". Brief has no Length row — do not look for one and '
+       'do not wait for one before "Generate now".\'')]),
+    ("S6", PROMPTS, "the short mission's header names no length",
+     [("        f' and LENGTH=\"{length}\". Anything else is a failure.'",
+       "        + (f' and LENGTH=\"{length}\"' if podcast_length != \"short\" else \"\")\n"
+       "        + \". Anything else is a failure.\"")]),
+    ("S7", PROMPTS, "⛔ the completion check and the download look for a Brief "
+     "card this run never made",
+     [('        "card_desc": "the Deep Dive · Short audio overview you generated",',
+       '        "card_desc": "the Brief audio overview you generated",')]),
+    ("S8", PROMPTS, "the download's match hint steers off every Deep Dive entry",
+     [('        "match_hint": "the one whose label says \'Deep Dive\' with the SHORTEST '
+       'duration of the Deep Dive entries (never a \'Brief\' entry)",',
+       '        "match_hint": "the one whose label says \'Brief\' or whose duration is '
+       'short (~3–5 min) — NOT a Deep Dive entry",')]),
+    ("S9", PROMPTS, "the download's tie-break targets the Brief entry",
+     [('target the SHORTEST-DURATION Deep Dive entry.",',
+       'target the BRIEF entry (short duration / no \'Deep Dive\' label).",')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

@@ -14061,9 +14061,12 @@ _DEFAULT_PHASE_MINUTES = {0: 0.2, 1: 27, 2: 55, 3: 15, 4: 8, 5: 4}
 # visible string ("5–10m typical"); the structured `expectedMinutes`
 # emit field uses the high end (FE displays a single number for the
 # progress-bar label, and overestimating beats underestimating —
-# avoids panicking the user when actual exceeds estimate). Matches the
-# Settings UI copy at FE settings/page.tsx ("Short ≈ 5–10 · Default ≈
-# 10–20 · Long ≈ 30–45").
+# avoids panicking the user when actual exceeds estimate). These are minutes
+# of GENERATION, not the audio's own length (which the Settings copy gives).
+# ⭐ 2026-09-30: short is Deep dive + Short now, no longer Brief (every length
+# is a Deep dive). Its (5, 10) stays, read now as half of Default's (10, 20),
+# the same step Long takes above Default in the Settings copy. ASSUMED: no
+# Deep dive + Short has been generated yet to measure.
 _AUDIO_TYPICAL_RANGE_MIN = {
     "short":   (5, 10),
     "default": (10, 20),
@@ -72934,7 +72937,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # 2026-05-13: per-variant format + length names for log / narrator
         # / CUA task copy. Mirrors make_prompt_audio_generate's table.
         _variant_label = {
-            "short": ("Brief", "the Brief format (no separate length step)"),
+            "short": ("Deep dive", "Deep dive + Short length"),
             "default": ("Deep dive", "Deep dive + Default length"),
             "long": ("Deep dive", "Deep dive + Long length"),
         }.get(podcast_length, ("Deep dive", "Deep dive + Long length"))
@@ -73575,10 +73578,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             interval=20)
         try:
             # 2026-05-14: length-aware download prompt — CUA targets the
-            # SAME card the generate step created (Brief / Deep Dive Default
-            # / Long Deep Dive), not the hardcoded Long + Deep Dive that
-            # would either not exist (short) or pick the wrong card if a
-            # parallel Deep Dive misclick existed (default).
+            # SAME card the generate step created (Deep Dive + Short / Default
+            # / Long since 2026-09-30; short was Brief before), not the
+            # hardcoded Long + Deep Dive that could pick the wrong card if a
+            # parallel Deep Dive misclick existed.
             _audio_dl_mission = make_prompt_audio_download(podcast_length, target_ordinal=_target_ord)
 
             async def _audio_download_cua():
@@ -74446,15 +74449,16 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
 
     Duration is NOT in the card text (confirmed user dump 2026-06-03: a completed
     card reads "audio_magic_eraser <Title> Deep dive · N sources · <ago> ..." —
-    no MM:SS / "N min" token), so the pick uses FORMAT (Brief vs Deep dive, which
-    IS in the text) + DOM order:
-      - short        → the first BRIEF card (text lacks "deep dive"); falls back
-                       to the first complete card if no Brief label is present.
-      - long/default → the LAST complete Deep-dive card. The misclick default
-                       fires FIRST (so completes first) → the user-requested
-                       length is typically the LATER card. Best-effort;
-                       ambiguous=True whenever >1 Deep-dive card exists (they are
-                       indistinguishable by text).
+    no MM:SS / "N min" token), so the pick uses FORMAT (Deep dive, which IS in
+    the text) + DOM order. Every length is a Deep dive (owner, 2026-09-30:
+    short is Deep dive + Short, no longer Brief), so every length picks the
+    same way:
+      - short/default/long → the LAST complete Deep-dive card (the last card
+                       of any kind only when none reads Deep dive).
+                       The misclick default fires FIRST (so completes first) →
+                       the user-requested length is typically the LATER card.
+                       Best-effort; ambiguous=True whenever >1 Deep-dive card
+                       exists (they are indistinguishable by text).
 
     Returns {count, target_ordinal (1-based, top-down DOM order), complete,
     ambiguous, reason, snippet}. Best-effort and exception-safe: on any
@@ -74472,7 +74476,6 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
                 return {
                     ordinal: i + 1,                                   // 1-based DOM order
                     isDeepDive: low.indexOf('deep dive') !== -1,
-                    isBrief: low.indexOf('brief') !== -1,
                     // in-flight cards still show the "Generating Audio Overview…"
                     // text; a completed card does not.
                     generating: /generating audio overview/i.test(t),
@@ -74507,28 +74510,16 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     _all_generating = not complete_cards
     length = (podcast_length or "long").lower()
 
-    if length == "short":
-        # Prefer an explicit "Brief" card; else any non-Deep-Dive card (the
-        # Brief can render before its label); else the first card. The requested
-        # short audio is Brief and the misclick default is Deep Dive, so
-        # excluding Deep Dive isolates the Brief.
-        explicit_brief = [c for c in cpool if c.get("isBrief")]
-        non_dd = [c for c in cpool if not c.get("isDeepDive")]
-        cand = explicit_brief or non_dd or cpool
-        target = cand[0]
-        reason = ("short→explicit Brief card" if explicit_brief
-                  else "short→first non-deep-dive card" if non_dd
-                  else "short→first card (no Brief label found)")
-    else:
-        # long/default → the LAST complete Deep-dive card. The dominant residual
-        # dup vector (a fail-open CUA body-misclick during the OPEN step) fires
-        # the default FIRST, so the user-requested card completes LATER → last.
-        # Best-effort + ambiguous when >1 (text can't distinguish two Deep
-        # Dives); worst case streams a valid complete Deep-dive podcast.
-        deep = [c for c in cpool if c.get("isDeepDive")]
-        cand = deep or cpool
-        target = cand[-1]
-        reason = f"{length}→last deep-dive card"
+    # Every length → the LAST complete Deep-dive card (short too since
+    # 2026-09-30; it was the first Brief card). The dominant residual dup vector
+    # (a fail-open CUA body-misclick during the OPEN step) fires the default
+    # FIRST, so the user-requested card completes LATER → last. Best-effort +
+    # ambiguous when >1 (text can't distinguish two Deep Dives); worst case
+    # streams a valid complete Deep-dive podcast.
+    deep = [c for c in cpool if c.get("isDeepDive")]
+    cand = deep or cpool
+    target = cand[-1]
+    reason = f"{length}→last deep-dive card"
 
     return {
         "count": count,
@@ -74549,7 +74540,9 @@ async def _cleanup_nlm_keep_requested_audio(page, podcast_length: str = "long") 
     (pre-flight / post-generate / mid-poll). Retained only as reference for the
     old length-aware keep logic; slated for full removal under #771 (prod-grade
     cleanup). If you ever need NLM dedup, it MUST be detect-and-surface, never a
-    delete.
+    delete. Its "short" predicate below is the Brief short from before
+    2026-09-30 (short is Deep dive + Short now); nothing calls it, so nothing
+    in a run reads it.
 
     Strict-keep cleanup. Identifies the SINGLE NLM Studio audio card
     that matches the user-requested `podcast_length` and deletes every
