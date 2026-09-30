@@ -189,8 +189,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("E24", "over", "the tier goes back to a literal 'max', so every other "
      "policy tier silently selects nothing on the layout without ids",
-     [("                            if (!hit && allowText) hit = rows.find(isWanted);",
-       "                            if (!hit && allowText) hit = rows.find(el => norm(el.textContent) === 'max');")],
+     # ⚠ RE-ANCHORED 2026-09-30 (Claude round 2): the fallback now also records
+     # which search found the row (`hitVia`).
+     [("                                hit = rows.find(isWanted);",
+       "                                hit = rows.find(el => norm(el.textContent) === 'max');")],
      [T_NEW]),
     ("E25", "under", "the call site stops handing the policy tier to the page "
      "script, so `want` is empty and the text fallback matches nothing",

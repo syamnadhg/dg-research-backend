@@ -215,8 +215,10 @@ MUTANTS = [
     ("C6", "research.py", "over",
      "⛔ an unknown effort word CONSTRUCTS a test id, so the page script "
      "addresses an element that does not exist and its text fallback never runs",
+     # ⚠ RE-AIMED 2026-09-30 (Claude round 2): the word → slug map moved into
+     # `_claude_effort_id`, so the unknown word is spelled out here.
      [('    return f"effort-option-{slug}" if slug else ""',
-       '    return f"effort-option-{slug or word}"')]),
+       '    return f"effort-option-{slug or (effort or \'\').strip().lower()}"')]),
 
     ("C7", "research.py", "over",
      "⛔⛔ the effort row is pressed and CLAIMED without checking it became the "

@@ -60949,8 +60949,8 @@ _CLAUDE_EFFORT_CHECKED_JS = r"""(P) => {
         if (trig) {
             const toks = ((trig.getAttribute('aria-label') || '') + ' '
                           + (trig.textContent || '')).toLowerCase().split(/[^a-z0-9.]+/);
-            const TIERS = ['low', 'medium', 'high', 'extra', 'max'];
-            const shown = toks.find(t => TIERS.indexOf(t) !== -1);
+            const tierWords = ['low', 'medium', 'high', 'extra', 'max'];
+            const shown = toks.find(t => tierWords.indexOf(t) !== -1);
             if (shown) {
                 return { found: true, checked: shown === String(P.word || '').toLowerCase(),
                          via: 'button', shown: shown };
@@ -63012,27 +63012,33 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             return !!want && (t === want || t === want + ' effort'
                                               || t === want + 'default');
                         };
-                        let pick = null, scope = null, items = [];
+                        let pick = null, scope = null, items = [], pickVia = '';
                         for (const c of pools) {
                             const rows = rowsIn(c);
-                            let hit = null;
+                            let hit = null, hitVia = '';
                             // ⭐ 2026-09-30 round 2 — the captured hook first:
                             // every option row carries `data-effort-id`
                             // (low|medium|high|xhigh|max), and the 08-17 test
-                            // ids are gone.
+                            // ids are gone. `hitVia` names the search that FOUND
+                            // the row, so the log says which hook still works.
                             if (P.effortId) {
                                 hit = rows.find(el =>
                                     el.getAttribute('data-effort-id') === P.effortId);
+                                if (hit) hitVia = 'effort-id';
                             }
                             if (!hit && P.optTestid) {
                                 hit = rows.find(el =>
                                     el.getAttribute('data-testid') === P.optTestid);
+                                if (hit) hitVia = 'testid';
                             }
                             // The text search stays as the fallback for an older
                             // layout, with its ligature stripping intact.
-                            if (!hit && allowText) hit = rows.find(isWanted);
+                            if (!hit && allowText) {
+                                hit = rows.find(isWanted);
+                                if (hit) hitVia = 'text';
+                            }
                             if (!items.length) items = rows;
-                            if (hit) { pick = hit; scope = c; items = rows; break; }
+                            if (hit) { pick = hit; scope = c; items = rows; pickVia = hitVia; break; }
                         }
                         if (!pick) {
                             // ⭐ 2026-09-23 — A MISS NAMES THE SUBMENU'S OWN ROWS,
@@ -63074,12 +63080,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                 // was chosen" — the distinction that let a decoy
                                 // outside every menu be pressed once before.
                                 picked: norm(pick.textContent).slice(0, 40),
-                                via: (P.effortId &&
-                                      pick.getAttribute('data-effort-id') === P.effortId)
-                                    ? 'effort-id'
-                                    : (P.optTestid &&
-                                       pick.getAttribute('data-testid') === P.optTestid
-                                       ? 'testid' : 'text'),
+                                via: pickVia,
                                 scoped: scope !== document, menus: menus.length,
                                 cands: cands.length};
                     }""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
@@ -63233,7 +63234,7 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
             # by the caller's read of the button (`_claude_effort_ledger_at_send`).
             _got = _claude_effort_in_effect(
                 confirmed=_effort_confirmed, wanted=_claude_effort,
-                row_shows=_eff_row_shows, pressed=_eff_option_pressed)
+                pressed=_eff_option_pressed, row_shows=_eff_row_shows)
             _st = dict(_P2_THINKING_STATE.get("claude") or {})
             _st.update({"effort": _effort_confirmed, "effort_got": _got})
             _P2_THINKING_STATE["claude"] = _st

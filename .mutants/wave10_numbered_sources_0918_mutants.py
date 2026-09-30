@@ -170,9 +170,11 @@ SPAN_REJECT = ('    for start, end in spans:\n'
 #: The ordered-item clamp's own trap: `2025. Prices fell…` is not a list item.
 ORDERED = '        if ordered and (in_list or ordered.group("n") == "1"):'
 #: The alternate title, for a report that already ends with its own sources.
+# ⚠ RE-ANCHORED 2026-09-30 (Claude round 2): the choice now reads the start of the
+# report's own sources section, which the same pass uses to leave a listed-only
+# source out of the second list.
 ALT_TITLE = ('    heading = _doc_sources_heading(\n'
-             '        _DOC_SOURCES_ALT_TITLE if _doc_ends_with_its_own_sources(masked)\n'
-             '        else _DOC_SOURCES_TITLE)')
+             '        _DOC_SOURCES_ALT_TITLE if own_at is not None else _DOC_SOURCES_TITLE)')
 #: The heading level — read by three web surfaces, see `_doc_sources_heading`.
 LEVEL = '_DOC_SOURCES_HEADING_LEVEL = 5'
 #: The strip's gate: it only ever removes a tail carrying OUR markers.

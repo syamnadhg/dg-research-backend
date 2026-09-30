@@ -311,9 +311,11 @@ MUTANTS = [
        '"thinking": _thinking_confirmed,')]),
     ("E19", "over", "⛔ the effort state outlives the setup that wrote it: a setup "
      "that stops early names the LAST run's tier",
-     [('    _P2_PICKED_VERSION.pop("claude", None)\n'
-       '    _P2_THINKING_STATE.pop("claude", None)\n',
-       '    _P2_PICKED_VERSION.pop("claude", None)\n')]),
+     # ⚠ RE-ANCHORED 2026-09-30 (Claude round 2): the two clears now sit under
+     # `if not effort_only:` — the pre-send effort re-set keeps this run's state.
+     [('        _P2_PICKED_VERSION.pop("claude", None)\n'
+       '        _P2_THINKING_STATE.pop("claude", None)\n',
+       '        _P2_PICKED_VERSION.pop("claude", None)\n')]),
     ("E11", "over", "⛔ the press is not passed on, so a stale pre-press read is "
      "reported as the tier",
      [("row_shows=_eff_row_shows, pressed=_eff_option_pressed)",
