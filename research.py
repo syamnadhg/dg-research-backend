@@ -38049,8 +38049,15 @@ _CHATGPT_DONE_PROBE_JS = _cg_js("""() => {
     const steps = document.querySelectorAll(
         '[class*="research"] li, [class*="step"], [class*="task"]'
     ).length;
+    // ⭐ 2026-09-30 (round 2): Deep research runs as an APP — its frame
+    // (mcp-app-<hash>.web-sandbox.oaiusercontent.com) sits in the thread, or in
+    // the side viewer once opened (tests/fixtures/chatgpt_0930/
+    // 3-chatgpt-dr-toppage.json). See `detect_completion_chatgpt`.
+    const drApp = !!document.querySelector(
+        '[data-mcp-app-frame] iframe, [data-mcp-app-side-panel-frame-container] iframe, ' +
+        'iframe[src*="web-sandbox.oaiusercontent.com"]');
     return { hasStop, thoughtFor, researchDone, completedChip, docPanelAffordances,
-             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh };
+             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };
 }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
 
 # A non-main context must be a real surface before its download-button scan may
@@ -38132,12 +38139,25 @@ async def detect_completion_chatgpt(page):
                                and _num(d, "vh") >= _CHATGPT_FRAME_SURFACE_MIN_VH)
 
         has_stop = any(bool(d.get("hasStop")) for _c, _h, d in readings)
+        # ⛔⛔ 2026-09-30 (round 2) — DEEP RESEARCH AS AN APP: DONE IS THE STOP
+        # BUTTON GONE. The app writes "Worked for 7s" (or "Worked for a few
+        # seconds") above its card the moment it launches, so the thinking-time
+        # badge is on the page for the whole run and says nothing about the
+        # end; with no digit in it, it is not even read, and the finished page
+        # then carries no marker at all (the owner's recording: after the run,
+        # "Worked for a few seconds", the report in the app's frame, no Stop).
+        # The Stop button is the one sign both ways: in the page for the whole
+        # run (hidden once the card is up — the recording's 0×0 Stop, and the
+        # 09-30 log's "stop_btn_present" at 11 and 13 minutes) and gone at the
+        # end. So on the app's page the badge counts for nothing, and no Stop in
+        # any context is the done sign. The caller's two flat reads still stand.
+        dr_app = any(bool(d.get("drApp")) for _c, h, d in readings if h)
 
         # (marker name, does this reading carry it) — first hit names the reason.
         marker_from = ""
         which_marker = ""
         for name, pred in (
-            ("thought_for", lambda h, d: bool(d.get("thoughtFor"))),
+            ("thought_for", lambda h, d: bool(d.get("thoughtFor")) and not dr_app),
             ("completed_chip", lambda h, d: bool(d.get("completedChip"))),
             ("doc_panel_affordances",
              lambda h, d: bool(d.get("docPanelAffordances")) and _surface(h, d)),
@@ -38149,6 +38169,8 @@ async def detect_completion_chatgpt(page):
                     break
             if which_marker:
                 break
+        if not which_marker and dr_app:
+            which_marker, marker_from = "stop_gone_dr_app", "host"
         has_done_marker = bool(which_marker)
 
         # `text_len` is what the caller's flatness gate watches. A non-main
@@ -51167,6 +51189,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             if p["chatgpt_panel_dom_misses"] in (2, 6):
                                 await _log_chatgpt_thread_snapshot(
                                     p["page"], tag=f"p2-miss{p['chatgpt_panel_dom_misses']}")
+                            # 2026-09-30 (round 2): and what the app's frames hold.
+                            await _chatgpt_dr_census(p["page"], "miss-activity",
+                                                     label="ChatGPT")
                             _stand_down = _chatgpt_panel_stand_down_reason(
                                 p, res.get("label") or "")
                             if _stand_down:
@@ -52112,6 +52137,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _de:
                     log(f"[{name}] detect_completion error: {_de}", "WARN")
                     dom_done, dom_reason, snap = (False, f"detect_error: {_de}", {})
+                # 2026-09-30 (round 2): what Deep research's app frame holds, at
+                # launch and five minutes in — see `_chatgpt_dr_census`.
+                if name == "ChatGPT":
+                    await _chatgpt_dr_census_tick(p, label=name)
                 p.setdefault("flat_history", [])
                 p.setdefault("done_marker_first_at", 0.0)
                 p.setdefault("extraction_attempts", 0)
@@ -56451,6 +56480,527 @@ async def _run_with_clipboard_hijack(
                 pass
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ChatGPT Deep research as an APP (2026-09-30, round 2)
+# ─────────────────────────────────────────────────────────────────────────────
+# Since 09-28 Deep research runs as an app inside a cross-origin frame
+# (mcp-app-<hash>.web-sandbox.oaiusercontent.com, title "Deep research"): a card
+# in the thread ("Opening Deep research" → "Opened Deep research", with "Open
+# app in tab"), and a side viewer (data-testid viewer-header: "Enter full
+# screen", "Close viewer") that the same frame moves into. The owner's page
+# recorder could not see inside the frame (tests/fixtures/chatgpt_0930/
+# 3-chatgpt-dr-toppage.json, 3b, 3c — origin and box only). Playwright can:
+# `page.frames` holds it, and every frame nested in it.
+#
+# So three things here, all ⚠ ASSUMED about the frame's inside, which no
+# recording shows:
+#   1. a CENSUS of the app's frames — tags, roles, labels, short texts, in the
+#      recorder's own node shape — written at launch, mid-run and done, and on
+#      every DOM miss, so the next run IS the capture;
+#   2. the report DOWNLOADED inside the frame when it shows a download/export
+#      control and then a Markdown row (the 09-30 computer use pressed exactly
+#      that: "the download icon" at the frame's top right, then "Export to
+#      Markdown"); nothing found → computer use, as before;
+#   3. the report's CITATIONS linked to the sources the rendered report shows
+#      (see `_chatgpt_link_citations`).
+
+#: What a frame of the app is: its sandbox origin. A frame nested inside one of
+#: these (the about:blank the report may render in) belongs to it too.
+_CHATGPT_DR_APP_HOST = "web-sandbox.oaiusercontent.com"
+
+
+def _chatgpt_dr_app_frames(page):
+    """Every frame of the Deep research app: its sandbox frames and every frame
+    nested inside one. [] when there is none (research not launched, or the old
+    page) or the page cannot be read."""
+    out = []
+    try:
+        main = page.main_frame
+        for f in page.frames:
+            if f is main:
+                continue
+            node, hit = f, False
+            while node is not None and node is not main:
+                try:
+                    if _CHATGPT_DR_APP_HOST in (node.url or "").lower():
+                        hit = True
+                        break
+                    node = node.parent_frame
+                except Exception:
+                    break
+            if hit:
+                out.append(f)
+            if len(out) >= 12:
+                break
+    except Exception:
+        return []
+    return out
+
+
+# The census: the recorder's node shape ({tag, a, box, txtLen, label?, k}), so a
+# census reads like the owner's recordings and `tests/_capture_page.py` can
+# build a page from it. Bounded: 500 nodes, 9 levels, 100 controls. Link
+# addresses are cut to their origin, and no text longer than 40 characters is
+# kept — the report's words never reach the log.
+_CHATGPT_DR_CENSUS_JS = r"""(P) => {
+    const MAX = P.max || 500, DEPTH = P.depth || 9;
+    const KEEP = ['role', 'aria-label', 'aria-expanded', 'aria-haspopup', 'aria-controls',
+                  'aria-pressed', 'aria-checked', 'aria-selected', 'aria-hidden', 'data-state',
+                  'data-testid', 'title', 'type', 'href', 'target', 'download', 'tabindex',
+                  'hidden', 'id'];
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const label = (el) => { const t = norm(el.innerText || el.textContent); return t.length <= 40 ? t : null; };
+    const attrs = (el) => {
+        const a = {};
+        for (const k of KEEP) {
+            const v = el.getAttribute(k);
+            if (v === null) continue;
+            a[k] = k === 'href' ? v.replace(/^(https?:\/\/[^\/?#]+).*$/i, '$1').slice(0, 80) : v.slice(0, 60);
+        }
+        let extra = 0;
+        for (const x of el.attributes) {
+            if (!x.name.startsWith('data-') || x.name in a || extra >= 8) continue;
+            a[x.name] = x.value.slice(0, 40);
+            extra += 1;
+        }
+        const c = norm(el.getAttribute('class'));
+        if (c) a['class'] = c.slice(0, 100);
+        return a;
+    };
+    const box = (el) => { const r = el.getBoundingClientRect();
+        return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; };
+    let count = 0;
+    const tags = {};
+    const walk = (el, depth) => {
+        if (count >= MAX) return null;
+        count += 1;
+        tags[el.tagName] = (tags[el.tagName] || 0) + 1;
+        const n = { tag: el.tagName, a: attrs(el), box: box(el), txtLen: (el.textContent || '').length };
+        const l = label(el);
+        if (l !== null) n.label = l;
+        if (depth < DEPTH && el.children.length) {
+            const k = [];
+            for (const c of el.children) { const w = walk(c, depth + 1); if (w) k.push(w); }
+            if (k.length) n.k = k;
+        }
+        return n;
+    };
+    const controls = [];
+    for (const el of document.querySelectorAll(
+            'button, a, input, select, summary, [role], [tabindex], [aria-label], [title]')) {
+        if (controls.length >= 100) break;
+        controls.push({ tag: el.tagName, a: attrs(el), box: box(el), label: label(el) });
+    }
+    const body = document.body;
+    return {
+        origin: location.origin, title: norm(document.title).slice(0, 60),
+        vw: window.innerWidth, vh: window.innerHeight,
+        textLen: body ? (body.innerText || '').length : 0,
+        headings: document.querySelectorAll('h1, h2, h3').length,
+        links: document.querySelectorAll('a[href^="http"]').length,
+        frames: document.querySelectorAll('iframe').length,
+        controls, tree: body ? walk(body, 0) : null, cut: count >= MAX, tags
+    };
+}"""
+
+#: Which census stages this run has written, per page — each stage once.
+_CHATGPT_DR_CENSUS_SEEN: dict = {}
+
+
+def _chatgpt_dr_census_dir() -> "Path":
+    """The run's own log folder when a run is armed (so a support bundle carries
+    the census), else the machine's log folder."""
+    sink = _active_run_sink()
+    if sink is not None and getattr(sink, "dir", None):
+        return Path(sink.dir)
+    return Path(os.path.expanduser("~/.super-research/logs"))
+
+
+async def _chatgpt_dr_census(page, stage, *, label="ChatGPT"):
+    """Write a census of the Deep research app's frames for `stage` ("launch",
+    "mid-run", "done", "miss-<step>"), once per stage per page, and log one
+    plain line saying what it found and where it went. Never raises; returns the
+    census (None when it wrote nothing)."""
+    try:
+        key = (id(page), stage)
+        if key in _CHATGPT_DR_CENSUS_SEEN:
+            return None
+        frames = _chatgpt_dr_app_frames(page)
+        if not frames:
+            return None
+        _CHATGPT_DR_CENSUS_SEEN[key] = time.time()
+        if len(_CHATGPT_DR_CENSUS_SEEN) > 400:
+            for k in sorted(_CHATGPT_DR_CENSUS_SEEN, key=_CHATGPT_DR_CENSUS_SEEN.get)[:200]:
+                _CHATGPT_DR_CENSUS_SEEN.pop(k, None)
+        out = []
+        for f in frames:
+            try:
+                c = await f.evaluate(_CHATGPT_DR_CENSUS_JS, {})
+            except Exception as _fe:
+                c = {"origin": (getattr(f, "url", "") or "")[:80], "error": str(_fe)[:120]}
+            if isinstance(c, dict):
+                out.append(c)
+        census = {"what": "sr-dr-app-census", "site": "chatgpt.com", "stage": stage,
+                  "when": _utc_iso(), "frames": out}
+        path = ""
+        try:
+            d = _chatgpt_dr_census_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r"[^a-z0-9-]+", "-", str(stage).lower()).strip("-") or "stage"
+            p = d / f"chatgpt_dr_census_{safe}.json"
+            p.write_text(json.dumps(census, ensure_ascii=False), encoding="utf-8")
+            path = str(p)
+        except Exception as _we:
+            log(f"[{label}] Deep research census could not be saved ({_we})", "DEBUG")
+        parts = []
+        for c in out:
+            names = []
+            for ctl in (c.get("controls") or []):
+                a = ctl.get("a") or {}
+                nm = a.get("aria-label") or a.get("title") or ctl.get("label") or ""
+                if nm and nm not in names:
+                    names.append(str(nm)[:30])
+            parts.append(f"{str(c.get('origin') or '?')[:48]}: "
+                         f"{sum((c.get('tags') or {}).values())} elements, "
+                         f"{len(c.get('controls') or [])} controls "
+                         f"{json.dumps(names[:12], ensure_ascii=False)}, "
+                         f"{c.get('links', 0)} links, {c.get('headings', 0)} headings, "
+                         f"text {c.get('textLen', 0)} chars")
+        log(f"[{label}] Deep research app, what its frames hold ({stage}): "
+            + " | ".join(parts) + (f" — saved to {path}" if path else ""))
+        return census
+    except Exception as _ce:
+        log(f"[{label}] Deep research census skipped ({_ce})", "DEBUG")
+        return None
+
+
+async def _chatgpt_dr_census_tick(p, *, label="ChatGPT"):
+    """The Phase 2 poll's two census moments: the first poll that sees the app's
+    frame ("launch"), and the first poll five minutes in ("mid-run")."""
+    try:
+        page = p.get("page")
+        if page is None:
+            return
+        await _chatgpt_dr_census(page, "launch", label=label)
+        if time.time() - float(p.get("start_time") or time.time()) >= 300:
+            await _chatgpt_dr_census(page, "mid-run", label=label)
+    except Exception:
+        pass
+
+
+# Mark the one control in a frame that a step presses. `pattern` is matched
+# against the control's aria-label, title, test id and short text; `top` keeps
+# the look to the frame's header strip (the 09-30 computer use pressed "the
+# download icon" about 24 px below the frame's top edge). A link to another site
+# is never a control here — the report's own links can say "download".
+_CHATGPT_DR_MARK_JS = r"""(P) => {
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) el.removeAttribute(P.attr);
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const re = new RegExp(P.pattern, 'i');
+    let best = null, bestTop = Infinity;
+    for (const el of document.querySelectorAll(
+            'button, [role="button"], [role="menuitem"], [role="menuitemradio"], [role="option"], a')) {
+        if (el.tagName === 'A' && /^https?:/i.test(el.getAttribute('href') || '')) continue;
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) continue;
+        if (P.top && r.top > P.top) continue;
+        const words = norm([el.getAttribute('aria-label'), el.getAttribute('title'),
+                            el.getAttribute('data-testid'),
+                            norm(el.innerText || '').slice(0, 60)].join(' '));
+        if (!re.test(words)) continue;
+        if (r.top < bestTop) { best = el; bestTop = r.top; }
+    }
+    if (!best) return { marked: false };
+    best.setAttribute(P.attr, P.value);
+    return { marked: true, tag: best.tagName,
+             text: norm([best.getAttribute('aria-label'), best.getAttribute('title'),
+                         norm(best.innerText || '').slice(0, 40)].join(' ')).slice(0, 60) };
+}"""
+
+#: The header control: a download or an export button.
+_CHATGPT_DR_DOWNLOAD_RE = r"\b(download|export)\b"
+#: The menu row: Markdown.
+_CHATGPT_DR_MARKDOWN_RE = r"markdown|\.md\b"
+#: How long a press may take to be clickable, and how long the file may take.
+_CHATGPT_DR_PRESS_MS = 5000
+_CHATGPT_DR_FILE_S = 20.0
+
+
+async def _chatgpt_dr_press(frame, value, pattern, *, top=0):
+    """Mark and really click one control in `frame`. Returns what was pressed, or
+    None when nothing matched or the press failed."""
+    try:
+        hit = await frame.evaluate(_CHATGPT_DR_MARK_JS, {
+            "attr": _SR_CLICK_MARK, "value": value, "pattern": pattern, "top": top})
+    except Exception:
+        return None
+    if not (isinstance(hit, dict) and hit.get("marked")):
+        return None
+    try:
+        await frame.locator(f'[{_SR_CLICK_MARK}="{value}"]').first.click(
+            timeout=_CHATGPT_DR_PRESS_MS)
+    except Exception:
+        return None
+    return hit
+
+
+async def _chatgpt_dr_dom_download(page, label="ChatGPT"):
+    """The finished report, downloaded inside the Deep research app's frame: its
+    download/export control, then the Markdown row. Returns the file's text, or
+    "" when no frame shows such a control (the caller then asks computer use, as
+    before) — a miss writes a census, so the next run shows what was there."""
+    frames = _chatgpt_dr_app_frames(page)
+    if not frames:
+        return ""
+    got = []
+    done = asyncio.Event()
+
+    def _on_download(dl):
+        got.append(dl)
+        done.set()
+
+    page.on("download", _on_download)
+    pressed = []
+    try:
+        for f in frames:
+            first = await _chatgpt_dr_press(f, "dr-download", _CHATGPT_DR_DOWNLOAD_RE, top=160)
+            if not first:
+                continue
+            pressed.append(first.get("text") or first.get("tag") or "?")
+            try:
+                await asyncio.wait_for(done.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
+            if not got:
+                second = None
+                for g in [f] + [x for x in frames if x is not f]:
+                    second = await _chatgpt_dr_press(g, "dr-markdown", _CHATGPT_DR_MARKDOWN_RE)
+                    if second:
+                        break
+                if second:
+                    pressed.append(second.get("text") or second.get("tag") or "?")
+                    try:
+                        await asyncio.wait_for(done.wait(), timeout=_CHATGPT_DR_FILE_S)
+                    except asyncio.TimeoutError:
+                        pass
+            break
+        if not got:
+            log(f"[{label}] Deep research download by the page: "
+                + (f"pressed {json.dumps(pressed, ensure_ascii=False)} but no file came"
+                   if pressed else "no download or export control in the app's frames")
+                + " — computer use downloads it instead")
+            await _chatgpt_dr_census(page, "miss-download", label=label)
+            return ""
+        try:
+            path = await got[0].path()
+
+            def _read(p):
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    return fh.read()
+
+            text = await asyncio.to_thread(_read, path) if path else ""
+        except Exception as _re:
+            log(f"[{label}] Deep research download by the page: the file could not be "
+                f"read ({_re})", "WARN")
+            text = ""
+        log(f"[{label}] Deep research download by the page: pressed "
+            f"{json.dumps(pressed, ensure_ascii=False)}, file {len(text)} chars")
+        return text
+    finally:
+        try:
+            page.remove_listener("download", _on_download)
+        except Exception:
+            pass
+        for dl in got:
+            try:
+                await dl.delete()
+            except Exception:
+                pass
+
+
+# ⛔⛔ 2026-09-30 (round 2) — WHY CHATGPT'S DOCUMENT HAD NO SOURCES. The owner's
+# 09-30 document (100,945 chars) ends with a reference list and carries not one
+# URL, and no footnote. Three answers, measured:
+#   * the EXPORT (computer use, "Export to Markdown", 107,195 chars) writes each
+#     citation as a token run naming ChatGPT's own source list —
+#     "\ue200cite\ue202turn18view0\ue202turn18view1\ue201" — never a URL
+#     (6,250 chars of them that day; the reference list's lines end in one);
+#   * OUR `_strip_chatgpt_citation_tokens` then deleted every run, so even the
+#     place of each citation was gone;
+#   * and the sources that WOULD have been merged in were never collected: 0
+#     from the side panel all run (the press that opened it no longer does).
+# The 09-19 export happened to carry 12 URLs of its own, so that document had
+# its numbered sources; the 09-20 and 09-30 ones had none.
+# ⭐ What is ours to fix: the rendered report in the app's frame shows each
+# citation as a link to its source, right where the export has its token run.
+# So each run is matched to the link that follows the SAME words in the
+# rendered report (the last 24 letters and digits before it), and becomes that
+# link. The document then carries its sources' URLs, and the existing numbering
+# (`_extract_findings`, `_number_document_sources`) gives it its numbered
+# markers and its Sources list, as it does for Claude's reports. A run with no
+# match is removed, as before.
+# ⚠ ASSUMED (no recording reaches inside the frame): that the rendered report's
+# citations are links (<a href="https://…">), as they are in Phase 1's reply
+# (4-chatgpt-p1-thinking.json: a[data-testid="chatgpt-citation"], its
+# aria-label "Site: Title, https://…").
+_CHATGPT_REPORT_LINKS_JS = r"""() => {
+    const out = [];
+    const BLOCK = 'p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, dd, dt, figcaption';
+    for (const a of document.querySelectorAll('a[href^="http"]')) {
+        if (out.length >= 600) break;
+        const b = a.closest(BLOCK) || a.parentElement;
+        let before = '';
+        if (b) {
+            const w = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+            let n;
+            while ((n = w.nextNode())) {
+                if (a.contains(n)) break;
+                if (a.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING) break;
+                // Another citation's own words are not the report's.
+                if (n.parentElement && n.parentElement.closest('a[href]')) continue;
+                before += n.nodeValue || '';
+            }
+        }
+        out.push({ url: a.href, label: (a.getAttribute('aria-label') || '').slice(0, 240),
+                   text: (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                   before: before.slice(-300) });
+    }
+    return out;
+}"""
+
+#: A markdown link or image, for reading a report's words without its markup.
+_CG_MD_LINK_TEXT_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+#: The letters and digits a citation is matched on, and how many of them.
+_CG_CITE_KEY_LEN = 24
+
+
+def _cg_cite_key(text: str) -> str:
+    """The last letters and digits before a citation: what the export and the
+    rendered report both have in front of it, whatever their markup."""
+    t = _CG_MD_LINK_TEXT_RE.sub(r"\1", text or "")
+    t = re.sub(r"[^0-9a-z]+", "", t.lower())
+    return t[-_CG_CITE_KEY_LEN:]
+
+
+def _cg_cite_title(link: dict) -> str:
+    """A source's name for its link: the name the page shows on the citation
+    (its text without a "+2"), else the site in its label ("Site: Title,
+    https://…" → "Site"), else its host. Short, as the page shows it — the
+    Sources list gives the host beside it."""
+    t = re.sub(r"\s*\+\d+\s*$", "", str(link.get("text") or "")).strip()
+    if not t:
+        lab = str(link.get("label") or "")
+        m = re.match(r"^(.*?),\s*https?://", lab)
+        t = (m.group(1) if m else lab).split(":")[0].strip()
+    if not t:
+        t = re.sub(r"^https?://(www\.)?", "", str(link.get("url") or "")).split("/")[0]
+    t = re.sub(r"[\[\]\n\r]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()[:80] or "source"
+
+
+def _chatgpt_cite_runs_to_links(md: str, links: list):
+    """Each citation token run in `md` → the link the rendered report shows after
+    the same words. Runs side by side are one citation of several sources; their
+    links go together before the cited sentence's full stop, so the sentence is
+    the one numbered. Returns (markdown, runs linked, runs seen). A run with no
+    match is removed, as `_strip_chatgpt_citation_tokens` always did."""
+    if not md or "\ue200" not in md:
+        return md, 0, 0
+    # Each link with its key; a link is used once, in page order.
+    pool = []
+    for ln in links or []:
+        u = str((ln or {}).get("url") or "")
+        if not u.lower().startswith(("http://", "https://")) or _find_is_platform_host(u):
+            continue
+        k = _cg_cite_key(str(ln.get("before") or ""))
+        if len(k) >= 12:
+            pool.append([k, ln])
+    runs = list(_CHATGPT_CITE_TOKEN_RE.finditer(md))
+    out = []
+    last = 0
+    linked = 0
+    i = 0
+    while i < len(runs):
+        seg = md[last:runs[i].start()]
+        # The group: this run and every run after it with only spaces between.
+        j = i + 1
+        while j < len(runs) and not md[runs[j - 1].end():runs[j].start()].strip():
+            j += 1
+        k = _cg_cite_key(_CHATGPT_CITE_TOKEN_RE.sub("", md[max(0, runs[i].start() - 900):runs[i].start()]))
+        found = []
+        for _ in range(i, j):
+            # The same words in front: equal keys first; else one key the end of
+            # the other (a link near the start of its paragraph has fewer letters
+            # in front of it than the export's run), never fewer than 12.
+            hit = None
+            if len(k) >= 12:
+                hit = next((e for e in pool if e[0] == k), None) or next(
+                    (e for e in pool if k.endswith(e[0]) or e[0].endswith(k)), None)
+            if hit is None:
+                continue
+            pool.remove(hit)
+            ln = hit[1]
+            lk = f"[{_cg_cite_title(ln)}]({ln['url']})"
+            if lk not in found:
+                found.append(lk)
+            linked += 1
+        last = runs[j - 1].end()
+        if not found:
+            out.append(seg)
+        else:
+            links_md = " ".join(found)
+            # "…the brief. RUN The next…" → "…the brief [Source](url). The next…"
+            pm = re.search(r"([.!?])(\s*)$", seg)
+            if pm:
+                out.append(seg[:pm.start()] + " " + links_md + pm.group(1) + pm.group(2))
+            else:
+                out.append(seg + ("" if not seg or seg[-1].isspace() else " ") + links_md)
+        i = j
+    out.append(md[last:])
+    return "".join(out), linked, len(runs)
+
+
+async def _chatgpt_report_links(page) -> list:
+    """The citation links the rendered report shows, from every frame of the
+    Deep research surface (never the host page: the thread holds the brief)."""
+    links = []
+    seen = set()
+    for target in _chatgpt_surface_frame_targets(page)[1:]:
+        try:
+            got = await target.evaluate(_CHATGPT_REPORT_LINKS_JS)
+        except Exception:
+            continue
+        for ln in got or []:
+            key = (ln.get("url"), ln.get("before"))
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(ln)
+    return links
+
+
+async def _chatgpt_link_citations(page, md: str, label="ChatGPT") -> str:
+    """The Deep research export with its citations linked to their sources (see
+    above), and every leftover token run removed."""
+    if not md or "\ue200" not in md:
+        return _strip_chatgpt_citation_tokens(md)
+    try:
+        links = await _chatgpt_report_links(page)
+    except Exception:
+        links = []
+    try:
+        out, linked, seen = _chatgpt_cite_runs_to_links(md, links)
+    except Exception as _le:
+        log(f"[{label}] citations could not be linked ({_le})", "WARN")
+        out, linked, seen = md, 0, 0
+    log(f"[{label}] Citations: {linked} of {seen} in the report linked to a source "
+        f"the report shows on the page ({len(links)} source links read there)"
+        + ("" if linked else " — the document will carry no sources"))
+    if seen and not linked:
+        await _chatgpt_dr_census(page, "miss-sources", label=label)
+    return _strip_chatgpt_citation_tokens(out)
+
+
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
     """Extract ChatGPT response — 3 Wayland-safe tiers (rewritten 2026-05-14).
 
@@ -56497,6 +57047,25 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
+    # ── Tier 0 (2026-09-30, round 2): the download inside the app's frame ──
+    # Deep research runs as an app in a frame, and the finished report opens in
+    # it with a download control at its top right (the 09-30 computer use
+    # pressed it, then "Export to Markdown"). The page presses the same two
+    # controls when the frame shows them; computer use (Tier 1) only when not.
+    # A census of the app's frames is written here too — the finished state.
+    if _chatgpt_dr_app_frames(page):
+        await _chatgpt_dr_census(page, "done", label=label)
+        md = await _chatgpt_dr_dom_download(page, label)
+        if md and len(md) >= 500:
+            if _is_sources_not_document(md, platform="chatgpt"):
+                log(f"[{label}] T0 page download wrong-artifact ({len(md)} chars) — "
+                    f"falling to Tier 1", "WARN")
+            else:
+                md = await _chatgpt_link_citations(page, md, label)
+                log(f"[{label}] Extracted via T0 page download (Export to Markdown): "
+                    f"{len(md)} chars")
+                return md
+
     # ── Tier 1: CUA-driven download flow ──
     # CUA handles: close any open side panel, click the artifact-card
     # enlarge button (opens canvas full-page), click the canvas's
@@ -56532,7 +57101,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                 except Exception:
                     pass
             else:
-                md = _strip_chatgpt_citation_tokens(md)
+                md = await _chatgpt_link_citations(page, md, label)
                 log(f"[{label}] Extracted via T1 CUA download (Export to Markdown): {len(md)} chars")
                 return md
 
@@ -56641,7 +57210,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                 except Exception:
                     pass
             else:
-                md = _strip_chatgpt_citation_tokens(md)
+                md = await _chatgpt_link_citations(page, md, label)
                 log(f"[{label}] Extracted via T3 CUA + clipboard hijack: {len(md)} chars")
                 return md
 
