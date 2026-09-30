@@ -119,7 +119,7 @@ def model_button(tier: str = "Medium") -> str:
 
 
 def plus_button() -> str:
-    n = _clicked(M, 16, "BUTTON")                       # the "+" ()
+    n = _clicked(M, 16, "BUTTON")                       # the "+" (\ue001)
     assert n["a"]["data-testid"] == "chat-input-attach"
     return render(n, attrs={"aria-expanded": "false", "id": "sr-plus"},
                   drop=("data-popup-open", "data-pressed", "class"))
@@ -181,7 +181,7 @@ def sidebar() -> str:
     # ASSUMED: two rows the 09-30 run saved as Claude "steps" (the capture's
     # recents section is cut at depth 11 and carries neither label).
     extra = ('<div data-sr-assumed="09-30 steps"><div data-row>Chats and tasks'
-             '</div><div data-row><span>Pin projects to keep them here</span>'
+             '</div><div data-row>\ue0bd<span>Pin projects to keep them here</span>'
              '</div></div>')
     return body.replace("</aside>", extra + "</aside>")
 
@@ -195,7 +195,7 @@ def turn(finished: bool) -> str:
 def stop_button() -> str:
     a = frame(R, 26)["stopButtons"][0]["a"]
     assert a["aria-label"] == "Stop response"
-    return render({"tag": "BUTTON", "a": a, "label": ""},
+    return render({"tag": "BUTTON", "a": a, "label": "\ue0a9"},
                   attrs={"id": "sr-stop"}, drop=("class",))
 
 
@@ -233,7 +233,7 @@ def research_panel() -> str:
         '<div class="shrink-0 flex items-center justify-between">'
         '<div>Large-breed dog food comparison</div>'
         '<button type="button" data-cds="Button" data-cds-icon-only="" '
-        'aria-label="Close"></button></div>'
+        'aria-label="Close">\ue10f</button></div>'
         '<ol role="list" class="flex flex-col overflow-y-auto px-5">'
         + step("Searching for large-breed dog food brand comparisons", RESEARCH_ROWS)
         + step("Reading veterinary nutrition guidance for giant breeds", RESEARCH_ROWS_2)
@@ -419,7 +419,7 @@ def page(*, tier: str = "Medium", finished: bool = False, running: bool = False,
          research_sticks: bool = True) -> str:
     """The whole page. `panel` is "", "research" or "report" (open at load)."""
     pill = ('<button type="button" id="sr-research-pill" aria-label="Research" '
-            'aria-pressed="true"' + ("" if research_on else " hidden") + '></button>')
+            'aria-pressed="true"' + ("" if research_on else " hidden") + '>\ue0d0</button>')
     composer = (
         '<fieldset data-cds-dock-group="" data-perf-region="composer" id="sr-composer">'
         '<div data-cds="ChatComposer"><div class="relative w-full min-w-0">'

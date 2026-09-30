@@ -39225,7 +39225,7 @@ _CLAUDE_PANEL_SOURCE_ROWS_JS = r"""(sels) => {
             }
         };
         walk(root);
-        return t.replace(/[-]/g, ' ').replace(/\s+/g, ' ');
+        return t.replace(/[\ue000-\uf8ff]/g, ' ').replace(/\s+/g, ' ');
     };
     const ROW = /((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\s+(\d[\d,]*)\s+sources?\b/gi;
     for (const p of panels) {
@@ -57585,7 +57585,7 @@ _CLAUDE_COPY_OPTIONS_MARK_JS = r"""(P) => {
 
 _CLAUDE_MD_ROW_MARK_JS = r"""(P) => {
     const vis = el => el.getClientRects().length > 0;
-    const norm = s => (s || '').replace(/[-]/g, ' ')
+    const norm = s => (s || '').replace(/[\ue000-\uf8ff]/g, ' ')
         .replace(/\s+/g, ' ').trim().toLowerCase();
     for (const el of document.querySelectorAll('[' + P.attr + ']')) {
         el.removeAttribute(P.attr);
@@ -60528,12 +60528,12 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
 #
 # Step 3B had not found the Research row since 09-03. The 09-30 capture
 # (1-claude-menus, frames 17-22) settles why: the "+" menu's rows carry an
-# icon-font glyph in their text ("Research"), so the exact match on
+# icon-font glyph in their text ("\ue0d0Research"), so the exact match on
 # 'research' could never be true, and the prefix fallback wanted a switch
 # inside the row. The row IS the switch: `role="menuitemcheckbox"`,
 # `data-testid="add-menu-research"`, `aria-checked` and
 # `data-checked`/`data-unchecked`. Pressing it closes the menu (frame 18), and
-# the reopened menu shows it checked with a ✓ glyph (, frame 22).
+# the reopened menu shows it checked with a ✓ glyph (\ue03b, frame 22).
 #
 # So: the captured test id first, then the row's text with the glyphs taken
 # out, searched ONLY inside open menus; the row is MARKED and pressed for real
@@ -60541,7 +60541,7 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
 _CLAUDE_RESEARCH_ROW_TESTID = "add-menu-research"
 _CLAUDE_TOOLS_TRIGGER_TESTID = "chat-input-attach"
 _CLAUDE_RESEARCH_ROW_JS = r"""(P) => {
-    const norm = s => (s || '').replace(/[-]/g, ' ')
+    const norm = s => (s || '').replace(/[\ue000-\uf8ff]/g, ' ')
         .replace(/\s+/g, ' ').trim().toLowerCase();
     const vis = el => el.getClientRects().length > 0;
     if (P.attr) {
