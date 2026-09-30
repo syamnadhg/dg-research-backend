@@ -29613,9 +29613,10 @@ _HOTSPOT_VISION_HINTS = {
             "Research' (top level, or under 'More tools'); a merely-visible chip is NOT "
             "proof it is armed — it is ON only when the placeholder reads 'What do you "
             "want to research?' (chat mode = 'Ask Gemini'), so do NOT re-toggle a pill "
-            "that is already active. Claude: the model must be {claude_family} with Max effort "
+            "that is already active. Claude: the model must be {claude_family} "
             "— if it already reads {claude_family}, LEAVE IT ALONE (a higher {claude_family} is correct, and "
-            "there is no separate thinking toggle on the current model) — then enable "
+            "there is no separate thinking toggle on the current model); leave the "
+            "Effort setting exactly as it is (the run sets and reads it itself) — then enable "
             "the 'Research' tool. Do NOT type, paste, "
             "compose, or send anything; do NOT click Send/Submit; do NOT attach files "
             "(Claude); never click the microphone or the Stop/stop-generating button. "
@@ -29624,7 +29625,7 @@ _HOTSPOT_VISION_HINTS = {
         ),
         "success_signals": [
             "an active/highlighted 'Deep research' or 'Research' pill near the composer (Gemini: composer placeholder reads 'What do you want to research?', not 'Ask Gemini')",
-            "Claude only: the model button shows {claude_family} (+ Max effort)",
+            "Claude only: the model button shows {claude_family}",
             "the composer input focused / caret blinking with nothing typed and no message sent"
         ],
     },
@@ -29641,7 +29642,7 @@ _HOTSPOT_VISION_HINTS = {
             "research' chip is NOT proof, so if the placeholder still says 'Ask Gemini' "
             "click the chip ONCE and RE-CHECK the placeholder. On Claude: the "
             "model-selector button at the bottom of the composer must read '{claude_family} …' (it "
-            "also shows the effort, e.g. 'Max', on the button itself), and the priority "
+            "also shows the effort on the button itself — leave it as it is), and the priority "
             "knob — the 'Research' tool — must be ON (an active/highlighted pill or "
             "chip, or a checkmark beside 'Research' in the '+' tools menu); also click "
             "the X on any stale attachment chip in the composer. Do NOT type, paste, "
@@ -32246,7 +32247,8 @@ PHASE_FLOW_CONTEXT = {
         "attach PDFs, submit the brief prompt, then ~10-20 min of reasoning "
         "+ writing while the frontend token-streams the output."),
     2: ("Phase 2 is parallel deep research. ChatGPT Deep Research, Gemini "
-        "Deep Research, and Claude's Research tool on max effort run "
+        "Deep Research, and Claude's Research tool on " + effort_label(
+            p2_labels("claude").get("effort")) + " effort run "
         "at the same time with the same brief. Each crawls 40-60+ sources "
         "and produces an independent 5-15k-word markdown report. Runs "
         "30-90 min; per-agent sources, sections, and thinking stream live."),
@@ -32282,7 +32284,8 @@ AGENT_PHASE_FLOWS: dict[tuple[str, int], list[str]] = {
     ("claude", 2): [
         # Version-free on purpose: the runtime picks the highest Opus offered, so a
         # pinned number here would misreport the moment the family moves on.
-        "0-60s: Opening Claude with the latest Opus (Max effort) + Research tools",
+        "0-60s: Opening Claude with the latest Opus ("
+        + effort_label(p2_labels("claude").get("effort")) + " effort) + Research tools",
         "60s-3m: Loading the brief and planning the research scope",
         "3-15m: Conducting web searches and reading sources, artifact preview building",
         "15-40m: Building the artifact with research findings and citations",
@@ -33249,6 +33252,11 @@ def _extract_top_hosts(events: list, limit: int = 2) -> list:
             single = d.get("url")
             if single:
                 urls.append(single)
+        # ⭐ 2026-09-30 round 2 — sites with no page address: Claude's Research
+        # panel lists hosts, not links (`sourceHosts` on its progress emit).
+        hv = d.get("sourceHosts")
+        if isinstance(hv, list):
+            urls.extend(f"https://{h}/" for h in hv if isinstance(h, str) and h)
         for u in urls:
             if not isinstance(u, str):
                 continue
@@ -37735,10 +37743,21 @@ async def scrape_progress_claude(page):
             try {
                 const VERB2 = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\\b/i;
                 const panelRoots = document.querySelectorAll('aside, [role="complementary"], [role="dialog"], [data-state="open"], [class*="artifact-panel"], [class*="research-panel"], [class*="side-panel" i], [class*="sidebar" i], [class*="drawer" i], [aria-label*="research" i], [aria-label*="sources" i], [aria-label*="activity" i]');
+                // ⭐⭐ 2026-09-30 round 2 — CLAUDE'S OWN LEFT SIDEBAR IS NOT A
+                // PANEL. It is an `aside` (aria-label "Sidebar",
+                // data-testid="sidebar", class dframe-sidebar — capture
+                // 2-claude-research), so `aside` and `[class*="sidebar"]` both
+                // took it as a root, and the 09-30 run's steps began
+                // "Artifacts", "Projects", "Pin projects to keep them here",
+                // "Pinned… Drag to pin", "Chats and tasks". Anything inside it,
+                // or holding it, is skipped.
+                const APP_NAV = 'aside[aria-label="Sidebar" i], [data-testid="sidebar"], '
+                              + '[class*="dframe-sidebar"]';
                 const panelSeen = new Set();
                 const panelRows = [];
                 let panelLive = '';
                 for (const root of panelRoots) {
+                    if (root.closest(APP_NAV + ', nav') || root.querySelector(APP_NAV)) continue;
                     const pr = root.getBoundingClientRect();
                     if (pr.width < 220 || pr.height < 150) continue;
                     const rowEls = Array.from(root.querySelectorAll('li, [role="listitem"], div, p, button, [role="button"]'));
@@ -39137,6 +39156,157 @@ async def _click_claude_artifact(page, index=0):
         return False
 
 
+# ⭐⭐ 2026-09-30 round 2 — CLAUDE'S RESEARCH PANEL, from the capture
+# (2-claude-research). The research card in the turn is a <button> whose
+# aria-label ends "… Open research panel." ("Large-breed dog food comparison:
+# Searching for sources.... Open research panel."); pressing it opens
+# `[role="region"][aria-label="Research panel"]` on the right, whose timeline
+# (`ol[role="list"]` of steps) holds each search's sources rows
+# ("royalcanin.com 19 sources", "petsmart.com 1 source", …). The finished
+# report opens `[role="region"][aria-label^="Artifact panel"]`.
+_CLAUDE_RESEARCH_PANEL_SEL = '[role="region"][aria-label="Research panel"]'
+_CLAUDE_REPORT_PANEL_SEL = '[role="region"][aria-label^="Artifact panel"]'
+
+_CLAUDE_RESEARCH_CARD_MARK_JS = r"""(P) => {
+    const vis = el => el.getClientRects().length > 0;
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    const panel = [...document.querySelectorAll(P.panelSel)].find(vis);
+    if (panel) return { open: true, found: true };
+    const cards = [...document.querySelectorAll('button[aria-label]')].filter(b =>
+        vis(b) && /open research panel\.?\s*$/i.test(b.getAttribute('aria-label') || '')
+        && !b.closest('nav, aside, [role="menu"], [role="dialog"]'));
+    if (!cards.length) return { open: false, found: false };
+    // The LATEST turn's card: a conversation can hold an earlier one.
+    const card = cards[cards.length - 1];
+    card.setAttribute(P.attr, P.value);
+    return { open: false, found: true,
+             label: (card.getAttribute('aria-label') || '').slice(0, 90) };
+}"""
+
+
+async def _claude_open_research_panel(page, *, wait_s: float = 5.0) -> dict:
+    """Open Claude's Research panel with a REAL press on the research card, and
+    wait up to `wait_s` for the panel to be there.
+
+    ⭐ 2026-09-30 round 2. `_click_claude_artifact` dispatched a synthetic
+    pointer chain and looked once, 1.5 s later: across the log corpus the first
+    press "did not mount the side panel" 39 times against 33 opens, and on 09-30
+    the panel first opened at the third poll, 13 minutes into the research. The
+    card is a plain <button> the capture names by its aria-label, so it is
+    marked and pressed by Playwright, and the panel is polled for.
+
+    ⛔ Never pressed when the panel is already open — the card is a toggle.
+
+    Returns {"found": a research card or the panel is there, "open": the panel
+    is open now, "pressed": we pressed, "how": the press technique}."""
+    try:
+        st = await page.evaluate(_CLAUDE_RESEARCH_CARD_MARK_JS,
+                                 {"attr": _SR_CLICK_MARK, "value": "claude-research-card",
+                                  "panelSel": _CLAUDE_RESEARCH_PANEL_SEL}) or {}
+    except Exception as e:
+        log(f"[Claude] research card read failed ({e})", "DEBUG")
+        return {"found": False, "open": False, "pressed": False, "how": ""}
+    if st.get("open"):
+        return {"found": True, "open": True, "pressed": False, "how": ""}
+    if not st.get("found"):
+        return {"found": False, "open": False, "pressed": False, "how": ""}
+    how = await _sr_real_click(page, "claude-research-card", tag="[Claude]")
+    for _ in range(max(1, int(wait_s / 0.25))):
+        await asyncio.sleep(0.25)
+        try:
+            if await page.evaluate(
+                    "(sel) => [...document.querySelectorAll(sel)]"
+                    ".some(el => el.getClientRects().length > 0)",
+                    _CLAUDE_RESEARCH_PANEL_SEL):
+                return {"found": True, "open": True, "pressed": True, "how": how}
+        except Exception:
+            break
+    return {"found": True, "open": False, "pressed": bool(how), "how": how}
+
+
+# The sources rows under each search in the Research panel's timeline, read
+# WITHOUT pressing anything: a host followed by its count ("royalcanin.com" +
+# "19 sources"). The text is walked with a gap at every element boundary, so the
+# host and the count separate whether they are two blocks or two inline spans.
+# ⚠ ASSUMED row shape: the capture records the rows only as the pressed button's
+# label ("royalcanin.com 19 sources petsmart.com 1 …") and one <p> inside a
+# `flex items-center text-xs` row; the host-then-count order is what it shows.
+_CLAUDE_PANEL_SOURCE_ROWS_JS = r"""(sels) => {
+    const out = { open: false, hosts: [], counts: {}, rows: 0 };
+    const vis = el => el.getClientRects().length > 0;
+    const panels = [];
+    for (const s of sels) {
+        for (const el of document.querySelectorAll(s)) {
+            if (vis(el) && panels.indexOf(el) === -1) panels.push(el);
+        }
+    }
+    if (!panels.length) return out;
+    out.open = true;
+    const spaced = root => {
+        let t = '';
+        const walk = n => {
+            for (const c of n.childNodes || []) {
+                if (c.nodeType === 3) t += c.nodeValue || '';
+                else if (c.nodeType === 1) { t += ' '; walk(c); t += ' '; }
+            }
+        };
+        walk(root);
+        return t.replace(/[\ue000-\uf8ff]/g, ' ').replace(/\s+/g, ' ');
+    };
+    const ROW = /((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\s+(\d[\d,]*)\s+sources?\b/gi;
+    for (const p of panels) {
+        const t = spaced(p);
+        let m;
+        while ((m = ROW.exec(t)) !== null) {
+            const host = m[1].toLowerCase().replace(/^www\./, '');
+            const n = parseInt(m[2].replace(/,/g, ''), 10) || 0;
+            if (!(host in out.counts)) { out.hosts.push(host); out.counts[host] = 0; }
+            out.counts[host] = Math.max(out.counts[host], n);
+            out.rows += 1;
+        }
+    }
+    out.hosts = out.hosts.slice(0, 200);
+    return out;
+}"""
+
+
+async def _claude_panel_source_rows(page) -> dict:
+    """Read-only: the sites Claude's open Research panel lists, with each one's
+    count. Presses nothing. `{}`-shaped on failure (open=False, no hosts)."""
+    try:
+        res = await page.evaluate(_CLAUDE_PANEL_SOURCE_ROWS_JS,
+                                  [_CLAUDE_RESEARCH_PANEL_SEL,
+                                   '[role="region"][aria-label="Research sources"]'])
+        return res if isinstance(res, dict) else {"open": False, "hosts": [], "counts": {}}
+    except Exception:
+        return {"open": False, "hosts": [], "counts": {}}
+
+
+def _claude_fold_row_hosts(union: dict, rows: dict) -> bool:
+    """Fold one read of the panel's sources rows into the run's running union
+    (host → the highest count seen). Returns True when a host was added, so the
+    caller logs only when the list grows. The rows vanish when the research
+    finishes (09-30: "sources toggle not on the page" at done), so the union is
+    what the run keeps."""
+    grew = False
+    counts = (rows or {}).get("counts") or {}
+    for h in (rows or {}).get("hosts") or []:
+        h = str(h or "").strip().lower()
+        if not h:
+            continue
+        try:
+            n = int(counts.get(h, 0) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if h not in union:
+            union[h] = 0
+            grew = True
+        union[h] = max(union[h], n)
+    return grew
+
+
 def _claude_artifact_frame_targets(page):
     """Return frame targets worth scraping for Claude artifact content.
 
@@ -39548,17 +39718,27 @@ async def _close_claude_artifact_panel(page):
         await page.keyboard.press("Escape")
         await asyncio.sleep(0.3)
         # Verify panel closed by checking if aside/panel shrank
+        # ⭐ 2026-09-30 round 2 — Claude's own left sidebar is an <aside> that is
+        # always open; it is not the panel. The captured Research panel's own
+        # Close button (capture 2-claude-research) comes first.
         still_open = await page.evaluate("""() => {
-            const panel = document.querySelector('aside, [class*="artifact-panel"], [class*="side-panel"]');
-            return panel && panel.offsetWidth > 100;
+            const APP_NAV = 'aside[aria-label="Sidebar" i], [data-testid="sidebar"], '
+                          + '[class*="dframe-sidebar"]';
+            return [...document.querySelectorAll(
+                    '[role="region"][aria-label="Research panel"], '
+                    + '[role="region"][aria-label^="Artifact panel"], '
+                    + 'aside, [class*="artifact-panel"], [class*="side-panel"]')]
+                .some(p => !p.closest(APP_NAV) && p.offsetWidth > 100);
         }""")
         if still_open:
             # Try clicking close button
             await page.evaluate("""() => {
                 const close = document.querySelector(
-                    'aside button[aria-label="Close"], ' +
+                    '[role="region"][aria-label="Research panel"] button[aria-label="Close"], ' +
+                    '[role="region"][aria-label^="Artifact panel"] button[aria-label="Close"], ' +
+                    'aside:not([aria-label="Sidebar"]) button[aria-label="Close"], ' +
                     '[class*="artifact-panel"] button[aria-label="Close"], ' +
-                    'aside button:has(svg[class*="close"]), ' +
+                    'aside:not([aria-label="Sidebar"]) button:has(svg[class*="close"]), ' +
                     'button[data-testid="close-artifact"]'
                 );
                 if (close) close.click();
@@ -39615,6 +39795,19 @@ async def _claude_artifact_panel_state(page):
                 if (r.width > 40 && r.height > 40) { out.menu_open = true; break; }
             }
         } catch (e) {}
+        // ⭐ 2026-09-30 round 2 — the captured panels first: the Research panel
+        // and the finished report's Artifact panel are named regions.
+        for (const el of document.querySelectorAll(
+                '[role="region"][aria-label="Research panel"], '
+                + '[role="region"][aria-label^="Artifact panel"]')) {
+            const r = el.getBoundingClientRect();
+            if (r.width < 200 || r.height < 150) continue;
+            out.open = true;
+            out.width = Math.round(r.width);
+            out.text_len = (el.innerText || '').trim().length;
+            out.region = el.getAttribute('aria-label').slice(0, 40);
+            return out;
+        }
         const NAV_MARKERS = /\\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\\b)\\b/i;
         const CHAT_MARKERS = '[data-message-author-role="user"], ' +
             '[data-testid="user-message"], .font-claude-message';
@@ -40153,7 +40346,7 @@ def claude_sources_log_line(res: dict) -> tuple:
 
 
 def claude_source_count(live: int = 0, printed: int = 0,
-                        toggle_label: int = 0, vision: int = 0) -> int:
+                        toggle_label: int = 0, vision: int = 0, rows: int = 0) -> int:
     """One source number from the union of every place Claude states it.
 
     Claude prints its own source count in three separate surfaces, each blind in
@@ -40169,6 +40362,9 @@ def claude_source_count(live: int = 0, printed: int = 0,
     ``vision`` is the fourth input and not one of Claude's own: the Gemini panel
     estimate already landing in `observed_sources`. It is folded in here so the
     union cannot LOSE a number that field was already carrying.
+
+    ``rows`` (2026-09-30 round 2) — the sum of the per-site counts the Research
+    panel's sources rows show ("royalcanin.com 19 sources"), read on every check.
 
     The union is the maximum, because these are views of ONE quantity and each
     can only UNDER-report — a surface that has not rendered reads 0, and none of
@@ -40191,7 +40387,7 @@ def claude_source_count(live: int = 0, printed: int = 0,
         except (TypeError, ValueError):
             return 0
         return i if i > 0 else 0
-    return max(_n(live), _n(printed), _n(toggle_label), _n(vision))
+    return max(_n(live), _n(printed), _n(toggle_label), _n(vision), _n(rows))
 
 
 def merge_claude_sources(snap: dict, urls=None, hosts=None,
@@ -40328,7 +40524,12 @@ async def claude_finished_sources_read(page, p, snapshots, *,
         snap = (snapshots or {}).get(agent_key)
         if isinstance(snap, dict):
             before = len(snap.get("source_urls") or [])
-            merge_claude_sources(snap, res.get("urls"), res.get("hosts"),
+            # ⭐ 2026-09-30 round 2 — plus every site the Research panel's rows
+            # listed while the run went (`_claude_row_hosts`): the rows are gone
+            # by now, and this read alone saw none of them on 09-30.
+            merge_claude_sources(snap, res.get("urls"),
+                                 list(res.get("hosts") or [])
+                                 + list((p or {}).get("_claude_row_hosts") or {}),
                                  int(res.get("count", 0) or 0))
             after = len(snap.get("source_urls") or [])
             if after != before:
@@ -40380,7 +40581,23 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
     _click_box = None  # Track-B: the clicked card's viewport center — ONLY when WE clicked this call
     try:
         if not already_open:
-            clicked = await _click_claude_artifact(page, index=0)
+            # ⭐ 2026-09-30 round 2 — the research card first, by a REAL press,
+            # waiting up to 5 s for the Research panel (see
+            # `_claude_open_research_panel`). The generic card click below stays
+            # for a page with no research card.
+            _rp = await _claude_open_research_panel(page)
+            clicked = None
+            if _rp.get("found"):
+                if _rp.get("open"):
+                    log(f"[Claude] research panel open after a real press on the "
+                        f"research card ({_rp.get('how') or 'it was already open'})",
+                        "DEBUG")
+                else:
+                    log(f"[Claude] research card pressed "
+                        f"({_rp.get('how') or 'no press landed'}) but the research "
+                        f"panel did not open within 5 s", "DEBUG")
+            else:
+                clicked = await _click_claude_artifact(page, index=0)
             if clicked:
                 if isinstance(clicked, dict):
                     _click_box = clicked
@@ -40409,7 +40626,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                     log("[Claude] artifact panel open after click "
                         f"(width={_st_click.get('width')}, "
                         f"text_len={_st_click.get('text_len')})", "DEBUG")
-            else:
+            elif not _rp.get("found"):
                 log("[Claude] artifact card click found no target "
                     "(count saw cards, click's filtered set was empty)", "DEBUG")
         content = await _read_claude_artifact_panel(page)
@@ -50713,11 +50930,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if name == "Claude" and scrape_ok:
                 try:
                     _cl_tog = await _claude_sources_toggle_state(p["page"])
+                    # ⭐⭐ 2026-09-30 round 2 — THE RESEARCH PANEL'S SOURCES ROWS,
+                    # read on every check while the run goes, pressing nothing.
+                    # They are gone when the research finishes (09-30: 336
+                    # sources, 5 urls at done), so the run keeps a union.
+                    _cl_rows = await _claude_panel_source_rows(p["page"])
+                    _cl_union = p.setdefault("_claude_row_hosts", {})
+                    if _claude_fold_row_hosts(_cl_union, _cl_rows):
+                        log(f"[Claude] research panel lists {len(_cl_union)} site(s): "
+                            + ", ".join(f"{h} {n}" for h, n in list(_cl_union.items())[:6])
+                            + (" …" if len(_cl_union) > 6 else "")
+                            + " — read without pressing anything", "INFO")
+                    if _cl_union:
+                        progress["source_hosts"] = list(_cl_union)[:_SOURCE_LIST_CAP]
                     progress["observed_sources"] = claude_source_count(
                         live=int(progress.get("observed_sources", 0) or 0),
                         printed=int(progress.get("printed_sources", 0) or 0),
                         toggle_label=int(_cl_tog.get("count", 0) or 0)
                         if _cl_tog.get("found") else 0,
+                        rows=sum(_cl_union.values()),
                     )
                     # A signature, not a counter: the same shape says so once, a
                     # NEW shape says so immediately. `found=False` and
@@ -51986,6 +52217,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # (the raw-activity popup renders these instead of bare
                     # hostnames). Empty/absent → FE falls back to sourceUrls.
                     sourceItems=progress.get("source_items", []),
+                    # ⭐ 2026-09-30 round 2 — the sites Claude's Research panel
+                    # lists (no page addresses exist for them); the narrator's
+                    # host hint reads them (`_extract_top_hosts`).
+                    **({"sourceHosts": progress["source_hosts"]}
+                       if progress.get("source_hosts") else {}),
                     sections=progress.get("sections", []),
                     partialTextLen=_partial_text_len,
                     partialTextPreview=_obs_preview,
@@ -57323,6 +57559,186 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     return ""
 
 
+# ⭐⭐ 2026-09-30 round 2 — CLAUDE'S FINISHED REPORT, BY THE PAGE, from the
+# capture (2-claude-research, frames 86-91). The report card in the turn is
+# `button[data-testid="artifact-card-open"]` ("View <title>", aria-pressed true
+# while its panel is open); the panel is `[role="region"][aria-label^="Artifact
+# panel"]`; its header holds the "Copy" split button, whose arrow is
+# `button[aria-label="Copy options"]`, and that menu's rows are "Copy with
+# citations" (`copy-artifact-with-citations`), "Download as Markdown"
+# (`a[data-testid="export-download"]`) and "Download as PDF". On 09-30 and on
+# every run in the corpus this was done by computer use (open 3-4 steps,
+# download 2); the page names every control.
+_CLAUDE_REPORT_CARD_MARK_JS = r"""(P) => {
+    const vis = el => el.getClientRects().length > 0;
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    const cards = [...document.querySelectorAll('button[data-testid="artifact-card-open"]')]
+        .filter(b => vis(b) && !b.closest(
+            '[data-testid="user-message"], [data-message-author-role="user"], nav, aside'));
+    const panel = [...document.querySelectorAll(P.panelSel)].find(vis);
+    if (!cards.length) return { found: false, open: !!panel };
+    // The LAST card is the final report.
+    const card = cards[cards.length - 1];
+    if (panel && card.getAttribute('aria-pressed') === 'true') {
+        return { found: true, open: true, count: cards.length };
+    }
+    card.setAttribute(P.attr, P.value);
+    return { found: true, open: false, count: cards.length,
+             label: (card.getAttribute('aria-label') || '').slice(0, 90) };
+}"""
+
+_CLAUDE_COPY_OPTIONS_MARK_JS = r"""(P) => {
+    const vis = el => el.getClientRects().length > 0;
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    const panels = [...document.querySelectorAll(P.panelSel)].filter(vis);
+    const panel = panels[panels.length - 1];
+    if (!panel) return { found: false, why: 'no report panel' };
+    let btn = [...panel.querySelectorAll('button[aria-label="Copy options"]')].find(vis);
+    let via = 'aria-label';
+    if (!btn) {
+        const grp = [...panel.querySelectorAll('[role="group"][aria-label="Copy"]')].find(vis);
+        if (grp) {
+            btn = [...grp.querySelectorAll('button[aria-haspopup="menu"]')].find(vis);
+            via = 'copy-group';
+        }
+    }
+    if (!btn) return { found: false, why: 'no Copy options button' };
+    btn.setAttribute(P.attr, P.value);
+    return { found: true, via: via, expanded: btn.getAttribute('aria-expanded') === 'true' };
+}"""
+
+_CLAUDE_MD_ROW_MARK_JS = r"""(P) => {
+    const vis = el => el.getClientRects().length > 0;
+    const norm = s => (s || '').replace(/[\ue000-\uf8ff]/g, ' ')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+    for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+        el.removeAttribute(P.attr);
+    }
+    const menus = [...document.querySelectorAll('[role="menu"]')].filter(vis);
+    for (const m of menus) {
+        let row = [...m.querySelectorAll('[data-testid="export-download"]')].find(vis);
+        let via = 'testid';
+        if (!row) {
+            row = [...m.querySelectorAll('[role="menuitem"], a, button')]
+                .find(el => vis(el) && norm(el.textContent) === 'download as markdown');
+            via = 'text';
+        }
+        if (row) {
+            row.setAttribute(P.attr, P.value);
+            return { found: true, via: via };
+        }
+    }
+    return { found: false, menus: menus.length,
+             rows: menus.flatMap(m => [...m.querySelectorAll('[role="menuitem"]')]
+                 .filter(vis).map(e => norm(e.textContent).slice(0, 30))).slice(0, 8) };
+}"""
+
+
+async def _claude_open_report_panel(page, *, wait_s: float = 8.0) -> dict:
+    """Open the finished report with a real press on its card and wait for its
+    panel. Returns {"found", "open", "pressed"}; never raises."""
+    try:
+        st = await page.evaluate(_CLAUDE_REPORT_CARD_MARK_JS,
+                                 {"attr": _SR_CLICK_MARK, "value": "claude-report-card",
+                                  "panelSel": _CLAUDE_REPORT_PANEL_SEL}) or {}
+    except Exception as e:
+        log(f"[Claude] report card read failed ({e})", "DEBUG")
+        return {"found": False, "open": False, "pressed": False}
+    if not st.get("found") or st.get("open"):
+        return {"found": bool(st.get("found")), "open": bool(st.get("open")),
+                "pressed": False}
+    how = await _sr_real_click(page, "claude-report-card", tag="[Claude]")
+    for _ in range(max(1, int(wait_s / 0.25))):
+        await asyncio.sleep(0.25)
+        try:
+            if await page.evaluate(
+                    "(sel) => [...document.querySelectorAll(sel)]"
+                    ".some(el => el.getClientRects().length > 0)",
+                    _CLAUDE_REPORT_PANEL_SEL):
+                return {"found": True, "open": True, "pressed": True, "how": how}
+        except Exception:
+            break
+    return {"found": True, "open": False, "pressed": bool(how), "how": how}
+
+
+async def _claude_download_report_by_page(page, label="Claude", *,
+                                          timeout_s: float = 30.0,
+                                          min_chars: int = 500) -> str:
+    """Tier 1 by the page: the arrow next to "Copy" in the report header, then
+    "Download as Markdown", captured with `page.expect_download()`. Returns the
+    markdown, or "" so the computer-use download stays the fallback."""
+    try:
+        st = await page.evaluate(_CLAUDE_COPY_OPTIONS_MARK_JS,
+                                 {"attr": _SR_CLICK_MARK, "value": "claude-copy-options",
+                                  "panelSel": _CLAUDE_REPORT_PANEL_SEL}) or {}
+    except Exception as e:
+        log(f"[{label}] page download: the report header read failed ({e})", "INFO")
+        return ""
+    if not st.get("found"):
+        log(f"[{label}] page download: {st.get('why') or 'no Copy options button'} — "
+            f"computer use downloads it", "INFO")
+        return ""
+    if not await _sr_real_click(page, "claude-copy-options", tag=f"[{label}]"):
+        return ""
+    row = {}
+    for _ in range(12):
+        await asyncio.sleep(0.25)
+        try:
+            row = await page.evaluate(_CLAUDE_MD_ROW_MARK_JS,
+                                      {"attr": _SR_CLICK_MARK,
+                                       "value": "claude-md-row"}) or {}
+        except Exception:
+            row = {}
+        if row.get("found"):
+            break
+    if not row.get("found"):
+        log(f"[{label}] page download: no 'Download as Markdown' row in the menu "
+            f"(rows={json.dumps(row.get('rows') or [], ensure_ascii=False)})", "INFO")
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return ""
+    dl = None
+    try:
+        async with page.expect_download(timeout=timeout_s * 1000) as dl_info:
+            how = await _sr_real_click(page, "claude-md-row", tag=f"[{label}]")
+            if not how:
+                raise RuntimeError("the Download as Markdown row could not be pressed")
+        dl = await dl_info.value
+        path = await dl.path()
+        if not path:
+            return ""
+
+        def _read_md(p):
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+
+        content = await asyncio.to_thread(_read_md, path)
+    except Exception as e:
+        log(f"[{label}] page download: no file ({type(e).__name__}: {str(e)[:120]})",
+            "INFO")
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return ""
+    finally:
+        if dl is not None:
+            try:
+                await dl.delete()
+            except Exception:
+                pass
+    if not content or len(content) < min_chars:
+        log(f"[{label}] page download: {len(content or '')} chars < {min_chars}", "INFO")
+        return ""
+    return content
+
+
 async def extract_claude_response(page, browser=None, cua_client=None, label="Claude", verbose=False,
                                    artifact_panel_open=False):
     """Extract Claude response — artifact-aware extraction.
@@ -57368,10 +57784,17 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 'aside',
                 '[class*="artifact-panel" i]',
                 '[class*="side-panel" i]',
-                '[role="complementary"]'
+                '[role="complementary"]',
+                '[role="region"][aria-label="Research panel"]',
+                '[role="region"][aria-label^="Artifact panel"]'
             ];
+            // ⭐ 2026-09-30 round 2 — not Claude's own left sidebar, an
+            // <aside aria-label="Sidebar"> that is always there.
+            const APP_NAV = 'aside[aria-label="Sidebar" i], [data-testid="sidebar"], '
+                          + '[class*="dframe-sidebar"]';
             for (const s of sels) {
                 for (const el of document.querySelectorAll(s)) {
+                    if (el.closest(APP_NAV)) continue;
                     const r = el.getBoundingClientRect();
                     if (r.width > 200 && r.height > 200) return true;
                 }
@@ -57464,7 +57887,19 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     if artifact_count > 0:
         target_idx = max(0, artifact_count - 1)  # Last artifact = final report
         log(f"[{label}] Post-completion: opening artifact[{target_idx}] (final report)")
-        clicked = await _click_claude_artifact(page, index=target_idx)
+        # ⭐ 2026-09-30 round 2 — the report card by a real press first, and its
+        # panel waited for (see `_claude_open_report_panel`). The generic card
+        # click stays for a page without the captured card.
+        _rep = await _claude_open_report_panel(page)
+        if _rep.get("open"):
+            log(f"[{label}] the report panel is open "
+                f"({'after a real press on its card' if _rep.get('pressed') else 'it already was'})")
+            clicked = True
+        else:
+            if _rep.get("found"):
+                log(f"[{label}] pressed the report card but its panel did not open "
+                    f"within 8 s — trying the generic card click", "INFO")
+            clicked = await _click_claude_artifact(page, index=target_idx)
         # 2026-05-14: when the DOM pre-click can't resolve a real artifact
         # button (Claude's `[data-testid*="artifact"]` selector can match
         # research-tracking cards, context-menu triggers, etc.), fall back
@@ -57512,7 +57947,11 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # navigate preamble still has a shot.
         _panel_open = True
         try:
+            # ⭐ 2026-09-30 round 2 — the captured report panel is a named
+            # region; the old class selectors never matched it (34 of 34 opens
+            # in the corpus fell through to computer use).
             await page.wait_for_selector(
+                f'{_CLAUDE_REPORT_PANEL_SEL}, '
                 'aside [class*="markdown"], aside .prose, '
                 '[class*="artifact-panel"] [class*="markdown"], '
                 '[class*="artifact-panel"] .prose',
@@ -57600,6 +58039,18 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # `get_clipboard()` read entirely.
         # 2026-05-14: tiers de-indented out of the prior `if clicked:`
         # gate so a missed pre-click doesn't silently skip everything.
+
+        # ── Tier 1 by the page: Copy options → Download as Markdown ──
+        # ⭐ 2026-09-30 round 2. Computer use below is the fallback only.
+        md_page = await _claude_download_report_by_page(page, label)
+        if md_page:
+            if _is_sources_not_document(md_page, platform="claude"):
+                log(f"[{label}] page download is the sources list, not the report "
+                    f"({len(md_page)} chars) — computer use tries", "WARN")
+            else:
+                log(f"[{label}] Extracted via the page's Download as Markdown: "
+                    f"{len(md_page)} chars")
+                return md_page
 
         # ── Tier 1 (CUA-driven download): Download as Markdown ──
         # CUA finds the small down-arrow button next to the Copy button
@@ -60101,6 +60552,127 @@ _CLAUDE_MODE_STATE_JS = """(P) => {
 }"""
 
 
+# ⭐⭐ 2026-09-30 round 2 — CLAUDE'S RESEARCH SWITCH, from the capture.
+#
+# Step 3B had not found the Research row since 09-03. The 09-30 capture
+# (1-claude-menus, frames 17-22) settles why: the "+" menu's rows carry an
+# icon-font glyph in their text ("\ue0d0Research"), so the exact match on
+# 'research' could never be true, and the prefix fallback wanted a switch
+# inside the row. The row IS the switch: `role="menuitemcheckbox"`,
+# `data-testid="add-menu-research"`, `aria-checked` and
+# `data-checked`/`data-unchecked`. Pressing it closes the menu (frame 18), and
+# the reopened menu shows it checked with a ✓ glyph (\ue03b, frame 22).
+#
+# So: the captured test id first, then the row's text with the glyphs taken
+# out, searched ONLY inside open menus; the row is MARKED and pressed for real
+# by the caller, never `el.click()`; and "on" is read back from the row itself.
+_CLAUDE_RESEARCH_ROW_TESTID = "add-menu-research"
+_CLAUDE_TOOLS_TRIGGER_TESTID = "chat-input-attach"
+_CLAUDE_RESEARCH_ROW_JS = r"""(P) => {
+    const norm = s => (s || '').replace(/[\ue000-\uf8ff]/g, ' ')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+    const vis = el => el.getClientRects().length > 0;
+    if (P.attr) {
+        for (const el of document.querySelectorAll('[' + P.attr + ']')) {
+            el.removeAttribute(P.attr);
+        }
+    }
+    const isOn = el => el.getAttribute('aria-checked') === 'true'
+        || el.getAttribute('aria-pressed') === 'true'
+        || el.hasAttribute('data-checked')
+        || el.getAttribute('data-state') === 'checked'
+        || el.getAttribute('data-state') === 'on';
+    const menus = [...document.querySelectorAll('[role="menu"]')].filter(vis);
+    const words = ['research', 'research tool', 'deep research', 'research mode'];
+    const NOT_TOOL = /\b(history|projects|settings|memory|past|recent)\b/;
+    let row = null, via = '';
+    for (const m of menus) {
+        const hit = [...m.querySelectorAll('[data-testid="' + P.testid + '"]')].find(vis);
+        if (hit) { row = hit; via = 'testid'; break; }
+    }
+    if (!row) {
+        const sel = '[role="menuitemcheckbox"], [role="menuitem"], [role="menuitemradio"], '
+                  + '[role="switch"], [role="checkbox"], button';
+        for (const m of menus) {
+            for (const el of m.querySelectorAll(sel)) {
+                if (!vis(el)) continue;
+                const t = norm(el.textContent), a = norm(el.getAttribute('aria-label'));
+                if (words.indexOf(t) !== -1 || words.indexOf(a) !== -1) {
+                    row = el; via = 'text'; break;
+                }
+            }
+            if (row) break;
+        }
+    }
+    if (!row) {
+        // A Research row carrying a description ("Research · Get a detailed
+        // report"), when it is a toggle row — never a "Research history" link.
+        for (const m of menus) {
+            for (const el of m.querySelectorAll('[role="menuitemcheckbox"]')) {
+                if (!vis(el)) continue;
+                const t = norm(el.textContent);
+                if (/^research\b/.test(t) && !NOT_TOOL.test(t)) {
+                    row = el; via = 'text-prefix'; break;
+                }
+            }
+            if (row) break;
+        }
+    }
+    if (!row) {
+        return { found: false, menus: menus.length,
+                 rows: menus.flatMap(m => [...m.querySelectorAll('[role^="menuitem"]')]
+                     .filter(vis).map(e => norm(e.textContent).slice(0, 30))).slice(0, 14) };
+    }
+    const sw = row.querySelector('[role="switch"], [role="checkbox"]');
+    const on = isOn(row) || (!!sw && isOn(sw));
+    if (!on && P.attr) (sw || row).setAttribute(P.attr, P.value);
+    return { found: true, on: on, via: via, menus: menus.length };
+}"""
+
+
+async def _claude_research_reads_on(page) -> bool:
+    """Is Claude's Research switch ON? Read from the row itself, never assumed.
+
+    ⭐ 2026-09-30 round 2. Pressing the row closes the "+" menu (capture
+    1-claude-menus, frame 18), so when no menu is open the menu is opened again
+    with a real press on the captured "+" and the row read there (frame 22 shows
+    it `aria-checked="true"` with a ✓), then closed with Escape. Returns False
+    when the row cannot be read — a switch nobody saw turn on is not on."""
+    async def _read():
+        try:
+            return await page.evaluate(
+                _CLAUDE_RESEARCH_ROW_JS,
+                {"testid": _CLAUDE_RESEARCH_ROW_TESTID, "attr": "", "value": ""}) or {}
+        except Exception:
+            return {}
+
+    async def _close():
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+    st = await _read()
+    if not st.get("found"):
+        try:
+            await page.click(f'button[data-testid="{_CLAUDE_TOOLS_TRIGGER_TESTID}"]',
+                             timeout=3000)
+        except Exception as e:
+            log(f"[setup_claude_dr] Step 3B: could not open the \"+\" menu again to "
+                f"read the Research row ({type(e).__name__})", "INFO")
+            return False
+        for _ in range(8):
+            await asyncio.sleep(0.25)
+            st = await _read()
+            if st.get("found"):
+                break
+    on = bool(st.get("found") and st.get("on"))
+    if st.get("found"):
+        await _close()
+    return on
+
+
 # ⭐⭐ Claude's composer test ids, captured live 2026-08-17. The most durable hooks
 # either platform gives us: an exact name for the control AND one for every option
 # under it. They are tried first and the existing text searches remain as the
@@ -60137,12 +60709,23 @@ def _claude_effort_option_testid(effort: str) -> str:
     matters. Unknown words map to "" so the caller falls through to its text
     search rather than addressing a test id that does not exist.
     """
+    slug = _claude_effort_id(effort)
+    return f"effort-option-{slug}" if slug else ""
+
+
+def _claude_effort_id(effort: str) -> str:
+    """The option row's `data-effort-id` for a policy effort word ('extra' → 'xhigh').
+
+    ⭐ 2026-09-30 round 2 — the captured hook. The Effort submenu on the new page
+    (capture 1-claude-menus, frame 4) names every option row
+    `data-effort-id="low|medium|high|xhigh|max"`; the 08-17 `effort-option-*`
+    test ids are gone. Same slugs, so one map serves both. "" for a word it does
+    not know, so the caller falls through to its text search."""
     word = (effort or "").strip().lower()
     known = {"low": "low", "medium": "medium", "high": "high",
              "extra": "xhigh", "extra high": "xhigh", "xhigh": "xhigh",
              "max": "max"}
-    slug = known.get(word)
-    return f"effort-option-{slug}" if slug else ""
+    return known.get(word, "")
 
 
 def _claude_effort_is_set(*, marked: bool, already: bool,
@@ -60382,6 +60965,32 @@ _CLAUDE_EFFORT_CHECKED_JS = r"""(P) => {
         .replace(/\s+/g, ' ').trim().toLowerCase();
     const isOn = el => el.getAttribute('aria-checked') === 'true' ||
                        el.dataset.state === 'checked' || el.dataset.state === 'on';
+    // \u2b50\u2b50 2026-09-30 round 2 \u2014 THE MODEL BUTTON FIRST. Pressing an option
+    // CLOSES both menus (capture 1-claude-menus: the frame after "Extra" was
+    // pressed has no menu open), so a read of the row after the press found
+    // nothing and reported a set tier as not set. The button carries the tier
+    // the page is on ("Opus 5.5 Extra"), and it is what the pre-send check reads
+    // too. Only the words the Effort menu labels its rungs with count.
+    if (P.trigTestid) {
+        const trig = [...document.querySelectorAll('[data-testid="' + P.trigTestid + '"]')]
+            .find(el => el.getClientRects().length > 0);
+        if (trig) {
+            const toks = ((trig.getAttribute('aria-label') || '') + ' '
+                          + (trig.textContent || '')).toLowerCase().split(/[^a-z0-9.]+/);
+            const tierWords = ['low', 'medium', 'high', 'extra', 'max'];
+            const shown = toks.find(t => tierWords.indexOf(t) !== -1);
+            if (shown) {
+                return { found: true, checked: shown === String(P.word || '').toLowerCase(),
+                         via: 'button', shown: shown };
+            }
+        }
+    }
+    // The captured option hook, when the submenu is still up.
+    if (P.effortId) {
+        const el = [...document.querySelectorAll('[data-effort-id="' + P.effortId + '"]')]
+            .find(e => e.getClientRects().length > 0);
+        if (el) return { found: true, checked: isOn(el), via: 'effort-id' };
+    }
     if (P.optTestid) {
         const el = document.querySelector('[data-testid="' + P.optTestid + '"]');
         if (el) return { found: true, checked: isOn(el), via: 'testid' };
@@ -60459,8 +61068,11 @@ _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
             trigger: !!((P.trigTestid &&
                          c.querySelector('[data-testid="' + P.trigTestid + '"]'))
                         || (P.rowAttr && c.querySelector('[' + P.rowAttr + ']'))),
-            option: !!(P.optTestid &&
-                       c.querySelector('[data-testid="' + P.optTestid + '"]')),
+            // The option's test id (08-17) or its `data-effort-id` (09-30).
+            option: !!((P.optTestid &&
+                        c.querySelector('[data-testid="' + P.optTestid + '"]'))
+                       || (P.effortId &&
+                           c.querySelector('[data-effort-id="' + P.effortId + '"]'))),
             rungs: labels.filter(isRung).length,
             labels: labels.slice(0, 12),
         });
@@ -61052,8 +61664,9 @@ def _report_claude_plan_limit(excluded: str, using: str) -> None:
         pass
 
 
-async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=False) -> bool:
-    """Enable Claude Opus (the newest offered) + Max Effort + Research tool via
+async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=False,
+                          effort_only=False) -> bool:
+    """Enable Claude Opus (the newest offered) + the policy effort + Research tool via
     direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits these
     across the model popover + the tools menu:
         1. Model dropdown        → the HIGHEST Opus offered
@@ -61093,7 +61706,15 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
     (best-effort: WARN on miss). Correctness gates are the model + Research tool
     — those hard-return False on miss. The CUA fallback lives one layer up in
     setup_agent + validate_setup_with_cua so this routine can fail fast without
-    fighting the DOM."""
+    fighting the DOM.
+
+    ⭐⭐ `effort_only` (2026-09-30 round 2) — THE PRE-SEND RE-SET. On 09-30 the
+    owner moved the tier to Low by hand after setup and Claude researched at Low.
+    `ensure_deep_mode_active` now calls this with `effort_only=True` when the
+    model button shows another tier right before Send: the same Step 1C (open
+    the model popover, hover Effort, press the wanted option, read the button
+    back), and nothing else — no model pick, no Chat-tab switch, no "+" menu. It
+    returns whether the button then reads the wanted tier."""
     # ⚠ Clear FIRST. `_P2_PICKED_VERSION` is a process-global that survives for
     # the daemon's lifetime, and several paths below return before writing it
     # (Step 1A FAIL, Step 1B FAIL, the outer except). A stale entry from a
@@ -61103,10 +61724,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
     # setup reaches its end, so a setup that returns early left the LAST run's
     # tier in place, and the pre-send line and caption named a tier this run
     # never read.
-    _P2_PICKED_VERSION.pop("claude", None)
-    _P2_THINKING_STATE.pop("claude", None)
+    # ⭐ Not on the pre-send effort re-set: that is THIS run's setup state, and
+    # the re-set updates its effort half in place (see the early return below).
+    if not effort_only:
+        _P2_PICKED_VERSION.pop("claude", None)
+        _P2_THINKING_STATE.pop("claude", None)
     try:
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.3 if effort_only else 2)
 
         # ── Step 0: ensure the composer is on the "Chat" tab, NOT "Cowork" ──
         # (2026-07-16) claude.ai added a Chat|Cowork segmented control to the
@@ -61142,7 +61766,8 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         }
         """
         try:
-            _chat_state = await page.evaluate(_ENSURE_CHAT_JS)
+            _chat_state = ("effort-only" if effort_only
+                           else await page.evaluate(_ENSURE_CHAT_JS))
             if _chat_state == "clicked-chat":
                 await asyncio.sleep(1.2)  # let the composer re-render into Chat
                 _cs = await page.evaluate(_VERIFY_CHAT_JS)
@@ -61155,6 +61780,8 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     "INFO" if _cs == "chat" else "WARN")
             elif _chat_state == "already-chat":
                 log("[setup_claude_dr] Step 0 OK: composer already on Chat")
+            elif _chat_state == "effort-only":
+                pass
             else:
                 log("[setup_claude_dr] Step 0: no Chat/Cowork toggle present "
                     "(older UI) — nothing to switch", "INFO")
@@ -61303,6 +61930,12 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # Max") still counts as the family being selected.
         _trigger_has_family = bool(isinstance(_trigger_read, dict) and _trigger_read.get("fam"))
         model_ok = (pin_model is None and step_below is None) and _trigger_has_family
+        if effort_only and not model_ok:
+            # The re-set never picks a model seconds before Send; a wrong model
+            # is the full re-activation's job (`ensure_deep_mode_active`).
+            log("[setup_claude_dr] effort re-set skipped: the model button does not "
+                "show the family, so nothing is touched before Send", "WARN")
+            return False
         if pin_model is not None or step_below is not None:
             log(f"[setup_claude_dr] step-back: re-picking away from the model that failed "
                 f"(pin={pin_model!r} below={step_below!r})")
@@ -61798,7 +62431,9 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                         pass
                     return False
                 await asyncio.sleep(0.6)
-            else:
+            elif not effort_only:
+                # (Not on the pre-send effort re-set: no model moves seconds
+                # before Send.)
                 # ── Step 1B*: the family is right — is a NEWER one offered? ──
                 # This is the whole "most recent model of the family" guarantee.
                 # Claude.ai keeps an account on the previous flagship after a
@@ -62143,7 +62778,8 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                 {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
                                  "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,
                                  "optTestid": _claude_effort_option_testid(
-                                     _claude_effort)}) or {}
+                                     _claude_effort),
+                                 "effortId": _claude_effort_id(_claude_effort)}) or {}
                         except Exception:
                             _eff_probe = {}
                         _eff_state = _claude_effort_submenu_verdict(_eff_probe)
@@ -62404,19 +63040,33 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             return !!want && (t === want || t === want + ' effort'
                                               || t === want + 'default');
                         };
-                        let pick = null, scope = null, items = [];
+                        let pick = null, scope = null, items = [], pickVia = '';
                         for (const c of pools) {
                             const rows = rowsIn(c);
-                            let hit = null;
-                            if (P.optTestid) {
+                            let hit = null, hitVia = '';
+                            // ⭐ 2026-09-30 round 2 — the captured hook first:
+                            // every option row carries `data-effort-id`
+                            // (low|medium|high|xhigh|max), and the 08-17 test
+                            // ids are gone. `hitVia` names the search that FOUND
+                            // the row, so the log says which hook still works.
+                            if (P.effortId) {
+                                hit = rows.find(el =>
+                                    el.getAttribute('data-effort-id') === P.effortId);
+                                if (hit) hitVia = 'effort-id';
+                            }
+                            if (!hit && P.optTestid) {
                                 hit = rows.find(el =>
                                     el.getAttribute('data-testid') === P.optTestid);
+                                if (hit) hitVia = 'testid';
                             }
                             // The text search stays as the fallback for an older
                             // layout, with its ligature stripping intact.
-                            if (!hit && allowText) hit = rows.find(isWanted);
+                            if (!hit && allowText) {
+                                hit = rows.find(isWanted);
+                                if (hit) hitVia = 'text';
+                            }
                             if (!items.length) items = rows;
-                            if (hit) { pick = hit; scope = c; items = rows; break; }
+                            if (hit) { pick = hit; scope = c; items = rows; pickVia = hitVia; break; }
                         }
                         if (!pick) {
                             // ⭐ 2026-09-23 — A MISS NAMES THE SUBMENU'S OWN ROWS,
@@ -62458,14 +63108,13 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                                 // was chosen" — the distinction that let a decoy
                                 // outside every menu be pressed once before.
                                 picked: norm(pick.textContent).slice(0, 40),
-                                via: P.optTestid &&
-                                    pick.getAttribute('data-testid') === P.optTestid
-                                    ? 'testid' : 'text',
+                                via: pickVia,
                                 scoped: scope !== document, menus: menus.length,
                                 cands: cands.length};
                     }""", {"trigTestid": _CLAUDE_EFFORT_TRIGGER_TESTID,
                            "rowAttr": _CLAUDE_EFFORT_ROW_ATTR,
                            "optTestid": _claude_effort_option_testid(_claude_effort),
+                           "effortId": _claude_effort_id(_claude_effort),
                            "word": str(_claude_effort or "").lower(),
                            "attr": _SR_CLICK_MARK,
                            "value": "claude-effort-option"}) or {}
@@ -62495,17 +63144,31 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                             page, "claude-effort-option", tag="[setup_claude_dr]"))
                         _eff_option_pressed = _eff_pressed
                         if _eff_pressed:
-                            await asyncio.sleep(0.4)
+                            # ⭐ 2026-09-30 round 2 — READ THE MODEL BUTTON BACK,
+                            # and give it up to ~2 s. The press closes both
+                            # menus, so the row is gone; the button then reads
+                            # "Opus 5.5 Extra" (see _CLAUDE_EFFORT_CHECKED_JS).
                             _eff_ok = {}
-                            try:
-                                _eff_ok = await page.evaluate(
-                                    _CLAUDE_EFFORT_CHECKED_JS,
-                                    {"optTestid": _claude_effort_option_testid(
-                                        _claude_effort),
-                                     "word": str(_claude_effort or "").lower()}) or {}
-                            except Exception:
-                                _eff_ok = {}
+                            for _rb in range(8):
+                                await asyncio.sleep(0.25)
+                                try:
+                                    _eff_ok = await page.evaluate(
+                                        _CLAUDE_EFFORT_CHECKED_JS,
+                                        {"optTestid": _claude_effort_option_testid(
+                                            _claude_effort),
+                                         "effortId": _claude_effort_id(_claude_effort),
+                                         "trigTestid": _CLAUDE_MODEL_TRIGGER_TESTID,
+                                         "word": str(_claude_effort or "").lower()}) or {}
+                                except Exception:
+                                    _eff_ok = {}
+                                if _eff_ok.get("checked"):
+                                    break
                             _eff_checked = bool(_eff_ok.get("checked"))
+                            if _eff_ok.get("shown"):
+                                # What the button reads now is the tier in effect,
+                                # whether or not it is the one wanted.
+                                _eff_row_shows = _eff_ok.get("shown")
+                                _eff_option_pressed = False
                             if not _eff_checked:
                                 log(f"[setup_claude_dr] Step 1C WARN: pressed the "
                                     f"{_claude_effort!r} row but it did not become "
@@ -62593,6 +63256,21 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                     f"again next run, so the model popover will keep opening. Check that "
                     f"the directory is writable.", "WARN")
 
+        if effort_only:
+            # ⭐ The pre-send re-set ends here: the effort half of this run's
+            # setup state is updated in place, and the ledger entry is restated
+            # by the caller's read of the button (`_claude_effort_ledger_at_send`).
+            _got = _claude_effort_in_effect(
+                confirmed=_effort_confirmed, wanted=_claude_effort,
+                pressed=_eff_option_pressed, row_shows=_eff_row_shows)
+            _st = dict(_P2_THINKING_STATE.get("claude") or {})
+            _st.update({"effort": _effort_confirmed, "effort_got": _got})
+            _P2_THINKING_STATE["claude"] = _st
+            log(f"[setup_claude_dr] effort re-set before Send: "
+                f"{'the button now reads ' + effort_label(_claude_effort) if _effort_confirmed else 'the page did not take ' + effort_label(_claude_effort)}",
+                "INFO" if _effort_confirmed else "WARN")
+            return bool(_effort_confirmed)
+
         # ── Step 3: open tools menu and enable Research ────────────────
         # Precise selectors first — the old `button[aria-label*="+"]`
         # wildcard was matching unrelated buttons ("New chat", etc.)
@@ -62606,7 +63284,11 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
         # single E2E reveals the exact selector (no more blind selector-guessing).
         tools_opened = False
         tools_sel_used = None
-        for sel in ['button[aria-label="Open tools menu"]',
+        # ⭐ 2026-09-30 round 2 — the captured "+" first (capture 1-claude-menus,
+        # frame 16: `data-testid="chat-input-attach"`, "Add files, connectors,
+        # and more"), pressed by Playwright's real click below.
+        for sel in [f'button[data-testid="{_CLAUDE_TOOLS_TRIGGER_TESTID}"]',
+                    'button[aria-label="Open tools menu"]',
                     'button[aria-label*="tools menu"]',
                     'button[aria-label*="Tools menu"]',
                     'button[data-testid*="tools"]',
@@ -62695,65 +63377,47 @@ async def setup_claude_dr(page, pin_model=None, step_below=None, allow_probe=Fal
                 log(f"[setup_claude_dr] Step 3A composer-button dump failed: {_de}", "WARN")
         research_enabled = False
         if tools_opened:
-            # State-aware + accept label variations ("Research", "Research
-            # tool", "Deep research"). Only clicks when not already on.
-            # #751 (2026-06-02): Step 3B failed on 100% of runs ("Research toggle
-            # not found (selectors rotated)") → CUA recovered it every time. Root
-            # cause: the role list omitted role="menuitemcheckbox" (the standard
-            # ARIA role for a toggle menu-item, which is what claude.ai now uses
-            # for Research), and the text match wasn't whitespace-normalized.
-            # Broaden the roles + normalize, and add the row-CONTAINS-a-switch
-            # fallback (same pattern as the Thinking toggle in Step 1D) so a
-            # Research row that wraps its toggle is still handled. State-aware:
-            # only clicks when not already on.
-            research_enabled = await page.evaluate("""() => {
-                const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const vis = el => el.offsetParent !== null;
-                const isResearch = el => {
-                    const t = norm(el.textContent), a = norm(el.getAttribute('aria-label'));
-                    // EXACT labels only for the direct match — a prefix like
-                    // /^research\\b/ would also catch "Research history" /
-                    // "Research projects" nav rows and toggle the wrong thing
-                    // (#751 review blocker). The row fallback below handles a
-                    // Research TOOL row that carries a description suffix.
-                    const hit = s => s === 'research' || s === 'research tool' ||
-                                     s === 'deep research' || s === 'research mode';
-                    return hit(t) || hit(a);
-                };
-                const isOn = el => el.getAttribute('aria-checked') === 'true' ||
-                                   el.getAttribute('aria-pressed') === 'true' ||
-                                   el.dataset.state === 'checked' || el.dataset.state === 'on';
-                const items = [...document.querySelectorAll(
-                    '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], button, [role="switch"], [role="checkbox"], label'
-                )].filter(vis);
-                // Direct: the Research item / toggle itself.
-                let target = items.find(isResearch);
-                // Fallback: a "Research"-labelled row that CONTAINS a switch.
-                if (!target) {
-                    const row = items.find(el => {
-                        const t = norm(el.textContent);
-                        // A "Research"-labelled row that CONTAINS a switch — but
-                        // NOT a "Research history"/"Research projects"-style nav
-                        // row (#751 review: exclude known non-tool segments so a
-                        // prefix match can't toggle the wrong control).
-                        const looksResearchTool =
-                            (/^research\\b/.test(t) || t.includes('deep research')) &&
-                            !/\\b(history|projects|settings|memory|past|recent)\\b/.test(t);
-                        return looksResearchTool &&
-                               el.querySelector('[role="switch"], [role="checkbox"], button');
-                    });
-                    if (row) target = row.querySelector('[role="switch"], [role="checkbox"], button') || row;
-                }
-                if (!target) return false;
-                if (!isOn(target)) target.click();
-                return true;
-            }""")
-            await asyncio.sleep(0.4)
+            # ⭐⭐ 2026-09-30 round 2 — FOUND IGNORING THE ICON GLYPH, PRESSED FOR
+            # REAL, READ BACK. See `_CLAUDE_RESEARCH_ROW_JS` for what the capture
+            # showed. The old script matched the row's text exactly — which
+            # carries a glyph since 09-03 — clicked with `el.click()`, and
+            # reported "on" for a row it had merely FOUND.
+            _rr = {}
             try:
-                await page.keyboard.press("Escape")
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
+                _rr = await page.evaluate(
+                    _CLAUDE_RESEARCH_ROW_JS,
+                    {"testid": _CLAUDE_RESEARCH_ROW_TESTID, "attr": _SR_CLICK_MARK,
+                     "value": "claude-research"}) or {}
+            except Exception as _rre:
+                log(f"[setup_claude_dr] Step 3B: the Research row read errored ({_rre})",
+                    "INFO")
+            if not _rr.get("found"):
+                log(f"[setup_claude_dr] Step 3B: no Research row in the "
+                    f"{_rr.get('menus', 0)} open menu(s) — rows="
+                    f"{json.dumps(_rr.get('rows') or [], ensure_ascii=False)}", "INFO")
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+            elif _rr.get("on"):
+                research_enabled = True
+                log(f"[setup_claude_dr] Step 3B OK: Research is already on (the row "
+                    f"reads checked, via {_rr.get('via')}) — not pressed")
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+            else:
+                _how = await _sr_real_click(page, "claude-research",
+                                            tag="[setup_claude_dr]")
+                await asyncio.sleep(0.5)
+                research_enabled = await _claude_research_reads_on(page)
+                log(f"[setup_claude_dr] Step 3B: pressed Research "
+                    f"({_how or 'no press landed'}, via {_rr.get('via')}) — the row "
+                    f"now reads {'checked' if research_enabled else 'NOT checked'}",
+                    "INFO" if research_enabled else "WARN")
         if research_enabled:
             log("[setup_claude_dr] Step 3B OK: Research tool toggled on")
         else:
@@ -64341,6 +65005,27 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                         log(f"[{label}] #744 Research-pill dump (fix detector from this): {json.dumps(_rdump, ensure_ascii=False)}", "INFO")
                     except Exception as _rde:
                         log(f"[{label}] #744 Research-pill dump failed: {_rde}", "INFO")
+            # ⭐⭐ 2026-09-30 round 2 — THE EFFORT IS SET AGAIN WHEN IT DRIFTED. On
+            # 09-30 setup read the wanted tier, the owner moved it to Low by hand
+            # before Send, and Claude researched at Low. When the model button
+            # right before Send names a DIFFERENT tier, the page's own Effort
+            # menu sets the wanted one again (hover Effort, press it, read the
+            # button back) — never computer use, which cannot hold that submenu
+            # open. Only a positive read of another tier acts: a button that
+            # names no tier is left alone. The re-read that follows is the one
+            # the run reports.
+            _eff_want = str(p2_labels("claude").get("effort") or "").strip().lower()
+            _eff_seen = str(state.get("effortShown") or "").strip().lower()
+            if (reactivate and _eff_want and _eff_seen and _eff_seen != _eff_want
+                    and state.get("hasExtended")):
+                log(f"[{label}] Claude's effort reads {effort_label(_eff_seen)} right "
+                    f"before Send, not {effort_label(_eff_want)} — setting it again "
+                    f"by the page", "WARN")
+                try:
+                    await setup_claude_dr(page, effort_only=True)
+                except Exception as _ere:
+                    log(f"[{label}] effort re-set before Send errored: {_ere}", "WARN")
+                state = await page.evaluate(_claude_state_js, _claude_state_arg)
             ok = bool(state.get("hasExtended") and state.get("researchOn"))
             if selfheal and selfheal.is_enabled():
                 await _selfheal_shadow_observe(page, "claude.enable_deep_research",
@@ -74176,10 +74861,25 @@ def _doc_ends_with_its_own_sources(masked: str) -> bool:
     """Does the report's LAST heading already say "sources"?
 
     Read off the masked text so a `# heading` inside a fenced block is not one."""
-    last = ""
+    return _doc_own_sources_start(masked) is not None
+
+
+def _doc_own_sources_start(masked: str):
+    """Where the report's own trailing sources section starts — the offset of
+    its heading — or None when the report's LAST heading is not a sources one.
+
+    ⭐ 2026-09-30 round 2. A url whose first mention is inside that section is
+    LISTED by the report, not cited in its prose, and must not be numbered into
+    a second list (see `_number_document_sources`)."""
+    last = None
     for m in _DOC_ANY_HEADING_RE.finditer(masked or ""):
-        last = (m.group("atx") or m.group("setext") or "").strip()
-    return bool(last) and _DOC_SOURCES_WORD_RE.match(last) is not None
+        last = m
+    if last is None:
+        return None
+    text = (last.group("atx") or last.group("setext") or "").strip()
+    if not text or _DOC_SOURCES_WORD_RE.match(text) is None:
+        return None
+    return last.start()
 
 
 def _doc_markdown_url(u: str) -> str:
@@ -74404,6 +75104,14 @@ def _number_document_sources(md: str, findings: list) -> str:
             "DEBUG")
         return md
     masked, spans = _mask_code_spans(md)
+    # ⭐⭐ 2026-09-30 round 2 — ONE SOURCES LIST, NOT TWO. Claude's report cites no
+    # url in its prose and ends with its own numbered "## Sources" list; every
+    # url's first mention was in that list, so each row got a number and the
+    # same rows were appended again as "Sources (numbered)" — the owner saw the
+    # document end with its sources twice. A url first met inside the report's
+    # own trailing sources section is listed, not cited: it gets no number and
+    # no second row. A report that cites in its prose is numbered as before.
+    own_at = _doc_own_sources_start(masked)
     ends: dict = {}
     for m in _FIND_BARE_URL_RE.finditer(masked):
         u = _find_trim_trailing_punct(m.group(0))
@@ -74427,6 +75135,8 @@ def _number_document_sources(md: str, findings: list) -> str:
         url_end = ends.get(k)
         if url_end is None:
             continue
+        if own_at is not None and url_end > own_at:
+            continue
         seen.add(k)
         # ⛔ The citation may be in the document's LAST sentence with nothing
         # after it — `[.!?]\s` needs the space, so a report that ends without a
@@ -74434,6 +75144,9 @@ def _number_document_sources(md: str, findings: list) -> str:
         at = _doc_marker_position(md, masked, spans, url_end, doc_end)
         placements.append((at, url_end, url, _doc_source_title(f, url)))
     if not placements:
+        if own_at is not None:
+            log("numbered sources: every source is only in the report's own "
+                "sources list — that list stays the one list", "DEBUG")
         return md
     # Ascending through the document, so the numbers a reader meets count up.
     placements.sort(key=lambda p: (p[0], p[1]))
@@ -74445,8 +75158,7 @@ def _number_document_sources(md: str, findings: list) -> str:
     rows = "\n".join(
         _doc_sources_row(i + 1, p[2], p[3]) for i, p in enumerate(placements))
     heading = _doc_sources_heading(
-        _DOC_SOURCES_ALT_TITLE if _doc_ends_with_its_own_sources(masked)
-        else _DOC_SOURCES_TITLE)
+        _DOC_SOURCES_ALT_TITLE if own_at is not None else _DOC_SOURCES_TITLE)
     return "%s\n\n%s\n\n%s\n" % (out.rstrip(), heading, rows)
 
 

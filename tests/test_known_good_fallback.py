@@ -288,8 +288,12 @@ def test_ensure_deep_mode_active_reactivate_param_gates_resetup():
     # reactivate=True (default) preserves today's behavior; False = measure-only.
     ed = inspect.getsource(research.ensure_deep_mode_active)
     assert "reactivate=True" in ed
-    assert ed.count("reactivate and") == 3, (
-        "all three platform re-activation blocks must be gated on `reactivate`."
+    # ⚠ 2026-09-30 (Claude round 2): FOUR — the three platform re-activations
+    # and Claude's pre-send effort re-set, which must be measure-only too (the
+    # step-back measures with reactivate=False so its pin holds).
+    assert ed.count("reactivate and") == 4, (
+        "every re-activation block (three platforms + Claude's effort re-set) "
+        "must be gated on `reactivate`."
     )
 
 

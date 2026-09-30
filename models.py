@@ -157,15 +157,14 @@ P2_MODEL_POLICY = {
         # research.py gates Step 1D on it and skips the advisory that would
         # otherwise report thinking as permanently unconfirmed.
         "family": "opus", "pick": "highest",
-        # ⭐⭐ (2026-09-30) EXTRA HIGH, NOT MAX — the owner: Max uses about six
-        # times the usage. The word is the one the Effort menu labels that rung
-        # with ("Low / Medium / High / Extra / Max", the 08-06 and 08-17
-        # captures), which is the vocabulary every reader compares against: the
-        # model button's tier read, the Effort row read and the option test id
-        # (`effort-option-xhigh`). A person reads it as `effort_label` gives it.
-        # ⚠ Setting it by the page is round 2 (the Effort submenu has never been
-        # captured on the new page); until then the run says plainly, before
-        # Send, when Claude is on another tier.
+        # ⭐⭐ (2026-09-30) EXTRA, NOT MAX — the owner: Max uses "5.5× or more
+        # usage" (the Max row's own badge in the 09-30 capture). The word is the
+        # one the Effort menu labels that rung with ("Low / Medium / High /
+        # Extra / Max"), which is the vocabulary every reader compares against:
+        # the model button's tier read ("Opus 5.5 Extra"), the Effort row read
+        # and the option's `data-effort-id="xhigh"`. Setup sets it by the page
+        # (hover Effort, press Extra, read the button back), and the pre-send
+        # check sets it again when it drifted.
         "effort": "extra", "thinking": False, "tool": "research",
         # ⭐ (2026-08-14) The family to use when the account's plan does not
         # include `family` at all. On a non-pro Claude account every Opus row in
@@ -1505,11 +1504,14 @@ def free_family_note(excluded: str, use_instead: str) -> str:
 
 #: How a person reads an effort word. Only the rungs whose menu word is not
 #: what people call them are listed; every other word is shown capitalised.
-_EFFORT_LABELS = {"extra": "Extra high"}
+#: ⭐ 2026-09-30 round 2 — empty. The Effort menu and the model button both say
+#: "Extra" (the 09-30 capture: the row reads "Extra", the button "Opus 5.5
+#: Extra"), so the run says the page's own word rather than "Extra high".
+_EFFORT_LABELS: dict = {}
 
 
 def effort_label(word) -> str:
-    """The effort tier as a person reads it: 'extra' → 'Extra high', 'max' → 'Max'.
+    """The effort tier as a person reads it: 'extra' → 'Extra', 'max' → 'Max'.
 
     For captions and progress lines only. Never compared with the page — the
     readers compare the policy word itself."""

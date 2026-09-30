@@ -291,6 +291,13 @@ class ScriptedPage:
             return self.chat_tab
         if "aria-label" in script and "cand.click()" in script:
             return "plus"                     # the '+' tools-menu detector
+        if script == research._CLAUDE_RESEARCH_ROW_JS:
+            # ⚠ 2026-09-30 round 2 — Step 3B reads the Research row and answers
+            # with its state (a dict), and presses only a row that is off. The
+            # double's "research on" is a row that already reads checked.
+            if self.research_on:
+                return {"found": True, "on": True, "via": "testid", "menus": 1}
+            return {"found": False, "menus": 1, "rows": []}
         if "research" in script.lower():
             return self.research_on
         return None
