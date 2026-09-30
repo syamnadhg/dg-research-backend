@@ -172,7 +172,7 @@ MUTANTS = [
        "            return \"\"\n")]),
     ("C18", RESEARCH, "⛔⛔ a copy that is not on this page is kept — another worker's "
      "brief on the shared clipboard becomes this run's",
-     [("    if not await _chatgpt_copy_on_page(page, text):",
+     [("    if not await _chatgpt_copy_on_page(page, text, unanswered):",
        "    if False:")]),
     ("C19", RESEARCH, "⛔⛔ Copy table is off the never-click list — the CUA copies one table "
      "and it becomes Phase 1's whole brief",
@@ -306,12 +306,12 @@ MUTANTS += [
     # ═══ N — is it on this page ═══════════════════════════════════════════
     ("N1", RESEARCH, "⛔⛔ one shared line is enough — another worker's brief that ends "
      "the way every brief ends passes",
-     [("sum(p in shown for p in probes) >= min(2, len(probes))",
-       "sum(p in shown for p in probes) >= 1")]),
-    ("N2", RESEARCH, "every one of the first three lines must be on the page — a source "
-     "chip inside a sentence costs the brief",
-     [("sum(p in shown for p in probes) >= min(2, len(probes))",
-       "sum(p in shown for p in probes) >= len(probes)")]),
+     [("hits >= max(min(2, len(probes)), -(-2 * len(probes) // 3))",
+       "hits >= 1")]),
+    ("N2", RESEARCH, "every line must be on the page — a source chip inside a sentence "
+     "costs the brief",
+     [("hits >= max(min(2, len(probes)), -(-2 * len(probes) // 3))",
+       "hits >= len(probes)")]),
     ("N3", RESEARCH, "a link's address is looked for on the page, where only its words "
      "show",
      [(r'''    line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)''' + "\n",
@@ -361,12 +361,15 @@ MUTANTS += [
     # ═══ S — the latest reply ═══════════════════════════════════════════════
     ("S1", RESEARCH, "OVER-REACH: the latest reply its marker names is not used — after a "
      "follow-up with no reply yet, the latest reply's own copy is refused",
-     [("    if (replies.length) return [replies[replies.length - 1].innerText || '', null];\n",
-       "")]),
+     [("_CG_PAGE_TEXT_JS = _cg_js(\"\"\"(skip) => {\n"
+       "    const replies = document.querySelectorAll('__CG_ASSISTANT__');\n"
+       "    if (replies.length) return [replies[replies.length - 1].innerText || '', null];\n",
+       "_CG_PAGE_TEXT_JS = _cg_js(\"\"\"(skip) => {\n"
+       "    const replies = document.querySelectorAll('__CG_ASSISTANT__');\n")]),
     ("S2", RESEARCH, "⛔⛔ with no reply marker the whole page counts — after a follow-up, "
      "the CUA's press on the first draft's Copy passes and the user's added context "
      "is dropped",
-     [("            users.length ? (users[users.length - 1].innerText || '') : null];",
+     [("            users.length > k ? (users[users.length - 1 - k].innerText || '') : null];",
        "            null];")]),
     ("S3", RESEARCH, "OVER-REACH: a person's message with no marker makes every copy "
      "fail — a second rename costs the brief",

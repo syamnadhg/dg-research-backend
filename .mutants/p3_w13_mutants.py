@@ -96,7 +96,7 @@ MUTANTS = [
     # ═══ H — what the notebook shows decides ════════════════════════════════
     ("H1", RESEARCH, "⛔⛔ a sign-in page reads as a gone notebook — a new notebook for "
      "a person who only had to sign in",
-     [("    if await _page_shows_login_wall(page):\n"
+     [("    if await _work_tab_signed_out(page, \"notebooklm\", \"NotebookLM\"):\n"
        "        log(\"Phase 3: NotebookLM is asking to sign in",
        "    if False:\n"
        "        log(\"Phase 3: NotebookLM is asking to sign in")]),

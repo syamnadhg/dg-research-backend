@@ -76639,20 +76639,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             agent="chatgpt",
                         )
                         decision = await _controls.await_phase_decision(1)
-                    if decision == "retry" and p1 and p1.get("reread"):
-                        log("Phase 1: user requested retry — reading the brief again "
-                            "from ChatGPT's page", "INFO")
-                        _p1_reread = p1["reread"]
-                        emit_event("phase_restart", phase=1, reason="user_retry_reread", attempt=0)
-                        continue
                     if decision == "retry":
-                        log("Phase 1: user requested retry — re-running from the top", "INFO")
                         # #899: a Retry supersedes any stale login-pause skip —
                         # without this discard the preflight pause would see
                         # skipped_agents and return 'skipped' on its first
                         # tick, making Retry structurally unable to work.
                         _controls.consume_skip_marker("chatgpt")
                         _controls.login_pause_timeout_agents.discard("chatgpt")
+                        if p1 and p1.get("reread"):
+                            log("Phase 1: user requested retry — reading the brief "
+                                "again from ChatGPT's page", "INFO")
+                            _p1_reread = p1["reread"]
+                            emit_event("phase_restart", phase=1,
+                                       reason="user_retry_reread", attempt=0)
+                            continue
+                        log("Phase 1: user requested retry — re-running from the top", "INFO")
                         emit_event("phase_restart", phase=1, reason="user_retry_after_error", attempt=0)
                         continue
                     if decision == "skip":

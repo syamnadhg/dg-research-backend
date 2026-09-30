@@ -154,12 +154,13 @@ MUTANTS = [
      [("            when = re.split(r\"\\.(?:\\s|$)\", m.group(1))[0].strip(\" .,;:\")\n",
        "            when = m.group(1).strip(\" .,;:\")\n")]),
     ("U15", RESEARCH, "the limit leaves no line in the log",
-     [("        log(f\"[{label}] Claude's page shows its usage limit: \\\"{seen['line']}\\\" — \"\n"
-       "            \"nothing can be sent to Claude until it resets\", \"WARN\")\n",
-       "        pass\n")]),
-    ("U16", RESEARCH, "the page is read again after the limit was noted — the same line "
-     "every three seconds",
-     [("    if note or page is None:\n        return\n", "    if page is None:\n        return\n")]),
+     [("    log(f\"[{label}] Claude's page shows its usage limit: \\\"{seen['line']}\\\" — \"\n"
+       "        \"nothing can be sent to Claude until it resets\", \"WARN\")\n",
+       "    pass\n")]),
+    ("U16", RESEARCH, "the page is read again after the limit and its reset time were "
+     "noted — a line every three seconds",
+     [("    if page is None or (note and note.get(\"resets\")):\n        return\n",
+       "    if page is None:\n        return\n")]),
 
     # ═══ T — the new page's step list is open ═══════════════════════════════
     ("T1", RESEARCH, "⛔⛔ Phase 1's open check ignores the list — it presses the line "

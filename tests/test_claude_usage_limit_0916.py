@@ -195,8 +195,11 @@ def test_the_card_names_claudes_usage_limit_and_when_it_resets(launch):
     # The web shows this title as it is; one it filed as a passing hiccup would
     # lose the card its Skip button.
     assert not research._web_swallows_title(card["error"])
-    said = [m for _lv, m in out.lines if "Claude's page shows its usage limit" in m]
-    assert len(said) == 1 and BANNER in said[0], said  # once, quoting the page's own line
+    # Once, quoting the page's own line — and nothing more once the reset time
+    # is known (wave 13: the page is read again only while it is not).
+    said = [m for _lv, m in out.lines if "Claude's page " in m]
+    assert len(said) == 1 and BANNER in said[0], said
+    assert "shows its usage limit" in said[0]
 
 
 def test_a_fresh_tab_is_not_tried_once_the_limit_is_seen(launch):
