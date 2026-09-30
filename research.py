@@ -43827,6 +43827,8 @@ async def _chatgpt_done_badge(page) -> str:
 _CHATGPT_P1_FINISH_JS = _cg_js("""() => {
     const out = { stop: false, header: '', reply_len: 0 };
     out.stop = !!document.querySelector('button[aria-label="Stop generating"], __CG_STOP__');
+    // Still working: nothing else to read (this runs once a second).
+    if (out.stop) return out;
     const turns = document.querySelectorAll('__CG_TURN__');
     const last = turns.length ? turns[turns.length - 1] : null;
     if (!last) return out;
