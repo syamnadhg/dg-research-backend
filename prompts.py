@@ -818,20 +818,26 @@ IMPORTANT: Only touch the ONE failed source named for you. Never remove a health
 # 2026-05-13 (feature): podcast length is now configurable from the FE
 # Settings → Phase 3 segmented control. The prompt is constructed at runtime
 # so the literal Format/Length names inside the body match whatever the user
-# picked. Three variants:
-#   - "short"   → Format="Brief", no separate length step (~3–5 min)
+# picked. Three variants, every one a Deep dive (owner, 2026-09-30 — short
+# was Brief before, and Brief is never chosen now):
+#   - "short"   → Format="Deep dive", Length="Short" (~5–8 min, ASSUMED: half
+#                 of Default, the step Long takes above it in these notes;
+#                 none measured yet)
 #   - "default" → Format="Deep dive", Length="Default" (~10–15 min)
-#   - "long"    → Format="Deep dive", Length="Long" (~20–30 min, current)
-# The "short" variant solves the YouTube unverified-channel 15-min cap by
-# producing audio that always stays under the limit.
+#   - "long"    → Format="Deep dive", Length="Long" (~20–30 min, current —
+#                 but this machine's Deep dive + Long audio ran 39:05 and
+#                 53:50, and capture 5 shows 61:59, so that step is not a
+#                 measurement either)
+# The "short" variant exists for the YouTube unverified-channel 15-min cap;
+# ASSUMED that Deep dive + Short still stays under it.
 
 # ⭐ 2026-09-30 (capture 5): the words are the page's own. The Customise window
 # lists Format as Deep dive / Brief / Critique / Debate and Length as Short /
 # Default / Long; Brief shows NO Length row, and changing the format redraws
 # the Length row, so the format is always chosen first.
 _PROMPT_AUDIO_GENERATE_VARIANTS = {
-    "short": {"format": "Brief", "length": "Default",
-              "set_step_5": 'Choose FORMAT = "Brief". Brief has no Length row — do not look for one and do not wait for one before "Generate now".'},
+    "short": {"format": "Deep dive", "length": "Short",
+              "set_step_5": 'Choose FORMAT = "Deep dive" first (never "Brief"), then LENGTH = "Short" (changing the format redraws the Length row). Both must show as selected before "Generate now".'},
     "default": {"format": "Deep dive", "length": "Default",
                 "set_step_5": 'Choose FORMAT = "Deep dive", then LENGTH = "Default" (Default is already selected when the window opens — confirm it). Both must show as selected before "Generate now".'},
     "long": {"format": "Deep dive", "length": "Long",
@@ -862,8 +868,7 @@ def make_prompt_audio_generate(podcast_length: str = "long",
     step5 = v["set_step_5"]
     header = (
         f'Your task: Generate EXACTLY ONE audio overview with FORMAT="{fmt}"'
-        + (f' and LENGTH="{length}"' if podcast_length != "short" else "")
-        + ". Anything else is a failure."
+        f' and LENGTH="{length}". Anything else is a failure.'
     )
     _body = SYSTEM_BASE + f"""
 
@@ -941,14 +946,14 @@ PROMPT_AUDIO_GENERATE = make_prompt_audio_generate("long")
 # factories below. Mirrors _PROMPT_AUDIO_GENERATE_VARIANTS so the
 # completion/download CUA tasks point at the SAME card the generate task
 # created — critical for short/default runs where a hardcoded "Long + Deep
-# Dive" target would either send CUA hunting for an audio that doesn't
-# exist (short) or pick the wrong card if a misclick spawned a parallel
-# Deep Dive (default).
+# Dive" target could pick the wrong card if a misclick spawned a parallel
+# Deep Dive. Every length is a Deep Dive (2026-09-30), so the three are told
+# apart as the generate step made them: Short the shortest, Long the longest.
 _PROMPT_AUDIO_TARGET_VARIANTS = {
     "short": {
-        "card_desc": "the Brief audio overview you generated",
-        "match_hint": "the one whose label says 'Brief' or whose duration is short (~3–5 min) — NOT a Deep Dive entry",
-        "ambiguity_rule": "If only one audio entry exists, target that one. If multiple entries exist, target the BRIEF entry (short duration / no 'Deep Dive' label).",
+        "card_desc": "the Deep Dive · Short audio overview you generated",
+        "match_hint": "the one whose label says 'Deep Dive' with the SHORTEST duration of the Deep Dive entries (never a 'Brief' entry)",
+        "ambiguity_rule": "If only one audio entry exists, target that one. If multiple entries exist with similar Deep Dive labels, target the SHORTEST-DURATION Deep Dive entry.",
     },
     "default": {
         "card_desc": "the Deep Dive · Default audio overview you generated",
@@ -1004,8 +1009,10 @@ def make_prompt_audio_download(podcast_length: str = "long",
     prevention and >1 audio entry is visible, the read-only picker
     (_pick_nlm_audio_card) resolves WHICH entry (1-based, top-down DOM order)
     is the user-requested one and passes it here so the download targets that
-    exact card. Duration is NOT in the card text, so the picker uses format +
-    DOM order; this prompt restates the ordinal as the authoritative target.
+    exact card. The picker reads each card's format and, when the card shows
+    one, its duration (Short the shortest Deep dive, Long the longest; DOM
+    order otherwise); this prompt restates the ordinal as the authoritative
+    target.
     With the default (None — the happy single-card path) the prompt is
     BYTE-IDENTICAL to the prior version."""
     v = _PROMPT_AUDIO_TARGET_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_TARGET_VARIANTS["long"]

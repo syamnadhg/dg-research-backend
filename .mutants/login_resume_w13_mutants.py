@@ -14,6 +14,10 @@ itself when the login finishes.
        the note on disk and its liveness, this worker's waiting jobs, the
        resumed run spending the note, and the card coming down at the queue.
   S* — (review 09-30) a login open past 30 minutes keeps the run waiting.
+  K* — (review 09-30, round 3) a login killed where it stood: its sign-in
+       Chrome still open on the run's profile holds the run (and nothing else
+       does); its pid given to a younger program is not the login; the suite
+       keeps to its own home on Windows too (K7 mutates the test fixture).
 Driven through the real `run_pipeline` catching a real phase-2 / phase-3 /
 human-check raise, the real login marker helpers, the real resume helper and
 the real start listener (tests/test_login_auto_resume_w13.py).
@@ -49,8 +53,8 @@ MUTANTS = [
        "    if False:\n        _arm_login_auto_resume(_login_resume)\n")], LOGIN_T),
     ("A2", RESEARCH, "⛔ the run goes back on the queue while the login still has "
      "the browser — Chrome relaunches onto the profile being signed into",
-     [("        while _login_still_running():\n",
-       "        while False:\n")], LOGIN_T),
+     [("            if not _login_still_running():\n",
+       "            if True:\n")], LOGIN_T),
     ("A3", RESEARCH, "⛔⛔ a second resume path: the job is queued, but the files "
      "and the record are left paused — not what a Retry does",
      [("        resumed = await asyncio.to_thread(\n"
@@ -181,8 +185,8 @@ MUTANTS = [
     # ═══ S — review 09-30: a login left open a long time ═══════════════════
     ("S1", RESEARCH, "⛔⛔ a login open past 30 minutes counts as finished — the run "
      "starts again on the profile the login window has open",
-     [("        while _login_still_running():\n",
-       "        while _login_interrupt_active():\n")], LOGIN_T),
+     [("            if not _login_still_running():\n",
+       "            if not _login_interrupt_active():\n")], LOGIN_T),
     ("S2", RESEARCH, "a marker no process vouches for is believed for 12 hours",
      [("max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S if vouched else 30 * 60)",
        "max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S)")], LOGIN_T),
@@ -190,6 +194,34 @@ MUTANTS = [
      "run waiting for good",
      [("LOGIN_RESUME_LIVE_LOGIN_CAP_S = 12 * 3600", "LOGIN_RESUME_LIVE_LOGIN_CAP_S = 10 ** 9")],
      LOGIN_T),
+
+    # ═══ K — review 09-30 (round 3): a login killed where it stood ═════════
+    ("K1", RESEARCH, "⛔⛔ a killed login's sign-in Chrome is not waited for — the run "
+     "starts again onto the profile that Chrome still has open",
+     [("                if not await _login_left_chrome_open(profile, since):\n"
+       "                    break\n",
+       "                break\n")], LOGIN_T),
+    ("K2", RESEARCH, "⛔ a login that finished is waited on too — any Chrome on the "
+     "profile (this worker's next run) holds the paused run",
+     [("    if not _login_marker_path().exists():\n        return False\n"
+       "    if time.time() - since >= LOGIN_RESUME_LIVE_LOGIN_CAP_S:",
+       "    if time.time() - since >= LOGIN_RESUME_LIVE_LOGIN_CAP_S:")], LOGIN_T),
+    ("K3", RESEARCH, "a killed login's Chrome is waited for with no bound",
+     [("    if time.time() - since >= LOGIN_RESUME_LIVE_LOGIN_CAP_S:\n        return False\n",
+       "")], LOGIN_T),
+    ("K4", RESEARCH, "⛔ a Chrome on ANOTHER worker's profile holds this run",
+     [("        profile = str(_profile_dir(plan[\"worker_id\"]))\n",
+       "        profile = str(_profile_dir(plan[\"worker_id\"]).parent)\n")], LOGIN_T),
+    ("K5", RESEARCH, "⛔ a live pid is the login whenever it started — a younger program "
+     "given a killed login's number keeps the run waiting 12 hours",
+     [("                    if psutil.Process(pid).create_time() > started + 1:\n",
+       "                    if False:\n")], LOGIN_T),
+    ("K6", RESEARCH, "the login's marker does not say when the login started",
+     [("            data[\"started\"] = psutil.Process().create_time()\n",
+       "            pass\n")], LOGIN_T),
+    ("K7", "tests/test_login_auto_resume_w13.py", "⛔ the suite's home is HOME alone — on "
+     "Windows it writes, then deletes, the machine's REAL login marker",
+     [("    monkeypatch.setenv(\"USERPROFILE\", str(home))\n", "")], LOGIN_T),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

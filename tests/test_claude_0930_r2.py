@@ -277,6 +277,71 @@ def test_the_sources_rows_are_read_on_every_check_without_a_press(
     assert snaps["claude"].get("source_host_count") == 2, snaps
 
 
+def _rescue_block_source() -> str:
+    """The poll loop's one-shot vision rescue (Block 3), as the loop runs it."""
+    src = inspect.getsource(research.poll_all_agents_round_robin)
+    head = "            # ── Block 3: vision-extract source URLs from side panel ──\n"
+    tail = "                        p[\"vision_urls_done\"] = True  # don't retry on failure\n"
+    assert src.count(head) == 1 and src.count(tail) == 1, "the rescue block moved"
+    i = src.index(head)
+    block = textwrap.dedent(src[i:src.index(tail, i) + len(tail)])
+    return ("async def __rescue__(name, p, progress, elapsed):\n"
+            + textwrap.indent(block, "    "))
+
+
+def _run_rescue_block(chrome, p, progress, lines, monkeypatch):
+    """Run the rescue with the screenshot-and-model call replaced by a
+    recorder. Returns the calls it made."""
+    shots = []
+
+    async def _vision(page, agent_key, last_dom_count=0):
+        shots.append(agent_key)
+        return []
+
+    monkeypatch.setenv("DG_VISION_URL_EXTRACT", "1")
+    ns = dict(vars(research))
+    ns["log"] = lambda m, lv="INFO", *a, **k: lines.append((lv, str(m)))
+    ns["extract_source_urls_via_vision"] = _vision
+    exec(compile(_rescue_block_source(), "<rescue>", "exec"), ns)
+    chrome.run(ns["__rescue__"]("Claude", p, progress, 900))
+    return shots
+
+
+def test_the_vision_rescue_is_not_spent_once_the_research_panel_lists_sites(
+        chrome, open_page, lines, monkeypatch):
+    """⛔ 09-30 review: the rows reach `_claude_row_hosts` and never `sources`,
+    which stays 0 for Claude, so the one-shot vision rescue took a screenshot
+    and a model call on every Claude run and found nothing — the panel lists
+    sites, not urls. Driven in the order one check runs — the logs show the
+    rescue in the same check the panel first opened: the rows are read with the
+    panel shut, the panel is opened, then the rescue decides."""
+    page = open_page(running=True)
+    p = {"page": page}
+    progress = _run_sources_block(chrome, page, p, lines)
+    assert not p.get("_claude_row_hosts"), "the panel was shut: no rows yet"
+    assert chrome.run(research._claude_open_research_panel(page)).get("open") is True
+    p["artifact_panel_open"] = True
+    shots = _run_rescue_block(chrome, p, progress, lines, monkeypatch)
+    assert shots == [], (shots, lines)
+    assert list(p["_claude_row_hosts"]) == ["royalcanin.com", "petsmart.com"]
+    assert p.get("vision_urls_done") is True
+    assert any("vision-urls rescue not needed: the research panel lists 2 site(s)" in m
+               for _, m in lines), lines
+
+
+def test_an_open_panel_that_lists_no_sites_is_still_rescued(
+        chrome, open_page, lines, monkeypatch):
+    """The no-change guard: no sites kept, so the open panel's rescue runs as it
+    always has — once."""
+    page = open_page(running=True, panel="report")
+    p = {"page": page, "artifact_panel_open": True}
+    progress = _run_sources_block(chrome, page, p, lines)
+    shots = _run_rescue_block(chrome, p, progress, lines, monkeypatch)
+    assert shots == ["claude"], (shots, lines)
+    assert p.get("vision_urls_done") is True
+    assert not p.get("_claude_row_hosts")
+
+
 def test_the_steps_leave_claudes_left_sidebar_out(chrome, open_page, lines):
     """Capture 2's sidebar is an <aside aria-label="Sidebar">; on 09-30 the
     saved steps began "Artifacts", "Projects", "Pin projects to keep them

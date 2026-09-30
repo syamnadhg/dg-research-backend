@@ -307,7 +307,7 @@ def test_the_audio_download_leg_survived(audio_src, publish_src):
     SHARE one goes. The DOWNLOAD is the step that produces the file the phase
     now completes on — removing it would have deleted the artefact and the gate
     in one edit."""
-    assert "_nlm_open_audio_menu(browser.page)" in audio_src
+    assert "_nlm_open_audio_menu(browser.page, nth=_target_ord)" in audio_src
     assert 'want=("download",)' in audio_src
     assert "upload_audio_to_storage" in publish_src
     assert "_p3_publish_audio(audio_path" in audio_src, (

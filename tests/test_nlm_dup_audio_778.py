@@ -201,11 +201,12 @@ async def test_pick_long_targets_last_complete_deep_dive():
 
 
 @pytest.mark.asyncio
-async def test_pick_short_targets_brief_card():
-    # short → the Brief card (the non-deep-dive one), even if it's first.
+async def test_pick_short_targets_the_deep_dive_not_the_brief():
+    # Every length is a Deep dive (owner, 2026-09-30): short → the Deep dive
+    # card, never the Brief beside it.
     page = _FakePage(_cards((False, True, False), (True, False, False)))
     res = await research._pick_nlm_audio_card(page, "short")
-    assert res["target_ordinal"] == 1, "short must pick the Brief (non-deep-dive) card"
+    assert res["target_ordinal"] == 2, "short must pick the Deep dive, not the Brief"
 
 
 @pytest.mark.asyncio
@@ -243,13 +244,13 @@ async def test_pick_flags_all_generating_as_not_complete():
 
 
 @pytest.mark.asyncio
-async def test_pick_short_falls_back_to_non_deepdive_when_no_brief_label():
-    # An unlabeled (neither Brief nor Deep Dive) card alongside a Deep Dive: for
-    # short, the non-Deep-Dive card is the Brief target even without the literal
-    # "Brief" label.
+async def test_pick_short_takes_the_deep_dive_over_an_unlabeled_card():
+    # An unlabeled (neither Brief nor Deep Dive) card after a Deep Dive: short is
+    # a Deep dive now, so the Deep Dive card is the target, as for long.
     page = _FakePage(_cards((True, False, False), (False, False, False)))
     res = await research._pick_nlm_audio_card(page, "short")
-    assert res["target_ordinal"] == 2, "short must pick the non-deep-dive card as the Brief"
+    assert res["target_ordinal"] == 1, "short must pick the Deep dive card"
+    assert res["reason"] == "short→last deep-dive card", res["reason"]
 
 
 def test_download_prompt_default_omits_ordinal():

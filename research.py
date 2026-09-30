@@ -14061,9 +14061,17 @@ _DEFAULT_PHASE_MINUTES = {0: 0.2, 1: 27, 2: 55, 3: 15, 4: 8, 5: 4}
 # visible string ("5–10m typical"); the structured `expectedMinutes`
 # emit field uses the high end (FE displays a single number for the
 # progress-bar label, and overestimating beats underestimating —
-# avoids panicking the user when actual exceeds estimate). Matches the
-# Settings UI copy at FE settings/page.tsx ("Short ≈ 5–10 · Default ≈
-# 10–20 · Long ≈ 30–45").
+# avoids panicking the user when actual exceeds estimate). These are minutes
+# of GENERATION, not the audio's own length (which the Settings copy gives).
+# ⭐ 2026-09-30: short is Deep dive + Short now, no longer Brief (every length
+# is a Deep dive). Its (5, 10) is BRIEF's measured generation band carried
+# over (this machine's logs: Brief took 4.3–7.8 min over 7 runs); no Deep
+# dive + Short has been generated yet to measure. The same logs put Deep dive
+# + Long at 9.5–17.7 min over 5 runs, under the (30, 45) below, and its audio
+# at 39:05 and 53:50 (capture 5: 61:59), about twice the Settings copy's Long
+# ≈ 20–30 — so the Settings "Short ≈ 5–8" (half of Default, by the copy's own
+# Default→Long step) rests on a step no run has measured. Measure Short on the
+# next E2E, then set this, the Settings line and the support bullet together.
 _AUDIO_TYPICAL_RANGE_MIN = {
     "short":   (5, 10),
     "default": (10, 20),
@@ -36164,7 +36172,8 @@ except ValueError:
 
 def vision_url_rescue_should_run(*, agent, panel_open, elapsed_sec,
                                  dom_source_count, open_attempts_burned=0,
-                                 dom_misses=0, ever_opened=False) -> tuple:
+                                 dom_misses=0, ever_opened=False,
+                                 listed_sites=0) -> tuple:
     """Should the screenshot source-rescue run right now? Returns (bool, reason).
 
     ⛔⛔ THE DEFECT THIS FIXES IS THE SIGNATURE ONE IN THIS FILE: the rescue was
@@ -36202,11 +36211,20 @@ def vision_url_rescue_should_run(*, agent, panel_open, elapsed_sec,
     succeeds three times as often, and nothing has been measured about its
     never-opened case. Widening this to an unmeasured path is not a bug fix.
 
+    ⭐ 2026-09-30 round 3 — `listed_sites`, and it outranks every arm. Claude's
+    Research panel lists sites and their counts ("royalcanin.com 19 sources"),
+    not urls; the poll loop keeps them in `_claude_row_hosts`, never in
+    `sources`, which stays 0 for Claude. So the panel-open arm took a screenshot
+    and a model call on EVERY Claude run and found nothing. A run whose panel
+    has listed its sites is not rescued.
+
     Pure and module-level: the caller is a closure inside
     `poll_all_agents_round_robin`, which nothing in the suite executes, so a
     predicate written inline there could only ever be source-scanned — and
     mutation has already proved a source-scanned gate can ship inverted.
     """
+    if agent == "Claude" and int(listed_sites or 0) > 0:
+        return False, "panel-lists-sites"
     if agent in ("ChatGPT", "Claude") and panel_open:
         return True, "panel-open"
     if agent == "Gemini" and int(elapsed_sec or 0) > 120:
@@ -51730,6 +51748,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 _panel_open_now = bool(
                     p.get("chatgpt_activity_panel_open") if name == "ChatGPT"
                     else p.get("artifact_panel_open"))
+                # ⭐ 2026-09-30 round 3 — the sites Claude's Research panel has
+                # listed (the rows block above) stand for its sources here. The
+                # panel usually first opens in THIS check, after those rows were
+                # read with it shut, so an open panel with nothing kept yet is
+                # read once more — pressing nothing.
+                _listed_sites = 0
+                if name == "Claude":
+                    _cl_sites = p.setdefault("_claude_row_hosts", {})
+                    if _panel_open_now and not _cl_sites:
+                        _claude_fold_row_hosts(
+                            _cl_sites, await _claude_panel_source_rows(p["page"]))
+                    _listed_sites = len(_cl_sites)
                 _gate_ok, _gate_why = vision_url_rescue_should_run(
                     agent=name,
                     panel_open=_panel_open_now,
@@ -51742,7 +51772,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     open_attempts_burned=int(p.get("claude_panel_reopens", 0) or 0),
                     dom_misses=int(p.get("claude_artifact_dom_misses", 0) or 0),
                     ever_opened=bool(p.get("_claude_panel_ever_open")),
+                    listed_sites=_listed_sites,
                 )
+                if _gate_why == "panel-lists-sites":
+                    p["vision_urls_done"] = True
+                    log(f"[{name}] vision-urls rescue not needed: the research "
+                        f"panel lists {_listed_sites} site(s)", "INFO")
                 if _gate_ok:
                     if _gate_why.startswith("panel-never-opened"):
                         # The rescue firing on a never-opened panel is not
@@ -71127,9 +71162,10 @@ def _nlm_js(src: str) -> str:
 # The first scope is the same population `_count_nlm_audio_cards` and
 # `_pick_nlm_audio_card` already count — a visible <artifact-library-item>
 # carrying one of the `_NLM_AUDIO_ICONS` ligatures — so all three agree on what
-# an audio card is. WHICH audio card does not matter here: NotebookLM emits one
-# `/notebook/{id}` link for the notebook however you reach the share dialog, so
-# a duplicate changes nothing about the URL, only about whose menu opens.
+# an audio card is. WHICH audio card did not matter for Share: NotebookLM emits
+# one `/notebook/{id}` link for the notebook however you reach the share dialog.
+# It matters for the download, which saves that card's file — so the download
+# names the card the picker chose (`nth`, below).
 _NLM_AUDIO_MENU_SCOPES = [
     {"name": "audio-card", "sel": "artifact-library-item", "needs": list(_NLM_AUDIO_ICONS)},
     {"name": "artifact-item", "sel": "studio-panel artifact-library artifact-library-item", "needs": []},
@@ -71155,21 +71191,31 @@ _NLM_AUDIO_TRIGGER_SELS = [
 # collapsed or hidden panel needs no special case either: its buttons inherit
 # zero rects and fail the gate that matters, which is the one on the button
 # being clicked.
+#
+# `P.nth` (1-based, optional): the nth audio card only, counted as
+# `_pick_nlm_audio_card` counts them (a displayed card carrying an audio icon).
+# With it set, the wider scopes are never used and no other card's button
+# answers — the download of a picked card must not fall back to the topmost.
 _NLM_FIND_AUDIO_TRIGGER_JS = r"""
     const findTrigger = (P) => {
         for (const g of (P.scopes || [])) {
+            const counted = !!(g.needs && g.needs.length);
+            if (P.nth && !counted) continue;
+            let seen = 0;
             for (const scope of document.querySelectorAll(g.sel)) {
                 // `needs`: the card must carry ANY of these icon names.
-                if (g.needs && g.needs.length) {
+                if (counted) {
                     const st = (scope.innerText || scope.textContent || '');
                     if (!g.needs.some(n => st.indexOf(n) !== -1)) continue;
                 }
+                if (P.nth && (scope.offsetParent === null || ++seen !== P.nth)) continue;
                 for (const sel of (P.triggers || [])) {
                     for (const btn of scope.querySelectorAll(sel)) {
                         if (!onScreen(btn)) continue;
                         return { btn: btn, via: g.name, hook: sel };
                     }
                 }
+                if (P.nth) return null;
             }
         }
         return null;
@@ -71259,8 +71305,11 @@ _NLM_MENU_PICK_JS = (r"""(P) => {""" + _NLM_ONSCREEN_JS + _NLM_LABEL_JS + r"""
 }""")
 
 
-async def _nlm_open_audio_menu(page, label="Audio") -> dict:
+async def _nlm_open_audio_menu(page, label="Audio", nth=None) -> dict:
     """Open the AUDIO card's ⋮ menu — and prove it was that one.
+
+    `nth` (1-based) names which audio card when there are several — the
+    download picker's `target_ordinal`; unset, the first audio card's.
 
     Returns {opened, verified, via, hook, reason, outside}. `verified` is the
     only field a caller should act on: `opened` alone means a click landed, which
@@ -71270,7 +71319,8 @@ async def _nlm_open_audio_menu(page, label="Audio") -> dict:
     try:
         res = await page.evaluate(_NLM_OPEN_AUDIO_MENU_JS,
                                   {"scopes": _NLM_AUDIO_MENU_SCOPES,
-                                   "triggers": _NLM_AUDIO_TRIGGER_SELS}) or {}
+                                   "triggers": _NLM_AUDIO_TRIGGER_SELS,
+                                   "nth": nth}) or {}
     except Exception as _e:
         return {"opened": False, "verified": False, "via": "",
                 "reason": f"evaluate_failed:{type(_e).__name__}", "outside": 0}
@@ -71288,7 +71338,8 @@ async def _nlm_open_audio_menu(page, label="Audio") -> dict:
         try:
             chk = await page.evaluate(_NLM_AUDIO_MENU_VERIFY_JS,
                                       {"scopes": _NLM_AUDIO_MENU_SCOPES,
-                                       "triggers": _NLM_AUDIO_TRIGGER_SELS}) or {}
+                                       "triggers": _NLM_AUDIO_TRIGGER_SELS,
+                                       "nth": nth}) or {}
         except Exception as _e:
             chk = {}
             log(f"[{label}] audio ⋮ open-verify skipped: {_e}", "DEBUG")
@@ -72907,7 +72958,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # 2026-05-13: per-variant format + length names for log / narrator
         # / CUA task copy. Mirrors make_prompt_audio_generate's table.
         _variant_label = {
-            "short": ("Brief", "the Brief format (no separate length step)"),
+            "short": ("Deep dive", "Deep dive + Short length"),
             "default": ("Deep dive", "Deep dive + Default length"),
             "long": ("Deep dive", "Deep dive + Long length"),
         }.get(podcast_length, ("Deep dive", "Deep dive + Long length"))
@@ -73404,8 +73455,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # user-requested one. On the happy single-card path the ordinal is
         # omitted → the download prompt is byte-identical to before. When a
         # duplicate slipped past prevention the picker resolves the target by
-        # format + DOM order (duration is absent from the card) and the prompt
-        # is told to download ONLY that entry — so a dup never blocks delivery.
+        # format + the duration each card shows (DOM order when none shows one)
+        # and both the DOM rung below and the prompt download ONLY that entry —
+        # so a dup never blocks delivery.
         _pick = await _pick_nlm_audio_card(browser.page, podcast_length)
         _target_ord = _pick.get("target_ordinal") if _pick.get("count", 0) > 1 else None
         log(f"[Phase3] Download target: ordinal={_pick.get('target_ordinal')}/"
@@ -73464,9 +73516,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # Same shape as every other rung here: DOM first, CUA only if it misses.
         # Never by index — `Delete` is two rows away, so an ordinal click is one
         # layout change from destroying the user's audio instead of saving it.
+        # (The ROW is chosen by label. The CARD is the picker's: with two audio
+        # cards the menu opened is `_target_ord`'s, never simply the topmost.)
         _dl_via_dom = False
         try:
-            _dl_menu = await _nlm_open_audio_menu(browser.page)
+            _dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)
             if _dl_menu.get("verified"):
                 _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
                 # `blocked` is ADVISORY — the denied rows the picker filtered out
@@ -73548,10 +73602,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             interval=20)
         try:
             # 2026-05-14: length-aware download prompt — CUA targets the
-            # SAME card the generate step created (Brief / Deep Dive Default
-            # / Long Deep Dive), not the hardcoded Long + Deep Dive that
-            # would either not exist (short) or pick the wrong card if a
-            # parallel Deep Dive misclick existed (default).
+            # SAME card the generate step created (Deep Dive + Short / Default
+            # / Long since 2026-09-30; short was Brief before), not the
+            # hardcoded Long + Deep Dive that could pick the wrong card if a
+            # parallel Deep Dive misclick existed.
             _audio_dl_mission = make_prompt_audio_download(podcast_length, target_ordinal=_target_ord)
 
             async def _audio_download_cua():
@@ -74133,9 +74187,10 @@ _NLM_CANARY_STATE: set = set()
 # closes the window and starts the audio.
 
 # The configured podcast length → (Format, Length) in the page's own words.
-# "short" is Brief, which has no Length row. Anything unknown is the default.
+# ⭐ Every length is a Deep dive (owner, 2026-09-30): "short" is Deep dive +
+# Short, no longer Brief. Anything unknown is the default.
 _NLM_AUDIO_CHOICES = {
-    "short": ("Brief", None),
+    "short": ("Deep dive", "Short"),
     "default": ("Deep dive", "Default"),
     "long": ("Deep dive", "Long"),
 }
@@ -74143,7 +74198,7 @@ _NLM_AUDIO_CHOICES = {
 
 def _nlm_audio_choice(podcast_length) -> tuple:
     """(format, length) for a configured podcast length; Deep dive + Long by
-    default. `length` is None for Brief."""
+    default."""
     return _NLM_AUDIO_CHOICES.get(str(podcast_length or "long").lower(),
                                   _NLM_AUDIO_CHOICES["long"])
 
@@ -74334,6 +74389,25 @@ async def _nlm_customise_choose(page, op: str, want: str, wait_s: float = 4.0) -
         await asyncio.sleep(0.2)
 
 
+async def _nlm_deep_dive_took(page, wait_s: float = 3.0) -> dict:
+    """NotebookLM's own word that it took Deep dive: the Length row it redraws
+    for Deep dive offers Long, and no other format's does (Critique and Debate
+    offer Short and Default, Brief has no Length row). The format's radio alone
+    cannot say it — the browser checks it after any press on its row, even when
+    the app ignored the choice. {"ok": bool, "reason": str}."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        st = await _nlm_customise_read(page, "length", "Long")
+        opts = st.get("options") or []
+        if any(o.get("want") for o in opts):
+            return {"ok": True, "reason": ""}
+        if time.monotonic() >= deadline or not st.get("dialog"):
+            shown = ", ".join(o.get("name", "?") for o in opts) or "no Length row"
+            return {"ok": False,
+                    "reason": f"format reads Deep dive, but the Length row shows {shown}"}
+        await asyncio.sleep(0.2)
+
+
 #: How long the page watches for its own "Generate now" to show — the window
 #: closing, or the audio generating. A slow server reply can take longer than a
 #: few seconds. Only the log line depends on it: once the press landed, nothing
@@ -74357,11 +74431,14 @@ async def _nlm_customise_and_generate(page, podcast_length: str = "long") -> dic
            "reason": ""}
     # The format first: it redraws the Length row. Each choice is read back
     # before the next step, and the length's read-back is the last read before
-    # the press.
+    # the press. The format is read back twice: by its radio, and by the Length
+    # row the app redrew for it.
     for op, want in (("format", fmt), ("length", length)):
         if not want:
             continue
         r = await _nlm_customise_choose(page, op, want)
+        if r["ok"] and op == "format":
+            r = await _nlm_deep_dive_took(page)
         if not r["ok"]:
             res["reason"] = r["reason"]
             return res
@@ -74394,17 +74471,18 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     _count_nlm_audio_cards — visible <artifact-library-item> carrying the
     "audio_magic_eraser" Material-icon ligature.
 
-    Duration is NOT in the card text (confirmed user dump 2026-06-03: a completed
-    card reads "audio_magic_eraser <Title> Deep dive · N sources · <ago> ..." —
-    no MM:SS / "N min" token), so the pick uses FORMAT (Brief vs Deep dive, which
-    IS in the text) + DOM order:
-      - short        → the first BRIEF card (text lacks "deep dive"); falls back
-                       to the first complete card if no Brief label is present.
-      - long/default → the LAST complete Deep-dive card. The misclick default
-                       fires FIRST (so completes first) → the user-requested
-                       length is typically the LATER card. Best-effort;
-                       ambiguous=True whenever >1 Deep-dive card exists (they are
-                       indistinguishable by text).
+    Every length is a Deep dive (owner, 2026-09-30: short is Deep dive + Short,
+    no longer Brief), so the FORMAT alone cannot tell the requested card from a
+    second Deep dive. The DURATION can: the card's details line reads
+    "61:59 · Deep dive · 2 sources · 6h ago" (capture 5, 2026-09-30 — the
+    2026-06-03 dump had no duration, so it is read when shown, never required):
+      - short → the SHORTEST complete Deep-dive card that shows a duration.
+      - long  → the LONGEST one.
+      - default, or no Deep-dive card showing a duration → the LAST complete
+                Deep-dive card (the last card of any kind only when none reads
+                Deep dive). Card order is a guess: which card came later
+                depends on how the second one was made.
+    Ties go to the later card. ambiguous=True whenever >1 card exists.
 
     Returns {count, target_ordinal (1-based, top-down DOM order), complete,
     ambiguous, reason, snippet}. Best-effort and exception-safe: on any
@@ -74419,10 +74497,13 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
             const cards = items.map((el, i) => {
                 const t = (el.innerText || el.textContent || '');
                 const low = t.toLowerCase();
+                // "61:59 · Deep dive · …" or "1:02:03 · …" → seconds; null when
+                // the card shows no duration.
+                const d = /(?:(\d+):)?(\d{1,2}):(\d{2})\s*·/.exec(t);
                 return {
                     ordinal: i + 1,                                   // 1-based DOM order
                     isDeepDive: low.indexOf('deep dive') !== -1,
-                    isBrief: low.indexOf('brief') !== -1,
+                    seconds: d ? (+(d[1] || 0)) * 3600 + (+d[2]) * 60 + (+d[3]) : null,
                     // in-flight cards still show the "Generating Audio Overview…"
                     // text; a completed card does not.
                     generating: /generating audio overview/i.test(t),
@@ -74457,28 +74538,26 @@ async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
     _all_generating = not complete_cards
     length = (podcast_length or "long").lower()
 
-    if length == "short":
-        # Prefer an explicit "Brief" card; else any non-Deep-Dive card (the
-        # Brief can render before its label); else the first card. The requested
-        # short audio is Brief and the misclick default is Deep Dive, so
-        # excluding Deep Dive isolates the Brief.
-        explicit_brief = [c for c in cpool if c.get("isBrief")]
-        non_dd = [c for c in cpool if not c.get("isDeepDive")]
-        cand = explicit_brief or non_dd or cpool
-        target = cand[0]
-        reason = ("short→explicit Brief card" if explicit_brief
-                  else "short→first non-deep-dive card" if non_dd
-                  else "short→first card (no Brief label found)")
-    else:
-        # long/default → the LAST complete Deep-dive card. The dominant residual
-        # dup vector (a fail-open CUA body-misclick during the OPEN step) fires
-        # the default FIRST, so the user-requested card completes LATER → last.
-        # Best-effort + ambiguous when >1 (text can't distinguish two Deep
-        # Dives); worst case streams a valid complete Deep-dive podcast.
-        deep = [c for c in cpool if c.get("isDeepDive")]
-        cand = deep or cpool
-        target = cand[-1]
-        reason = f"{length}→last deep-dive card"
+    # Short and long → by the duration each Deep-dive card shows: Short is the
+    # shortest Deep dive and Long the longest, whichever came first. Card order
+    # cannot say it: a leftover or a misclick card may sit above or below the
+    # requested one. Default, or no duration shown → the LAST complete
+    # Deep-dive card, as before (short too since 2026-09-30; it was the first
+    # Brief card). Worst case streams a valid complete Deep-dive podcast.
+    deep = [c for c in cpool if c.get("isDeepDive")]
+    cand = deep or cpool
+    target = cand[-1]
+    reason = f"{length}→last deep-dive card"
+    timed = [c for c in deep if isinstance(c.get("seconds"), (int, float))]
+    if timed and length in ("short", "long"):
+        # Ties go to the later card, as the order rule above has it.
+        if length == "short":
+            target = min(timed, key=lambda c: (c["seconds"], -c["ordinal"]))
+        else:
+            target = max(timed, key=lambda c: (c["seconds"], c["ordinal"]))
+        _s = int(target["seconds"])
+        reason = (f"{length}→{'shortest' if length == 'short' else 'longest'} "
+                  f"deep-dive card ({_s // 60}:{_s % 60:02d})")
 
     return {
         "count": count,
@@ -74499,7 +74578,9 @@ async def _cleanup_nlm_keep_requested_audio(page, podcast_length: str = "long") 
     (pre-flight / post-generate / mid-poll). Retained only as reference for the
     old length-aware keep logic; slated for full removal under #771 (prod-grade
     cleanup). If you ever need NLM dedup, it MUST be detect-and-surface, never a
-    delete.
+    delete. Its "short" predicate below is the Brief short from before
+    2026-09-30 (short is Deep dive + Short now); nothing calls it, so nothing
+    in a run reads it.
 
     Strict-keep cleanup. Identifies the SINGLE NLM Studio audio card
     that matches the user-requested `podcast_length` and deletes every
@@ -87246,8 +87327,15 @@ def _write_login_marker() -> None:
     try:
         p = _login_marker_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"ts": int(time.time() * 1000), "pid": os.getpid()}),
-                     encoding="utf-8")
+        data = {"ts": int(time.time() * 1000), "pid": os.getpid()}
+        try:
+            # When this process started: the pid alone can be given out again
+            # once a killed login is gone (`_login_interrupt_active`).
+            import psutil
+            data["started"] = psutil.Process().create_time()
+        except Exception:
+            pass
+        p.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
 
@@ -87272,7 +87360,13 @@ def _login_interrupt_active(max_age_sec: int = 30 * 60) -> bool:
     minutes. The marker records the --login process pid (_write_login_marker);
     a recorded-but-dead pid means no login is in flight. Same liveness
     pattern as _enumerate_ongoing_runs' worker-lock check. Legacy/pid-less
-    markers keep the pure age check."""
+    markers keep the pure age check.
+
+    ⛔ A live pid is the login only if it is the same process: a killed
+    login's number can be given out again to a younger program (Windows reuses
+    them), which kept a paused run waiting up to 12 hours. The marker records
+    when the login started (`started`); a process under that pid that started
+    later is not the login. Markers without it keep the pid check alone."""
     try:
         p = _login_marker_path()
         if not p.exists():
@@ -87288,7 +87382,16 @@ def _login_interrupt_active(max_age_sec: int = 30 * 60) -> bool:
                 if not psutil.pid_exists(pid):
                     return False
             except Exception:
-                pass  # psutil unavailable → degrade to the age-only check
+                return True  # psutil unavailable → degrade to the age-only check
+            started = float(data.get("started") or 0)
+            if started > 0:
+                try:
+                    if psutil.Process(pid).create_time() > started + 1:
+                        return False
+                except psutil.NoSuchProcess:
+                    return False
+                except Exception:
+                    pass
         return True
     except Exception:
         return False
@@ -87390,16 +87493,47 @@ def _login_still_running() -> bool:
         max_age_sec=LOGIN_RESUME_LIVE_LOGIN_CAP_S if vouched else 30 * 60)
 
 
+async def _login_left_chrome_open(profile_dir: str, since: float) -> bool:
+    """Did a login that ended without clearing its marker leave its sign-in
+    Chrome open on this profile?
+
+    ⛔⛔ FOUND IN REVIEW (09-30). A login killed where it stood — its console
+    closed with the X on Windows, where nothing in the process runs on the way
+    out — clears neither its marker nor its sign-in Chrome, and that Chrome
+    (a program of its own) stays open on the worker's profile. The run was
+    started again at once, onto a profile a Chrome still held. A login that
+    ends normally closes its Chrome and then clears its marker, so this asks
+    only while the marker is still on disk; and not for longer than
+    `LOGIN_RESUME_LIVE_LOGIN_CAP_S` from `since`."""
+    if not _login_marker_path().exists():
+        return False
+    if time.time() - since >= LOGIN_RESUME_LIVE_LOGIN_CAP_S:
+        return False
+    return bool(await asyncio.to_thread(_chrome_procs_for_profile, profile_dir))
+
+
 async def _resume_after_login(plan: dict) -> str:
     """Wait for the login command to finish, then resume the run it paused.
 
     The login is over when its marker is gone (the login command clears it as
     it exits) or no longer counts (its process died, or the marker outlived its
-    cap) — `_login_still_running`. Returns what happened: "resumed", or the
-    verdict that kept the run where it is."""
+    cap) — `_login_still_running` — and, for a login that died without
+    clearing its marker, once no Chrome is left open on the run's own worker
+    profile (`_login_left_chrome_open`). Returns what happened: "resumed", or
+    the verdict that kept the run where it is."""
     with _machine_log_scope():
         rid8 = plan["research_id"][:8]
-        while _login_still_running():
+        profile = str(_profile_dir(plan["worker_id"]))
+        since, told = time.time(), False
+        while True:
+            if not _login_still_running():
+                if not await _login_left_chrome_open(profile, since):
+                    break
+                if not told:
+                    told = True
+                    log(f"[login-resume] {rid8}… the login ended with its Chrome still "
+                        f"open on this run's profile — continuing once it is closed",
+                        "INFO")
             await asyncio.sleep(LOGIN_RESUME_POLL_SEC)
         verdict = "unreadable"
         for _ in range(LOGIN_RESUME_READ_TRIES):

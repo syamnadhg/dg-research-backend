@@ -57,11 +57,13 @@ def chrome():
     loop.close()
 
 
-def _fixture_html(start="Deep dive", stuck="", dead=False, slow_ms=0) -> str:
+def _fixture_html(start="Deep dive", stuck="", dead=False, slow_ms=0, ignored="") -> str:
     src = (FIX / "customise.html").read_text(encoding="utf-8")
     body = 'data-start-format="Deep dive"'
     assert src.count(body) == 1, "the fixture's <body> switches moved"
     extra = f'data-start-format="{start}"'
+    if ignored:
+        extra += f' data-format-ignored="{ignored}"'
     if stuck:
         extra += f' data-length-stuck="{stuck}"'
     if dead:
@@ -158,10 +160,11 @@ def test_long_is_deep_dive_and_long_all_by_the_page(chrome, monkeypatch):
                'then "Generate now" pressed' in m for m in lines), lines
 
 
-def test_short_is_brief_with_no_length(chrome, monkeypatch):
-    """Brief has no Length row (capture frame 7); nothing waits for one."""
+def test_short_is_deep_dive_and_short(chrome, monkeypatch):
+    """Every length is a Deep dive (owner, 09-30): short is Deep dive + Short,
+    never Brief. The press lands on Short and Generate now makes Short."""
     presses, cua, lines = _run_audio(chrome, monkeypatch, "short")
-    assert presses == ["tile", "format:Brief", "generate-now:Brief|-"], (presses, lines)
+    assert presses == ["tile", "length:Short", "generate-now:Deep dive|Short"], (presses, lines)
     assert cua == []
 
 
@@ -199,6 +202,23 @@ def test_a_length_that_does_not_read_back_is_never_generated_by_the_page(chrome,
     _one_panel_open_handover(cua)
     assert any("The page could not finish Customise (length reads Default after "
                "choosing Long)" in m for m in lines), lines
+
+
+@pytest.mark.parametrize("length", ["short", "default"])
+def test_a_deep_dive_the_app_ignored_is_never_generated_by_the_page(chrome, monkeypatch,
+                                                                     length):
+    """⛔ 09-30 review: the format's radio reads checked after any press on its
+    row — the browser sets it, even when NotebookLM ignored the choice. Here the
+    window opens on Critique and the app ignores Deep dive: the radio reads Deep
+    dive, but Critique's Length row (Short, Default — never Long) stays, and its
+    Short or Default reads back as the chosen length. Generate now would make a
+    Critique; computer use takes the open window instead."""
+    presses, cua, lines = _run_audio(chrome, monkeypatch, length, start="Critique",
+                                     ignored="Deep dive")
+    assert presses == ["tile", "format:Deep dive"], (presses, lines)
+    _one_panel_open_handover(cua)
+    assert any("The page could not finish Customise (format reads Deep dive, but the "
+               "Length row shows Short, Default)" in m for m in lines), lines
 
 
 # ═════════════════════════════════════════════════════════════════════════════
