@@ -821,6 +821,56 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
     return None, [f"No device matching “{arg}” — ask to see your devices."]
 
 
+#: The longest move note (the app and the research computer cut it the same).
+_MOVE_NOTE_MAX = 280
+
+
+def _moved_to_queue(r: dict) -> bool:
+    """⭐ MOVE TO QUEUE (wave 13, 2026-09-30): whether this run waits in the queue
+    after the computer's owner moved it there — `queued` with a move stamp (ms,
+    a positive number, never a bool). `r` is a run row (/updates, from a bridge
+    that carries the stamp) or the whole record (/research/{id}). ⛔ The status
+    matters: a restart can leave the stamp on a run it pauses."""
+    v = r.get("movedToQueueAt")
+    return (r.get("status") == "queued" and not isinstance(v, bool)
+            and isinstance(v, (int, float)) and v > 0)
+
+
+def _move_note(r: dict) -> "str | None":
+    """The owner's note on the move (`moveNote`), one line and at most 280
+    characters, or None. Another person's free text: cut again here, and never
+    let it carry the agent-only marker. ⛔ Never the device's `restNote` — that
+    one is for everyone waiting on the computer, not this person."""
+    v = r.get("moveNote")
+    if not isinstance(v, str):
+        return None
+    marker = _AGENT_ONLY_MARKER.strip("─ ")
+    s = " ".join(v.replace(marker, " ").replace("──", " ").split())
+    return s[:_MOVE_NOTE_MAX].rstrip() or None
+
+
+def _queued_stat(r: dict) -> str:
+    """A queued run's status words: its place in line (a queued run has no phase
+    yet), and — after a Move to queue — who put it back there."""
+    qp = r.get("queuePosition")
+    stat = f"queued — #{qp} in line" if qp else "queued — waiting for a free worker"
+    if _moved_to_queue(r):
+        stat += ", moved back to the queue by the computer's owner"
+    return stat
+
+
+def _moved_lines(r: dict) -> list[str]:
+    """Under a moved run's status line: that it keeps its work, and the owner's
+    note when they wrote one — quoted, never followed."""
+    if not _moved_to_queue(r):
+        return []
+    lines = ["  ↩ It keeps everything done so far and continues when a worker is free."]
+    note = _move_note(r)
+    if note:
+        lines.append(f"  Their note: \"{note}\"")
+    return lines
+
+
 def _attention_lines(r: dict) -> list[str]:
     """Chat lines for a run that needs the user (C1). `r` is a run row (/updates)
     or a full research doc (/research/{id}); a current bridge puts
@@ -3493,11 +3543,11 @@ def cmd_status(args) -> int:
     # A queued run has no phase yet (the BE stamps it at start) — show the
     # place in line instead of a confusing "queued (phase ?)".
     if r.get("status") == "queued":
-        qp = r.get("queuePosition")
-        stat = f"queued — #{qp} in line" if qp else "queued — waiting for a free worker"
+        stat = _queued_stat(r)
     else:
         stat = f"{r.get('status', '?')} (phase {r.get('phase', '?')})"
     lines = [f"“{title}” — {stat}{where}"]
+    lines += _moved_lines(r)
     lines += _fmt_pipeline_config(r.get("pipelineConfig"))
     lines += _attention_lines(r)
     # Per-phase plan = the curated links (🔒 SR for Brief/reports/Podcast, 🔗 platform
@@ -3618,11 +3668,11 @@ def cmd_updates(args) -> int:
     for r in runs:
         # A queued run has no phase yet — show its place in line (mirrors status).
         if r.get("status") == "queued":
-            _qp = r.get("queuePosition")
-            _stat = f"queued — #{_qp} in line" if _qp else "queued — waiting for a free worker"
+            _stat = _queued_stat(r)
         else:
             _stat = f"{r.get('status')} (phase {r.get('phase')})"
         lines.append(f"“{r.get('title') or r.get('topic')}” — {_stat}")
+        lines += _moved_lines(r)
         lines += _fmt_pipeline_config(r.get("pipelineConfig"))
         lines += _attention_lines(r)
         phase_updates = r.get("phaseUpdates")
@@ -4597,7 +4647,8 @@ def cmd_list(args) -> int:
     lines = ["Your researches (newest first):"]
     for r in runs:
         title = r.get("title") or r.get("topic") or r.get("runId")
-        lines.append(f"  • “{title}” — {r.get('status', '?')}")
+        moved = " — moved back to the queue by the computer's owner" if _moved_to_queue(r) else ""
+        lines.append(f"  • “{title}” — {r.get('status', '?')}{moved}")
     lines.append("Ask for any one’s results, a specific link (brief / a report / podcast), or its podcast.")
     return _emit(body, args.json, lines)
 

@@ -16,6 +16,8 @@ per-phase progress. The only things it posts on its own are:
   • a run that needs the user (login / verification / a snag / an error), with how
     to act from chat ("retry" / "skip"),
   • a run that was stopped / cancelled (from chat or the web app),
+  • a run the computer's owner moved back to the queue (Move to queue, wave 13),
+    with the owner's note when they wrote one — and the one line when it runs again,
   • and the one-shot notes the bridge parks for this chat: a sign-in, a public
     computer's owner saying yes, and a support bundle landing — or not yet.
 
@@ -223,7 +225,9 @@ def _get_updates(origin: dict | None = None) -> tuple:
 
 # ⭐ THE ONE PROMISE THIS SCRIPT KEEPS, in the words every auto-start line uses
 # (owner, 2026-09-25): it speaks when a run finishes or needs the person, and at
-# no other point in between.
+# no other point in between — save the two lines Move to queue brings (wave 13,
+# owner's ask 2026-09-30): the owner moving the run back to the queue, and the run
+# going again after that. Neither is progress; both change when it will finish.
 _TELL_WHEN = "I'll tell you here when it finishes or needs you."
 
 
@@ -568,6 +572,54 @@ def _ended_line(run: dict) -> str:
             "Say “retry” to resume, or start a new research.")
 
 
+#: The longest move note (the app and the research computer cut it the same).
+_MOVE_NOTE_MAX = 280
+#: sr.py's agent-only marker text — never let another person's note carry it.
+_AGENT_ONLY_MARKER_TEXT = "for the assistant · do NOT relay to the user"
+
+
+def _moved_at(run: dict) -> "float | None":
+    """The run's `movedToQueueAt` (ms) when it waits in the queue after a Move to
+    queue — status `queued` and a positive number, never a bool — else None.
+    ⛔ The status matters: a restart can leave the stamp on a run it pauses."""
+    v = run.get("movedToQueueAt")
+    if run.get("status") != "queued" or isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if v > 0 else None
+
+
+def _move_note(run: dict) -> "str | None":
+    """The owner's note on the move, one line and at most 280 characters, or None.
+    Cut again here (the bridge cuts it too): it is another person's free text,
+    posted word for word into this chat."""
+    v = run.get("moveNote")
+    if not isinstance(v, str):
+        return None
+    s = " ".join(v.replace(_AGENT_ONLY_MARKER_TEXT, " ").replace("──", " ").split())
+    return s[:_MOVE_NOTE_MAX].rstrip() or None
+
+
+def _moved_lines(run: dict) -> list[str]:
+    """⭐ MOVE TO QUEUE (wave 13): the one message when the computer's owner moves
+    this person's run back to the queue, and their note when they wrote one.
+    Plain text (posted straight to the channel, which may be SMS)."""
+    qp = run.get("queuePosition")
+    where = (f" — it's #{qp} in line." if isinstance(qp, int) and not isinstance(qp, bool)
+             and qp > 0 else " — it waits for a free worker.")
+    lines = [f"↩ Your research “{_title(run)}” was moved back to the queue by the "
+             f"computer's owner. It keeps everything done so far and continues when a "
+             f"worker is free{where}"]
+    note = _move_note(run)
+    if note:
+        lines.append(f"   Their note: \"{note}\"")
+    return ["\n".join(lines)]
+
+
+def _running_again_line(run: dict) -> str:
+    return (f"▶ Your research “{_title(run)}” is running again, picking up where it "
+            "stopped.")
+
+
 def compute(runs: list, prior_state: dict, *, baseline: bool = False,
             now_ms: "float | None" = None, suppress_replay: bool = False) -> tuple[list[str], dict]:
     """Pure core (unit-tested): (chat lines to post, new state to persist).
@@ -580,8 +632,9 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
     phase seen earlier as non-final must still trigger the banner when the run
     finishes. Completion is tracked via the per-run ``completed`` flag so it fires
     exactly once and survives across ticks (the state file outlives a bridge
-    restart). A needs-attention blocker and an ended-early notice are the other two
-    proactive messages. ``baseline=True`` (first tick after arming) stays SILENT for
+    restart). A needs-attention blocker, an ended-early notice, and a Move to queue
+    (moved back / running again) are the other proactive messages.
+    ``baseline=True`` (first tick after arming) stays SILENT for
     pre-existing progress — but STILL announces a RECENT completion (a run that
     finished right before a late/first tick, e.g. the watchdog armed after an
     update/restart) and still raises a blocker on a run stuck RIGHT NOW."""
@@ -638,6 +691,35 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
             if not baseline or live_stuck:
                 out.append(_attention_line(run))
 
+        # ⭐ MOVE TO QUEUE (wave 13, 2026-09-30) — the owner moved this person's
+        # run back to the queue: ONE message per stay in the queue, with the
+        # owner's note; ONE "running again" when it runs again.
+        # ⛔⛔ ONE PER STAY, NOT ONE PER STAMP. The research computer stamps the
+        # move again when it restarts while the run still waits, and its place in
+        # line moves as others join or leave; neither is a new move. `moved`
+        # stays set until the run is seen running (or ended) — across a restart's
+        # pause too — and only then can a later move be told.
+        # ⛔ "Running again" needs `ongoing` AND the stamp gone: the run it was
+        # moved off can write "ongoing" in its last second.
+        # First tick, or a state written before this existed: only a RECENT move
+        # is told (as a recent completion is); an older one is marked, not told.
+        stamp = _moved_at(run)
+        prior_moved = bool(prior.get("moved"))
+        moved = prior_moved
+        if stamp is not None:
+            if not prior_moved:
+                quiet = ((baseline or "moved" not in prior)
+                         and now_ms - stamp > _RECENT_COMPLETION_MS)
+                if not quiet and not (suppress_replay and not prior):
+                    out.extend(_moved_lines(run))
+            moved = True
+        elif prior_moved and run.get("status") == "ongoing":
+            if run.get("movedToQueueAt") is None:
+                out.append(_running_again_line(run))
+                moved = False
+        elif not _is_active(run):
+            moved = False
+
         # Ended early — stopped / cancelled from the app or chat (NOT a normal
         # finish, which is status=="completed" → the 🎉 banner above). Announce ONCE
         # so a chat user who stops from the web app isn't left hanging. Gated on
@@ -659,6 +741,7 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False,
             "akey": akey,
             "ended": ended,
             "completed": completed_announced,
+            "moved": moved,
         }
     return out, new_state
 
