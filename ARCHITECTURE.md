@@ -570,14 +570,14 @@ against paid third-party services.
 | at the will-not-do decision (2026-08-05) | ~58,800 |
 | at 2026-08-25 | 75,965 |
 | at 2026-08-28, after the share step came out | 74,663 |
-| **today (2026-09-19)** | **83,374** |
-| the seven sibling modules, between them | 7,077 |
+| at 2026-09-19 | 83,374 |
+| **today (2026-09-30)** | **96,156** |
+| the seven sibling modules, between them | 7,249 |
 
-So the file has grown by roughly **42%** in the forty-five days since the
-decision, and holds **88%** of the non-test Python outside `agent/` (the figure
-this row carried before named no denominator; counting the agent package's own
-sources it is 71%, and the number only means something with the boundary
-stated). An unbounded trajectory is a real objection and none of the reasoning
+So the file has grown by roughly **64%** in the fifty-six days since the
+decision, and holds **93%** of the non-test Python outside `agent/` (counting
+the agent package's own tracked sources it is 72%; the number only means
+something with the boundary stated). An unbounded trajectory is a real objection and none of the reasoning
 above answers it.
 
 ⭐ **The only fall on record is the step between the 2026-08-25 and 2026-08-28
