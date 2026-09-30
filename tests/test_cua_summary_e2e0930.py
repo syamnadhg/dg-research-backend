@@ -174,3 +174,20 @@ def test_the_purpose_does_not_leak_past_its_call(run):
     asyncio.run(run.direct(1, prompt=research.PROMPT_DIAGNOSE, phase=2, agent="chatgpt"))
     research._dom_summary()
     assert "[cua-summary]   p2 chatgpt · diagnose: 1 time, 1 step" in _summary(run.lines)
+
+
+def test_a_vision_step_that_acts_is_counted_too(run, monkeypatch):
+    """With the vision tier acting (DG_VISION_TIER=act), the vision model can
+    finish a step without any computer use; that read is counted under the
+    same step name."""
+    async def _act_loop(page, **kw):
+        return SimpleNamespace(action="declare_success", reason="panel open")
+
+    monkeypatch.setattr(research, "_vision", SimpleNamespace(
+        is_vision_enabled=lambda: "tier2", act_loop=_act_loop, ACT_MAX_STEPS_DEFAULT=3))
+    out = asyncio.run(run.dispatched(2, phase=1, platform="phase1",
+                                     step="open_activity_panel_p1"))
+    assert out["status"] == "vision_success", out
+    research._dom_summary()
+    assert _summary(run.lines)[1:] == [
+        "[cua-summary]   p1 chatgpt · open activity panel p1: 1 vision read"]
