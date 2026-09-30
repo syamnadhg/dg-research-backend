@@ -79,11 +79,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
        '            research_id: "str | None" = None, **kwargs) -> bool:')], [T], SRC),
     ("F3", "over", "⭐ the id guard reverts to the shape that rejects EVERY real "
      "id — a feature that silently never works",
-     [('RESEARCH_ID_RE = re.compile(r"^chat_[0-9]{13}_[0-9]{1,6}$")',
+     [('RESEARCH_ID_RE = re.compile(r"^(?:chat_[0-9]{13}_[0-9]{1,6}|agent-[0-9a-f]{16})$")',
        'RESEARCH_ID_RE = re.compile(r"^[A-Za-z0-9]{20}$")')], [T], SRC),
     ("F4", "under", "the id guard accepts anything, so a topic arrives by looking "
      "vaguely id-shaped",
-     [('RESEARCH_ID_RE = re.compile(r"^chat_[0-9]{13}_[0-9]{1,6}$")',
+     [('RESEARCH_ID_RE = re.compile(r"^(?:chat_[0-9]{13}_[0-9]{1,6}|agent-[0-9a-f]{16})$")',
        'RESEARCH_ID_RE = re.compile(r"^.*$")')], [T], SRC),
     ("F5", "under", "the run_id suffix denial goes, and a one-word topic survives "
      "safe_name as bare alphanumerics",

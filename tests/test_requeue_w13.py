@@ -470,6 +470,67 @@ def test_a_second_move_of_the_same_run_is_a_no_op(monkeypatch, tmp_path):
     assert len(_said(m, "REQUEUE: ignored", "already restarting")) == 1, m.lines
 
 
+# ══ 1b. a refused move says why, where the app can show it (w13 low) ═══════
+#
+# ⛔ The app rests the worker BEFORE it sends the command, so a refused move left
+# the worker off with the run still going and nothing on screen to say why. The
+# worker now writes `requeueRefusal: {runId, workerId, reason, at}` to its own
+# device document (the app lane's rules clause and popup read exactly this).
+
+def _refusals(m):
+    return [u for u in m.store.device_updates if "requeueRefusal" in u]
+
+
+def _refused_by(reason, monkeypatch, tmp_path):
+    """A running run, set up so worker 2 refuses the move for `reason`."""
+    import shutil
+    if reason == "private-run":
+        rid = f"incog_{int(time.time() * 1000)}_7"
+        m, _j, _f = _running(monkeypatch, tmp_path, rid=rid)
+        return m, _requeue(researchId=rid), rid
+    m, _j, folder = _running(monkeypatch, tmp_path, supervised=reason != "not-on-startup")
+    if reason == "in-the-cloud":
+        (folder / "delivery.json").write_text(json.dumps({"status": "completed"}),
+                                              encoding="utf-8")
+    if reason == "nothing-saved":
+        shutil.rmtree(folder)
+    over = {"not-owner": dict(submittedBy=SHARER),
+            "not-running-here": dict(researchId=OTHER_RID)}.get(reason, {})
+    return m, _requeue(**over), over.get("researchId", RID)
+
+
+@pytest.mark.parametrize("reason", ["not-owner", "not-running-here", "private-run",
+                                    "in-the-cloud", "not-on-startup", "nothing-saved"])
+def test_a_refused_move_tells_the_app_why(monkeypatch, tmp_path, reason):
+    m, cmd, rid = _refused_by(reason, monkeypatch, tmp_path)
+    before = int(time.time() * 1000)
+    _command(monkeypatch, m, cmd)
+    after = int(time.time() * 1000)
+    assert m.exits == [], "the move was refused, yet the worker restarted"
+    got = _refusals(m)
+    assert len(got) == 1, m.store.device_updates
+    # ⛔ An update of its own: exactly one key, so a rules deploy that lags this
+    # key can never cost the rest-the-worker write.
+    assert list(got[0]) == ["requeueRefusal"], got
+    refusal = dict(got[0]["requeueRefusal"])
+    at = refusal.pop("at")
+    assert refusal == {"runId": rid, "workerId": 2, "reason": reason}, refusal
+    assert isinstance(at, int) and before <= at <= after, at
+
+
+def test_a_move_that_goes_through_clears_an_earlier_refusal(monkeypatch, tmp_path):
+    """Beside the refusals: the move that works clears what an earlier refusal
+    left, and a second press while the worker is leaving writes no refusal."""
+    m, _job_, _folder = _running(monkeypatch, tmp_path)
+    _command(monkeypatch, m, _requeue())
+    assert m.exits == ["requeue"]
+    assert _refusals(m) == [{"requeueRefusal": research._crun_delete_field()}], (
+        m.store.device_updates)
+    monkeypatch.setattr(research, "_exit_scheduled", True)
+    _command(monkeypatch, m, _requeue())
+    assert len(_refusals(m)) == 1, "a second press while leaving was shown as a refusal"
+
+
 # ══ 2. the next worker that is ON takes it — first ══════════════════════════
 
 def _rescan(monkeypatch, m, *, resting=False, fleet=2):

@@ -467,6 +467,47 @@ def test_refused_receipts_never_latch_the_heal_or_blame_the_pairing(env):
     assert research._update_research_doc(SHARER, RID, {"status": "ongoing"}) is True
 
 
+def _stale_token(fs, *, remint_heals=True):
+    """This computer's cached token in the known stale shape: no deviceId
+    claim. A re-mint brings the claim back (or, `remint_heals=False`, does not)."""
+    creds = fs._credentials
+    creds.token = _mk_token({"ownerUid": OWNER})
+    counted = creds.refresh
+
+    def refresh(request):
+        counted(request)
+        if remint_heals:
+            creds.token = _mk_token({"deviceId": DEV, "ownerUid": OWNER})
+    creds.refresh = refresh
+
+
+def test_a_receipt_refused_only_for_a_stale_token_lands_after_one_re_mint(env):
+    """⭐ w13 low. The owner's own receipt, refused only because this computer's
+    cached token lacked its deviceId claim, was dropped for good: `heal=False`
+    skipped the re-mint that clears exactly that. It gets ONE re-mint now — and
+    the research writes' net is untouched: no cooldown stamp (a research write
+    ten seconds later still gets its own re-mint), no count, no latch."""
+    fs, clock, lines = env
+    _stale_token(fs)
+    assert research._open_log_bundle_row(OWNER, CODES[0], DEV) is True
+    assert f"users/{OWNER}/logBundles/{CODES[0]}" in fs.docs
+    assert fs._credentials.refresh_calls == 1
+    assert research._grpc_heal_last_ts == 0.0, "the receipt stamped the research writes' cooldown"
+    assert research._grpc_heal_consec_fail == 0 and research._grpc_heal_structural is False
+    clock.t += 10
+    fs.research_stale = True
+    assert research._update_research_doc(SHARER, RID, {"status": "ongoing"}) is True
+    assert fs._credentials.refresh_calls == 2
+
+
+def test_a_stale_token_the_re_mint_does_not_fix_costs_one_re_mint_and_is_final(env):
+    fs, clock, lines = env
+    _stale_token(fs, remint_heals=False)
+    assert research._open_log_bundle_row(OWNER, CODES[0], DEV) is False
+    assert fs._credentials.refresh_calls == 1
+    assert research._grpc_heal_consec_fail == 0 and research._grpc_heal_structural is False
+
+
 def test_the_live_writer_still_says_when_a_receipt_failed(env):
     fs, clock, lines = env
     assert research._write_log_bundle_status(EXSHARER, CODES[0], {"status": "done"}) is False

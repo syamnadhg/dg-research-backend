@@ -347,3 +347,33 @@ def test_an_incognito_runs_lifecycle_events_do_not_name_it(spool):
     assert "research_id" not in by_ev[int(tm.Ev.RUN_STARTED)]
     assert "research_id" not in by_ev[int(tm.Ev.RUN_FINISHED)]
     assert not any(e["ev"] == int(tm.Ev.TELEMETRY_INVALID) for e in events)
+
+
+# ══ 5. the chat assistant's runs (wave 13 low) ═════════════════════════════
+# The agent bridge mints `"agent-" + uuid4().hex[:16]` (agent/facade/bridge.py).
+# The owner's 0.1.13 bundle: every event of agent-1b6398fe35be4559 was refused
+# ("RUN_STARTED rejected field research_id (wrong type)"), so no event named it.
+AGENT = "agent-1b6398fe35be4559"
+
+
+def test_a_chat_assistant_runs_events_name_it(monkeypatch, spool):
+    """All three emitters, run for real: the capture's start and finish, and
+    the per-event tap."""
+    with research._RunLogCapture(research_id=AGENT):
+        _arm(monkeypatch, AGENT)
+        research._tm_note_event("phase_start", phase=1, agent="chatgpt")
+    events = spool()
+    by_ev = {e["ev"]: e["d"] for e in events}
+    for ev in (tm.Ev.RUN_STARTED, tm.Ev.PHASE_START, tm.Ev.RUN_FINISHED):
+        assert by_ev[int(ev)].get("research_id") == AGENT, (ev, events)
+    assert not any(e["ev"] == int(tm.Ev.TELEMETRY_INVALID) for e in events)
+
+
+@pytest.mark.parametrize("hostile", [
+    "agent-1b6398fe35be455", "agent-1b6398fe35be45590", "agent-1B6398FE35BE4559",
+    "agent-kalki2898adbox0", "agent_1b6398fe35be4559", "agent-1b6398fe35be4559_x",
+    f"{AGENT}_20260921_014618"])
+def test_only_the_assistants_exact_shape_is_admitted(hostile):
+    """The widened guard admits the minted shape and nothing near it."""
+    with pytest.raises(tm.TelemetryFieldError):
+        tm.coerce_field("research_id", hostile)

@@ -90,6 +90,19 @@ from urllib.parse import urlparse, urlsplit
 # problem can still export `GRPC_VERBOSITY=DEBUG` and be obeyed.
 # ⚠ ERROR, not NONE: a genuine gRPC failure must still reach the log.
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+# ⛔ AND gRPC'S FORK SUPPORT IS OFF (wave 13), read at the same moment. grpcio
+# ships it ON, so every `subprocess` fork re-starts gRPC's poller INSIDE THE
+# CHILD, in the moment before the child execs its program. Measured on this
+# Mac (grpcio 1.84, Python 3.13): 2,656 of 3,000 plain `sh -c 'exit 0'` children
+# of a process holding a Firestore-style stream printed ev_poll_posix.cc lines
+# from that moment. The same file's line 659 is the owner's
+# "F… ev_poll_posix.cc:659] Check failed: wakeup_fd_->ConsumeWakeup().ok()"
+# (08-25, 09-16, 09-29 — the last two at the second the browser was launched):
+# that poller racing the exec and aborting the half-born child. Fork support
+# is only for a child that goes on USING gRPC after a fork, and nothing here
+# does — every fork here is subprocess's fork-then-exec. Off, no child runs any
+# gRPC code (0 of 3,000) and the parent's calls are unchanged.
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
 # Explicit, NOT `from prompts import *` (DGOPS-9508). A star import blinds ruff to
 # undefined names in this whole file: it cannot resolve the import, so it downgrades
 # every unresolved global from `F821 undefined-name` to the far weaker
@@ -8736,7 +8749,27 @@ def _grpc_write_with_heal(op, *, what: str, uid: "str | None" = None,
             if not _is_synth_permission_denied(_plain_e, ignore=exc):
                 raise
         if not heal:
-            raise  # the original denial — the free retry is all this write gets
+            # ⭐ ONE EXCEPTION (wave 13): a token that visibly lacks its deviceId
+            # claim — the known stale shape, which a re-mint CLEARS — gets ONE
+            # re-mint and one retry, so this computer's own stale credential
+            # does not drop a receipt for good. Still no cooldown stamp, no
+            # count toward the latch and no latch cleared: the research writes'
+            # net is left exactly as it was. A token that carries the claim (all
+            # 1,314 refused receipts in the owner's 0.1.13 logs) gets nothing more.
+            creds = getattr(_firebase_db, "_credentials", None)
+            if creds is None or _grpc_token_claims().get("deviceId"):
+                raise  # the original denial — the free retry is all this write gets
+            try:
+                creds.refresh(None)
+                reminted = True
+            except Exception as ref_e:
+                log(f"[grpc-heal] {what}: re-mint failed: {ref_e}", "DEBUG")
+                reminted = False
+            if not reminted:
+                raise  # the original denial
+            log(f"[grpc-heal] {what}: the token had no deviceId claim — re-minted "
+                f"once and retrying", "INFO")
+            return op()
         # Throttle + structural latch under the lock so concurrent worker
         # threads can't all slip past the cooldown and fire simultaneous heals.
         with _grpc_heal_lock:
@@ -9949,7 +9982,57 @@ def _requeue_target_worker(data) -> int:
     return n if 1 <= n <= fleet else 1
 
 
+#: ⭐ WHY A "MOVE TO QUEUE" WAS REFUSED, as the app is told it — the handler's
+#: own word on the left, the fixed code the app shows on the right. A refused
+#: move used to leave the worker off (the app rests it before it sends the
+#: command) with nothing on the screen to say why the run kept going.
+#: ⛔ CONTRACT WITH THE APP (its rules clause and its popup): the device
+#: document's `requeueRefusal` = {runId, workerId, reason, at}, `at` in epoch
+#: milliseconds, `reason` one of these six values. "exiting" is not here: a
+#: second press while the worker is already leaving is the move succeeding.
+_REQUEUE_REFUSAL_REASONS = {
+    "not-owner": "not-owner",
+    "not-running-here": "not-running-here",
+    "keeps-nothing": "private-run",
+    "handed-off": "in-the-cloud",
+    "not-supervised": "not-on-startup",
+    "not-saved": "nothing-saved",
+}
+
+
+def _note_requeue_refusal(rid: str, reason: "str | None") -> None:
+    """Tell the app why this worker refused a move (`reason`, a code from
+    `_REQUEUE_REFUSAL_REASONS`), or clear an earlier refusal (`None`).
+
+    ⛔ IN AN UPDATE OF ITS OWN, like `capabilities`: `hasOnly` refuses a whole
+    update over one key the deployed rules do not admit yet, and this key must
+    never cost the rest-the-worker write beside it. Best-effort: a refusal the
+    app cannot be told is still logged in one line by the handler."""
+    try:
+        did = load_device_id()
+        if _firebase_db is None or not did:
+            return
+        value = (_crun_delete_field() if reason is None else {
+            "runId": rid, "workerId": int(WORKER_ID), "reason": reason,
+            "at": int(time.time() * 1000)})
+        _firebase_db.collection("devices").document(did).update(
+            {"requeueRefusal": value})
+    except Exception as e:
+        log(f"[device-cmds] REQUEUE: could not tell the app ({reason or 'clear'}): "
+            f"{e}", "DEBUG")
+
+
 def _handle_requeue_command(data) -> str:
+    """"Move to queue", on the worker the command names — and, when it is
+    refused, the reason written where the app can show it."""
+    outcome = _move_run_to_queue(data)
+    reason = _REQUEUE_REFUSAL_REASONS.get(outcome)
+    if reason:
+        _note_requeue_refusal(str((data or {}).get("researchId") or "").strip(), reason)
+    return outcome
+
+
+def _move_run_to_queue(data) -> str:
     """"Move to queue", on the worker the command names. What it did, as one
     word — the tests and the log both read it.
 
@@ -10006,6 +10089,7 @@ def _handle_requeue_command(data) -> str:
     _forget_running_job_in_snapshot()
     _update_research_doc(uid, rid, _waiting_record_patch())
     _keep_worker_resting(WORKER_ID)
+    _note_requeue_refusal(rid, None)   # a refusal shown earlier no longer holds
     _publish_queue_positions_now()
     try:
         left = _wait_for_uploads_to_settle(max_wait_s=5.0)
