@@ -59,7 +59,9 @@ dependencies = [
     # so floor to the current line (2026-06-30: patchright 1.61.1 / playwright
     # 1.61.0). Keep in sync with requirements.txt.
     "playwright>=1.61",
-    "patchright>=1.61",
+    # ⛔ patchright 1.62.3+: 1.61.1's Windows driver ran our scripts in the
+    # page's own world (see requirements.txt). Keep in sync with it.
+    "patchright>=1.62.3",
     "markdownify>=1.2",
     "requests>=2.32",
     # ⛔ DIRECT, not incidental. The wave-4 document-image path imports urllib3

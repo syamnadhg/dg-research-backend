@@ -19654,9 +19654,11 @@ def _supervisor_is_my_parent() -> bool:
     # 1 is init/launchd re-parenting after the real parent died; 0 is not a pid.
     if ppid <= 1:
         return False
+    # ⛔ Or the process above this worker's own venv launcher (Windows).
+    above_launcher = _venv_launcher_parent(ppid)
     try:
         for pid, _cmd, role in _enumerate_research_py_procs():
-            if pid == ppid and role == "daemon-loop":
+            if (pid == ppid or pid == above_launcher) and role == "daemon-loop":
                 return True
     except Exception as _e:
         # Assume foreground. The failure mode of guessing "supervised" is an
@@ -19664,6 +19666,33 @@ def _supervisor_is_my_parent() -> bool:
         # that logs loudly. Only one of those is survivable.
         log(f"[reconnect] supervisor probe failed ({_e}) — assuming foreground", "DEBUG")
     return False
+
+
+def _venv_launcher_parent(ppid) -> "int | None":
+    """The pid ABOVE a venv launcher that started this process, or None.
+
+    ⛔ ON WINDOWS A VENV'S `Scripts\\python.exe` IS A LAUNCHER (Windows review of
+    wave 13, 2026-09-30): it starts the real interpreter as its child with the
+    very same command line and waits. A pipx or venv install's daemon-loop
+    spawns each worker through one, so the worker's direct parent is its own
+    launcher — a `--serve` process — and the daemon-loop is one step further
+    up. Measured on the owner's box: parent and child command lines identical,
+    argv[0] included. Nothing else looks like that: a daemon-loop's own command
+    line is never its worker's, and a foreground `--serve` started from a
+    shell has the shell above it. Needs psutil; None when it can't tell. Only
+    on Windows: a POSIX venv's python is a symlink, not a launcher."""
+    if _supervisor_platform() != "Windows":
+        return None
+    try:
+        import psutil as _ps
+        me = _ps.Process()
+        parent = _ps.Process(int(ppid))
+        if parent.cmdline() and parent.cmdline() == me.cmdline():
+            up = parent.ppid()
+            return up if up and up > 1 else None
+    except Exception:
+        pass
+    return None
 
 
 # Set at boot by run_server. The reconnect loop cannot build this itself: it has
@@ -56137,7 +56166,12 @@ async def _chatgpt_read_copied(page, marker) -> str:
         except Exception:
             got = None
         if got is not None and got != marker:
-            return got
+            # ⛔ LF, AS THE PAGE READ GIVES IT (Windows review of wave 13, 2026-09-30).
+            # Chrome on Windows hands the clipboard back with CRLF line ends, and
+            # brief.md is written in text mode, which turns each one into CR CR LF:
+            # read back, every line gains a blank line after it and a table's rows
+            # fall apart before the brief reaches the Phase 2 agents.
+            return got.replace("\r\n", "\n").replace("\r", "\n")
         if time.monotonic() >= deadline:
             return marker
         await asyncio.sleep(0.25)
@@ -87055,7 +87089,97 @@ def _enumerate_research_py_procs_windows() -> list[tuple[int, str, str]]:
     all get caught.
 
     Includes pythonw.exe because the Scheduled Task action runs the
-    supervisor under the no-console interpreter."""
+    supervisor under the no-console interpreter.
+
+    ⛔⛔ NOT WMIC FIRST (Windows review of wave 13, 2026-09-30). WMIC is gone
+    from current Windows 11 (the owner's 10.0.26200 box has no WMIC.exe), and
+    this function ran it inside `except Exception: return []` — so the list was
+    always empty there, and an empty list reads as "nothing running": `--retire`
+    found nothing to stop, and `_supervisor_is_my_parent` answered "foreground"
+    to every supervised worker, so Move to queue was never offered and every
+    requeue was refused as not supervised. psutil first (a declared
+    dependency), then PowerShell's CIM, and WMIC only for a box with neither."""
+    rows = _windows_python_procs_psutil()
+    if rows is None:
+        rows = _windows_python_procs_cim()
+    if rows is None:
+        rows = _windows_python_procs_wmic()
+    results: list[tuple[int, str, str]] = []
+    for pid, cmdline in rows or []:
+        if "research.py" not in cmdline:
+            continue
+        if "--daemon-loop" in cmdline:
+            role = "daemon-loop"
+        elif "--serve" in cmdline:
+            role = "serve"
+        else:
+            role = "other"
+        results.append((pid, cmdline, role))
+    return results
+
+
+#: The interpreters `_enumerate_research_py_procs_windows` looks at.
+_WIN_PYTHON_NAMES = ("python.exe", "pythonw.exe")
+
+
+def _windows_python_procs_psutil() -> "list[tuple[int, str]] | None":
+    """[(pid, command line)] of every python.exe / pythonw.exe, via psutil;
+    None when psutil cannot be used at all (so the next source is asked). A
+    process that ends or refuses mid-scan is skipped, as WMIC skipped it."""
+    try:
+        import psutil as _ps
+    except Exception:
+        return None
+    rows: list[tuple[int, str]] = []
+    try:
+        for proc in _ps.process_iter(["pid", "name", "cmdline"]):
+            try:
+                info = proc.info
+                if str(info.get("name") or "").lower() not in _WIN_PYTHON_NAMES:
+                    continue
+                args = info.get("cmdline") or []
+                rows.append((int(info["pid"]), subprocess.list2cmdline([str(a) for a in args])))
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return rows
+
+
+def _windows_python_procs_cim() -> "list[tuple[int, str]] | None":
+    """The same list from PowerShell's Get-CimInstance (present on every Windows
+    that lost WMIC); None when PowerShell could not answer."""
+    script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+              "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" "
+              "| Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
+                           capture_output=True, timeout=30, creationflags=_PS_NO_WINDOW)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or b"").decode("utf-8", errors="replace").strip()
+    if not out:
+        return []                            # no python process at all
+    try:
+        data = json.loads(out)
+    except Exception:
+        return None
+    if isinstance(data, dict):               # one process: ConvertTo-Json gives an object
+        data = [data]
+    rows: list[tuple[int, str]] = []
+    for e in data if isinstance(data, list) else []:
+        try:
+            rows.append((int(e.get("ProcessId")), str(e.get("CommandLine") or "")))
+        except Exception:
+            continue
+    return rows
+
+
+def _windows_python_procs_wmic() -> "list[tuple[int, str]] | None":
+    """The same list from WMIC, for a Windows that still has it and has neither
+    psutil nor PowerShell's CIM; None when WMIC could not run."""
     try:
         ps = subprocess.run(
             ["wmic", "process", "where",
@@ -87065,7 +87189,7 @@ def _enumerate_research_py_procs_windows() -> list[tuple[int, str, str]]:
             creationflags=_PS_NO_WINDOW,
         )
     except Exception:
-        return []
+        return None
     # wmic /format:list emits blank lines BETWEEN fields of the same entry
     # (CommandLine=...\n\nProcessId=...\n\n\n\n) on Windows 10/11. The old
     # parser treated any blank line as an entry boundary, splitting each
@@ -87085,23 +87209,13 @@ def _enumerate_research_py_procs_windows() -> list[tuple[int, str, str]]:
                 entries.append(cur); cur = {}
     if cur:
         entries.append(cur)
-    results: list[tuple[int, str, str]] = []
+    rows: list[tuple[int, str]] = []
     for e in entries:
-        cmdline = e.get("CommandLine", "")
-        if "research.py" not in cmdline:
-            continue
         try:
-            pid = int(e.get("ProcessId", ""))
+            rows.append((int(e.get("ProcessId", "")), e.get("CommandLine", "")))
         except ValueError:
             continue
-        if "--daemon-loop" in cmdline:
-            role = "daemon-loop"
-        elif "--serve" in cmdline:
-            role = "serve"
-        else:
-            role = "other"
-        results.append((pid, cmdline, role))
-    return results
+    return rows
 
 
 def _proc_age_seconds(pid: int) -> "float | None":
@@ -87116,7 +87230,14 @@ def _proc_age_seconds(pid: int) -> "float | None":
 
 def _proc_age_seconds_windows(pid: int) -> "float | None":
     """Return seconds since process creation, or None if unknown.
-    Best-effort via wmic CreationDate (yyyymmddHHMMSS.ffffff±zzz)."""
+    psutil first — WMIC is gone from current Windows 11 (see
+    `_enumerate_research_py_procs_windows`) — then WMIC's CreationDate
+    (yyyymmddHHMMSS.ffffff±zzz)."""
+    try:
+        import psutil as _ps
+        return max(0.0, time.time() - _ps.Process(int(pid)).create_time())
+    except Exception:
+        pass
     try:
         r = subprocess.run(
             ["wmic", "process", "where", f"ProcessId={pid}",

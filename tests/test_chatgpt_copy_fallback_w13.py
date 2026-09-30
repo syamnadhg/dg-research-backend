@@ -1424,7 +1424,14 @@ def test_live_a_chatgpt_tab_behind_another_tab_still_gets_its_brief(chrome, page
     try:
         _open(chrome, other, "new", thread=True)            # opened after ChatGPT's: in front
         chrome.run(page.evaluate(_WRITE_JS, "probe"))
-        assert chrome.run(page.evaluate(_READ_JS)) == "", "the ChatGPT tab is not behind"
+        # ⚠ WHERE THE CASE CAN BE STAGED (Windows review of wave 13, 2026-09-30).
+        # Linux's headless Chrome answers the tab behind every time, and
+        # Windows' does once earlier tests in this file have typed into a tab —
+        # there is then no tab-behind case to bring forward, and asserting it
+        # failed the suite on the setup, not on the product.
+        if chrome.run(page.evaluate(_READ_JS)) != "":
+            pytest.skip("this headless Chrome answers a tab behind too — no tab-behind "
+                        "case to stage here")
         got = _brief(chrome, page)
     finally:
         chrome.run(other.close())

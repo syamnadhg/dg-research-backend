@@ -95,7 +95,9 @@ MUTANTS = [
      "the supervised fleet AND a foreground --serve at once (the owner's own "
      "setup) it says 'supervised' for the foreground session and os._exit()s the "
      "very session it was meant to protect",
-     [("            if pid == ppid and role == \"daemon-loop\":",
+     # ⚠ RE-ANCHORED 2026-09-30 (Windows review of wave 13): the parent OR the
+     # process above this worker's venv launcher.
+     [("            if (pid == ppid or pid == above_launcher) and role == \"daemon-loop\":",
        "            if role == \"daemon-loop\":")]),
 
     ("C2", "research.py", "over",

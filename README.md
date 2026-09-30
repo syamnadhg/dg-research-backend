@@ -357,7 +357,7 @@ pip install -r requirements.txt
 python -m patchright install chrome
 ```
 
-Requires **Python 3.11+** and a working **real Google Chrome** install, plus `patchright>=1.61` and `playwright>=1.61` (floors bumped 2026-06-30 — both are pinned in `requirements.txt`). `research.py` launches via `patchright` (a stealth Playwright fork) with `channel="chrome"` — it uses your installed Chrome binary, NOT bundled Chromium, so anti-bot heuristics see a real browser fingerprint.
+Requires **Python 3.11+** and a working **real Google Chrome** install, plus `patchright>=1.62.3` and `playwright>=1.61` (patchright floor raised 2026-09-30 — 1.61.1's Windows driver ran our scripts in the page's own world; floors first bumped 2026-06-30 — both are pinned in `requirements.txt`). `research.py` launches via `patchright` (a stealth Playwright fork) with `channel="chrome"` — it uses your installed Chrome binary, NOT bundled Chromium, so anti-bot heuristics see a real browser fingerprint.
 
 If Chrome itself isn't installed, install it first:
 - **Windows:** [google.com/chrome](https://www.google.com/chrome/) → run the installer.
