@@ -7652,11 +7652,11 @@ def _local_pending_owner_entries() -> "list[dict]":
         # ⛔ NO `title` — 7.7E. This list is published into the device document's
         # `queueOwners` array, which every member of the machine reads. See the
         # note at the append in `_recompute_deferred_queue_positions`.
-        out.append({
-            "uid": uid_v,
-            "runId": rid_v,
-            "position": len(out) + 1,
-        })
+        # ⭐ WAVE 13: a run with work done this worker took from the queue and
+        # has not started yet is still one waiting after a move — `moved: true`,
+        # so the owner's long-press stops it and keeps the work.
+        out.append(_waiting_owner_entry(uid_v, rid_v, len(out) + 1,
+                                        kept_work=bool(job.get("kept_work"))))
     return out
 
 
@@ -7722,11 +7722,26 @@ def _recompute_deferred_queue_positions_locked() -> None:
     device_id = load_device_id()
     if not device_id:
         return
+    # ⭐ WAVE 13 — RUNS WAITING FOR A WORKER LEAD EVERYTHING. A run the owner
+    # moved to the queue (or one a resting worker's restart handed back) goes
+    # to #1, and everything already waiting moves down one — local claims and
+    # deferred documents alike. They wait on this disk (`_waiting_runs`), which
+    # the subcollection scan below cannot see.
+    # ⭐ A run with work done carries `moved: true` — the owner's long-press on
+    # its pill stops it and keeps the work, where an ordinary queued run's
+    # cancels it (see `_waiting_owner_entry`).
+    _front = _waiting_runs()
+    _front_owners = [_waiting_owner_entry(str(w.get("uid") or ""),
+                                          str(w.get("research_id") or ""), i + 1,
+                                          kept_work=_waiting_kept_work(w))
+                     for i, w in enumerate(_front)]
+    _front_patches = _waiting_position_patches(_front)
     # #890: locally-claimed queued jobs (single-worker busy claims) lead the
     # published queueOwners union — the subcollection scan below can't see
     # them (their queue docs were deleted at claim). Snapshot here, as close
     # to the publish as possible, so a just-picked-up job drops out promptly.
-    _local_owners = _local_pending_owner_entries()
+    _local_owners = [dict(e, position=e["position"] + len(_front_owners))
+                     for e in _local_pending_owner_entries()]
     col = _firebase_db.collection("devices").document(device_id).collection("queue")
     try:
         candidates = list(col.limit(50).stream())
@@ -7738,9 +7753,10 @@ def _recompute_deferred_queue_positions_locked() -> None:
         # stale amber badges when the local deque drained too). Best-effort.
         try:
             _firebase_db.collection("devices").document(device_id).update(
-                {"queueOwners": _local_owners})
+                {"queueOwners": _front_owners + _local_owners})
         except Exception:
             pass
+        _commit_queue_position_patches(_front_patches)
         return
 
     def _fifo_key(snap):
@@ -7771,9 +7787,10 @@ def _recompute_deferred_queue_positions_locked() -> None:
         # the local deque is empty too). Best-effort.
         try:
             _firebase_db.collection("devices").document(device_id).update(
-                {"queueOwners": _local_owners})
+                {"queueOwners": _front_owners + _local_owners})
         except Exception:
             pass
+        _commit_queue_position_patches(_front_patches)
         return
 
     try:
@@ -7804,7 +7821,7 @@ def _recompute_deferred_queue_positions_locked() -> None:
     # their published positions so the amber badges + banner numbers reflect
     # the true device-wide order (offset is 0 in the common multi-worker case,
     # where busy submits defer instead of queueing locally).
-    _local_offset = len(_local_owners)
+    _local_offset = len(_front_owners) + len(_local_owners)
     patches: "list[tuple[str, str, dict]]" = []
     _queue_owners: "list[dict]" = []
     for idx, (_sid, d) in enumerate(queue):
@@ -7836,7 +7853,7 @@ def _recompute_deferred_queue_positions_locked() -> None:
         # locally-claimed queued jobs count as "ahead" too (#890).
         _ahead_self = 0
         _ahead_others = 0
-        for _lo in _local_owners:
+        for _lo in _front_owners + _local_owners:
             if _lo.get("uid") == uid_v and uid_v:
                 _ahead_self += 1
             else:
@@ -7861,13 +7878,14 @@ def _recompute_deferred_queue_positions_locked() -> None:
                 "queueEtaMs": _eta_ms_r,
                 "queueEtaComputedAt": _now_ms_recompute,
             }
-        elif _local_owners:
+        elif _front_owners or _local_owners:
             # Head of the DEFERRED set but locally-claimed jobs are ahead —
             # point "behind" at the local tail so the banner names the run
             # it actually waits on (#890), not the currently-running one.
+            # (Or a run waiting for a worker, when nothing is claimed locally.)
             patch = {
                 "queuePosition": new_pos,
-                "queuedBehindRunId": _local_owners[-1]["runId"],
+                "queuedBehindRunId": (_front_owners + _local_owners)[-1]["runId"],
                 "queuedBehindTitle": _crun_delete_field(),  # ⛔ 7.7E — another account's topic
                 "queueTotalAhead": new_pos - 1,
                 "queueAheadFromSelf": _ahead_self,
@@ -7903,11 +7921,42 @@ def _recompute_deferred_queue_positions_locked() -> None:
     # jobs lead the union (they run first). Best-effort / non-fatal.
     try:
         _firebase_db.collection("devices").document(device_id).update({
-            "queueOwners": _local_owners + _queue_owners,
+            "queueOwners": _front_owners + _local_owners + _queue_owners,
         })
     except Exception as _qo_err:
         log(f"[deferred-recompute] queueOwners publish failed (best-effort): {_qo_err}", "DEBUG")
 
+    _commit_queue_position_patches(_front_patches + patches)
+
+
+def _waiting_position_patches(front) -> "list[tuple[str, str, dict]]":
+    """The queue fields of each run waiting for a worker, front first (wave
+    13). ⛔ NEVER `status`: a worker can take the run between the scan and the
+    commit, and a late batch writing "queued" would put a running run back in
+    the queue. The move and the boot park write "queued" once, themselves."""
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    out: "list[tuple[str, str, dict]]" = []
+    for i, w in enumerate(front):
+        uid_v = str(w.get("uid") or "")
+        rid_v = str(w.get("research_id") or "")
+        if not (uid_v and rid_v):
+            continue
+        mine = sum(1 for a in front[:i] if str(a.get("uid") or "") == uid_v)
+        out.append((uid_v, rid_v, {
+            "queuePosition": i + 1,
+            "queueTotalAhead": i,
+            "queueAheadFromSelf": mine,
+            "queueAheadFromOthers": i - mine,
+            "queuedBehindRunId": (str(front[i - 1].get("research_id") or "")
+                                  if i else _DF),
+            "queuedBehindTitle": _DF,
+        }))
+    return out
+
+
+def _commit_queue_position_patches(patches) -> None:
+    """Commit `(uid, research id, patch)` renumber writes, one batch per
+    account, each through the heal."""
     if not patches:
         return
 
@@ -8767,6 +8816,9 @@ _heartbeat_failures = 0
 # on change (see _heartbeat_loop / _device_version_fields).
 _last_published_version_fields: "dict | None" = None
 _version_publish_next_ms = 0
+# Wave 13: the "Move to queue" capability, published in its own write — see
+# `REQUEUE_CAPABILITY`.
+_last_published_requeue_patch: "dict | None" = None
 # One-shot latch: the waiter's update outcome is published exactly once per serve.
 #
 # ⚠ NOT because the sentinel is consumed on read. `_consume_pending_update_result`
@@ -9310,6 +9362,734 @@ def _rest_keepalive_pass():
             log(f"[rest-keepalive] re-assert failed for {rid[:8]}… (non-fatal): {_e}", "DEBUG")
 
 
+# ── Wave 13 — a run moved back to the queue ──────────────────────────────────
+# The owner's "Move to queue" (the Shared-with popup, long-pressing a busy
+# worker's pill) ends the run on that worker, keeps everything it has done, and
+# puts it at the FRONT of this computer's queue for the next AWAKE worker; the
+# worker it ran on stays off. A resting worker whose run a restart interrupted
+# does the same at boot instead of resuming it (`_park_instead_of_resuming`).
+#
+# ⭐ THE WAIT LIVES ON THIS DISK, INSIDE THE RUN'S OWN FOLDER, because nothing
+# else can hold it. The rules let only a MEMBER create a `devices/{id}/queue`
+# document and this machine is not one, so it cannot hand the run back through
+# the queue everybody else uses; and each worker's own line (`_job_queue`) is
+# one process's memory. A marker beside the checkpoint is seen by every worker,
+# survives a restart, and goes wherever the folder goes.
+#
+# ⭐ TAKEN BY A RENAME. `os.rename` of one name succeeds for exactly one
+# process; a sibling that loses gets FileNotFoundError and moves on. The taken
+# name carries the worker's number, so a crash between taking and starting is
+# put back by that worker's next boot (`_release_waiting_claims`).
+WAITING_MARKER = ".waiting_for_worker"
+
+#: What a waiting run's marker is renamed to once somebody stopped or cancelled
+#: it, beside the run's `.stop`: it no longer waits, holds no folder, and every
+#: worker's copy of the cancel can still tell it was a run the queue held.
+WAITING_ENDED = f"{WAITING_MARKER}.ended"
+
+#: The device-command action the app sends for "Move to queue".
+REQUEUE_ACTION = "requeue"
+
+#: ⭐ WHAT THIS CODE CAN DO, published so the app shows "Move to queue" only
+#: where it works: an older build ignores the command, and a backend that is
+#: not running under its startup supervisor cannot restart the worker the run
+#: was on. The name this computer lists in the device document's
+#: `capabilities` — the list the app reads, and the key the rules admit.
+#: Written in its OWN update, never inside the version patch — `hasOnly`
+#: refuses a whole update over one unadmitted key, and a lagging rules deploy
+#: must cost the chip, not the About row's update signal.
+#:
+#: ⛔⛔ NOT UNDER A KEY OF ITS OWN. The first build announced it under one while
+#: the app read `capabilities`; the rules refused the write and the chip showed
+#: on no computer, with both sides' tests green. The web pins this list against
+#: this file (`moveToQueueWire.test.ts`).
+REQUEUE_CAPABILITY = "requeue"
+
+
+def _requeue_capability_patch() -> dict:
+    """The device-document field that tells the app "Move to queue" works on
+    this computer: this build, running under its startup supervisor (the move
+    restarts the worker, and nothing restarts a backend started by hand). Off
+    that, the field is cleared, and the app shows no chip."""
+    if _supervisor_is_my_parent():
+        return {"capabilities": [REQUEUE_CAPABILITY]}
+    return {"capabilities": _crun_delete_field()}
+
+
+def _waiting_taken_name(worker_id) -> str:
+    """The marker's name once worker `worker_id` has taken the run."""
+    return f"{WAITING_MARKER}.w{int(worker_id)}"
+
+
+def _run_dir_waiting(run_dir) -> bool:
+    """Is this run folder waiting in the queue, not yet taken by any worker?"""
+    if run_dir is None:
+        return False
+    try:
+        return (Path(run_dir) / WAITING_MARKER).exists()
+    except Exception:
+        return False
+
+
+def _run_dir_held_by_queue(run_dir) -> bool:
+    """Waiting, or taken by a worker that has not started it yet — what every
+    sweep and the storage clear must leave alone, however old it is."""
+    if run_dir is None:
+        return False
+    try:
+        d = Path(run_dir)
+        return (d / WAITING_MARKER).exists() or any(d.glob(f"{WAITING_MARKER}.w*"))
+    except Exception:
+        return False
+
+
+def _waiting_runs() -> "list[dict]":
+    """Every run waiting in this computer's queue, FRONT FIRST. The one moved
+    most recently leads: a moved run goes to #1 and whatever was already
+    waiting moves down one (the owner's rule, 2026-09-29). Each is its marker's
+    record, with `_dir` — the run folder.
+
+    ⛔ A RUN ENDED FOR GOOD (`.stop` beside it) IS NOT WAITING, whatever marker
+    is left: listed, it stayed the amber #1 and held every new start back
+    behind a run that will never run. Its marker is retired here, so it no
+    longer holds the folder either."""
+    out: "list[dict]" = []
+    try:
+        dirs = [d for d in (Path(__file__).parent / "queues").iterdir() if d.is_dir()]
+    except Exception:
+        return out
+    for d in dirs:
+        marker = d / WAITING_MARKER
+        try:
+            if not marker.exists():
+                continue
+            if (d / ".stop").exists():
+                _retire_waiting_marker(marker)
+                continue
+            rec = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        moved = rec.get("moved_at_ms")
+        rec["moved_at_ms"] = moved if isinstance(moved, int) and not isinstance(moved, bool) else 0
+        rec["_dir"] = d
+        out.append(rec)
+    out.sort(key=lambda r: (-r["moved_at_ms"], r["_dir"].name))
+    return out
+
+
+def _waiting_kept_work(rec) -> bool:
+    """Did this waiting run have work done — the run a worker was RUNNING, which
+    the owner moved to the queue or a resting worker's restart put back? Its
+    amber pill carries `moved: true`, and the owner's long-press offers Stop,
+    which keeps the work, instead of Cancel. A job a resting worker had only
+    queued (`queued_job`) waits as the ordinary queued run it was.
+
+    ⛔⛔ EXCEPT A QUEUED RESUME (its job names a `resume_dir`): it has finished
+    steps, and the owner's Cancel wrote `cancelled: true, phase: 0` on it — the
+    app's delete-on-close for a run with work done (rv13b, 09-29)."""
+    queued_job = (rec or {}).get("queued_job")
+    if not isinstance(queued_job, dict):
+        return True
+    return bool(queued_job.get("resume_dir"))
+
+
+def _waiting_owner_entry(uid, run_id, position, *, kept_work: bool) -> dict:
+    """One `queueOwners` entry. ⭐ `moved: true` only on a run with work done
+    waiting for a worker (see `_waiting_kept_work`); an ordinary queued run
+    carries no `moved` key at all. On the device document, because the owner
+    cannot read a sharer's research record.
+
+    ⭐ Two whole literals, not a key added after: the web reads this file for
+    an entry naming its `runId` beside `"moved": True` (`moveToQueueWire`)."""
+    if kept_work:
+        return {"uid": uid, "runId": run_id, "position": position, "moved": True}
+    return {"uid": uid, "runId": run_id, "position": position}
+
+
+def _waiting_record_patch() -> dict:
+    """What a run waiting in the queue says on its research record: queued, at
+    the front, and no card left asking anybody for anything."""
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    return {
+        "status": "queued",
+        "queuePosition": 1,
+        "queueTotalAhead": 0,
+        "queueAheadFromSelf": 0,
+        "queueAheadFromOthers": 0,
+        "queuedBehindRunId": _DF,
+        "queuedBehindTitle": _DF,
+        "pendingDecision": _DF,
+        "queueEtaMs": _DF,
+        "queueEtaComputedAt": _DF,
+        "movedToQueueAt": int(time.time() * 1000),
+    }
+
+
+def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None":
+    """Put `job`'s run at the front of this computer's queue: write its marker,
+    naming the whole job, so whichever worker takes it can resume it without
+    asking anyone. The run folder, or None when the job names no person, or
+    the write failed — which is also the answer for a run with no folder yet:
+    it has nothing to keep, and a folder is never made up for it here.
+
+    ⭐ `behind` — a job a RESTING worker had only QUEUED in its own line when a
+    restart came (wave 13 repair). It goes to the BACK of the waiting runs, in
+    the order its line had it, which is where the published order already
+    showed it; restored into that line instead, the worker that is off ran it.
+    Its marker carries the job exactly as it was queued (`queued_job`), so the
+    worker that takes it runs what this one would have. A job that has not
+    started has no folder yet: one is made for it here, holding only its place,
+    and the pipeline starts in it as it would have.
+
+    ⛔ A TAKEN MARKER LEFT IN THE FOLDER GOES. The run is being put back now, so
+    no worker is about to start it from an earlier claim; left, a `.w<N>`
+    beside the new marker made worker N's claim fail on every tick on Windows
+    (a rename onto an existing name is refused there) and put the run back
+    again at N's next boot."""
+    run_dir = _job_run_dir(job)
+    uid = str((job or {}).get("uid") or "").strip()
+    rid = str((job or {}).get("research_id") or "").strip()
+    if run_dir is None or not (uid and rid):
+        return None
+    if behind and not run_dir.exists():
+        try:
+            run_dir.mkdir(parents=True)
+        except Exception as e:
+            log(f"[moved-run] could not make a place in the queue for {rid[:8]}…: {e}", "WARN")
+            return None
+    now_ms = int(time.time() * 1000)
+    rec = {
+        "uid": uid, "research_id": rid, "run_id": run_dir.name,
+        "topic": str(job.get("topic") or ""),
+        "email": str(job.get("email") or ""),
+        "config": dict(job.get("config") or {}),
+        "submitted_by": str(job.get("submitted_by") or "").strip(),
+        "moved_at_ms": (min([w["moved_at_ms"] for w in _waiting_runs()] + [now_ms]) - 1
+                        if behind else now_ms),
+        "from_worker": int(from_worker),
+    }
+    if behind:
+        rec["queued_job"] = dict(job)
+    tmp = run_dir / f"{WAITING_MARKER}.tmp"
+    try:
+        for stale in run_dir.glob(f"{WAITING_MARKER}.w*"):
+            stale.unlink(missing_ok=True)
+        tmp.write_text(json.dumps(rec), encoding="utf-8")
+        os.replace(tmp, run_dir / WAITING_MARKER)
+    except Exception as e:
+        log(f"[moved-run] could not put {rid[:8]}… in the queue: {e}", "WARN")
+        return None
+    return run_dir
+
+
+def _retire_waiting_marker(marker) -> bool:
+    """Rename a waiting or taken marker to `WAITING_ENDED`: the run no longer
+    waits and holds nothing. True when this call did it — False when another
+    worker (or thread) got there first, or the rename failed."""
+    try:
+        os.replace(marker, Path(marker).parent / WAITING_ENDED)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        log(f"[moved-run] could not end the wait in {Path(marker).parent.name}: {e}", "DEBUG")
+        return False
+
+
+def _end_waiting_run(uid, research_id) -> "dict | None":
+    """A cancel or a stop of a run waiting in this computer's queue, or taken
+    by a worker that has not started it (wave 13 repair). Ends it for good —
+    `.stop` FIRST, which every pickup refuses, then its markers retired — and
+    returns its marker's record. Also returns the record when another worker's
+    copy of the same cancel ended it a moment earlier (`WAITING_ENDED`), so
+    that copy writes the same thing and never the purge. None when no marker
+    in any folder names this person's research.
+
+    ⛔⛔ BEFORE THIS, A MOVED RUN COULD NOT BE STOPPED WITH ITS WORK KEPT: no
+    worker held it, so the start listener wrote the "cancelled before
+    starting" patch — `cancelled: true`, the app's delete-on-close, on a run
+    with finished steps — and the owner's Stop was dropped and the run ran
+    later. Its marker stayed too, so it stayed the amber #1 and held every new
+    start back."""
+    uid, rid = str(uid or ""), str(research_id or "")
+    if not (uid and rid):
+        return None
+    try:
+        dirs = [d for d in (Path(__file__).parent / "queues").iterdir() if d.is_dir()]
+    except Exception:
+        return None
+    for d in dirs:
+        try:
+            live = [m for m in [d / WAITING_MARKER, *d.glob(f"{WAITING_MARKER}.w*")]
+                    if m.exists()]
+            ended = d / WAITING_ENDED
+            names = live + ([ended] if ended.exists() else [])
+        except Exception:
+            continue
+        rec = None
+        for m in names:
+            try:
+                r = json.loads(m.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if (isinstance(r, dict) and str(r.get("uid") or "") == uid
+                    and str(r.get("research_id") or "") == rid):
+                rec = r
+                break
+        if rec is None:
+            continue
+        try:
+            (d / ".stop").touch()
+        except Exception as e:
+            log(f"[moved-run] could not end {d.name}: {e}", "WARN")
+        for m in live:
+            _retire_waiting_marker(m)
+        rec["_dir"] = d
+        return rec
+    return None
+
+
+def _claim_waiting_run(worker_id) -> "dict | None":
+    """Take the run at the front of the queue for worker `worker_id`: its job,
+    ready for that worker's line, or None when nothing waiting may run now.
+    BLOCKING (disk + Firestore) — call it off the loop.
+
+    ⛔ A run a live worker still holds is put back: the worker it was moved off
+    has a few seconds of exit left — and a Resume may have started it on
+    another — and two browsers on one run is the one outcome this must never
+    produce. A research that is gone, archived, not this computer's any more,
+    or that is over or stopped, stops waiting here.
+
+    ⭐ "ONGOING" WITH NOBODY HOLDING IT IS TAKEN, not dropped: it is the record
+    whose "queued" write never landed (a Firestore blip at the move), or that
+    the old worker's last second wrote over. Dropped, the run would be lost —
+    its record saying it runs while nothing runs it."""
+    for rec in _waiting_runs():
+        d = rec["_dir"]
+        uid = str(rec.get("uid") or "")
+        rid = str(rec.get("research_id") or "")
+        taken = d / _waiting_taken_name(worker_id)
+        # ⛔ `os.replace`, NOT `os.rename`: Windows refuses a rename onto a name
+        # that exists, and a taken marker this worker left behind made its
+        # claim fail on every tick — this worker then took nothing at all,
+        # not even a deferred start. The SOURCE still decides between
+        # workers: only one rename of it can find it.
+        try:
+            os.replace(d / WAITING_MARKER, taken)
+        except FileNotFoundError:
+            continue  # a sibling worker took it first
+        except OSError as e:
+            log(f"[moved-run] could not take {rid[:8]}…: {e}", "DEBUG")
+            continue
+        if _scan_sibling_locks_for_research(rid, worker_id):
+            try:
+                os.replace(taken, d / WAITING_MARKER)
+            except Exception:
+                pass
+            continue
+        withdrawn, record = _pickup_withdrawn(uid, rid, "moved-run")
+        status = (record or {}).get("status")
+        if withdrawn or (record is not None and status not in ("queued", "ongoing")):
+            if not withdrawn:
+                log(f"[moved-run] {rid[:8]}… is {status} now — it is no longer "
+                    f"waiting in the queue", "INFO")
+            _drop_waiting_claim(d, worker_id)
+            continue
+        queued_job = rec.get("queued_job")
+        if isinstance(queued_job, dict):
+            # A job a resting worker had only queued: run exactly as it was
+            # queued (a new run starts in the place kept for it).
+            # ⭐ A queued Resume keeps its mark until it starts here (`moved`,
+            # see `_waiting_kept_work`); a new run stays unmarked.
+            log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the queue — "
+                f"a run that had not started on the worker that is off", "INFO")
+            return dict(queued_job, uid=uid, research_id=rid,
+                        run_id=str(queued_job.get("run_id") or d.name),
+                        queued_at_ms=int(time.time() * 1000), moved_run=True,
+                        kept_work=_waiting_kept_work(rec))
+        log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the front of "
+            f"the queue — it goes on from the start of the step it was on", "INFO")
+        return {
+            "topic": str(rec.get("topic") or ""),
+            "email": str(rec.get("email") or ""),
+            "config": dict(rec.get("config") or {}),
+            "run_id": d.name, "uid": uid, "research_id": rid,
+            "resume_dir": str(d),
+            "submitted_by": str(rec.get("submitted_by") or ""),
+            "queued_at_ms": int(time.time() * 1000),
+            "moved_run": True,
+            # It was running: until it starts here its pill says so (`moved`).
+            "kept_work": True,
+        }
+    return None
+
+
+def _drop_waiting_claim(run_dir, worker_id) -> None:
+    """The run this worker took has started here, or will never run: it is no
+    longer waiting anywhere."""
+    if run_dir is None:
+        return
+    try:
+        (Path(run_dir) / _waiting_taken_name(worker_id)).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"[moved-run] could not clear the queue marker in {Path(run_dir).name}: {e}",
+            "DEBUG")
+
+
+def _release_waiting_claims(worker_id) -> int:
+    """Boot: put every run this worker took and never started (it died in
+    between) back in the queue, for the next awake worker."""
+    n = 0
+    try:
+        dirs = [d for d in (Path(__file__).parent / "queues").iterdir() if d.is_dir()]
+    except Exception:
+        return 0
+    for d in dirs:
+        taken = d / _waiting_taken_name(worker_id)
+        try:
+            if taken.exists():
+                os.replace(taken, d / WAITING_MARKER)
+                n += 1
+        except Exception as e:
+            log(f"[moved-run] could not put {d.name} back in the queue: {e}", "WARN")
+    if n:
+        log(f"[moved-run] worker {worker_id}: {n} run(s) it had taken but not "
+            f"started are back in the queue", "INFO")
+        _kick_queue_publish()
+    return n
+
+
+def _kick_queue_publish() -> None:
+    """Re-publish the queue order (research records + `queueOwners`) in the
+    background."""
+    try:
+        _threading.Thread(target=_recompute_deferred_queue_positions,
+                          daemon=True, name="queueowners-moved").start()
+    except Exception as e:
+        log(f"[moved-run] queue publish launch failed (non-fatal): {e}", "DEBUG")
+
+
+async def _offer_waiting_run(job_queue) -> bool:
+    """Idle and awake: take the front run of the queue into this worker's line.
+    True when one was queued here.
+
+    ⭐ The record says "running, on this worker" only once the job is really in
+    this worker's line — the funnel can still refuse it (ended for good, gone).
+    The worker's own queued→ongoing flip cannot be relied on for it (the idle
+    rescan writes its pickups the same way), and the worker's number is what
+    a later restart resumes it on."""
+    job = await asyncio.to_thread(_claim_waiting_run, WORKER_ID)
+    if job is None:
+        return False
+    if not _safe_enqueue(job_queue, job, source="moved-run", take_unreadable=True):
+        run_dir = _job_run_dir(job)
+        await asyncio.to_thread(_drop_waiting_claim, run_dir, WORKER_ID)
+        # ⛔⛔ A RUN THAT HAS USED UP ITS AUTOMATIC ATTEMPTS IS NOT LEFT
+        # "QUEUED". The funnel refuses it — only a person's Retry spends a new
+        # budget — and with its marker gone nothing would ever run it, while
+        # its record said queued at #1 for ever, with no card and no Resume.
+        # It gets the card a restart gives any interrupted run.
+        if (run_dir is not None and not (run_dir / ".stop").exists()
+                and _no_auto_retry_marked(run_dir)):
+            rid = str(job.get("research_id") or "")
+            await asyncio.to_thread(_update_research_doc, job["uid"], rid,
+                                    _restart_recovery_patch(rid))
+            log(f"[moved-run] {rid[:8]}… has used up its automatic attempts — "
+                f"offered to its person to resume instead", "INFO")
+            _kick_queue_publish()
+        return False
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    await asyncio.to_thread(_update_research_doc, job["uid"], job["research_id"], {
+        "status": "ongoing", "assignedWorker": WORKER_ID,
+        "queuePosition": _DF, "queuedBehindRunId": _DF,
+        "queuedBehindTitle": _DF, "queueTotalAhead": _DF,
+        "queueAheadFromSelf": _DF, "queueAheadFromOthers": _DF,
+        "movedToQueueAt": _DF,
+    })
+    _kick_queue_publish()
+    return True
+
+
+def _publish_queue_positions_now(timeout_s: float = 10.0) -> None:
+    """Publish the queue order NOW, waiting for a recompute already running —
+    the ordinary kick skips when one is, and this process is about to exit."""
+    if not _ETA_RECOMPUTE_LOCK.acquire(timeout=timeout_s):
+        return
+    try:
+        _recompute_deferred_queue_positions_locked()
+    except Exception as e:
+        log(f"[moved-run] queue publish failed (non-fatal): {e}", "DEBUG")
+    finally:
+        _ETA_RECOMPUTE_LOCK.release()
+
+
+def _keep_worker_resting(worker_id) -> None:
+    """The worker a run was moved off stays off. The app writes this before it
+    sends the command; written again here, so a lost app write cannot bring the
+    worker back up to take its own run straight back."""
+    global _RESTING_CACHE
+    ids = set(_RESTING_CACHE.get("ids") or ()) | {int(worker_id)}
+    _RESTING_CACHE = {"at": time.time(), "ids": tuple(sorted(ids))}
+    try:
+        did = load_device_id()
+        if _firebase_db is not None and did:
+            from google.cloud.firestore import ArrayUnion as _AU
+            _firebase_db.collection("devices").document(did).update(
+                {"restingWorkerIds": _AU([int(worker_id)])})
+    except Exception as e:
+        log(f"[moved-run] could not mark worker {worker_id} as off (the app "
+            f"already did): {e}", "DEBUG")
+
+
+def _forget_running_job_in_snapshot() -> None:
+    """The move: rewrite this worker's queue snapshot without the job it is
+    running, under the lock Reset Backend and the worker's own boundary write
+    it under (wave 13 repair). Its waiting line is written back as it is.
+
+    ⛔⛔ THE SNAPSHOT STILL NAMED THE MOVED RUN AS THIS WORKER'S JOB. The worker
+    came back from its restart, read it, and — off — put the run back at #1
+    over the run another worker had taken meanwhile, or — turned back on —
+    started a second pipeline on it: two browsers on one run. The run is the
+    queue's now, and its marker is the one description of it that stays."""
+    lock = _QUEUE_STATE.get("_hard_reset_lock")
+    persist = _QUEUE_STATE.get("persist_fn")
+    if lock is None or persist is None:
+        return
+    try:
+        with lock:
+            if not _QUEUE_STATE.get("_hard_reset_in_progress"):
+                persist(current_job=None)
+    except Exception as e:
+        log(f"[device-cmds] REQUEUE: could not rewrite the queue snapshot: {e}", "WARN")
+
+
+def _requeue_target_worker(data) -> int:
+    """Which worker a "requeue" command is for. A value naming no worker of
+    this computer goes to worker 1, which answers it with one line and takes
+    the command away — otherwise nobody would."""
+    w = (data or {}).get("workerId")
+    n = int(w) if isinstance(w, int) else 0
+    try:
+        fleet = int(load_worker_count() or 1)
+    except Exception:
+        fleet = 1
+    return n if 1 <= n <= fleet else 1
+
+
+def _handle_requeue_command(data) -> str:
+    """"Move to queue", on the worker the command names. What it did, as one
+    word — the tests and the log both read it.
+
+    ⭐ EXACTLY WHAT A BACKEND RESTART DOES TO A RUN, because that is the one
+    stop this machine already survives with everything kept: the run folder,
+    the finished steps and the checkpoint stay on disk, and the run goes on
+    from the start of the step it was on. So this worker EXITS — after any
+    upload in flight settles — and its supervisor brings it back resting. No
+    stop is requested: a stop writes "stopped" over the run.
+
+    ⛔ Before the exit: the run is put in the queue (its marker), its record
+    says "queued" at the front, the pipeline's own later writes to that record
+    are cut off (it has a second or two left), the worker is kept off, and the
+    queue order is published — nothing after the exit can do any of it."""
+    global _fb_uid, _fb_research_id
+    rid = str((data or {}).get("researchId") or "").strip()
+    uid = str((data or {}).get("uid") or "").strip()
+    who = str((data or {}).get("submittedBy") or "").strip()
+    owner = str(load_paired_uid() or "").strip()
+    if not who or who != owner:
+        log("[device-cmds] REQUEUE: ignored — only this computer's owner can move "
+            "a run to the queue", "WARN")
+        return "not-owner"
+    current = _QUEUE_STATE.get("current_job") or {}
+    if (not rid or current.get("research_id") != rid
+            or str(current.get("uid") or "") != uid):
+        log(f"[device-cmds] REQUEUE: ignored — {rid[:8]}… is not running on "
+            f"worker {WORKER_ID}", "INFO")
+        return "not-running-here"
+    if _exit_scheduled:
+        log(f"[device-cmds] REQUEUE: ignored — worker {WORKER_ID} is already "
+            f"restarting", "INFO")
+        return "exiting"
+    if _is_incognito_research(rid):
+        log(f"[device-cmds] REQUEUE: ignored — {rid[:8]}… keeps nothing, so it "
+            f"cannot wait in the queue; it keeps running", "INFO")
+        return "keeps-nothing"
+    if _handed_off_to_cloud(_job_run_dir(current)):
+        log(f"[device-cmds] REQUEUE: ignored — {rid[:8]}… has finished its part on "
+            f"this computer", "INFO")
+        return "handed-off"
+    if not _supervisor_is_my_parent():
+        log(f"[device-cmds] REQUEUE: ignored — this backend is not running on "
+            f"startup, so worker {WORKER_ID} cannot restart to let the run go; "
+            f"it keeps running", "WARN")
+        return "not-supervised"
+    if _park_waiting_run(current, from_worker=WORKER_ID) is None:
+        log(f"[device-cmds] REQUEUE: ignored — {rid[:8]}… has nothing saved on this "
+            f"computer yet to go on from; it keeps running", "WARN")
+        return "not-saved"
+    if _fb_research_id == rid:
+        _fb_uid = None
+        _fb_research_id = None
+    _forget_running_job_in_snapshot()
+    _update_research_doc(uid, rid, _waiting_record_patch())
+    _keep_worker_resting(WORKER_ID)
+    _publish_queue_positions_now()
+    try:
+        left = _wait_for_uploads_to_settle(max_wait_s=5.0)
+        if left:
+            log(f"[device-cmds] REQUEUE: {left} upload(s) still going after 5s — "
+                f"going anyway", "WARN")
+    except Exception as e:
+        log(f"[device-cmds] REQUEUE: upload check failed: {e}", "WARN")
+    log(f"[device-cmds] REQUEUE: {rid[:8]}… moved to the front of the queue — "
+        f"worker {WORKER_ID} stays off and restarts to let it go", "INFO")
+    _schedule_server_exit("requeue", delay_sec=1.5)
+    return "moved"
+
+
+def _drain_waiting_runs() -> "list[dict]":
+    """Reset Backend: every run waiting in this computer's queue — taken or not
+    — stops waiting and is ended for good (`.stop`, which every pickup refuses).
+    Returns their jobs, for the reset to mark stopped like the rest it drains."""
+    out: "list[dict]" = []
+    try:
+        dirs = [d for d in (Path(__file__).parent / "queues").iterdir() if d.is_dir()]
+    except Exception:
+        return out
+    for d in dirs:
+        markers = [d / WAITING_MARKER] + list(d.glob(f"{WAITING_MARKER}.w*"))
+        markers = [m for m in markers if m.exists()]
+        if not markers:
+            continue
+        rec: dict = {}
+        for m in markers:
+            try:
+                rec = json.loads(m.read_text(encoding="utf-8")) or rec
+            except Exception:
+                pass
+        try:
+            (d / ".stop").touch()
+        except Exception as e:
+            log(f"[moved-run] could not end {d.name}: {e}", "WARN")
+        for m in markers:
+            try:
+                m.unlink()
+            except Exception:
+                pass
+        out.append({"uid": str((rec or {}).get("uid") or ""),
+                    "research_id": str((rec or {}).get("research_id") or ""),
+                    "run_id": d.name})
+    return out
+
+
+def _park_instead_of_resuming(job, *, where: str, behind: bool = False,
+                              status: "str | None" = None) -> bool:
+    """Boot, on a RESTING worker: a run a restart interrupted goes to the front
+    of the queue instead of resuming here, and waits for an awake worker. True
+    when it was put there. Blocking (disk + Firestore).
+
+    `behind`: a job the worker had only queued goes to the back of the waiting
+    runs instead (see `_park_waiting_run`). Its record already says queued —
+    `status`, as the caller read it — and is written only when it does not.
+
+    ⛔ NOT A RUN THAT KEEPS NOTHING (it cannot wait on this disk), and ⛔⛔ NOT
+    ONE THAT HAS USED UP ITS AUTOMATIC ATTEMPTS OR WAS ENDED FOR GOOD
+    (`.no_auto_retry`, `.stop`). The queue's own funnel refuses both, so parked,
+    such a run lost its Retry card to the "queued" write and then waited for
+    ever with nothing to run it. False here, and the caller does what it did
+    before this wave — the Resume card a restart gives."""
+    rid = str((job or {}).get("research_id") or "")
+    if _is_incognito_research(rid):
+        return False
+    run_dir = _job_run_dir(job)
+    if run_dir is not None and ((run_dir / ".stop").exists()
+                                or _no_auto_retry_marked(run_dir)):
+        log(f"[{where}] {rid[:8]}… has used up its automatic attempts or was ended — "
+            f"not put in the queue", "INFO")
+        return False
+    if _park_waiting_run(job, from_worker=WORKER_ID, behind=behind) is None:
+        return False
+    if not behind:
+        _update_research_doc(str(job.get("uid") or ""), rid, _waiting_record_patch())
+        log(f"[{where}] {rid[:8]}… — worker {WORKER_ID} is off, so the run waits at the "
+            f"front of the queue for a worker that is on", "INFO")
+    else:
+        if status != "queued":
+            _update_research_doc(str(job.get("uid") or ""), rid, {"status": "queued"})
+        log(f"[{where}] {rid[:8]}… — worker {WORKER_ID} is off, so the run it had "
+            f"queued waits in the queue, behind the runs already waiting, for a "
+            f"worker that is on", "INFO")
+    _kick_queue_publish()
+    return True
+
+
+def _run_folders_in_use() -> "set[str]":
+    """The run folders this computer must not delete: running on ANY worker, or
+    waiting in any queue.
+
+    ⛔⛔ "CLEAR LOCAL STORAGE" USED TO KEEP ONLY THE CALLING WORKER'S RUN. On a
+    computer with two workers the idle one took the command and deleted the
+    busy one's folder mid-run (reproduced on 58d705e and 40c9655). Every worker
+    writes a claim lock naming its run the moment it takes one, and a snapshot
+    of its waiting line at every boundary — both on this disk, so any worker
+    can read all of them."""
+    names: "set[str]" = set()
+    root = Path(__file__).parent / "queues"
+    try:
+        if _tracks_dir is not None:
+            names.add(_tracks_dir.name)
+    except NameError:
+        pass
+    try:
+        import psutil as _ps
+    except Exception:
+        _ps = None
+    try:
+        locks = list(root.glob(".worker.*.lock"))
+    except Exception:
+        locks = []
+    for lock in locks:
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        alive = True
+        if _ps is not None:
+            try:
+                alive = bool(data.get("pid")) and _ps.pid_exists(int(data["pid"]))
+            except Exception:
+                alive = True
+        if alive and data.get("run_id"):
+            names.add(str(data["run_id"]))
+    jobs = list(_jobs_held_locally(_QUEUE_STATE.get("queue_ref"))) + list(_UNREAD_RESTORES)
+    try:
+        snaps = list(root.glob("_pending_queue*.json"))
+    except Exception:
+        snaps = []
+    for snap in snaps:
+        try:
+            s = json.loads(snap.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(s, dict):
+            jobs.append(s.get("current") or {})
+            jobs.extend(s.get("pending") or [])
+    for j in jobs:
+        d = _job_run_dir(j) if isinstance(j, dict) else None
+        if d is not None:
+            names.add(d.name)
+    try:
+        dirs = [d for d in root.iterdir() if d.is_dir()]
+    except Exception:
+        dirs = []
+    names.update(d.name for d in dirs if _run_dir_held_by_queue(d))
+    return names
+
+
 def save_worker_count(n: int) -> None:
     """Merge-write workerCount into research_config.json. Clamped to >=1
     so a bad caller can't disable the only worker. Atomic write via
@@ -9428,6 +10208,7 @@ async def _heartbeat_loop():
     # rejects `global X` if X has already been read in this scope.
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db, _firebase_down_reason
     global _last_published_version_fields, _version_publish_next_ms
+    global _last_published_requeue_patch
     global _update_live_next_ms
     global _update_result_published
     while True:
@@ -9532,6 +10313,23 @@ async def _heartbeat_loop():
                         # persistent 403 retries every ~5 min, not every tick.
                         _version_publish_next_ms = _now_ms + 300_000
                         log(f"[heartbeat] version-signal publish skipped ({_vf_err})", "DEBUG")
+                    # ⭐ WAVE 13 — WHETHER "MOVE TO QUEUE" WORKS HERE, IN ITS OWN
+                    # WRITE on the same five-minute clock. Its own so a rules
+                    # deploy that has not admitted the key costs the chip and
+                    # nothing else; the version patch above is untouched by it.
+                    try:
+                        _rq = await asyncio.to_thread(_requeue_capability_patch)
+                        if _rq != _last_published_requeue_patch:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    lambda: _firebase_db.collection("devices")
+                                        .document(device_id).update(_rq)),
+                                timeout=10.0,
+                            )
+                            _last_published_requeue_patch = _rq
+                    except Exception as _rq_err:
+                        log(f"[heartbeat] move-to-queue signal publish skipped ({_rq_err})",
+                            "DEBUG")
 
                 # Which runs this machine still holds logs for, per submitter.
                 # ⭐ HERE rather than at run teardown, and the reason is what the
@@ -12181,6 +12979,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # away). Leaving it means the doc persists until worker 1 processes
                 # it (or the 30s stale gate reaps it). Worker 1 deletes it (`else`).
                 continue
+            elif (action == REQUEUE_ACTION
+                    and _requeue_target_worker(data) != WORKER_ID):
+                # ⛔ "Move to queue" is for ONE worker — the one running the
+                # run — and every worker is its own process on this same
+                # stream. Deleting it here would take it away before that
+                # worker's listener delivers it: left in place for it.
+                log(f"[device-cmds] REQUEUE: for worker {_requeue_target_worker(data)}, "
+                    f"not this one ({WORKER_ID}) — left for it")
+                continue
             else:
                 try:
                     doc.reference.delete()
@@ -12394,6 +13201,12 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     # any other, and go the same way.
                     _drained_jobs.extend(_UNREAD_RESTORES)
                     del _UNREAD_RESTORES[:]
+                    # ⛔⛔ AND THE RUNS WAITING IN THIS COMPUTER'S QUEUE FOR A
+                    # WORKER (wave 13, "Move to queue"). They wait on this disk,
+                    # not in any list above, so left alone they would come back
+                    # after the reset and run on the first awake worker. Ended
+                    # for good (`.stop`), kept in the listing as stopped.
+                    _drained_jobs.extend(_drain_waiting_runs())
                     log(f"[device-cmds] HARD_RESET: drain found {len(_drained_jobs)} queued job(s)")
                     if _drained_jobs and _firebase_db:
                         try:
@@ -12691,6 +13504,13 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                         log("[device-cmds] HARD_RESET: no event loop ref — gate cleared, no active-run stop signal sent", "WARN")
                 continue
 
+            if action == REQUEUE_ACTION:
+                # The owner's "Move to queue". Only the worker the command
+                # names reaches this line (see the gate above); the handler
+                # checks the rest and says in one line why it did nothing.
+                _handle_requeue_command(data)
+                continue
+
             if action == "clear_local_storage":
                 # User-triggered manual cleanup of the device-side queues/
                 # dir. Documents/audios/chat already live in Firestore +
@@ -12698,17 +13518,13 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # per-run scratch (sources_*.md, brief.md, source PDFs,
                 # half-rendered podcasts). Safe to wipe.
                 #
-                # Active-run guard: if a pipeline is currently producing
-                # for `_tracks_dir`, that single dir is preserved. Without
-                # this, an in-flight run would crash mid-phase when its
-                # checkpoint.json / source files vanish.
+                # Active-run guard: every run running on ANY worker, and every
+                # run waiting in a queue, keeps its folder — see
+                # `_run_folders_in_use`. Without this, an in-flight run would
+                # crash mid-phase when its checkpoint.json / source files
+                # vanish, and a waiting one would have nothing to resume from.
                 queues_root = Path(__file__).parent / "queues"
-                active_name = None
-                try:
-                    if _tracks_dir is not None:
-                        active_name = _tracks_dir.name
-                except NameError:
-                    active_name = None
+                in_use = _run_folders_in_use()
 
                 wiped = 0
                 preserved = 0
@@ -12718,7 +13534,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             # Keep top-level files (README.md, _pending_queue.json).
                             if not entry.is_dir():
                                 continue
-                            if active_name and entry.name == active_name:
+                            if entry.name in in_use:
                                 preserved += 1
                                 continue
                             try:
@@ -12729,8 +13545,9 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 except Exception as _walk_err:
                     log(f"[device-cmds] CLEAR_LOCAL_STORAGE: walk failed: {_walk_err}", "WARN")
 
-                if active_name and preserved:
-                    log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s); preserved active run {active_name}")
+                if preserved:
+                    log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s); kept "
+                        f"{preserved} run(s) still running or waiting in the queue")
                 else:
                     log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s)")
                 continue
@@ -15802,6 +16619,9 @@ def start_firestore_start_listener(job_queue, loop):
                                     and not _job_is_another_persons(j, _u))
                         kept = [j for j in dq if not _cancels(j)]
                         removed = any(_cancels(j) for j in dq)
+                        # One this worker took from the queue for a worker and
+                        # has not started yet (wave 13) — see below.
+                        removed_taken = any(_cancels(j) and j.get("moved_run") for j in dq)
                         dq.clear()
                         for j in kept:
                             dq.append(j)
@@ -15857,6 +16677,47 @@ def start_firestore_start_listener(job_queue, loop):
                                     f"Cancel: deferred start doc scan failed (non-fatal): {_se}",
                                     "DEBUG",
                                 )
+                        # ⭐⭐ WAVE 13 REPAIR — A RUN WAITING IN THIS COMPUTER'S
+                        # QUEUE FOR A WORKER (the owner moved it there, or a
+                        # resting worker's restart handed it back), or taken
+                        # from it and not started. No worker runs it and no
+                        # start document names it, so every branch here missed
+                        # it: the "cancelled before starting" purge landed on a
+                        # run with finished steps, the owner's Stop was dropped
+                        # and the run ran later, and its marker kept it the
+                        # amber #1, holding every new start back. It is ended
+                        # for good now, and written the way the run it was
+                        # would have been: one that was RUNNING as a running
+                        # run's stop or cancel is — its steps never reset, and
+                        # the owner's Stop keeps everything; a job that was only
+                        # QUEUED as a job that never started.
+                        _waiting_rec = (_end_waiting_run(u, rid)
+                                        if _start_doc_id is None and (removed_taken or not removed)
+                                        else None)
+                        if _waiting_rec is not None and _waiting_rec.get("queued_job") is not None:
+                            removed = True
+                            _kick_queue_publish()
+                        elif _waiting_rec is not None or removed_taken:
+                            if _firebase_db:
+                                from google.cloud.firestore import DELETE_FIELD as _DF
+                                _update_research_doc(u, rid, dict(
+                                    _owner_control_patch(oc, running=True) or {
+                                        "status": "stopped",
+                                        "summary": "Cancelled",
+                                        "cancelled": True,
+                                        "queuePosition": _DF,
+                                        "queuedBehindRunId": _DF,
+                                        "queuedBehindTitle": _DF,
+                                    }, movedToQueueAt=_DF))
+                            _kick_queue_publish()
+                            log(f"Cancel: rid={rid[:8]}… was waiting in the queue for a "
+                                f"worker — ended as a running run is"
+                                f"{' (owner '+oc+')' if oc else ''}", "INFO")
+                            try:
+                                dref.delete()
+                            except Exception:
+                                pass
+                            return
                         # Owner-STOP of a running run: only the worker holding
                         # current_job (handled in the sync + late re-check
                         # branches above) writes the terminal status. An idle
@@ -16427,7 +17288,14 @@ def start_firestore_start_listener(job_queue, loop):
             # re-check still applies (an AWAKE sibling should claim, and then
             # we must not write status=queued over its ongoing).
             _resting = _worker_is_resting()
-            if _resting:
+            # ⭐ WAVE 13 — A RUN WAITING FOR A WORKER IS AHEAD OF THIS ONE. A
+            # run the owner moved to the queue goes to #1; an idle worker that
+            # claimed this new doc here would start it first. Deferred like a
+            # busy worker's doc, and the idle rescan takes the waiting run
+            # before it (`_offer_waiting_run`). The latch arms the rescan on a
+            # single-worker install too, exactly as a rest does.
+            _front_waiting = bool(_waiting_runs())
+            if _resting or _front_waiting:
                 _REST_DEFER_SEEN["v"] = True
             # Review MAJOR (2026-07-06): while _REST_DEFER_SEEN is set, the
             # single-worker idle-rescan is armed as the wake-side pickup — so
@@ -16442,6 +17310,7 @@ def start_firestore_start_listener(job_queue, loop):
                 # installs skip both (no contender to race; no free Firestore
                 # RTT per start event) — UNLESS resting, which defers.
                 if (_resting
+                        or _front_waiting
                         or _QUEUE_STATE.get("running")
                         or job_queue.qsize() > 0
                         or _pending_enq_read() > 0):
@@ -16465,6 +17334,8 @@ def start_firestore_start_listener(job_queue, loop):
                     # Bernard symptom).
                     if _resting:
                         _defer_reason = "worker-resting"
+                    elif _front_waiting:
+                        _defer_reason = "moved-run-waiting"
                     elif _QUEUE_STATE.get("running"):
                         _defer_reason = "busy-running"
                     elif job_queue.qsize() > 0:
@@ -18010,11 +18881,26 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
     skipped = 0
     refused = []
     withdrew = False
+    parked = False
     paired = str(load_paired_uid() or "").strip()
     members: "set[str] | None" = None
     members_read = False
     for j in disk_jobs:
         rid = str((j or {}).get("research_id") or "")
+        # ⭐ WAVE 13 — A RUN WAITING IN THE QUEUE FOR A WORKER IS THE QUEUE'S,
+        # asked FIRST, before the age rule: the run the owner moved sits in
+        # this snapshot as the job this worker was running, and however long
+        # it waits it must be neither restored here nor dropped as stale. The
+        # queue holds it; the snapshot lets go of its copy.
+        # ⛔ AND SO IS ONE ANOTHER WORKER HAS TAKEN and not started yet — its
+        # taken marker is the only sign of that (this worker's own taken
+        # markers went back to waiting before this ran).
+        if _run_dir_held_by_queue(_job_run_dir(j)):
+            log(f"[pending_queue] {rid[:24]}… is waiting in the queue for a worker, "
+                f"or one has taken it — left there", "INFO")
+            skipped += 1
+            withdrew = True
+            continue
         # ⛔⛔ TOO OLD TO BE ANYBODY'S NOW — before any read, on the startup
         # sweep's own horizon. Nobody is watching a tile for a week.
         age = _job_age_s(j)
@@ -18052,9 +18938,42 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # 58d705e, 2026-09-29): one device read per restore, not one more per
         # entry. A read that FAILED is not an answer, so the pickup asks again —
         # a blip at boot must not keep a former sharer's job.
-        if _pickup_withdrawn((j or {}).get("uid"), (j or {}).get("research_id"),
-                             "disk-restore", denied_is_answer=True,
-                             members=_MEMBERS_UNREAD if members is None else members)[0]:
+        withdrawn, record = _pickup_withdrawn(
+            (j or {}).get("uid"), (j or {}).get("research_id"),
+            "disk-restore", denied_is_answer=True,
+            members=_MEMBERS_UNREAD if members is None else members)
+        if withdrawn:
+            skipped += 1
+            withdrew = True
+            continue
+        # ⛔⛔ WAVE 13 REPAIR — A RUN ANOTHER WORKER RUNS NOW IS NOT THIS
+        # SNAPSHOT'S. The worker a run was moved off came back and found it
+        # here as its own job: a sibling had taken it from the queue in the
+        # seconds between, and this restore put it back at #1 over that live
+        # run, or started a second pipeline on it. The same question the
+        # restart's retries ask: a live sibling lock, or a record that says
+        # another worker runs it.
+        why = _run_taken_since_boot((j or {}).get("uid"), rid, record, job_queue,
+                                    unstamped_is_worker_1=False)
+        if why is not None:
+            log(f"[pending_queue] {rid[:24]}… not restored — {why}", "INFO")
+            skipped += 1
+            withdrew = True
+            continue
+        # ⭐⭐ WAVE 13 — THE RUN THIS WORKER WAS RUNNING, ON A RESTING WORKER,
+        # goes to the front of the queue instead of resuming here: the same
+        # rule the rehydrate scan follows, for the runs that scan cannot see
+        # (a sharer's, while sharer rehydration is off, is the common one).
+        # ⭐ AND THE JOBS IT HAD ONLY QUEUED go behind it (wave 13 repair):
+        # restored into this line, the worker that is off ran them one after
+        # another while the published order showed them waiting. Only on a
+        # record that was read and still says it wants to run — a park writes
+        # "queued", and a Resume card or a stop must not be written over.
+        if (_worker_is_resting()
+                and (record or {}).get("status") in ("queued", "ongoing")
+                and _park_instead_of_resuming(j, where="pending_queue", behind=j is not cur,
+                                              status=(record or {}).get("status"))):
+            parked = True
             skipped += 1
             withdrew = True
             continue
@@ -18081,6 +19000,12 @@ def _restore_pending_queue_snapshot(path, job_queue, already_rids) -> "tuple[int
         # The same rewrite, for the same reason: what restored is in the queue
         # and what the funnel refused is kept; only the withdrawn entry goes.
         _forget_pending_queue_snapshot(path, job_queue, refused)
+    # ⛔ ONE PUBLISH AFTER THE LAST PARK, AND IT WAITS ITS TURN (wave 13 repair).
+    # Each park kicks the queue order in the background, and a kick that finds
+    # a publish already running skips — so a restore that parked the run and the
+    # jobs behind it published whatever the first scan happened to see.
+    if parked:
+        _publish_queue_positions_now()
     # ⛔⛔ A HELD ENTRY IS ASKED ABOUT AGAIN, IN THIS PROCESS (wave 10.10
     # leftovers). Kept for the next boot and nothing more, it waited for a
     # restart that might be days away while its person watched a tile that
@@ -77852,6 +78777,29 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                 if (await asyncio.to_thread(
                         _pickup_withdrawn, tree_uid, research_id, "rehydrate"))[0]:
                     continue
+                # ⭐ WAVE 13 — A RUN WAITING FOR A WORKER IS THE QUEUE'S, NOT
+                # THIS SCAN'S. Its record should say "queued" (so this query
+                # would not see it), but the run it was moved off can write
+                # "ongoing" in its last second, and a worker that took it can
+                # die before starting it. Resuming it here or offering a
+                # Resume card would run it twice or strand it; it is put back
+                # to "queued" and left for the next awake worker.
+                _queue_dir_now = _run_dir_inside_queues(_corroborated_run_id(
+                    data.get("backendRunId"), research_id, tree_uid))
+                if _run_dir_waiting(_queue_dir_now):
+                    _update_research_doc(tree_uid, research_id, _waiting_record_patch())
+                    log(f"[rehydrate] {research_id[:24]}… is waiting in the queue for "
+                        f"a worker — left there", "INFO")
+                    _kick_queue_publish()
+                    continue
+                # ⛔ AND ONE ANOTHER WORKER HAS TAKEN FROM THE QUEUE and not yet
+                # started (wave 13 repair) — this worker's own taken runs went
+                # back to waiting before this scan. That worker is about to run
+                # it and its record is that worker's to write: nothing here.
+                if _run_dir_held_by_queue(_queue_dir_now):
+                    log(f"[rehydrate] {research_id[:24]}… was taken from the queue by "
+                        f"another worker — left to it", "INFO")
+                    continue
                 # ⛔⛔ AFTER THE HAND-OFF THE RUN IS THE CLOUD'S, AND THIS SCAN
                 # USED TO TAKE IT BACK (wave 10.9, 542-4). The query is
                 # status=="ongoing", and a run in its cloud tail is deliberately
@@ -78009,10 +78957,27 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                                 # Masked from the linter by `from prompts import *`,
                                 # which downgrades every unresolved global to F405.
                                 _qref = _QUEUE_STATE.get("queue_ref")
+                                _resume_job = {
+                                    "topic": topic, "email": "", "config": cfg,
+                                    "run_id": run_id, "resume_dir": str(queue_dir),
+                                    "uid": tree_uid, "research_id": research_id,
+                                    "submitted_by": str(data.get("submittedBy") or "").strip(),
+                                }
                                 if _qref is None:
                                     log("Rehydrate: no in-memory queue_ref yet (boot race) — "
                                         f"cannot auto-resume {research_id[:24]}…, falling through "
                                         "to paused_backend_restart", "WARN")
+                                # ⭐⭐ WAVE 13 — A RESTING WORKER DOES NOT RESUME
+                                # IT. The owner turned this worker off; a restart
+                                # (an update, a crash) used to bring its run back
+                                # up on it anyway, because a rest only ever guarded
+                                # NEW start documents. It goes to the front of the
+                                # queue instead, for a worker that is on.
+                                elif (await asyncio.to_thread(_worker_is_resting)
+                                      and await asyncio.to_thread(
+                                          _park_instead_of_resuming, _resume_job,
+                                          where="rehydrate")):
+                                    auto_resumed = True
                                 elif _safe_enqueue(_qref, {
                                     "topic": topic,
                                     "email": "",  # delivery prefs are on disk in delivery.json
@@ -78610,6 +79575,99 @@ def _local_run_private_details(queue_dir) -> dict:
             "delivery": None, "pipeline_state": _local_run_state(queue_dir)}
 
 
+def _startup_sweep_stale_runs(queues_root) -> None:
+    """Boot: purge stale failed runs older than `_STALE_RUN_S`.
+
+    ⭐ Lifted out of `run_server` unchanged (wave 13) so it can be RUN by a
+    test rather than read — plus the one keep it gained, for a run waiting in
+    the queue for a worker."""
+    # ── Startup sweep: purge stale failed runs older than 7 days ──
+    # Without this, queues/ piles up forever with partial MDs, partial
+    # audio, and orphaned Firestore docs. We only sweep entries whose
+    # delivery.json status is NOT in a clean-parked set, and only if the
+    # dir hasn't been touched in > 7 days so active debugging sessions
+    # aren't wiped out. (tracks/ removed 2026-04-29 — was the only other
+    # local artifact; nothing to sweep there anymore.)
+    try:
+        now_ts = time.time()
+        STALE_SECONDS = _STALE_RUN_S  # the boot restore's horizon too
+        KEEP_STATUSES = {"completed", "paused", "paused_backend_restart"}
+        swept = 0
+        if queues_root.exists():
+            for d in queues_root.iterdir():
+                if not d.is_dir():
+                    continue
+                delivery_path = d / "delivery.json"
+                status = ""
+                try:
+                    if delivery_path.exists():
+                        status = json.loads(delivery_path.read_text(encoding="utf-8")).get("status", "")
+                except Exception:
+                    pass
+                # ⛔⛔ A RUN WAITING IN THE QUEUE FOR A WORKER KEEPS ITS FOLDER,
+                # HOWEVER LONG IT WAITS (wave 13). A moved run's delivery still
+                # says "ongoing" and nobody works in its folder while it waits,
+                # so without this a week of resting workers deleted the very
+                # checkpoint it is waiting to resume from.
+                if _run_dir_held_by_queue(d):
+                    continue
+                if status in KEEP_STATUSES:
+                    continue
+                try:
+                    mtime = d.stat().st_mtime
+                except Exception:
+                    continue
+                if (now_ts - mtime) < STALE_SECONDS:
+                    continue
+                # Cascade Firestore cleanup if owner.json is present
+                owner_path = d / "owner.json"
+                if owner_path.exists() and _firebase_db:
+                    try:
+                        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                        uid, rid = owner.get("uid"), owner.get("researchId")
+                        if uid and rid:
+                            ref = _firebase_db.collection("users").document(uid) \
+                                .collection("researches").document(rid)
+                            # ⛔⛔ ONLY `commands`. THE OTHER FOUR AND THE DOC ITSELF
+                            # WERE REMOVED 2026-09-01 BECAUSE THIS PROCESS CANNOT DO
+                            # THEM — not "usually fails", cannot. Their rule is
+                            # owner-only and under Track D we are a synthetic DEVICE
+                            # user, so every one of those deletes came back
+                            # PERMISSION_DENIED and was swallowed by the bare
+                            # `except: pass` sitting under it. ⭐ The line above this
+                            # already SAID so — "the other four + the doc are
+                            # OWNER-ONLY in rules (synth user denied by design)" — so
+                            # the code has been documenting its own no-op since #720
+                            # while still walking every document to attempt it.
+                            # ⛔ A cleanup that cannot succeed is worse than none: it
+                            # reads like coverage, and it is why nobody asked who
+                            # WAS deleting these.
+                            # ▶ Who actually does: the front-end cascades, which run
+                            # as the owner. `pipeline_events` additionally has a
+                            # 30-day TTL as of 2026-09-01. ⚠ `documents`, `audios`
+                            # and `messages` have NO TTL — the front end is their
+                            # only reaper, exactly as it already was.
+                            try:
+                                for sd in ref.collection("commands").stream():
+                                    try:
+                                        _grpc_write_with_heal(
+                                            lambda sd=sd: sd.reference.delete(),
+                                            what="cascade-sweep cmd delete", uid=uid)
+                                    except Exception: pass
+                            except Exception: pass
+                    except Exception: pass
+                # Nuke local queue dir.
+                import shutil as _shutil
+                try: _shutil.rmtree(d)
+                except Exception: pass
+                swept += 1
+        if swept:
+            log(f"[startup-sweep] purged {swept} stale run(s) older than "
+                f"{_STALE_RUN_S // 86400} days", "INFO")
+    except Exception as _se:
+        log(f"[startup-sweep] failed: {_se}", "WARN")
+
+
 async def run_server(port=8000):
     """Start FastAPI server for real-time web app streaming."""
     from fastapi import FastAPI
@@ -78676,84 +79734,7 @@ async def run_server(port=8000):
 
     queues_root = Path(__file__).parent / "queues"
 
-    # ── Startup sweep: purge stale failed runs older than 7 days ──
-    # Without this, queues/ piles up forever with partial MDs, partial
-    # audio, and orphaned Firestore docs. We only sweep entries whose
-    # delivery.json status is NOT in a clean-parked set, and only if the
-    # dir hasn't been touched in > 7 days so active debugging sessions
-    # aren't wiped out. (tracks/ removed 2026-04-29 — was the only other
-    # local artifact; nothing to sweep there anymore.)
-    try:
-        now_ts = time.time()
-        STALE_SECONDS = _STALE_RUN_S  # the boot restore's horizon too
-        KEEP_STATUSES = {"completed", "paused", "paused_backend_restart"}
-        swept = 0
-        if queues_root.exists():
-            for d in queues_root.iterdir():
-                if not d.is_dir():
-                    continue
-                delivery_path = d / "delivery.json"
-                status = ""
-                try:
-                    if delivery_path.exists():
-                        status = json.loads(delivery_path.read_text(encoding="utf-8")).get("status", "")
-                except Exception:
-                    pass
-                if status in KEEP_STATUSES:
-                    continue
-                try:
-                    mtime = d.stat().st_mtime
-                except Exception:
-                    continue
-                if (now_ts - mtime) < STALE_SECONDS:
-                    continue
-                # Cascade Firestore cleanup if owner.json is present
-                owner_path = d / "owner.json"
-                if owner_path.exists() and _firebase_db:
-                    try:
-                        owner = json.loads(owner_path.read_text(encoding="utf-8"))
-                        uid, rid = owner.get("uid"), owner.get("researchId")
-                        if uid and rid:
-                            ref = _firebase_db.collection("users").document(uid) \
-                                .collection("researches").document(rid)
-                            # ⛔⛔ ONLY `commands`. THE OTHER FOUR AND THE DOC ITSELF
-                            # WERE REMOVED 2026-09-01 BECAUSE THIS PROCESS CANNOT DO
-                            # THEM — not "usually fails", cannot. Their rule is
-                            # owner-only and under Track D we are a synthetic DEVICE
-                            # user, so every one of those deletes came back
-                            # PERMISSION_DENIED and was swallowed by the bare
-                            # `except: pass` sitting under it. ⭐ The line above this
-                            # already SAID so — "the other four + the doc are
-                            # OWNER-ONLY in rules (synth user denied by design)" — so
-                            # the code has been documenting its own no-op since #720
-                            # while still walking every document to attempt it.
-                            # ⛔ A cleanup that cannot succeed is worse than none: it
-                            # reads like coverage, and it is why nobody asked who
-                            # WAS deleting these.
-                            # ▶ Who actually does: the front-end cascades, which run
-                            # as the owner. `pipeline_events` additionally has a
-                            # 30-day TTL as of 2026-09-01. ⚠ `documents`, `audios`
-                            # and `messages` have NO TTL — the front end is their
-                            # only reaper, exactly as it already was.
-                            try:
-                                for sd in ref.collection("commands").stream():
-                                    try:
-                                        _grpc_write_with_heal(
-                                            lambda sd=sd: sd.reference.delete(),
-                                            what="cascade-sweep cmd delete", uid=uid)
-                                    except Exception: pass
-                            except Exception: pass
-                    except Exception: pass
-                # Nuke local queue dir.
-                import shutil as _shutil
-                try: _shutil.rmtree(d)
-                except Exception: pass
-                swept += 1
-        if swept:
-            log(f"[startup-sweep] purged {swept} stale run(s) older than "
-                f"{_STALE_RUN_S // 86400} days", "INFO")
-    except Exception as _se:
-        log(f"[startup-sweep] failed: {_se}", "WARN")
+    _startup_sweep_stale_runs(queues_root)
 
     # ── Periodic orphan sweep ──
     # Complements the startup time-based sweep above. This one is
@@ -79560,7 +80541,11 @@ async def run_server(port=8000):
         """
         if not _firebase_db:
             return
-        if load_worker_count() <= 1 and not _REST_DEFER_SEEN["v"]:
+        # ⭐ WAVE 13: a run waiting for a worker (moved to the queue, or handed
+        # back by a resting worker's restart) is the FRONT of the queue — taken
+        # below before any deferred document, on any worker count.
+        _front_waiting = bool(await asyncio.to_thread(_waiting_runs))
+        if load_worker_count() <= 1 and not _REST_DEFER_SEEN["v"] and not _front_waiting:
             # Single-worker mode — the listener never gates on busy, so no
             # orphan can exist… EXCEPT a doc deferred by the #903 rest gate
             # (Firestore won't re-fire ADDED when the owner wakes the worker;
@@ -79603,6 +80588,13 @@ async def run_server(port=8000):
         # internally to ~1/min; still never claims anything.
         if await asyncio.to_thread(_worker_is_resting):
             await asyncio.to_thread(_rest_keepalive_pass)
+            return
+        # One at a time, like the claim below: the worker runs it before the
+        # next rescan looks again. ⛔ And a waiting run this tick could not
+        # take (the worker it was moved off is still exiting) keeps its place:
+        # no deferred document is claimed past it until the next tick.
+        if _front_waiting:
+            await _offer_waiting_run(_job_queue)
             return
         did = load_device_id()
         if not did:
@@ -79893,6 +80885,11 @@ async def run_server(port=8000):
                 job.get("research_id") or "",
                 job.get("run_id") or "",
             )
+            # ⭐ WAVE 13: a run taken from the front of the queue is no longer
+            # waiting once this worker's lock names it — the lock now keeps its
+            # folder, and nothing else may take it.
+            if job.get("moved_run"):
+                _drop_waiting_claim(_job_run_dir(job), WORKER_ID)
             # ⛔⛔ AN ACCOUNT THIS COMPUTER NO LONGER RUNS FOR — asked before the
             # flip, of every job (09-29 re-verify). The owner removed it while
             # its job waited here. Its record still READS "queued": the backend
@@ -80806,6 +81803,10 @@ async def run_server(port=8000):
         # an operator repair needs no manual cleanup step.
         if WORKER_ID >= 2:
             _clear_worker_dead_marker(WORKER_ID)
+        # Wave 13: a run this worker took from the front of the queue and died
+        # before starting goes back to the queue — BEFORE rehydration, which
+        # must see it as waiting, not as this worker's to resume.
+        _release_waiting_claims(WORKER_ID)
         # Track every Firestore research_id touched by rehydration — used by
         # the disk-restore block below so an ongoing run that got marked
         # paused_backend_restart isn't falsely re-enqueued from

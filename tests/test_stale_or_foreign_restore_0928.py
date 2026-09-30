@@ -503,9 +503,16 @@ def _days_old(folder):
 
 def _crash_with(tmp_path, jobs):
     """The worker boundary's own write of what waits in the queue — then the PC
-    dies, so this file is all the next boot has."""
+    dies, so this file is all the next boot has.
+
+    ⛔ AND NOTHING IN MEMORY SURVIVES IT (wave 13 repair). The Resume above ran
+    in this test's process and recorded itself as started here; a real crash
+    starts the next boot with that record empty. Left, the boot restore — which
+    now asks whether a Resume in THIS process has started the run — read the
+    dead process's Resume as a live one."""
     path = tmp_path / "queues" / "_pending_queue.json"
     research._write_pending_queue_snapshot(path, None, jobs)
+    research._RESUMED_HERE.clear()
     return path
 
 

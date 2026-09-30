@@ -40,8 +40,10 @@ MUTANTS = [
        "                .get())\n")]),
     ("R2", RESEARCH, "⛔ the boot restore does not pass the members it read — one more "
      "device read per entry of another account",
-     [("members=_MEMBERS_UNREAD if members is None else members)[0]:",
-       "members=_MEMBERS_UNREAD)[0]:")]),
+     # ⚠ RE-ANCHORED 2026-09-29 (wave 13 repair): the restore keeps the record
+     # the pickup read, for the "who holds it now" question after it.
+     [("            members=_MEMBERS_UNREAD if members is None else members)\n        if withdrawn:\n",
+       "            members=_MEMBERS_UNREAD)\n        if withdrawn:\n")]),
     ("R3", RESEARCH, "⛔ the members a caller passes are ignored — every pickup reads "
      "the device document again",
      [("    if members is _MEMBERS_UNREAD:\n        members = _device_members()\n",

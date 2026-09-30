@@ -308,8 +308,10 @@ def test_the_defer_gate_still_defers_on_every_busy_signal():
     src = _listener_src()
     i = src.index("if (_resting")
     cond = " ".join(src[i:src.index("):", i) + 1].split())
+    # Wave 13: a run waiting in the queue for a worker (`_front_waiting`) holds a
+    # new start back too — its behaviour is pinned in tests/test_requeue_w13.py.
     assert cond == (
-        'if (_resting or _QUEUE_STATE.get("running") '
+        'if (_resting or _front_waiting or _QUEUE_STATE.get("running") '
         'or job_queue.qsize() > 0 or _pending_enq_read() > 0)'
     ), f"the busy check changed shape: {cond}"
 

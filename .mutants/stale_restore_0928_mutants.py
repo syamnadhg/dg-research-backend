@@ -62,8 +62,10 @@ DENIED_TEST = ('    return (type(err).__name__ == "PermissionDenied" or "403" in
                '            or "Missing or insufficient permissions" in s)')
 FUNNEL_DENIED = "                if denied is not None:"
 # ⚠ RE-ANCHORED 2026-09-29 (Windows review): the restore passes the members it read.
-RESTORE_ASKS = ('                             "disk-restore", denied_is_answer=True,\n'
-                '                             members=_MEMBERS_UNREAD if members is None else members)[0]:')
+# ⚠ RE-ANCHORED 2026-09-29 (wave 13 repair): the restore keeps the record it read.
+RESTORE_ASKS = ('            "disk-restore", denied_is_answer=True,\n'
+                '            members=_MEMBERS_UNREAD if members is None else members)\n'
+                '        if withdrawn:\n')
 RESTORE_LIST = "                         hold_unreadable=_UNREAD_RESTORES, denied=denied):"
 RESTORE_SHEDS = ("        elif denied:\n"
                  "            # The pickup rule's read answered and this one was refused: the\n"
@@ -125,7 +127,7 @@ MUTANTS = [
      [(FUNNEL_DENIED, "                if False:")]),
     ("D6", RESEARCH, "the boot restore stops asking the pickup rule for a refusal "
      "— the record read logs 'taking the job' before the funnel drops it",
-     [(RESTORE_ASKS, '                             "disk-restore")[0]:')]),
+     [(RESTORE_ASKS, '            "disk-restore")\n        if withdrawn:\n')]),
     ("D7", RESEARCH, "⛔ the boot restore hands the funnel no list — a refusal on "
      "the funnel's read is trusted and run",
      [(RESTORE_LIST, "                         hold_unreadable=_UNREAD_RESTORES):")]),
