@@ -1,0 +1,3843 @@
+{
+ "what": "chatgpt-copy-button-capture",
+ "when": "2026-09-29T20:45:59.091Z",
+ "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+ "replies": 1,
+ "turns": 1,
+ "copyButtons": [
+  {
+   "button": {
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Copy message"
+    },
+    "visible": true,
+    "innerTextLen": 0
+   },
+   "siblingLabels": [
+    "Copy message",
+    "Share prompt",
+    "Edit message"
+   ],
+   "inTurnKey": true,
+   "inAssistantUnit": false,
+   "inReplyText": false,
+   "inCodeBlock": false,
+   "ancestors": [
+    {
+     "tag": "SPAN",
+     "attrs": {
+      "data-state": "closed",
+      "class": "contents"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex turn-action-controls items-center gap-0.5 browser:gap-0"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "me-1 ms-1 flex items-center gap-2 opacity-0 group-focus-within/user-message:opacity-100 gr"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-row-reverse items-center gap-1"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col gap-1 items-end"
+     },
+     "textLen": 410
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "w-full",
+      "data-content-search-unit-key": "fallback-turn-0:0:user"
+     },
+     "textLen": 410
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/user-message flex w-full flex-col gap-2 items-end"
+     },
+     "textLen": 410
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+      "data-chatgpt-search-message-ids": "<36 chars>"
+     },
+     "textLen": 410
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     },
+     "textLen": 421
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-turn-key": "fallback-turn-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 pb-5",
+      "data-thread-find-target": "conversation"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     },
+     "textLen": 39235
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain browser:ove",
+      "role": "presentation"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     },
+     "textLen": 39259
+    }
+   ]
+  },
+  {
+   "button": {
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Copy table"
+    },
+    "visible": true,
+    "innerTextLen": 0
+   },
+   "siblingLabels": [
+    "Copy table",
+    "Expand table"
+   ],
+   "inTurnKey": true,
+   "inAssistantUnit": true,
+   "inReplyText": true,
+   "inCodeBlock": false,
+   "ancestors": [
+    {
+     "tag": "SPAN",
+     "attrs": {
+      "data-state": "closed",
+      "class": "contents"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "absolute end-0 top-0 z-50 flex w-fit select-none items-center gap-1 rounded-full bg-surfac",
+      "data-block-actions": "true",
+      "data-markdown-copy": "exclude"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/app-widget pointer-coarse:pt-11 [@media(hover:none)]:pt-11 TableContainer-UfIOz_",
+      "data-markdown-table": "true",
+      "data-wide-block": "",
+      "tabindex": "-1"
+     },
+     "textLen": 1345
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-selected-text-overlay-target": "_r_ch_",
+      "dir": "auto",
+      "data-markdown-text-style": "assistant-message",
+      "class": "MarkdownRoot-rZKhxa [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*:last-child]:mb-0 [&>"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex min-w-0 flex-col",
+      "data-chatgpt-selection-conversation-id": "6abbefc5-2050-83ea-ad73-70142df1eb80",
+      "data-chatgpt-selection-message-id": "691cc3b6-0079-4eb9-b135-2d6be3048edc"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-message-ids": "<73 chars>"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-turn-key": "fallback-turn-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 pb-5",
+      "data-thread-find-target": "conversation"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     },
+     "textLen": 39235
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain browser:ove",
+      "role": "presentation"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    }
+   ]
+  },
+  {
+   "button": {
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Copy table"
+    },
+    "visible": true,
+    "innerTextLen": 0
+   },
+   "siblingLabels": [
+    "Copy table",
+    "Expand table"
+   ],
+   "inTurnKey": true,
+   "inAssistantUnit": true,
+   "inReplyText": true,
+   "inCodeBlock": false,
+   "ancestors": [
+    {
+     "tag": "SPAN",
+     "attrs": {
+      "data-state": "closed",
+      "class": "contents"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "absolute end-0 top-0 z-50 flex w-fit select-none items-center gap-1 rounded-full bg-surfac",
+      "data-block-actions": "true",
+      "data-markdown-copy": "exclude"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/app-widget pointer-coarse:pt-11 [@media(hover:none)]:pt-11 TableContainer-UfIOz_",
+      "data-markdown-table": "true",
+      "data-wide-block": "",
+      "tabindex": "-1"
+     },
+     "textLen": 1586
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-selected-text-overlay-target": "_r_ch_",
+      "dir": "auto",
+      "data-markdown-text-style": "assistant-message",
+      "class": "MarkdownRoot-rZKhxa [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*:last-child]:mb-0 [&>"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex min-w-0 flex-col",
+      "data-chatgpt-selection-conversation-id": "6abbefc5-2050-83ea-ad73-70142df1eb80",
+      "data-chatgpt-selection-message-id": "691cc3b6-0079-4eb9-b135-2d6be3048edc"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-message-ids": "<73 chars>"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-turn-key": "fallback-turn-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 pb-5",
+      "data-thread-find-target": "conversation"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     },
+     "textLen": 39235
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain browser:ove",
+      "role": "presentation"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    }
+   ]
+  },
+  {
+   "button": {
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Copy table"
+    },
+    "visible": true,
+    "innerTextLen": 0
+   },
+   "siblingLabels": [
+    "Copy table",
+    "Expand table"
+   ],
+   "inTurnKey": true,
+   "inAssistantUnit": true,
+   "inReplyText": true,
+   "inCodeBlock": false,
+   "ancestors": [
+    {
+     "tag": "SPAN",
+     "attrs": {
+      "data-state": "closed",
+      "class": "contents"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "absolute end-0 top-0 z-50 flex w-fit select-none items-center gap-1 rounded-full bg-surfac",
+      "data-block-actions": "true",
+      "data-markdown-copy": "exclude"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/app-widget pointer-coarse:pt-11 [@media(hover:none)]:pt-11 TableContainer-UfIOz_",
+      "data-markdown-table": "true",
+      "data-wide-block": "",
+      "tabindex": "-1"
+     },
+     "textLen": 752
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-selected-text-overlay-target": "_r_ch_",
+      "dir": "auto",
+      "data-markdown-text-style": "assistant-message",
+      "class": "MarkdownRoot-rZKhxa [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*:last-child]:mb-0 [&>"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex min-w-0 flex-col",
+      "data-chatgpt-selection-conversation-id": "6abbefc5-2050-83ea-ad73-70142df1eb80",
+      "data-chatgpt-selection-message-id": "691cc3b6-0079-4eb9-b135-2d6be3048edc"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-message-ids": "<73 chars>"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-turn-key": "fallback-turn-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 pb-5",
+      "data-thread-find-target": "conversation"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     },
+     "textLen": 39235
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain browser:ove",
+      "role": "presentation"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    }
+   ]
+  },
+  {
+   "button": {
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Copy table"
+    },
+    "visible": true,
+    "innerTextLen": 0
+   },
+   "siblingLabels": [
+    "Copy table",
+    "Expand table"
+   ],
+   "inTurnKey": true,
+   "inAssistantUnit": true,
+   "inReplyText": true,
+   "inCodeBlock": false,
+   "ancestors": [
+    {
+     "tag": "SPAN",
+     "attrs": {
+      "data-state": "closed",
+      "class": "contents"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "absolute end-0 top-0 z-50 flex w-fit select-none items-center gap-1 rounded-full bg-surfac",
+      "data-block-actions": "true",
+      "data-markdown-copy": "exclude"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/app-widget pointer-coarse:pt-11 [@media(hover:none)]:pt-11 TableContainer-UfIOz_",
+      "data-markdown-table": "true",
+      "data-wide-block": "",
+      "tabindex": "-1"
+     },
+     "textLen": 2155
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-selected-text-overlay-target": "_r_ch_",
+      "dir": "auto",
+      "data-markdown-text-style": "assistant-message",
+      "class": "MarkdownRoot-rZKhxa [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*:last-child]:mb-0 [&>"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex min-w-0 flex-col",
+      "data-chatgpt-selection-conversation-id": "6abbefc5-2050-83ea-ad73-70142df1eb80",
+      "data-chatgpt-selection-message-id": "691cc3b6-0079-4eb9-b135-2d6be3048edc"
+     },
+     "textLen": 38715
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+      "data-chatgpt-search-message-ids": "<73 chars>"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "block-BQZwFn"
+     },
+     "textLen": 38729
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-3 browser:gap-1"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-turn-key": "fallback-turn-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 pb-5",
+      "data-thread-find-target": "conversation"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     },
+     "textLen": 39235
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain browser:ove",
+      "role": "presentation"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    }
+   ]
+  },
+  {
+   "button": {
+    "attrs": {
+     "type": "button",
+     "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+     "aria-label": "Copy"
+    },
+    "visible": true,
+    "innerTextLen": 0
+   },
+   "siblingLabels": [
+    "Copy",
+    "Share",
+    "Read aloud",
+    "Regenerate response",
+    "More actions"
+   ],
+   "inTurnKey": true,
+   "inAssistantUnit": false,
+   "inReplyText": false,
+   "inCodeBlock": false,
+   "ancestors": [
+    {
+     "tag": "SPAN",
+     "attrs": {
+      "data-state": "closed",
+      "class": "contents"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-5 min-w-0 flex-wrap items-center gap-0.5 browser:gap-0"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "mt-1.5 flex turn-action-controls min-h-5 min-w-0 max-w-(--thread-content-max-width) flex-w"
+     },
+     "textLen": 0
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group flex flex-col"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col gap-1.5"
+     },
+     "textLen": 39170
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-content-search-turn-key": "fallback-turn-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+      "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": ""
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex flex-col"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative shrink-0"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-chatgpt-conversation-selection-target": "true",
+      "class": "flex min-h-full flex-1 flex-col gap-1.5 pb-5",
+      "data-thread-find-target": "conversation"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-mcp-app-portal-target": "true",
+      "data-thread-user-message-navigation-content": "true",
+      "class": "relative flex flex-1 shrink-0 flex-col transcriptContent-l_FOQD [--thread-content-max-widt"
+     },
+     "textLen": 39185
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "[container-type:inline-size] flex min-h-full shrink-0 flex-col justify-start overflow-x-cl"
+     },
+     "textLen": 39235
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-app-action-timeline-scroll": "",
+      "class": "thread-scroll-container overflow-x-hidden overflow-y-auto overscroll-y-contain browser:ove",
+      "role": "presentation"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "data-request-input-activity-root": "true",
+      "class": "group/thread-scroll-layout has-[[data-composer-expand-toggle]]:[container-type:size] relat"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "contents"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "min-h-0 flex-1"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative mx-auto flex min-h-0 w-full flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex min-h-0 flex-1 flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex h-full flex-col"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative h-full min-h-0"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "flex h-full min-h-0 min-w-0 flex-1 flex-col outline-none",
+      "data-app-shell-focus-area": "main"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "relative flex min-h-0 flex-1 [--thread-content-responsive-max-width:var(--thread-content-e",
+      "data-app-shell-main-content-top-fade": "visible"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "MainContentFrame-sss8BP",
+      "data-app-shell-thread-edge-divider": "false"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "MainContentViewport-OinMfT",
+      "data-app-shell-main-content-layout": "thread-edge-scroll",
+      "data-app-shell-custom-titlebar": "false",
+      "data-app-shell-header-edge-scroll": "false",
+      "data-app-shell-right-panel-full-width": "false"
+     },
+     "textLen": 39259
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "WorkspaceContent-dnr6uY relative isolate flex min-h-0 flex-1 overflow-hidden"
+     },
+     "textLen": 39259
+    }
+   ]
+  }
+ ],
+ "lastReply": {
+  "tree": {
+   "tag": "DIV",
+   "attrs": {
+    "data-selected-text-overlay-target": "_r_ch_",
+    "dir": "auto",
+    "data-markdown-text-style": "assistant-message",
+    "class": "MarkdownRoot-rZKhxa [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*:last-child]:mb-0 [&>"
+   },
+   "textLen": 38715,
+   "kids": [
+    {
+     "tag": "H1",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 105,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 105,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H2",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 31,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 31,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 218,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 218,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 291,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 103,
+       "kids": []
+      },
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 68,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 68,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 120,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 74,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 15,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 15,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 1,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-markdown-copy": "inline-code",
+        "class": "InlineCode-Cddi3Y InlineMarkdownIsolate-QWDV4W",
+        "dir": "ltr"
+       },
+       "textLen": 58,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 24,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 24,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "BLOCKQUOTE",
+     "attrs": {
+      "class": "Blockquote-EqEEot",
+      "dir": "auto"
+     },
+     "textLen": 269,
+     "kids": [
+      {
+       "tag": "P",
+       "attrs": {
+        "class": "Paragraph-kKnbIo",
+        "dir": "auto"
+       },
+       "textLen": 269,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 269,
+         "kids": []
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 274,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 274,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 307,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 35,
+       "kids": []
+      },
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 146,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 146,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 126,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 319,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 319,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H2",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 49,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 49,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 113,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 94,
+       "kids": []
+      },
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 18,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 18,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 1,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 39,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 39,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 201,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 17,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 17,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 184,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 274,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 30,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 30,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 244,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 209,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 209,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 406,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 406,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 125,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 125,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H2",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 58,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 58,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 16,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 16,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 801,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 786,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-state": "closed",
+        "class": "contents"
+       },
+       "textLen": 14,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "class": "ms-1 inline-flex max-w-full items-center font-sans select-none relative top-[-0.094rem] tr",
+          "data-search-result-target": ""
+         },
+         "textLen": 14,
+         "kids": [
+          {
+           "tag": "A",
+           "attrs": {
+            "data-testid": "chatgpt-citation",
+            "aria-label": "Liquid Compute: The GPU Offtaker Credit Map: 200 Private AI Compute Buyers, Ranked — Liqui",
+            "class": "no-underline! group cursor-interaction hover:bg-primary-solid hover:text-inverse! flex h-4",
+            "rel": "noopener noreferrer",
+            "target": "_blank"
+           },
+           "textLen": 14,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "relative start-0 bottom-0 flex h-full w-full items-center"
+             },
+             "textLen": 14,
+             "kids": [
+              {
+               "tag": "SPAN",
+               "attrs": {
+                "class": "flex min-w-0 flex-1 items-center gap-1"
+               },
+               "textLen": 14,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "Favicon-xZwQNw inline-block shrink-0 rounded-2xs size-3 overflow-hidden rounded-full text-"
+                 },
+                 "textLen": 0,
+                 "kids": [
+                  {
+                   "tag": "IMG",
+                   "attrs": {
+                    "alt": "",
+                    "class": "absolute inset-0 h-full w-full rounded-2xs object-contain opacity-100",
+                    "decoding": "async",
+                    "draggable": "false",
+                    "referrerpolicy": "no-referrer"
+                   },
+                   "textLen": 0,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "max-w-[15ch] min-w-0 grow truncate overflow-hidden text-center"
+                 },
+                 "textLen": 14,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 66,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 66,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 533,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 523,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-state": "closed",
+        "class": "contents"
+       },
+       "textLen": 9,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "class": "ms-1 inline-flex max-w-full items-center font-sans select-none relative top-[-0.094rem] tr",
+          "data-search-result-target": ""
+         },
+         "textLen": 9,
+         "kids": [
+          {
+           "tag": "A",
+           "attrs": {
+            "data-testid": "chatgpt-citation",
+            "aria-label": "Anthropic: Anthropic and Amazon expand compute collaboration \\ Anthropic, https://www.anth",
+            "class": "no-underline! group cursor-interaction hover:bg-primary-solid hover:text-inverse! flex h-4",
+            "rel": "noopener noreferrer",
+            "target": "_blank"
+           },
+           "textLen": 9,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "relative start-0 bottom-0 flex h-full w-full items-center"
+             },
+             "textLen": 9,
+             "kids": [
+              {
+               "tag": "SPAN",
+               "attrs": {
+                "class": "flex min-w-0 flex-1 items-center gap-1"
+               },
+               "textLen": 9,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "Favicon-xZwQNw inline-block shrink-0 rounded-2xs size-3 overflow-hidden rounded-full text-"
+                 },
+                 "textLen": 0,
+                 "kids": [
+                  {
+                   "tag": "IMG",
+                   "attrs": {
+                    "alt": "",
+                    "class": "absolute inset-0 h-full w-full rounded-2xs object-contain opacity-100",
+                    "decoding": "async",
+                    "draggable": "false",
+                    "referrerpolicy": "no-referrer"
+                   },
+                   "textLen": 0,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "max-w-[15ch] min-w-0 grow truncate overflow-hidden text-center"
+                 },
+                 "textLen": 9,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 80,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 24,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 24,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "BR",
+       "attrs": {},
+       "textLen": 0,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-markdown-copy": "inline-code",
+        "class": "InlineCode-Cddi3Y InlineMarkdownIsolate-QWDV4W",
+        "dir": "ltr"
+       },
+       "textLen": 55,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 61,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 61,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 377,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 361,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-state": "closed",
+        "class": "contents"
+       },
+       "textLen": 15,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "class": "ms-1 inline-flex max-w-full items-center font-sans select-none relative top-[-0.094rem] tr",
+          "data-search-result-target": ""
+         },
+         "textLen": 15,
+         "kids": [
+          {
+           "tag": "A",
+           "attrs": {
+            "data-testid": "chatgpt-citation",
+            "aria-label": "US Press Center: OpenAI-and-Amazon-Announce-Strategic-Partnership - US Press Center, https",
+            "class": "no-underline! group cursor-interaction hover:bg-primary-solid hover:text-inverse! flex h-4",
+            "rel": "noopener noreferrer",
+            "target": "_blank"
+           },
+           "textLen": 15,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "relative start-0 bottom-0 flex h-full w-full items-center"
+             },
+             "textLen": 15,
+             "kids": [
+              {
+               "tag": "SPAN",
+               "attrs": {
+                "class": "flex min-w-0 flex-1 items-center gap-1"
+               },
+               "textLen": 15,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "Favicon-xZwQNw inline-block shrink-0 rounded-2xs size-3 overflow-hidden rounded-full text-"
+                 },
+                 "textLen": 0,
+                 "kids": [
+                  {
+                   "tag": "IMG",
+                   "attrs": {
+                    "alt": "",
+                    "class": "absolute inset-0 h-full w-full rounded-2xs object-contain opacity-100",
+                    "decoding": "async",
+                    "draggable": "false",
+                    "referrerpolicy": "no-referrer"
+                   },
+                   "textLen": 0,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "max-w-[15ch] min-w-0 grow truncate overflow-hidden text-center"
+                 },
+                 "textLen": 15,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 110,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 24,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 24,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "BR",
+       "attrs": {},
+       "textLen": 0,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-markdown-copy": "inline-code",
+        "class": "InlineCode-Cddi3Y InlineMarkdownIsolate-QWDV4W",
+        "dir": "ltr"
+       },
+       "textLen": 85,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 75,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 75,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 382,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 366,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-state": "closed",
+        "class": "contents"
+       },
+       "textLen": 15,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "class": "ms-1 inline-flex max-w-full items-center font-sans select-none relative top-[-0.094rem] tr",
+          "data-search-result-target": ""
+         },
+         "textLen": 15,
+         "kids": [
+          {
+           "tag": "A",
+           "attrs": {
+            "data-testid": "chatgpt-citation",
+            "aria-label": "US Press Center: Recursive Signs $410 Million, Multi-Year Collaboration with AWS to Scale ",
+            "class": "no-underline! group cursor-interaction hover:bg-primary-solid hover:text-inverse! flex h-4",
+            "rel": "noopener noreferrer",
+            "target": "_blank"
+           },
+           "textLen": 15,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "relative start-0 bottom-0 flex h-full w-full items-center"
+             },
+             "textLen": 15,
+             "kids": [
+              {
+               "tag": "SPAN",
+               "attrs": {
+                "class": "flex min-w-0 flex-1 items-center gap-1"
+               },
+               "textLen": 15,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "Favicon-xZwQNw inline-block shrink-0 rounded-2xs size-3 overflow-hidden rounded-full text-"
+                 },
+                 "textLen": 0,
+                 "kids": [
+                  {
+                   "tag": "IMG",
+                   "attrs": {
+                    "alt": "",
+                    "class": "absolute inset-0 h-full w-full rounded-2xs object-contain opacity-100",
+                    "decoding": "async",
+                    "draggable": "false",
+                    "referrerpolicy": "no-referrer"
+                   },
+                   "textLen": 0,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "max-w-[15ch] min-w-0 grow truncate overflow-hidden text-center"
+                 },
+                 "textLen": 15,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 154,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 24,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 24,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "BR",
+       "attrs": {},
+       "textLen": 0,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-markdown-copy": "inline-code",
+        "class": "InlineCode-Cddi3Y InlineMarkdownIsolate-QWDV4W",
+        "dir": "ltr"
+       },
+       "textLen": 129,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 78,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 78,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 526,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 519,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-state": "closed",
+        "class": "contents"
+       },
+       "textLen": 6,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "class": "ms-1 inline-flex max-w-full items-center font-sans select-none relative top-[-0.094rem] tr",
+          "data-search-result-target": ""
+         },
+         "textLen": 6,
+         "kids": [
+          {
+           "tag": "A",
+           "attrs": {
+            "data-testid": "chatgpt-citation",
+            "aria-label": "Akamai: Akamai Announces $11.6 Billion Multi-year Agreement with Anthropic to Support Grow",
+            "class": "no-underline! group cursor-interaction hover:bg-primary-solid hover:text-inverse! flex h-4",
+            "rel": "noopener noreferrer",
+            "target": "_blank"
+           },
+           "textLen": 6,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "relative start-0 bottom-0 flex h-full w-full items-center"
+             },
+             "textLen": 6,
+             "kids": [
+              {
+               "tag": "SPAN",
+               "attrs": {
+                "class": "flex min-w-0 flex-1 items-center gap-1"
+               },
+               "textLen": 6,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "Favicon-xZwQNw inline-block shrink-0 rounded-2xs size-3 overflow-hidden rounded-full text-"
+                 },
+                 "textLen": 0,
+                 "kids": [
+                  {
+                   "tag": "IMG",
+                   "attrs": {
+                    "alt": "",
+                    "class": "absolute inset-0 h-full w-full rounded-2xs object-contain opacity-100",
+                    "decoding": "async",
+                    "draggable": "false",
+                    "referrerpolicy": "no-referrer"
+                   },
+                   "textLen": 0,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "max-w-[15ch] min-w-0 grow truncate overflow-hidden text-center"
+                 },
+                 "textLen": 6,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 162,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 24,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 24,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "BR",
+       "attrs": {},
+       "textLen": 0,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-markdown-copy": "inline-code",
+        "class": "InlineCode-Cddi3Y InlineMarkdownIsolate-QWDV4W",
+        "dir": "ltr"
+       },
+       "textLen": 137,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 84,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 84,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 446,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 438,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-state": "closed",
+        "class": "contents"
+       },
+       "textLen": 7,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "class": "ms-1 inline-flex max-w-full items-center font-sans select-none relative top-[-0.094rem] tr",
+          "data-search-result-target": ""
+         },
+         "textLen": 7,
+         "kids": [
+          {
+           "tag": "A",
+           "attrs": {
+            "data-testid": "chatgpt-citation",
+            "aria-label": "Reuters: Anthropic's $518 billion AI buildout hinges largely on deals that cannot be cance",
+            "class": "no-underline! group cursor-interaction hover:bg-primary-solid hover:text-inverse! flex h-4",
+            "rel": "noopener noreferrer",
+            "target": "_blank"
+           },
+           "textLen": 7,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "relative start-0 bottom-0 flex h-full w-full items-center"
+             },
+             "textLen": 7,
+             "kids": [
+              {
+               "tag": "SPAN",
+               "attrs": {
+                "class": "flex min-w-0 flex-1 items-center gap-1"
+               },
+               "textLen": 7,
+               "kids": [
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "Favicon-xZwQNw inline-block shrink-0 rounded-2xs size-3 overflow-hidden rounded-full text-"
+                 },
+                 "textLen": 0,
+                 "kids": [
+                  {
+                   "tag": "IMG",
+                   "attrs": {
+                    "alt": "",
+                    "class": "absolute inset-0 h-full w-full rounded-2xs object-contain opacity-100",
+                    "decoding": "async",
+                    "draggable": "false",
+                    "referrerpolicy": "no-referrer"
+                   },
+                   "textLen": 0,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "SPAN",
+                 "attrs": {
+                  "class": "max-w-[15ch] min-w-0 grow truncate overflow-hidden text-center"
+                 },
+                 "textLen": 7,
+                 "kids": []
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 141,
+     "kids": [
+      {
+       "tag": "STRONG",
+       "attrs": {
+        "class": "font-semibold"
+       },
+       "textLen": 16,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {},
+         "textLen": 16,
+         "kids": []
+        }
+       ]
+      },
+      {
+       "tag": "BR",
+       "attrs": {},
+       "textLen": 0,
+       "kids": []
+      },
+      {
+       "tag": "SPAN",
+       "attrs": {
+        "data-markdown-copy": "inline-code",
+        "class": "InlineCode-Cddi3Y InlineMarkdownIsolate-QWDV4W",
+        "dir": "ltr"
+       },
+       "textLen": 124,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 140,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 140,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H2",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 42,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 42,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 87,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 87,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 386,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 386,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 258,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 258,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 254,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 254,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 236,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 236,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 200,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 200,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 159,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 159,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 373,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 373,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H2",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 67,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 67,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 254,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 254,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 61,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 61,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "DIV",
+     "attrs": {
+      "class": "group/app-widget pointer-coarse:pt-11 [@media(hover:none)]:pt-11 TableContainer-UfIOz_",
+      "data-markdown-table": "true",
+      "data-wide-block": "",
+      "tabindex": "-1"
+     },
+     "textLen": 1345,
+     "kids": [
+      {
+       "tag": "DIV",
+       "attrs": {
+        "class": "TableScroller-ZhMTLB"
+       },
+       "textLen": 1345,
+       "kids": [
+        {
+         "tag": "DIV",
+         "attrs": {
+          "class": "TableWrapper-i1mUIE"
+         },
+         "textLen": 1345,
+         "kids": [
+          {
+           "tag": "TABLE",
+           "attrs": {
+            "class": "Table-LqdUhs",
+            "dir": "auto"
+           },
+           "textLen": 1345,
+           "kids": [
+            {
+             "tag": "THEAD",
+             "attrs": {},
+             "textLen": 33,
+             "kids": [
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 32,
+               "kids": [
+                {
+                 "tag": "TH",
+                 "attrs": {
+                  "class": "TableHeaderCell-esYSpn SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 11,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 11,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TH",
+                 "attrs": {
+                  "class": "TableHeaderCell-esYSpn SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 20,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 20,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "tag": "TBODY",
+             "attrs": {
+              "class": "TableBody-A5sMNL"
+             },
+             "textLen": 1312,
+             "kids": [
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 169,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 19,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 19,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 149,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 149,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 125,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 19,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 19,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 105,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 105,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 172,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 19,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 19,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 152,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 152,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 185,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 17,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 17,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 167,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 167,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 185,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 19,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 19,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 165,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 165,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 151,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 21,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 21,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 129,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 129,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 169,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 20,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 20,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 148,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 148,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "tag": "TR",
+               "attrs": {
+                "class": "TableRow-ENsaGm"
+               },
+               "textLen": 149,
+               "kids": [
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "sm"
+                 },
+                 "textLen": 21,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 21,
+                   "kids": []
+                  }
+                 ]
+                },
+                {
+                 "tag": "TD",
+                 "attrs": {
+                  "class": "TableCell-WcsygL SingleChildTableCell-Sv7jTC",
+                  "dir": "auto",
+                  "data-col-size": "xl"
+                 },
+                 "textLen": 127,
+                 "kids": [
+                  {
+                   "tag": "SPAN",
+                   "attrs": {},
+                   "textLen": 127,
+                   "kids": []
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "tag": "DIV",
+       "attrs": {
+        "class": "absolute end-0 top-0 z-50 flex w-fit select-none items-center gap-1 rounded-full bg-surfac",
+        "data-block-actions": "true",
+        "data-markdown-copy": "exclude"
+       },
+       "textLen": 0,
+       "kids": [
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "data-state": "closed",
+          "class": "contents"
+         },
+         "textLen": 0,
+         "kids": [
+          {
+           "tag": "BUTTON",
+           "attrs": {
+            "type": "button",
+            "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+            "aria-label": "Copy table"
+           },
+           "textLen": 0,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "CompactSource-d7ZD01",
+              "aria-hidden": "true"
+             },
+             "textLen": 0,
+             "kids": [
+              {
+               "tag": "svg"
+              }
+             ]
+            },
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "LeadingSource-d79mNZ",
+              "aria-hidden": "true"
+             },
+             "textLen": 0,
+             "kids": [
+              {
+               "tag": "svg"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "tag": "SPAN",
+         "attrs": {
+          "data-state": "closed",
+          "class": "contents"
+         },
+         "textLen": 0,
+         "kids": [
+          {
+           "tag": "BUTTON",
+           "attrs": {
+            "type": "button",
+            "class": "no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:",
+            "aria-label": "Expand table",
+            "aria-expanded": "false",
+            "aria-haspopup": "dialog"
+           },
+           "textLen": 0,
+           "kids": [
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "CompactSource-d7ZD01",
+              "aria-hidden": "true"
+             },
+             "textLen": 1,
+             "kids": [
+              {
+               "tag": "svg"
+              }
+             ]
+            },
+            {
+             "tag": "SPAN",
+             "attrs": {
+              "class": "LeadingSource-d79mNZ",
+              "aria-hidden": "true"
+             },
+             "textLen": 0,
+             "kids": [
+              {
+               "tag": "svg"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 201,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 201,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 291,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 291,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 153,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 153,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H2",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 45,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 45,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 228,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 228,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 70,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 70,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "H3",
+     "attrs": {
+      "class": "Heading-Ro3lZr",
+      "dir": "auto"
+     },
+     "textLen": 31,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 31,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 251,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 251,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 160,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 160,
+       "kids": []
+      }
+     ]
+    },
+    {
+     "tag": "P",
+     "attrs": {
+      "class": "Paragraph-kKnbIo",
+      "dir": "auto"
+     },
+     "textLen": 162,
+     "kids": [
+      {
+       "tag": "SPAN",
+       "attrs": {},
+       "textLen": 162,
+       "kids": []
+      }
+     ]
+    }
+   ]
+  },
+  "ancestors": [
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "group flex min-w-0 flex-col",
+     "data-chatgpt-selection-conversation-id": "6abbefc5-2050-83ea-ad73-70142df1eb80",
+     "data-chatgpt-selection-message-id": "691cc3b6-0079-4eb9-b135-2d6be3048edc"
+    },
+    "textLen": 38715
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+     "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+     "data-chatgpt-search-message-ids": "<73 chars>"
+    },
+    "textLen": 38729
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "block-BQZwFn"
+    },
+    "textLen": 38729
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "flex flex-col gap-3 browser:gap-1"
+    },
+    "textLen": 39170
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "group flex flex-col"
+    },
+    "textLen": 39170
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "contents"
+    },
+    "textLen": 39170
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "contents"
+    },
+    "textLen": 39170
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "flex flex-col gap-1.5"
+    },
+    "textLen": 39170
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "data-content-search-turn-key": "fallback-turn-0"
+    },
+    "textLen": 39185
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "[&_[data-virtualized-turn-content]]:[content-visibility:visible]",
+     "data-turn-key": "c73f5f1e-d6f2-4761-8ed5-babaed6b1b31"
+    },
+    "textLen": 39185
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": ""
+    },
+    "textLen": 39185
+   },
+   {
+    "tag": "DIV",
+    "attrs": {
+     "class": "flex flex-col"
+    },
+    "textLen": 39185
+   }
+  ]
+ },
+ "lastReplyNodes": 263
+}

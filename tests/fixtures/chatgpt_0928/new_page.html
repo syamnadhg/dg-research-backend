@@ -33,16 +33,22 @@
   up (the reply is still being written).
   WAVE 13 HOOKS (Phase 1's Copy fallback): body[data-reply-actions] — every reply
   gets the row of icons under it: Copy, Share, Read aloud, Regenerate response,
-  More actions. The labels and attributes are the capture's ("buttons" in
-  chatgpt-reply-capture2.json); WHERE the row sits is NOT captured — it is
-  ASSUMED to be inside the reply's .block-BQZwFn, right after the reply unit,
-  the way the user's own row sits inside the user block. Its Copy writes the
-  reply's markdown to the clipboard (body[data-copy-gives]: "nothing" writes
-  nothing, "prompt" writes the last user message, "cited" adds a citation-token
-  run). body[data-reply-renamed] — a future rename: the reply's text root loses
-  every marker, so the page read comes back empty. body[data-clicked] records
-  each click on a button outside the composer, by its data-sr-name or aria-label; body[data-replies] counts
-  the replies drawn.
+  More actions. The labels and button attributes are chatgpt-reply-capture2.json's
+  ("buttons"); WHERE the row sits is chatgpt-copy-button-capture.json's (the
+  owner's capture of a finished Pro brief, 2026-09-29): the turn's own row,
+  div.turn-action-controls > div > span[data-state] > button, a child of the
+  turn's "group flex flex-col" wrapper right after the column that holds the
+  user block and the reply block — inside the turn, outside the reply's unit.
+  Its Copy writes the reply's markdown to the clipboard (body[data-copy-gives]:
+  "nothing" writes nothing, "prompt" writes the last user message, "cited" adds
+  a citation-token run). body[data-reply-renamed] — a future rename: the reply's
+  text root loses every marker, so the page read comes back empty.
+  body[data-clicked] records each click on a button outside the composer, by its
+  data-sr-name or aria-label; body[data-replies] counts the replies drawn. The
+  tests swap long_brief_reply.html (a long brief rebuilt from the same capture)
+  into #sr-reply; the Copy writes its bold runs, inline code, quote, tables and
+  source chips as markdown too, and leaves out what ChatGPT marks
+  data-markdown-copy="exclude" (a table's own Copy table / Expand table row).
 -->
 <html lang="en">
 <head>
@@ -123,9 +129,10 @@
      and the link are NOT in the capture and are kept generic. -->
 <template id="sr-reply"><h2>Research brief: the St Bernard</h2><p class="Paragraph-kKnbIo" dir="auto"><span>Scope: the breed's history in the Alps, its rescue work at the Great St Bernard Pass, health and temperament, and today's breeding standards. The report should separate what the historical record supports from the legends that grew around the breed in the nineteenth century, and it should say plainly where the two cannot be told apart.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Start from the breed standard at <a href="https://example.org/st-bernard-breed-standard" target="_blank" rel="noopener">the breed standard page</a> and the hospice archives, then work outwards to the kennel club registries, veterinary literature on giant breeds, and first-hand accounts from the monks and travellers who crossed the pass before the tunnel opened.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Questions to answer: when the hospice first kept dogs and for what work; how the rescue reputation formed and which rescues are documented; how the short-haired and long-haired varieties diverged; what the modern standard requires and why it changed; which health problems are most common and what screening breeders use; and how life expectancy compares with other giant breeds.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Method: prefer primary sources and peer-reviewed veterinary studies; quote dates and numbers with their source; where sources disagree, give both and say which is better supported. Keep marketing material and breeder advertising out of the evidence, and flag any figure that appears only in popular articles.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Structure: an executive summary of no more than one page; a history section; a section on working roles past and present; a health and welfare section with a table of conditions, prevalence and screening; a section on the breed standard; and a closing list of open questions the evidence could not settle.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Out of scope: other mastiff-type breeds except where a comparison explains a St Bernard trait; training advice; and product recommendations of any kind. If a source discusses the breed only in passing, cite it only for the point it actually makes, and do not let a single anecdote stand in for a pattern.</span></p><p class="Paragraph-kKnbIo" dir="auto"><span>Deliverable: a structured report with sections, sources and open questions for the research agent to pursue, written for a reader who knows dogs but not this breed, with every claim traceable to a cited source.</span></p></template>
 
-<!-- The row of icons under a reply (body[data-reply-actions]): labels and
-     attributes as captured, placement ASSUMED (see the note at the top). -->
-<template id="sr-reply-actions"><div class="flex justify-start" data-sr-reply-actions=""><div class="flex turn-action-controls items-center gap-0.5 browser:gap-0"><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Copy" data-sr-act="copy"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Share" data-state="closed"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Read aloud" aria-pressed="false"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Regenerate response" data-state="closed" aria-haspopup="menu" aria-expanded="false"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="Button-G93JGk outline-hidden cursor-interaction" data-color="secondary" data-variant="ghost" data-uniform="" data-size="xs" data-icon-size="sm" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" data-state="closed"><svg></svg></button></span></div></div></template>
+<!-- The row of icons under a reply (body[data-reply-actions]): the row and its
+     inner div as chatgpt-copy-button-capture.json records them (class values cut
+     as captured), the buttons as chatgpt-reply-capture2.json. -->
+<template id="sr-reply-actions"><div class="mt-1.5 flex turn-action-controls min-h-5 min-w-0 max-w-(--thread-content-max-width) flex-w" data-sr-reply-actions=""><div class="flex min-h-5 min-w-0 flex-wrap items-center gap-0.5 browser:gap-0"><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Copy" data-sr-act="copy"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Share" data-state="closed"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Read aloud" aria-pressed="false"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="no-drag cursor-interaction items-center select-none disabled:cursor-default aria-disabled:" aria-label="Regenerate response" data-state="closed" aria-haspopup="menu" aria-expanded="false"><svg></svg></button></span><span data-state="closed" class="contents"><button type="button" class="Button-G93JGk outline-hidden cursor-interaction" data-color="secondary" data-variant="ghost" data-uniform="" data-size="xs" data-icon-size="sm" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" data-state="closed"><svg></svg></button></span></div></div></template>
 
 <!-- The model menu as the composer capture recorded it open: an unnamed wrapper,
      the [role=menu], its two rows, and the slider thumb under an aria-hidden
@@ -179,8 +186,9 @@
         root.removeAttribute('data-markdown-text-style');
         root.className = 'Answer-x1';
       }
-      if (document.body.dataset.replyActions) a.firstElementChild.appendChild(clone('sr-reply-actions'));
       col.appendChild(a);
+      // The captured place: the turn's wrapper, right after the column.
+      if (document.body.dataset.replyActions) col.parentElement.appendChild(clone('sr-reply-actions'));
       document.body.dataset.replies = String(parseInt(document.body.dataset.replies || '0', 10) + 1);
     };
     if (withReply) addReply();
@@ -235,16 +243,30 @@
 
   // The reply's markdown, as a Copy button hands it out: headings, paragraphs,
   // links, code blocks, and lists with their numbers and bullets WRITTEN (the page
-  // draws them; they are not in its text).
+  // draws them; they are not in its text); bold runs, inline code, a quote and
+  // tables as markdown; a source chip as a link to its source; nothing ChatGPT
+  // marks data-markdown-copy="exclude".
   function replyMarkdown(root) {
     const inline = (n) => [...n.childNodes].map((c) => c.nodeType === 3 ? c.textContent
+      : c.nodeType !== 1 ? ''
       : c.tagName === 'A' ? '[' + c.textContent + '](' + c.getAttribute('href') + ')'
-      : c.tagName === 'BUTTON' ? '' : inline(c)).join('');
+      : c.tagName === 'BUTTON' || c.tagName === 'IMG' ? ''
+      : c.tagName === 'STRONG' ? '**' + inline(c) + '**'
+      : c.tagName === 'BR' ? '\n'
+      : c.dataset.markdownCopy === 'inline-code' ? '`' + c.textContent + '`'
+      : c.dataset.markdownCopy === 'exclude' ? '' : inline(c)).join('');
+    const table = (t) => {
+      const rows = [...t.querySelectorAll('tr')].map((tr) => [...tr.children].map((td) => inline(td)));
+      return [rows[0], rows[0].map(() => '---'), ...rows.slice(1)]
+        .map((r) => '| ' + r.join(' | ') + ' |').join('\n');
+    };
     return [...root.children].map((c) => /^H[1-6]$/.test(c.tagName)
       ? '#'.repeat(parseInt(c.tagName[1], 10)) + ' ' + c.textContent
       : c.tagName === 'PRE' ? '```\n' + (c.querySelector('code') || c).textContent + '\n```'
       : c.tagName === 'OL' ? [...c.children].map((li, i) => (i + 1) + '. ' + inline(li)).join('\n')
       : c.tagName === 'UL' ? [...c.children].map((li) => '- ' + inline(li)).join('\n')
+      : c.tagName === 'BLOCKQUOTE' ? '> ' + inline(c).trim()
+      : c.querySelector('table') ? table(c.querySelector('table'))
       : inline(c)).join('\n\n');
   }
   document.addEventListener('click', (e) => {
@@ -253,7 +275,7 @@
     if (!b.closest('form')) document.body.dataset.clicked = (document.body.dataset.clicked || '')
       + (b.dataset.srName || b.getAttribute('aria-label') || '') + '|';
     if (b.dataset.srAct !== 'copy') return;
-    const root = b.closest('.block-BQZwFn').querySelector('[data-selected-text-overlay-target]');
+    const root = b.closest('[data-turn-key]').querySelector('[data-selected-text-overlay-target]');
     const users = document.querySelectorAll('[data-user-message-bubble="true"]');
     const gives = document.body.dataset.copyGives || '';
     if (gives === 'nothing') return;

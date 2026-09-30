@@ -16,12 +16,15 @@ prompt, reads like a brief, and is text this page shows (fleet workers on one
 computer share ONE clipboard — two tabs of one headless context share one too,
 which is how another worker is played here).
 
-⚠ ASSUMED, NOT CAPTURED: WHERE the Copy button sits. The capture names it
-(aria-label "Copy"; the user's own message has "Copy message") but not its
-place. The fixtures put the reply's row of icons right after the reply — inside
-the reply's block on the new page, inside its article on the old page (hooks
-body[data-reply-actions]). The owner's ~/Downloads/chatgpt-copy-button-capture.json
-will settle it; CHATGPT_COPY_REPLY_SEL is the one line a new capture edits.
+WHERE the Copy button sits is the owner's capture of a finished Pro brief
+(chatgpt-copy-button-capture.json, 2026-09-29): the turn's own row of icons,
+div.turn-action-controls > div > span[data-state] > button[aria-label="Copy"],
+inside the turn and outside the reply's unit and text. The same page's other
+Copy buttons carry other labels: "Copy message" under the user's own message,
+"Copy table" (beside "Expand table") on every table inside the reply. The new
+page's fixture puts the reply's row there (hook body[data-reply-actions]);
+test_chatgpt_long_brief_w13.py pins it to the capture button by button. The old
+page's row (the testid) is still reconstructed, inside the reply's article.
 
 The page is served at a local address the browser never leaves — page.route
 answers it from the fixture file and refuses every other request. The clipboard
@@ -184,12 +187,27 @@ def page(chrome):
     chrome.run(p.close())
 
 
-def _html_for(layout, *, thread=False, prompt=PROMPT, **hooks):
+#: A long Pro brief rebuilt from the owner's capture (the reply root's children).
+LONG_BRIEF = base.FIX / "long_brief_reply.html"
+
+
+def _long_reply():
+    """The long brief's children, the file's header comment left out."""
+    return LONG_BRIEF.read_text(encoding="utf-8").split("-->", 1)[1].strip()
+
+
+def _html_for(layout, *, thread=False, prompt=PROMPT, long_brief=False, **hooks):
     """The rebuilt page, with test hooks on <body>: reply_actions=True →
-    data-reply-actions="1"; copy_gives="nothing" → data-copy-gives="nothing"."""
+    data-reply-actions="1"; copy_gives="nothing" → data-copy-gives="nothing".
+    long_brief=True: every reply is the long brief (new page only)."""
     src = (base.FIX / f"{layout}_page.html").read_text(encoding="utf-8")
     body = '<body data-sr-fixture="chat" data-sr-prompt="">'
     assert src.count(body) == 1, "the fixture's <body> contract changed"
+    if long_brief:
+        tag = '<template id="sr-reply">'
+        assert src.count(tag) == 1, "the fixture's reply template contract changed"
+        head, rest = src.split(tag, 1)
+        src = head + tag + _long_reply() + "</template>" + rest.split("</template>", 1)[1]
     extra = "".join(f' data-{k.replace("_", "-")}="{"1" if v is True else _html.escape(str(v))}"'
                     for k, v in sorted(hooks.items()) if v)
     return src.replace(body, (f'<body data-sr-fixture="{"thread" if thread else "chat"}" '
@@ -879,7 +897,8 @@ def quick(monkeypatch, fast, logs):
 
 def test_live_a_code_blocks_copy_button_is_never_used(chrome, page, quick, logs):
     """⛔ No row of icons under the reply, no marker on its text (a future
-    rename) — only a code block's own "Copy". It is never pressed."""
+    rename) — only a code block's own "Copy", labelled exactly that. It sits in
+    no turn's row, so it is never pressed."""
     _open(chrome, page, "new", thread=True, reply_renamed=True)
     chrome.run(page.evaluate(CODE_BLOCK_JS))
     assert _brief(chrome, page) == ""
@@ -896,8 +915,8 @@ def test_live_with_a_code_block_the_copy_under_the_reply_is_used(chrome, page, q
 
 
 def test_live_a_copy_button_inside_the_reply_text_is_never_used(chrome, page, quick, logs):
-    """A "Copy" inside the reply's own text (a table's, say — not a code block)
-    is not the reply's Copy."""
+    """A "Copy" inside the reply's own text (a table's, labelled plain "Copy"
+    here — the captured one says "Copy table") is not the reply's Copy."""
     _open(chrome, page, "new", thread=True)
     chrome.run(page.evaluate("""() => {
         const root = document.querySelector('[data-markdown-text-style="assistant-message"]');
@@ -923,7 +942,8 @@ def _second_exchange(chrome, page, prompt="And now the updated brief, please."):
 
 def test_live_an_earlier_replys_copy_is_never_used(chrome, page, quick, logs):
     """⛔ The latest reply has no Copy yet; the earlier one has. Its copy would
-    be an older brief handed back as the latest."""
+    be an older brief handed back as the latest. (The latest turn's only
+    Copy-like button is the user's own "Copy message".)"""
     _open(chrome, page, "new", thread=True, reply_actions=True)
     _second_exchange(chrome, page)
     chrome.run(page.evaluate(
@@ -932,16 +952,76 @@ def test_live_an_earlier_replys_copy_is_never_used(chrome, page, quick, logs):
     assert _clicked(chrome, page) == []
 
 
+#: A second row of icons in the reply's turn, after the one shown, that ChatGPT
+#: keeps hidden — as it draws a table's icons twice, one of them hidden, for two
+#: screen widths (the capture's CompactSource / LeadingSource).
+HIDDEN_ROW_JS = """() => {
+    const row = document.getElementById('sr-reply-actions').content.cloneNode(true).firstElementChild;
+    row.style.display = 'none';
+    row.removeAttribute('data-sr-reply-actions');
+    row.querySelector('[aria-label="Copy"]').dataset.srName = 'hidden copy';
+    const shown = document.querySelector('[data-sr-reply-actions]');
+    shown.parentElement.appendChild(row);
+}"""
+
+
 def test_live_a_hidden_copy_button_is_passed_over(chrome, page, quick, logs):
-    """A "Copy" ChatGPT keeps hidden (a closed menu's, say) after the row is not
-    the one to press — pressing it would time out and lose the brief."""
+    """A Copy row ChatGPT keeps hidden after the one it shows is not the one to
+    press — pressing it would time out and lose the brief."""
     _open(chrome, page, "new", thread=True, reply_actions=True)
-    chrome.run(page.evaluate("""() => {
-        const m = document.createElement('div');
-        m.style.display = 'none';
-        m.innerHTML = '<button aria-label="Copy" data-sr-name="hidden copy">Copy</button>';
-        document.querySelector('main').appendChild(m);
-    }"""))
+    chrome.run(page.evaluate(HIDDEN_ROW_JS))
+    assert chrome.run(page.evaluate(
+        "() => !!document.querySelector('[data-turn-key] [data-sr-name=\"hidden copy\"]')"))
+    got = _brief(chrome, page)
+    assert got == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["Copy"]
+
+
+#: A later turn that holds no reply the page read would read (no reply marker
+#: names it — a reply of another kind, a notice), with its own row of icons.
+LATER_TURN_JS = """() => {
+    const turn = document.getElementById('sr-turn').content.cloneNode(true);
+    const col = turn.querySelector('div[class="flex flex-col gap-3 browser:gap-1"]');
+    const note = document.createElement('div');
+    note.className = 'block-BQZwFn';
+    note.textContent = 'Something went wrong while generating the response.';
+    col.appendChild(note);
+    const row = document.getElementById('sr-reply-actions').content.cloneNode(true).firstElementChild;
+    row.removeAttribute('data-sr-reply-actions');
+    row.querySelector('[aria-label="Copy"]').dataset.srName = 'later copy';
+    col.parentElement.appendChild(row);
+    document.getElementById('sr-transcript').appendChild(turn);
+}"""
+
+
+def test_live_a_later_turns_copy_is_not_the_latest_replys(chrome, page, quick, logs):
+    """⛔ The page read reads the latest reply its marker names; the Copy pressed
+    is THAT reply's, in its own turn — not the Copy of a later turn that holds no
+    such reply."""
+    _open(chrome, page, "new", thread=True, reply_actions=True)
+    chrome.run(page.evaluate(LATER_TURN_JS))
+    got = _brief(chrome, page)
+    assert got == _fixture_markdown(), logs
+    assert _clicked(chrome, page) == ["Copy"]
+
+
+#: A "Copy" elsewhere on the page, after the transcript and in no turn's row —
+#: a side panel's, say. It copies text that is on the page and long enough.
+PANEL_COPY_JS = """() => {
+    const panel = document.createElement('aside');
+    panel.innerHTML = '<button aria-label="Copy" data-sr-name="panel copy"><svg></svg></button>';
+    panel.querySelector('button').addEventListener('click',
+        () => navigator.clipboard.writeText(document.body.innerText));
+    document.body.appendChild(panel);
+}"""
+
+
+def test_live_a_copy_outside_every_turns_row_is_never_used(chrome, page, quick, logs):
+    """⛔ No marker names the reply (a future rename), so the Copy is looked for
+    across the page — but only in a turn's own row of icons, where the capture
+    puts it. A side panel's "Copy" after the transcript is never pressed."""
+    _open(chrome, page, "new", thread=True, reply_renamed=True, reply_actions=True)
+    chrome.run(page.evaluate(PANEL_COPY_JS))
     got = _brief(chrome, page)
     assert got == _fixture_markdown(), logs
     assert _clicked(chrome, page) == ["Copy"]
@@ -949,7 +1029,9 @@ def test_live_a_hidden_copy_button_is_passed_over(chrome, page, quick, logs):
 
 def test_live_the_users_copy_message_is_never_used(chrome, page, quick, logs):
     """A message of ours after the latest reply (a follow-up whose reply has not
-    started): its "Copy message" is ours — the reply's Copy is the one."""
+    started): its "Copy message" is ours, and its turn holds no reply — the
+    latest reply's Copy, in that reply's own turn, is the one (the page read
+    reads that reply too)."""
     _open(chrome, page, "new", thread=True, reply_actions=True)
     chrome.run(page.evaluate("""() => {
         const turn = document.getElementById('sr-turn').content.cloneNode(true);
@@ -1086,5 +1168,23 @@ def test_a_brief_needs_three_lines_of_prose():
 
 def test_the_copy_marker_is_one_place_and_takes_both_pages():
     parts = [p.strip() for p in research.CHATGPT_COPY_REPLY_SEL.split(",")]
-    assert parts == ['[data-testid="copy-turn-action-button"]', 'button[aria-label="Copy"]']
+    assert parts == ['[data-testid="copy-turn-action-button"]',
+                     '.turn-action-controls button[aria-label="Copy"]']
     assert research._CG_JS_MARKERS["__CG_COPY__"] is research.CHATGPT_COPY_REPLY_SEL
+
+
+def test_live_the_marker_names_only_the_replys_own_copy(chrome, page, quick):
+    """On the captured long brief — the user's "Copy message", four tables'
+    "Copy table" and "Expand table", the reply's row — plus a code block's own
+    "Copy" and a side panel's, the marker names exactly one button per reply:
+    the reply's Copy in its turn's row. On the old page, its testid."""
+    _open(chrome, page, "new", thread=True, reply_actions=True, long_brief=True)
+    chrome.run(page.evaluate(CODE_BLOCK_JS))
+    chrome.run(page.evaluate(PANEL_COPY_JS))
+    names = ("(s) => [...document.querySelectorAll(s)].map((b) => "
+             "b.dataset.srName || b.getAttribute('aria-label'))")
+    assert chrome.run(page.evaluate(
+        "() => document.querySelectorAll('button[aria-label^=\"Copy\"]').length")) == 8
+    assert chrome.run(page.evaluate(names, research.CHATGPT_COPY_REPLY_SEL)) == ["Copy"]
+    _open(chrome, page, "old", thread=True, reply_actions=True)
+    assert chrome.run(page.evaluate(names, research.CHATGPT_COPY_REPLY_SEL)) == ["Copy"]

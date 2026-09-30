@@ -23033,15 +23033,18 @@ CHATGPT_STOP_SEL = ('button[data-testid="stop-button"], '
 CHATGPT_MODEL_TRIGGER_SEL = ('[data-testid="model-selector"], '
                              'button[aria-label="Select ChatGPT model"][aria-haspopup="menu"]')
 #: The Copy button under a reply (wave 13 — Phase 1's fallback when the page
-#: read comes back empty; see `chatgpt_brief_via_copy`). The owner's capture
-#: (chatgpt-reply-capture2.json "buttons") names it: the reply's is exactly
-#: aria-label "Copy"; the user's own message has "Copy message", which this
-#: marker cannot match. ⚠ WHERE it sits relative to the reply is NOT captured
-#: yet — the lookup takes the last one on the page (see
-#: `_CHATGPT_COPY_BUTTON_JS`). The old page's is the testid. A new capture
-#: edits THIS line only.
+#: read comes back empty; see `chatgpt_brief_via_copy`). The owner's capture of
+#: a finished Pro brief (chatgpt-copy-button-capture.json, 2026-09-29) places it:
+#: the turn's own row of icons, div.turn-action-controls > div > span[data-state]
+#: > button, aria-label exactly "Copy", beside Share, Read aloud, Regenerate
+#: response and More actions — inside the turn ([data-turn-key]), outside the
+#: reply's unit and outside its text. Every other Copy on that page has another
+#: label or another row: the user's own message "Copy message" (its row is a
+#: turn-action-controls too), a table inside the reply "Copy table" beside
+#: "Expand table" (in the table's [data-block-actions] row). The old page's is
+#: the testid. Which turn: `_CHATGPT_COPY_BUTTON_JS`.
 CHATGPT_COPY_REPLY_SEL = ('[data-testid="copy-turn-action-button"], '
-                          'button[aria-label="Copy"]')
+                          '.turn-action-controls button[aria-label="Copy"]')
 
 #: The same markers for page JS. A JS string writes `'__CG_USER__'` — inside
 #: SINGLE quotes — and `_cg_js` splices the list in. Spliced rather than passed
@@ -54258,7 +54261,9 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 # still on the screen, under a Copy button that hands out its markdown. So:
 #   1. a marker goes on the clipboard first and is read back; if it does not
 #      come back the clipboard cannot be trusted here, and nothing is clicked;
-#   2. the Copy button under the latest reply is clicked (a real click);
+#   2. the Copy button in the latest reply's own row of icons is clicked (a
+#      real click; where it sits is the owner's capture, see
+#      CHATGPT_COPY_REPLY_SEL);
 #   3. no such button (a future rename) → the CUA clicks it — clicks only, and
 #      never on Send, Regenerate, Share or Edit;
 #   4. the clipboard is read, and kept only if it is not the marker, is as long
@@ -54299,21 +54304,20 @@ _CG_COPY_READ_JS = """async () => {
     try { return await navigator.clipboard.readText(); } catch (e) { return null; }
 }"""
 
-#: The Copy button under the LATEST reply, or null. The last Copy button on the
-#: page (the latest reply's row of icons is the last one), never one inside a
-#: code block, never one inside a reply's own text, never one ChatGPT hides;
-#: and while a reply can be found by its marker, only one AFTER the latest reply
-#: — an earlier reply's Copy would hand back an older brief. ⚠ Where the button
-#: sits is ASSUMED (not captured yet): "under the reply" = after it on the page.
+#: The Copy button of the reply the page read reads — the LATEST one — or null.
+#: The capture puts a reply's Copy in its own turn's row (CHATGPT_COPY_REPLY_SEL),
+#: so it is looked for inside the turn that holds the latest reply: never an
+#: earlier reply's (an older brief), never a later turn's that holds no reply
+#: the page read would read. With no reply found by its marker (a future
+#: rename), the last Copy row on the page: the latest turn that has one. A reply
+#: no turn marker holds (a rename of the turn) → none, and the CUA presses it.
+#: Never one ChatGPT hides.
 _CHATGPT_COPY_BUTTON_JS = _cg_js("""() => {
     const replies = document.querySelectorAll('__CG_ASSISTANT__');
-    const latest = replies.length ? replies[replies.length - 1] : null;
-    const texts = [...document.querySelectorAll('__CG_REPLY_TEXT__')];
+    const scope = replies.length ? replies[replies.length - 1].closest('__CG_TURN__') : document;
+    if (!scope) return null;
     const shown = (b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-    const ok = [...document.querySelectorAll('__CG_COPY__')].filter((b) => shown(b)
-        && !b.closest('pre, code')
-        && !texts.some((t) => t.contains(b))
-        && (!latest || !!(latest.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)));
+    const ok = [...scope.querySelectorAll('__CG_COPY__')].filter(shown);
     return ok.length ? ok[ok.length - 1] : null;
 }""")
 
