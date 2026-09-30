@@ -57530,7 +57530,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         plainly on the page (longer than the page read's own floor), a way to
         read it again: the card then says the brief was written but could not
         be read, and its Retry re-reads it instead of asking ChatGPT again
-        (wave 13; before, the card blamed the sign-in)."""
+        (wave 13; before, the card blamed the sign-in).
+        ⛔ Only while the tab still shows the chat the brief was written in
+        (wave 13 review): after a click on another chat, ITS reply is the long
+        one on the page, every re-read reads nothing (_p1_read_brief) and Retry
+        would loop — the old card's Retry runs Phase 1 again instead."""
+        if _chatgpt_chat_moved(_p1_chat, await _chatgpt_user_msg_count(browser.page)):
+            return out
         shown = await _chatgpt_reply_shown_len(browser.page, _p1_unanswered)
         if shown > _CG_COPY_MIN_CHARS:
             log(f"Phase 1: ChatGPT's reply is on the page ({shown} letters and digits) "

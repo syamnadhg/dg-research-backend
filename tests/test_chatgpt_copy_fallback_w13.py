@@ -944,15 +944,15 @@ CHAT_CHANGER_JS = """([mode, paras]) => {
 }"""
 
 
-def _chat_changer_page(chrome, page, p1, mode):
+def _chat_changer_page(chrome, page, p1, mode, other=OLD_BRIEF):
     """No Copy button by its marker (a future rename), and a click that puts
-    another chat holding OLD_BRIEF on the screen (CHAT_CHANGER_JS)."""
+    another chat holding `other` on the screen (CHAT_CHANGER_JS)."""
     _open(chrome, page, "new", reply_actions=True, reply_renamed=True, streaming=True)
 
     async def _hook():
         await page.evaluate("() => document.querySelector('[data-sr-act=\"copy\"]')"
                             ".setAttribute('aria-label', 'Copy response')")
-        await page.evaluate(CHAT_CHANGER_JS, [mode, OLD_BRIEF.split("\n\n")])
+        await page.evaluate(CHAT_CHANGER_JS, [mode, other.split("\n\n")])
         p1.at = {"changer": await page.evaluate(CENTER_JS, f'[data-sr-name="{mode}"]'),
                  "other copy": [620, 415]}
 
@@ -989,6 +989,31 @@ def test_live_p1_a_cua_click_that_changes_the_chat_never_gives_its_brief(
     else:
         assert _clicked(chrome, page) == ["other copy"]
         assert chrome.run(page.evaluate("() => location.href")).endswith("/c/another-chat")
+
+
+#: Another chat's brief past the "reply is on the page" floor (2000 letters and
+#: digits) — OLD_BRIEF alone is just under it.
+LONG_OLD_BRIEF = OLD_BRIEF + "\n\n" + "\n\n".join(OLD_BRIEF.split("\n\n")[1:])
+
+
+@pytest.mark.parametrize("mode", ["sidebar", "suggestion"])
+def test_live_p1_a_chat_that_changed_never_gets_the_could_not_be_read_card(
+        chrome, page, p1, logs, mode):
+    """⛔ Wave 13 review: the CUA's click put another chat on the screen, and
+    that chat's long reply is the one on the page. Every re-read reads nothing
+    from a tab that no longer shows the chat the brief was written in, so a
+    "couldn't be read" card whose Retry re-reads would loop for good. The run
+    hands back no re-read: the old card, whose Retry runs Phase 1 again."""
+    _chat_changer_page(chrome, page, p1, mode, other=LONG_OLD_BRIEF)
+    cua = _CopyCua(lambda: [_click(p1, "changer"), _click(p1, "other copy")])
+    out = p1.run(cua)
+    assert out["text"] == "", logs
+    # the other chat's reply IS long enough to count as "on the page"
+    assert chrome.run(research._chatgpt_reply_shown_len(page)) > research._CG_COPY_MIN_CHARS
+    assert _lines(logs, "Phase 1: the brief was not read — the ChatGPT tab no longer "
+                        "shows the chat it was written in"), logs
+    assert "reread" not in out, logs
+    assert not _lines(logs, "but the brief could not be read from it"), logs
 
 
 @pytest.mark.parametrize("renamed", [False, True], ids=["page-read", "copy-button"])

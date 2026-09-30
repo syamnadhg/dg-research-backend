@@ -7,7 +7,8 @@
   A — agent_loop's call to Claude runs off the event loop.
   T — the rows under ChatGPT's "Thinking ▾" reach Phase 1's live activity feed.
   U — a brief that is on ChatGPT's page but could not be read gets its own card,
-      and Retry re-reads it (never a new brief); a short reply keeps the old card.
+      and Retry re-reads it (never a new brief); a short reply keeps the old card,
+      and so does a tab that now shows another chat.
   L — Claude's usage-limit card keeps the reset time: the first limit line with
       a date wins, and later checks keep reading while no date is known.
   C — the Copy backup compares the WHOLE copy against the latest reply, and a
@@ -47,6 +48,8 @@ REREAD = ["tests/test_chatgpt_long_brief_w13.py::"
           "test_live_phase1_a_brief_on_the_page_that_cannot_be_read_is_read_again"]
 SHORT = ["tests/test_chatgpt_copy_fallback_w13.py::"
          "test_live_p1_a_short_reply_is_never_taken_as_the_brief"]
+MOVED = ["tests/test_chatgpt_copy_fallback_w13.py::"
+         "test_live_p1_a_chat_that_changed_never_gets_the_could_not_be_read_card"]
 LIMIT = ["tests/test_claude_usage_limit_0916.py"]
 SAME_OPENING = ["tests/test_chatgpt_copy_fallback_w13.py::"
                 "test_live_p1_after_a_follow_up_a_first_draft_that_opens_the_same_is_refused"]
@@ -96,6 +99,12 @@ MUTANTS = [
      "instead of reading the one on the page",
      [("                                lambda: (_p1_reread() if _p1_reread else",
        "                                lambda: (_p1_reread() if False else")], CARD),
+    ("U5", RESEARCH, "⛔ a tab that now shows another chat still gets \"couldn't be "
+     "read\" — its long reply counts, every re-read reads nothing, Retry loops",
+     [("        if _chatgpt_chat_moved(_p1_chat, await _chatgpt_user_msg_count(browser.page)):\n"
+       "            return out\n",
+       "        if False:\n"
+       "            return out\n")], MOVED),
 
     # ═══ L — Claude's reset time ════════════════════════════════════════════
     ("L1", RESEARCH, "the first limit line is kept even without a date — a dialog "
