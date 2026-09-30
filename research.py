@@ -42233,8 +42233,14 @@ def _claude_usage_limit(text) -> "dict | None":
     Returns ``{"line": <the page's line>, "resets": <when, in its words, or "">}``
     or None. The reset time is looked for on the limit's line and the two after
     it, and only kept when it names a date or a time (it holds a digit).
+
+    ⛔ Wave 13: the FIRST limit line is not always the one with the date. The
+    "Need more usage?" dialog names none, and when it came first the card lost
+    the reset time the banner further down gave. So every limit line is looked
+    at: the first one that has a reset time wins; with none, the first line.
     """
     lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    first = None
     for i, ln in enumerate(lines):
         if not _CLAUDE_LIMIT_RE.search(ln):
             continue
@@ -42247,23 +42253,35 @@ def _claude_usage_limit(text) -> "dict | None":
             if re.search(r"\d", when):
                 resets = when[:40]
                 break
-        return {"line": ln[:160], "resets": resets}
-    return None
+        if resets:
+            return {"line": ln[:160], "resets": resets}
+        if first is None:
+            first = {"line": ln[:160], "resets": ""}
+    return first
 
 
 async def _note_claude_usage_limit(page, note: dict, label: str = "2B") -> None:
-    """Record Claude's usage limit in `note` the first time the page shows it.
-    Never raises."""
-    if note or page is None:
+    """Record Claude's usage limit in `note` the first time the page shows it —
+    and, while no reset time is known, keep reading for one (wave 13: a first
+    read that saw only the dateless "Need more usage?" line kept the card from
+    ever saying when the limit resets). Never raises."""
+    if page is None or (note and note.get("resets")):
         return
     try:
         seen = _claude_usage_limit(await page.evaluate(_CLAUDE_PAGE_TEXT_JS))
     except Exception:
         return
-    if seen:
-        note.update(seen)
-        log(f"[{label}] Claude's page shows its usage limit: \"{seen['line']}\" — "
-            "nothing can be sent to Claude until it resets", "WARN")
+    if not seen:
+        return
+    if note:
+        if seen.get("resets"):
+            note.update(seen)
+            log(f"[{label}] Claude's page now says when its usage limit resets: "
+                f"\"{seen['line']}\"", "INFO")
+        return
+    note.update(seen)
+    log(f"[{label}] Claude's page shows its usage limit: \"{seen['line']}\" — "
+        "nothing can be sent to Claude until it resets", "WARN")
 
 
 def _claude_limit_card(resets: str) -> "tuple[str, str]":

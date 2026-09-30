@@ -53,7 +53,7 @@ CSS = """<style>
 
 
 def claude_page(*, banner="inline", toast=False, dialog=False, prompt=PROMPT,
-                chat_title="St Bernard breed history"):
+                chat_title="St Bernard breed history", dialog_first=False):
     if banner == "inline":
         b = ('<div data-sr-limit="1"><span>Usage limit reached</span> · '
              '<span>Resets Sep 20 at 1:00 AM</span></div>')
@@ -73,7 +73,7 @@ def claude_page(*, banner="inline", toast=False, dialog=False, prompt=PROMPT,
             '<div class="composer"><div contenteditable="true" class="ProseMirror">'
             f"<p>{prompt}</p></div><div>brief.md</div>"
             '<button aria-label="Send message" disabled>Send</button></div>'
-            f"{b}{t}{d}</main>")
+            + (f"{d}{b}{t}" if dialog_first else f"{b}{t}{d}") + "</main>")
 
 
 class _FastAsyncio:
@@ -237,6 +237,41 @@ def test_the_reset_time_on_the_next_line_is_found(launch):
     out = launch(claude_page(banner="stacked"))
     assert _one_card(out)["error"] == ("Claude's usage limit is reached — "
                                        "it resets Sep 20 at 1:00 AM")
+
+
+def test_a_dialog_above_the_banner_does_not_cost_the_reset_time(launch):
+    """⛔ Wave 13: the dateless "Need more usage?" dialog is the FIRST limit line
+    on the page, the banner with the date comes after it. Before, the reader
+    stopped at the dialog and the card lost the reset time."""
+    out = launch(claude_page(dialog=True, dialog_first=True))
+    card = _one_card(out)
+    assert card["error"] == "Claude's usage limit is reached — it resets Sep 20 at 1:00 AM"
+
+
+def test_a_reset_time_shown_after_the_first_read_is_kept(launch, monkeypatch):
+    """⛔ Wave 13: the first check sees only the dialog (no date); the banner
+    with the date shows on the next check and is gone by the time the launch
+    gives up. The reset time read in between is what the card says — before,
+    the first read was kept and nothing was read again."""
+    real = research.verify_claude_generating
+    calls = {"n": 0}
+
+    async def _verify(p):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            await p.evaluate(
+                "(b) => { const d = document.createElement('div');"
+                " d.dataset.srLimit = '1'; d.textContent = b;"
+                " document.querySelector('main').appendChild(d); }", BANNER)
+        elif calls["n"] == 3:
+            await p.evaluate("() => document.querySelectorAll('[data-sr-limit]')"
+                             ".forEach(e => e.remove())")
+        return await real(p)
+
+    monkeypatch.setattr(research, "verify_claude_generating", _verify)
+    out = launch(claude_page(banner="none", dialog=True))
+    card = _one_card(out)
+    assert card["error"] == "Claude's usage limit is reached — it resets Sep 20 at 1:00 AM"
 
 
 def test_the_dialog_alone_names_the_limit_without_a_date(launch):
