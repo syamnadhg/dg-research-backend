@@ -41542,7 +41542,14 @@ async def agent_loop(client, browser, system_prompt, user_message,
             # handling in the except branches below. Bounded per mission.
             while True:
                 try:
-                    response = client.beta.messages.create(
+                    # ⛔ Wave 13: OFF the event loop. The Anthropic call blocks for
+                    # as long as the model takes to answer (up to ~24 s a turn),
+                    # and made here directly it froze the whole program for that
+                    # long — the 5-second online signal (7 missed in one bundle),
+                    # Stop, and every other command waited behind it. The retries
+                    # below, the stop/pause checks and abort_event are unchanged.
+                    response = await asyncio.to_thread(
+                        client.beta.messages.create,
                         model=model, max_tokens=4096, system=system_prompt,
                         tools=tools, messages=messages, betas=[BETA_FLAG],
                     )
