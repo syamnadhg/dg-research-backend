@@ -147,20 +147,24 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
             claimed.read_text(encoding="utf-8")
         except OSError:
             continue''')], [T], SRC),
+    # RE-ANCHORED 2026-10-01 (org PR #4 review, item 7): what happens once a POST
+    # answers moved into `_settle`, so a POST that answers after the flush has
+    # stopped waiting is settled by the same code. S4, S5, T6 and D2 are the same
+    # mutants on the moved lines.
     ("S4", "under", "the claimed file is deleted BEFORE the post, so a failed "
      "delivery loses everything it was carrying",
-     [('''        ok = _post_with_deadline(sender, batch, deadline_sec)
-        if ok:''',
+     [('''        ok = _post_with_deadline(sender, batch, deadline_sec, on_late=_settle_late)
+''',
        '''        try:
             claimed.unlink()
         except OSError:
             pass
-        ok = _post_with_deadline(sender, batch, deadline_sec)
-        if ok:''')], [T], SRC),
+        ok = _post_with_deadline(sender, batch, deadline_sec, on_late=_settle_late)
+''')], [T], SRC),
     ("S5", "under", "a failed delivery drops the owed events instead of merging "
      "them back",
-     [('        else:\n            _merge_back(claimed, _unclaimed_name(path))',
-       '        else:\n            pass')], [T], SRC),
+     [('    _merge_back(claimed, _unclaimed_name(path))\n    return False',
+       '    return False')], [T], SRC),
     ("S6", "under", "the merge-back throws away whatever arrived while the "
      "delivery was in flight",
      [('        path.write_text(owed + newer, encoding="utf-8")',
@@ -248,7 +252,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
     ("T6", "under", "⛔⛔ FOUND BY MUTATION, AND IT WAS REAL. The events past the "
      "batch cap are deleted with the claimed file instead of staying owed — and "
      "an offline machine's spool is exactly where a batch hits that cap",
-     [('            if owed:\n                _write_back(owed, path)', '            pass')],
+     [('        if owed:\n            _write_back(owed, path)', '        pass')],
      [T], SRC),
     ("T7", "under", "the write-back drops whatever arrived while the batch was in "
      "flight",
@@ -260,10 +264,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
      [('    thread.join(max(0.1, float(deadline_sec)))', '    thread.join()')], [T], SRC),
     ("D2", "under", "an abandoned post is reported as delivered, so its events "
      "are deleted while still owed",
-     [('''    if thread.is_alive():
-        log.debug("telemetry: post abandoned at the %.1fs deadline", deadline_sec)
-        return False''', '''    if thread.is_alive():
-        return True''')], [T], SRC),
+     [('''              "events stay claimed until it answers", deadline_sec)
+    return None''', '''              "events stay claimed until it answers", deadline_sec)
+    return True''')], [T], SRC),
     ("D3", "under", "the post thread is not a daemon, so an unfinished flush "
      "holds the interpreter open at exit",
      [('    thread = threading.Thread(target=_run, name="telemetry-post", daemon=True)',

@@ -209,10 +209,13 @@ MUTANTS = [
      "has nothing to wait for, and delaying its recovery buys nothing",
      [("        if pending and supervised:", "        if pending:")]),
 
+    # RE-ANCHORED 2026-10-01 (org PR #4 review, item 6): the token fetch moved
+    # into the thread, so the counted body is now `_ask_with_token()`, which
+    # fetches the token and then runs the retries. Same mutant: nothing counted.
     ("D5", "research.py", "under",
      "⛔ the notice thread is not counted, so the respawn cannot see it",
-     [("        _fe_handoff_begin()\n        try:\n            _ask_with_retries()\n        finally:\n            _fe_handoff_end()",
-       "        _ask_with_retries()")]),
+     [("        _fe_handoff_begin()\n        try:\n            _ask_with_token()\n        finally:\n            _fe_handoff_end()",
+       "        _ask_with_token()")]),
 
     # ⛔ RE-ANCHORED (wave 10.9, 542-5): the single `_drive_once()` inside this
     # try became `_drive_cloud_phases(...)`, a retry ladder — which is MORE of a

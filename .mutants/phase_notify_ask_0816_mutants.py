@@ -108,11 +108,16 @@ MUTANTS = [
        '            name=f"phase-notify-{research_id[:8]}-{phase}",\n'
        "            daemon=True,\n        ).run()")]),
 
+    # RE-AIMED 2026-10-01 (org PR #4 review, item 6): the token is now fetched on
+    # the dispatch thread, so a raise there can no longer reach the phase — the
+    # caller has already returned. What can still go wrong at that line is the
+    # skip itself: without the return, a machine with no token sends the ask
+    # anyway, as `Bearer None`.
     ("C9", "research.py", "over",
-     "⛔ a machine with revoked credentials fails the phase instead of skipping "
-     "the ask — the browser's own notifier was always the backstop",
-     [('        log("phase-notify: no synth id-token (creds revoked?) — skipping", "INFO")\n        return False',
-       '        raise RuntimeError("no synth id-token")')]),
+     "⛔ a machine with revoked credentials sends the ask anyway, with no token, "
+     "instead of skipping it — the browser's own notifier was always the backstop",
+     [('            log("phase-notify: no synth id-token (creds revoked?) — skipping", "INFO")\n            return\n',
+       '            log("phase-notify: no synth id-token (creds revoked?) — skipping", "INFO")\n')]),
 
     ("C10", "research.py", "over",
      "⛔ the ask goes somewhere else — /api/uploadYouTube would re-drive P4/P5 "
