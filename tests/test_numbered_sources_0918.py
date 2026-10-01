@@ -625,22 +625,34 @@ def test_every_document_write_site_routes_through_the_numbering_funnel():
     against a fake Firestore), so `run_pipeline` keeps the two regen sites and
     the helper owns one. Splitting the key is the whole point of counting per
     function: had the helper's site been folded into the old total, deleting it
-    and adding a regen site would still have read as three."""
+    and adding a regen site would still have read as three.
+
+    ⭐ 2026-10-01 — the two regen re-saves go through `_p2_regenerated_document`
+    now (it adds the sites the agent visited, from the run's own list), so
+    `run_pipeline` counts that call twice and the helper owns the one numbering
+    call. `run_pipeline` still counts ZERO direct numbering calls, so a new write
+    site there fails this as before. The helper is executed in
+    `tests/test_doc_visited_sources_1001.py`."""
     from conftest import code_only_deep
 
     sites = {fn.__name__: code_only_deep(fn).count("_document_with_sources(")
              for fn in (research.run_pipeline, research._p2_persist_reports,
-                        research.run_phase2, research.extract_and_record_agent)}
+                        research.run_phase2, research.extract_and_record_agent,
+                        research._p2_regenerated_document)}
     assert sites == {
-        # the two regen re-saves
-        "run_pipeline": 2,
+        # no direct site: the two regen re-saves go through the helper below
+        "run_pipeline": 0,
         # the finalize re-save, which wave 10.9 moved out of run_pipeline
         "_p2_persist_reports": 1,
         # nothing: phase 2 records through extract_and_record_agent
         "run_phase2": 0,
         # the per-agent save, the site the executed test above drives
         "extract_and_record_agent": 1,
+        # the two regen re-saves' one numbering call
+        "_p2_regenerated_document": 1,
     }
+    # the two regen re-saves themselves
+    assert code_only_deep(research.run_pipeline).count("_p2_regenerated_document(") == 2
 
 
 @pytest.mark.parametrize("bad", [
@@ -709,13 +721,33 @@ class TestTheSourceTitleIsThePagesOwnName:
 
     def test_the_document_a_reader_sees_carries_those_titles(self):
         """The consumer, not the helper. This is the string that was wrong in
-        the delivered file, byte for byte."""
-        tail = research._document_with_sources(self.REFS).split(SOURCES_TAIL)[-1]
+        the delivered file, byte for byte.
+
+        ⛔ CHANGED 2026-10-01: the entries are read here WITHOUT the incident's
+        "**References**" lead. With it, that paragraph is now the report's own
+        trailing sources section (a bold lead in the closed word set,
+        `_doc_own_sources_start`) and it holds the links, so it stays the one
+        list and nothing is appended — the owner's rule is exactly one sources
+        section, and before this the document ended with two (see the next
+        test). Without the lead the entries are citations in the last section,
+        and the list they get must carry the pages' own names, never the
+        heading."""
+        refs = self.REFS.replace("**References**\n\n", "")
+        assert refs != self.REFS
+        tail = research._document_with_sources(refs).split(SOURCES_TAIL)[-1]
         assert tail == (
             "1. [Golden Retriever breed information.]"
             "(https://www.akc.org/dog-breeds/golden-retriever/) — akc.org\n"
             "2. [Canine Health Information Center / CHIC Programs.]"
             "(https://ofa.org/chic-programs/) — ofa.org\n")
+
+    def test_the_incidents_own_references_block_stays_the_one_list(self):
+        """2026-10-01. The incident's exact shape — a trailing "**References**"
+        paragraph holding the links — used to get a number after each address
+        inside that block AND our list repeating them: two sources sections,
+        the shape the owner ruled out on Claude's document. It is the report's
+        own list now, as Claude's "## Sources" is, and is left byte for byte."""
+        assert research._document_with_sources(self.REFS) == self.REFS
 
     def test_a_link_label_is_the_best_evidence_there_is(self):
         md = ("## Market overview\n\nRevenue grew per "

@@ -1009,7 +1009,16 @@ def test_EVERY_writer_of_an_agent_md_is_covered_by_one_guard_or_the_other():
         head = src[max(0, i - 4000):i]
         _swept = ("results = await run_phase2(" in head
                   or "for name, r in results.items():" in head)
-        _guarded = "reject_off_topic_text(" in head
+        # ⭐ 2026-10-01 — "its OWN topic guard" means one in the same function,
+        # before the write. It was the 4000 characters before the write, and
+        # that window is a distance, not a scope: the finalize writer's guard
+        # sat 3941 characters up, and numbering the visited sites into the
+        # document (one call grew two arguments) pushed it to 4175 with the
+        # guard exactly where it was. The function starts at the last top-level
+        # `def`; `run_pipeline`, which holds the other writers, has no guard
+        # of its own, so no writer there can borrow one.
+        fn_start = max(src.rfind("\ndef ", 0, i), src.rfind("\nasync def ", 0, i))
+        _guarded = "reject_off_topic_text(" in src[fn_start:i]
         assert _swept or _guarded, (
             f"the MD writer at offset {i} neither consumes a swept `results` nor "
             f"runs after its own topic guard — it is an unguarded path to disk")

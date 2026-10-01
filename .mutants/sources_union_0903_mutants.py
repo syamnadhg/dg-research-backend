@@ -58,20 +58,24 @@ _INFLIGHT = Path(__file__).with_suffix(".inflight")
 PANEL = (
     '            _panel_urls = []\n'
     '            try:\n'
-    '                _panel_urls = [\n'
+    # ⚠ 2026-10-01 re-anchored: the panel's addresses go through the public-page
+    # gate (`_doc_fold_sources` → `_doc_public_source_url`), which holds the
+    # scheme check and the platform-host rule this list used to spell out.
+    '                _panel_urls = _doc_fold_sources([], [\n'
     # ⚠ 2026-09-23 re-anchored (wave 10.10): `save_meta` reads the runtime it
     # was handed, `_rt`, so a late save writes what it was dispatched with.
     '                    u for u in (getattr(_rt, "agent_progress_snapshots", {})\n'
     '                                .get(platform, {}) or {}).get("source_urls", []) or []\n'
-    '                    if isinstance(u, str) and u.lower().startswith(("http://", "https://"))\n'
-    '                    and not _find_is_platform_host(u)\n'
-    '                ]\n'
+    '                    if isinstance(u, str)\n'
+    '                ])\n'
     '            except Exception:\n'
     '                _panel_urls = []'
 )
 LOOP = (
     '            _seen_keys, unique_urls = set(), []\n'
     '            for _u in urls + _panel_urls:\n'
+    # ⚠ 2026-10-01 re-anchored: one spelling per page (brackets plain).
+    '                _u = _doc_plain_parens(_u)\n'
     '                _k = _find_normalize_url(_u)\n'
     '                if _k in _seen_keys:\n'
     '                    continue\n'
@@ -112,12 +116,15 @@ MUTANTS = [
      "⛔⛔ the panel side skips the host rule, which reopens the previous fix "
      "through the door beside it — `support.anthropic.com` is back in the user's "
      "Sources, arriving by the rung nobody re-checked",
-     [(PANEL, PANEL.replace('\n                    and not _find_is_platform_host(u)', ''))]),
+     [(PANEL, PANEL.replace(
+         "_panel_urls = _doc_fold_sources([], [",
+         "_panel_urls = (lambda _r, l: [u for u in l if u.lower().startswith(('http://', 'https://'))])([], ["))]),
     ("P2", "under",
      "⛔ the scheme check goes, so a `javascript:` entry written by page JS reaches "
      "a list the app renders into hrefs",
-     [(PANEL, PANEL.replace('if isinstance(u, str) and u.lower().startswith(("http://", "https://"))\n                    and not',
-                            'if isinstance(u, str)\n                    and not'))]),
+     [(PANEL, PANEL.replace(
+         "_panel_urls = _doc_fold_sources([], [",
+         "_panel_urls = (lambda _r, l: [u for u in l if not _find_is_platform_host(u)])([], ["))]),
     ("P3", "under",
      "⛔⛔ the try/except goes, so a snapshot holding a TRUTHY non-iterable where a "
      "list was expected takes the WHOLE meta.json write down with it — the report, "
@@ -127,12 +134,11 @@ MUTANTS = [
      "draft of the mutant itself deleted the isinstance check and was absorbed "
      "the same way, which is what pointed at the try/except as the thing worth "
      "mutating",
-     [(PANEL, "            _panel_urls = [\n"
+     [(PANEL, "            _panel_urls = _doc_fold_sources([], [\n"
               '                u for u in (getattr(_rt, "agent_progress_snapshots", {})\n'
               '                            .get(platform, {}) or {}).get("source_urls", []) or []\n'
-              '                if isinstance(u, str) and u.lower().startswith(("http://", "https://"))\n'
-              "                and not _find_is_platform_host(u)\n"
-              "            ]")]),
+              "                if isinstance(u, str)\n"
+              "            ])")]),
 ]
 
 
