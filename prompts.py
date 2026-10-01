@@ -824,7 +824,7 @@ IMPORTANT: Only touch the ONE failed source named for you. Never remove a health
 #                 of Default, the step Long takes above it in these notes;
 #                 none measured yet)
 #   - "default" → Format="Deep dive", Length="Default" (~10–15 min)
-#   - "long"    → Format="Deep dive", Length="Long" (~20–30 min, current —
+#   - "long"    → Format="Deep dive", Length="Long" (~40–55 min measured 09-30, current —
 #                 but this machine's Deep dive + Long audio ran 39:05 and
 #                 53:50, and capture 5 shows 61:59, so that step is not a
 #                 measurement either)
