@@ -76535,8 +76535,10 @@ def _number_document_sources(md: str, findings: list, visited=None,
     rows, in the same list — and its own trailing section, which holds none, is
     replaced by that list. `label` names the agent in the log lines that say
     so. Without `visited` the output is exactly what it always was, except
-    that a bold-led sources paragraph after the last heading now counts as the
-    report's own section (`_doc_own_sources_start`).
+    that more shapes now count as the report's own section
+    (`_doc_own_sources_start`): a bold- or plain-led sources paragraph after
+    the last heading, and a last heading in the wider word set ("14. Key
+    sources").
 
     ⛔⛔ THE SENTENCE IS A BLOCK'S SENTENCE — see `_doc_marker_position`. A bullet,
     a numbered item and a table cell each END one, whether or not they close with
