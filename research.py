@@ -75834,9 +75834,27 @@ _DOC_SOURCE_MARK_RE = re.compile(r'\[\\\[\d{1,3}\\\]\]\(')
 #: have quietly stopped collapsing.
 _DOC_SOURCES_TITLE = "Sources"
 _DOC_SOURCES_ALT_TITLE = "Sources (numbered)"
-#: A heading whose text says "this is the source list" — the report's own.
+#: A title that says "this is the source list" — the report's own. Used on a
+#: heading's text and on the bold or plain lead of a paragraph.
+#: ⭐ 2026-10-01 — A CLOSED WORD SET, AND IT HAS TO BE CLOSED. An optional section
+#: number, an optional qualifier, the word itself, an optional "cited/consulted/
+#: used" or "and further reading/notes/…", an optional "." or ":" — and nothing
+#: else. "Sources of funding" or "References to the breed standard" is a section
+#: ABOUT something, and a title that merely starts with the word would remove it.
 _DOC_SOURCES_WORD_RE = re.compile(
-    r'(?:sources|references|citations|bibliography|works cited)[\s:]*\Z', re.IGNORECASE)
+    r'(?:\d{1,3}(?:\.\d{1,3})*[.)]?[ \t]+)?'
+    r'(?:(?:key|main|principal|selected|cited-source|cited|full|further'
+    r'|additional|list[ \t]+of)[ \t]+)?'
+    r'(?:sources?|references?|citations?|bibliography|works[ \t]+cited'
+    r'|reference[ \t]+list)'
+    r'(?:[ \t]+(?:cited|consulted|used)'
+    r'|[ \t]+and[ \t]+(?:further[ \t]+reading|notes|references|sources))?'
+    r'[ \t]*[.:]?[ \t]*\Z', re.IGNORECASE)
+#: A paragraph led by a bold title: `**Title**`, `**Title.**`, `**Title:**`,
+#: `**Title**:` (or `__…__`). `t` is the title inside the bold.
+_DOC_BOLD_LEAD_RE = re.compile(r'[ \t]{0,3}(\*\*|__)(?P<t>[^\n*_]{1,80}?)\1')
+#: A paragraph led by a plain `Title:`.
+_DOC_PLAIN_LEAD_RE = re.compile(r'[ \t]{0,3}(?P<t>[A-Za-z0-9][^\n:*_]{0,79}?):')
 #: Any heading, ATX or SETEXT, so "the last heading in the report" can be read.
 _DOC_ANY_HEADING_RE = re.compile(
     r'^#{1,6}[ \t]+(?P<atx>.+?)[ \t]*$|^(?P<setext>\S.*?)[ \t]*\n[ \t]{0,3}[-=]{2,}[ \t]*$',
@@ -75860,7 +75878,8 @@ _DOC_SOURCES_BLOCK_RE = re.compile(
        re.escape(_DOC_SOURCES_ALT_TITLE), re.escape(_DOC_SOURCES_TITLE)))
 #: The same tail with no marker in the document: the visited-sites list a
 #: document that cited nothing ends with. Our current level only, either title
-#: (the alternate when it follows the report's own list of titles).
+#: (the alternate stays readable: a build of 2026-10-01 wrote it after a
+#: report's own list of titles, which is now replaced instead).
 _DOC_VISITED_BLOCK_RE = re.compile(
     r'\n\n%s[ \t]+(?:%s|%s)[ \t]*\n\n(?:\d{1,3}\. \[.*\n?)+\Z'
     % ("#" * _DOC_SOURCES_HEADING_LEVEL,
@@ -75906,21 +75925,58 @@ def _doc_ends_with_its_own_sources(masked: str) -> bool:
 
 
 def _doc_own_sources_start(masked: str):
-    """Where the report's own trailing sources section starts — the offset of
-    its heading — or None when the report's LAST heading is not a sources one.
+    """Where the report's own trailing sources section starts, or None.
+
+    The section runs to the end of the document, from EITHER the report's LAST
+    heading, when its title is in `_DOC_SOURCES_WORD_RE`'s set, OR the first
+    paragraph after that last heading whose bold or plain lead is in the set
+    (`_doc_own_sources_lead`).
 
     ⭐ 2026-09-30 round 2. A url whose first mention is inside that section is
     LISTED by the report, not cited in its prose, and must not be numbered into
-    a second list (see `_number_document_sources`)."""
+    a second list (see `_number_document_sources`).
+
+    ⭐ 2026-10-01 — THE BOLD LEAD. ChatGPT's 09-30 report titles its sections in
+    bold, and its sources section was a paragraph, "**Cited-source
+    bibliography.** The following are the principal sources…", under a heading
+    named "Decision framework, recommendations, and research appendices". A
+    heading-only test never saw it, so the visited list landed after it and the
+    document ended with two sources sections."""
     last = None
     for m in _DOC_ANY_HEADING_RE.finditer(masked or ""):
         last = m
-    if last is None:
-        return None
-    text = (last.group("atx") or last.group("setext") or "").strip()
-    if not text or _DOC_SOURCES_WORD_RE.match(text) is None:
-        return None
-    return last.start()
+    if last is not None:
+        text = (last.group("atx") or last.group("setext") or "").strip()
+        if text and _DOC_SOURCES_WORD_RE.match(text) is not None:
+            return last.start()
+    return _doc_own_sources_lead(masked or "", last.end() if last is not None else 0)
+
+
+def _doc_own_sources_lead(masked: str, start: int):
+    """The offset of the first paragraph at or after `start` led by a sources
+    title (`_doc_lead_is_sources`), or None.
+
+    ⛔ ONLY AFTER THE LAST HEADING. A "**Sources:**" paragraph in a middle
+    section is followed by more of the report, and the section this opens runs
+    to the end of the file."""
+    at, prev_blank = start, True
+    for line in masked[start:].splitlines(keepends=True):
+        blank = not line.strip()
+        if not blank and prev_blank and _doc_lead_is_sources(line):
+            return at
+        prev_blank = blank
+        at += len(line)
+    return None
+
+
+def _doc_lead_is_sources(line: str) -> bool:
+    """Is this paragraph's first line led by a title in the sources word set —
+    `**Title**`, `**Title.**`, `**Title:**`, or a plain `Title:`?"""
+    m = _DOC_BOLD_LEAD_RE.match(line)
+    if m:
+        return _DOC_SOURCES_WORD_RE.match(m.group("t").strip()) is not None
+    m = _DOC_PLAIN_LEAD_RE.match(line)
+    return bool(m) and _DOC_SOURCES_WORD_RE.match(m.group("t").strip() + ":") is not None
 
 
 def _doc_markdown_url(u: str) -> str:
@@ -76028,6 +76084,14 @@ def _doc_sources_row(n: int, url: str, title: str) -> str:
 # the run's own tracking, in the order first seen, one link per line. A document
 # citing more keeps exactly what it had, and Claude's, which ends with its own
 # list, is never touched.
+#
+# ⭐⭐ EXACTLY ONE SOURCES SECTION (owner, 2026-10-01). A report's own trailing
+# sources section that holds no public link — Gemini's "Works cited" with the
+# links gone, ChatGPT's "**Cited-source bibliography.**" naming sources by
+# category — is REPLACED by this list, not kept above it. "Its own section" is
+# `_doc_own_sources_start`: from the last heading, or the first bold- or
+# plain-led paragraph after it, whose title is in `_DOC_SOURCES_WORD_RE`'s closed
+# set, to the end of the file.
 #
 # ⛔⛔ ONLY PUBLIC PAGES, AND THIS IS THE PART THAT MATTERS MOST. The tracking is
 # read from the agents' own signed-in browsers: it can hold the chat the report
@@ -76467,9 +76531,12 @@ def _number_document_sources(md: str, findings: list, visited=None,
     ⭐ 2026-10-01 — `visited` is the sites the run saw this agent visit
     (`_p2_visited_sources`). A document that cites fewer than
     `_DOC_VISITED_MIN_CITED` public sources itself and has no sources list of
-    its own ends with them, after its own numbered rows, in the same list.
-    `label` names the agent in the one log line that says so. Without
-    `visited` the output is exactly what it always was.
+    its own that holds a public link ends with them, after its own numbered
+    rows, in the same list — and its own trailing section, which holds none, is
+    replaced by that list. `label` names the agent in the log lines that say
+    so. Without `visited` the output is exactly what it always was, except
+    that a bold-led sources paragraph after the last heading now counts as the
+    report's own section (`_doc_own_sources_start`).
 
     ⛔⛔ THE SENTENCE IS A BLOCK'S SENTENCE — see `_doc_marker_position`. A bullet,
     a numbered item and a table cell each END one, whether or not they close with
@@ -76550,9 +76617,9 @@ def _number_document_sources(md: str, findings: list, visited=None,
         placements.append((at, url_end, url, _doc_source_title(f, url)))
     # ⭐ 2026-10-01 — the sites the agent visited, for a document that cites
     # (almost) none itself. ⛔ Never after a report's own sources list that
-    # holds addresses: that list is the one list (Claude's). A report's own list
-    # of bare TITLES is no list a reader can open — Gemini's copy ends "Works
-    # cited" with the links gone — so ours follows it, under the alternate title.
+    # holds addresses: that list is the one list (Claude's). A report's own
+    # section with no public link — bare titles, or categories of sources by
+    # name — is no list a reader can open, and it is REPLACED by ours below.
     # (A document already ending with our list was returned as it is, above.)
     extra: list = []
     own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))
@@ -76571,6 +76638,23 @@ def _number_document_sources(md: str, findings: list, visited=None,
                 else:
                     log(f"[{who}] the document cites no sources itself — ending "
                         f"it with the {len(extra)} sites {who} visited")
+    # ⭐⭐ 2026-10-01 — EXACTLY ONE SOURCES SECTION. Owner: "don't add two sources
+    # like we faced last time in a Claude document." ChatGPT's 09-30 report ended
+    # with its own "**Cited-source bibliography.**" — six paragraphs naming
+    # sources by category, not one link — and the visited list went after it:
+    # two sections, and only the second could be opened. When the visited list
+    # is added, the report's own trailing section (which holds no public link,
+    # or the list would not be added) is cut off and ours takes its place. Our
+    # rows stay the idempotency sentinel, so a second pass changes nothing.
+    # ⛔ The cut is at the section's start, so every placement — each sits in
+    # the report before it — is clamped there, and the document reads "Sources"
+    # once, under our first title.
+    cut = len(md[:own_at].rstrip()) if extra and own_at is not None else None
+    if cut is not None:
+        log(f"[{label or 'the agent'}] the report's own sources section holds no "
+            f"link — replaced by this list, so the document ends with one")
+        placements = [(min(p[0], cut),) + tuple(p[1:]) for p in placements]
+        own_at = None
     if not placements and not extra:
         if own_at is not None:
             log("numbered sources: every source is only in the report's own "
@@ -76578,7 +76662,7 @@ def _number_document_sources(md: str, findings: list, visited=None,
         return md
     # Ascending through the document, so the numbers a reader meets count up.
     placements.sort(key=lambda p: (p[0], p[1]))
-    out = md
+    out = md if cut is None else md[:cut]
     for i in range(len(placements) - 1, -1, -1):
         at, _url_end, url, _title = placements[i]
         lead = "" if at <= 0 or md[at - 1].isspace() else " "

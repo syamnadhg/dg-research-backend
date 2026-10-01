@@ -721,13 +721,33 @@ class TestTheSourceTitleIsThePagesOwnName:
 
     def test_the_document_a_reader_sees_carries_those_titles(self):
         """The consumer, not the helper. This is the string that was wrong in
-        the delivered file, byte for byte."""
-        tail = research._document_with_sources(self.REFS).split(SOURCES_TAIL)[-1]
+        the delivered file, byte for byte.
+
+        ⛔ CHANGED 2026-10-01: the entries are read here WITHOUT the incident's
+        "**References**" lead. With it, that paragraph is now the report's own
+        trailing sources section (a bold lead in the closed word set,
+        `_doc_own_sources_start`) and it holds the links, so it stays the one
+        list and nothing is appended — the owner's rule is exactly one sources
+        section, and before this the document ended with two (see the next
+        test). Without the lead the entries are citations in the last section,
+        and the list they get must carry the pages' own names, never the
+        heading."""
+        refs = self.REFS.replace("**References**\n\n", "")
+        assert refs != self.REFS
+        tail = research._document_with_sources(refs).split(SOURCES_TAIL)[-1]
         assert tail == (
             "1. [Golden Retriever breed information.]"
             "(https://www.akc.org/dog-breeds/golden-retriever/) — akc.org\n"
             "2. [Canine Health Information Center / CHIC Programs.]"
             "(https://ofa.org/chic-programs/) — ofa.org\n")
+
+    def test_the_incidents_own_references_block_stays_the_one_list(self):
+        """2026-10-01. The incident's exact shape — a trailing "**References**"
+        paragraph holding the links — used to get a number after each address
+        inside that block AND our list repeating them: two sources sections,
+        the shape the owner ruled out on Claude's document. It is the report's
+        own list now, as Claude's "## Sources" is, and is left byte for byte."""
+        assert research._document_with_sources(self.REFS) == self.REFS
 
     def test_a_link_label_is_the_best_evidence_there_is(self):
         md = ("## Market overview\n\nRevenue grew per "

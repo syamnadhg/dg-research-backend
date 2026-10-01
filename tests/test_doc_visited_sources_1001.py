@@ -289,15 +289,19 @@ class TestChatGPTAndGeminiEndWithTheSitesTheyVisited:
             run.runtime.agent_findings["chatgpt"])
         assert len(re.findall(r"^\d+\. \[", local, re.M)) == 5
 
-    def test_a_titles_only_works_cited_list_is_followed_by_the_links(self, run):
+    def test_a_titles_only_works_cited_list_is_replaced_by_the_links(self, run):
         """Gemini's export ends "Works cited" — and in a copy that lost its links
-        that list is bare titles nobody can open. The visited sites follow it,
-        under the alternate title so the document does not read "Sources" twice."""
+        that list is bare titles nobody can open.
+
+        ⛔⛔ CHANGED 2026-10-01, AND ON PURPOSE. This test used to expect the
+        visited sites AFTER the titles, under "Sources (numbered)": two sources
+        sections, which is exactly what the owner ruled out ("don't add two
+        sources like we faced last time in a Claude document"). The titles-only
+        list is now REPLACED by ours, and the document reads "Sources" once."""
         report = GEMINI_REPORT + "\n## Works cited\n\n1. RVC news release.\n2. PMC article.\n"
         run.runtime.agent_progress_snapshots["gemini"] = {"source_urls": GEMINI_TRACKED}
         local = run.write("Gemini", report)
-        assert local == ("# Gemini Deep Research\n\n" + report.rstrip()
-                         + "\n\n##### Sources (numbered)\n\n" + GEMINI_ROWS)
+        assert local == "# Gemini Deep Research\n\n" + GEMINI_REPORT.rstrip() + TAIL + GEMINI_ROWS
 
 
 class TestTheSuperResearchFieldCarriesThem:
@@ -412,7 +416,14 @@ class TestNeverTwice:
         assert again == ("# ChatGPT Deep Research (retry)\n\n" + CHATGPT_REPORT.rstrip()
                          + TAIL + CHATGPT_ROWS)
 
-    @pytest.mark.parametrize("own", ["", "\n## Works cited\n\n1. AKC breed page.\n"])
+    @pytest.mark.parametrize("own", [
+        "",
+        "\n## Works cited\n\n1. AKC breed page.\n",
+        # what an earlier build of this branch wrote: the titles, then ours
+        # under the alternate title
+        "\n## Works cited\n\n1. AKC breed page.\n\n##### Sources (numbered)\n\n"
+        "1. [akc.org/x](https://www.akc.org/x)\n",
+    ])
     def test_text_still_carrying_our_list_is_left_as_it_is(self, run, own):
         """Text that somehow still ends with our list — under either title — is
         never given a second one, even when more sites were tracked since."""
@@ -423,6 +434,165 @@ class TestNeverTwice:
         body = first.partition("\n\n")[2]
         again = research._p2_regenerated_document("ChatGPT", body, "regenerated")
         assert again.partition("\n\n")[2] == body
+
+
+# ── exactly one sources section (owner, 2026-10-01) ───────────────────────────
+#
+# "Don't add two sources like we faced last time in a Claude document." MEASURED
+# on the real 09-30 ChatGPT file before this change: the numbering funnel
+# returned TWO sections — ChatGPT's own "**Cited-source bibliography.**" block
+# (six "**Category:** names…" paragraphs, not one link), then our "##### Sources"
+# with the links.
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "documents_0930"
+#: The owner's real 09-30 files, byte for byte (German_Sheperd_20260930_212911).
+CHATGPT_0930 = (FIXTURES / "chatgpt.md").read_text(encoding="utf-8")
+CLAUDE_0930 = (FIXTURES / "claude.md").read_text(encoding="utf-8")
+
+#: The closed word set a sources section is titled with — PORTED here rather
+#: than read from the code, so the count below does not ask the code under test
+#: what a section is.
+_W = (r"(?:\d{1,3}(?:\.\d{1,3})*[.)]?[ \t]+)?"
+      r"(?:(?:key|main|principal|selected|cited-source|cited|full|further|additional"
+      r"|list[ \t]+of)[ \t]+)?"
+      r"(?:sources?|references?|citations?|bibliography|works[ \t]+cited"
+      r"|reference[ \t]+list)"
+      r"(?:[ \t]+(?:cited|consulted|used)"
+      r"|[ \t]+and[ \t]+(?:further[ \t]+reading|notes|references|sources))?")
+#: Every heading, bold lead or plain lead that titles a sources section —
+#: our own alternate title included, so a kept block beside ours counts as two.
+SECTION_TITLE_RE = re.compile(
+    r"^(?:#{1,6}[ \t]+" + _W + r"(?:[ \t]+\(numbered\))?[ \t]*[.:]?[ \t]*$"
+    r"|(?:\*\*|__)" + _W + r"[.:]?(?:\*\*|__)[.:]?(?:[ \t]|$)"
+    r"|" + _W + r":)",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def sources_sections(doc):
+    return [m.group(0).strip() for m in SECTION_TITLE_RE.finditer(doc)]
+
+
+ONE_ROW = "1. [akc.org/dog-breeds](https://www.akc.org/dog-breeds/)\n"
+BODY = "# ChatGPT Deep Research\n\n## Findings\n\nThe breed is popular in Canada.\n"
+
+#: A report's own trailing section with no public link, in each shape the rule
+#: names. Each is appended to BODY after a blank line.
+LINKLESS_OWN = {
+    "gemini-empty-sources": "## Sources\n",
+    "works-cited-titles": "## Works cited\n\n1. AKC breed page.\n2. OFA hip dysplasia.\n",
+    "numbered-key-sources": "## 14. Key sources\n\n- AKC, *German Shepherd Dog*.\n"
+                            "- OFA, *Hip dysplasia*.\n",
+    "bold-references": "**References:** AKC, *German Shepherd Dog*; OFA, *Hip dysplasia*.\n",
+    "bold-then-colon": "**Selected sources**: AKC breed page; OFA hip page.\n",
+    "bold-no-stop-then-list": "**Sources consulted**\n\nAKC breed page; OFA hip page.\n",
+    "plain-references": "References: AKC, German Shepherd Dog; OFA, Hip dysplasia.\n",
+    "only-a-private-link": "## Sources\n\n1. [This conversation](https://chatgpt.com/c/68dc1f2e)\n",
+}
+
+
+def _with_visited(md, visited=("https://www.akc.org/dog-breeds/",)):
+    return research._document_with_sources(md, visited=list(visited), label="ChatGPT")
+
+
+class TestExactlyOneSourcesSection:
+    def test_the_real_0930_chatgpt_document_ends_with_one_sources_section(self, run):
+        """⛔⛔ THE OWNER'S FILE, THROUGH THE REAL PER-AGENT WRITE. Its own block
+        goes, our list takes its place, and every byte of the report before the
+        block is as it was. save_meta still reads our rows back."""
+        header = "# ChatGPT Deep Research\n\n"
+        assert CHATGPT_0930.startswith(header)
+        # the input's one section is ChatGPT's own, with no link in it
+        assert sources_sections(CHATGPT_0930) == ["**Cited-source bibliography.**"]
+        block = CHATGPT_0930.index("**Cited-source bibliography.**")
+        assert "](http" not in CHATGPT_0930[block:]
+        run.poll("chatgpt", CHATGPT_TRACKED)
+        run.poll("chatgpt", [])
+        local = run.write("ChatGPT", CHATGPT_0930[len(header):])
+        assert local == CHATGPT_0930[:block].rstrip() + TAIL + CHATGPT_ROWS
+        assert sources_sections(local) == ["##### Sources"]
+        assert "Cited-source bibliography" not in local
+        assert "**Breed standards, history and screening:**" not in local
+        assert ("[ChatGPT] the report's own sources section holds no link — "
+                "replaced by this list, so the document ends with one") in run.logs
+        assert research._strip_numbered_sources_section(local) == CHATGPT_0930[:block].rstrip()
+        assert run.source_urls("chatgpt") == [
+            "https://www.akc.org/dog-breeds/german-shepherd-dog/",
+            "https://www.ofa.org/diseases/hip-dysplasia/",
+            "https://pubmed.ncbi.nlm.nih.gov/28770095/",
+            "https://en.wikipedia.org/wiki/Hip_dysplasia_(canine)",
+        ]
+
+    def test_the_real_0930_claude_document_is_byte_identical(self, run):
+        """⛔⛔ Claude's own "## Sources" holds 76 links: it is the one list, and
+        the document does not change by a byte, sites tracked or not."""
+        assert len(re.findall(r"^\d+\. \[[^\]]+\]\(https?://", CLAUDE_0930, re.M)) == 76
+        run.poll("claude", CHATGPT_TRACKED)
+        local = run.write("Claude", CLAUDE_0930[len("# Claude Deep Research\n\n"):])
+        assert local == CLAUDE_0930
+        assert _with_visited(CLAUDE_0930, CHATGPT_TRACKED) == CLAUDE_0930
+
+    def test_a_gemini_document_ending_with_an_empty_sources_heading(self, run):
+        """Gemini-shaped, through the real write: "## Sources" with nothing
+        under it is replaced, not followed."""
+        run.runtime.agent_progress_snapshots["gemini"] = {"source_urls": GEMINI_TRACKED}
+        local = run.write("Gemini", GEMINI_REPORT + "\n## Sources\n")
+        assert local == "# Gemini Deep Research\n\n" + GEMINI_REPORT.rstrip() + TAIL + GEMINI_ROWS
+        assert sources_sections(local) == ["##### Sources"]
+
+    @pytest.mark.parametrize("shape", sorted(LINKLESS_OWN))
+    def test_a_linkless_own_section_is_replaced_by_ours(self, shape, monkeypatch):
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        md = BODY + "\n" + LINKLESS_OWN[shape]
+        assert len(sources_sections(md)) == 1      # the shape IS a section
+        out = _with_visited(md)
+        assert out == BODY.rstrip() + TAIL + ONE_ROW
+        assert sources_sections(out) == ["##### Sources"]
+
+    @pytest.mark.parametrize("own", [
+        "**References:** [AKC](https://www.akc.org/dog-breeds/german-shepherd-dog/); "
+        "[OFA](https://www.ofa.org/diseases/hip-dysplasia/).\n",
+        "## Key sources\n\n- https://www.akc.org/dog-breeds/german-shepherd-dog/\n"
+        "- https://pubmed.ncbi.nlm.nih.gov/28770095/\n",
+        "References: https://www.akc.org/dog-breeds/german-shepherd-dog/\n",
+    ], ids=["bold-references-links", "key-sources-links", "plain-references-link"])
+    def test_an_own_section_holding_links_is_untouched(self, own, monkeypatch):
+        """Fewer than five links, so only its being the report's own section with
+        a public link keeps the visited list out — and nothing is replaced."""
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        md = BODY + "\n" + own
+        assert _with_visited(md, CHATGPT_TRACKED) == md
+
+    @pytest.mark.parametrize("md", [
+        BODY + "\n## Sources of funding\n\nThe registry is funded by breeders.\n"
+        "\n## Conclusion\n\nA fine breed for an active household.\n",
+        BODY + "\n## Sources\n\nAKC breed page; OFA.\n"
+        "\n## Conclusion\n\nA fine breed for an active household.\n",
+        BODY + "\n**Sources:** the AKC and the OFA agree on the breed's health.\n"
+        "\n## Conclusion\n\nA fine breed for an active household.\n",
+        BODY + "\n## Sources of uncertainty\n\nThe registry data are self-reported.\n",
+        BODY + "\nReferences to the breed standard: the FCI wrote it in 1899.\n",
+        BODY + "\nThe breed club publishes its data openly; see its\n"
+        "**Selected references** page for the full list.\n",
+    ], ids=["sources-of-funding", "sources-mid-report", "bold-sources-mid-report",
+            "last-heading-sources-of", "plain-references-to", "bold-on-a-wrapped-line"])
+    def test_a_section_like_title_that_is_not_the_trailing_section_is_untouched(
+            self, md, monkeypatch):
+        """Only the TRAILING section, and only a title in the closed set. A
+        section ABOUT sources, or a sources section with the report going on
+        after it, stays; ours is added at the end as for any report."""
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        assert _with_visited(md) == md.rstrip() + TAIL + ONE_ROW
+
+    @pytest.mark.parametrize(
+        "md", [CHATGPT_0930, CLAUDE_0930]
+        + [BODY + "\n" + LINKLESS_OWN[k] for k in sorted(LINKLESS_OWN)],
+        ids=["chatgpt-0930", "claude-0930"] + sorted(LINKLESS_OWN))
+    def test_running_twice_is_running_once(self, md, monkeypatch):
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        once = _with_visited(md, CHATGPT_TRACKED)
+        twice = _with_visited(once, CHATGPT_TRACKED + ["https://www.akc.org/tracked-since"])
+        assert twice == once
+        assert len(sources_sections(once)) == 1
 
 
 # ── the gate: only public pages, through the numbering funnel ─────────────────
