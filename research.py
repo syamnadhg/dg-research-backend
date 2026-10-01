@@ -76099,7 +76099,14 @@ def _doc_sources_lead_kind(line: str):
         return None
     if w.group("q") or w.group("tail") or w.group("w").lower() not in (
             "sources", "references", "citations"):
-        return "bib"
+        # ⛔⛔ A ONE-LINE BIBLIOGRAPHY LEAD IS A "line" LEAD (Windows release review,
+        # 2026-10-01): a title ending ":" with its entries on the same line
+        # ("**Key sources:** OFA, AKC.") opens nothing after it, exactly as
+        # "**References:** AKC." does. As "bib" it let every "**Budget:** …"
+        # paragraph after it count as a source entry, and a link-less report was
+        # cut from that lead to its end. The bold-period title ("**Cited-source
+        # bibliography.** The principal sources…") still opens category lines.
+        return "line" if (rest and title.endswith(":")) else "bib"
     return "line" if rest else "title"
 
 

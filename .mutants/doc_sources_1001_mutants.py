@@ -26,6 +26,8 @@ RESEARCH = "research.py"
 
 SUITES = [
     "tests/test_doc_visited_sources_1001.py",
+    # the one-line bibliography lead (Windows release review, 2026-10-01)
+    "tests/test_doc_sources_one_line_lead_1001.py",
     "tests/test_numbered_sources_0918.py",
     "tests/test_chatgpt_row_scope_0805.py::"
     "test_EVERY_writer_of_an_agent_md_is_covered_by_one_guard_or_the_other",
@@ -239,6 +241,10 @@ MUTANTS = [
     ("G14", "a search engine's own pages pass",
      [('        if _DOC_SEARCH_HOST_RE.match(bare):\n            return ""',
        '        if False:\n            return ""')]),
+    ("L1", "a one-line bibliography lead opens a bibliography again — "
+           "'**Key sources:** OFA.' then '**Budget:** …' is cut from the report",
+     [('        return "line" if (rest and title.endswith(":")) else "bib"\n',
+       '        return "bib"\n')]),
 ]
 
 
