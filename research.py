@@ -76022,20 +76022,21 @@ def _doc_sources_row(n: int, url: str, title: str) -> str:
 # CITES, so a document citing nothing got no list.
 #
 # ⭐ THE RULE. A document that cites fewer than `_DOC_VISITED_MIN_CITED` public
-# sources itself, and does not already end with a sources list of its own, ends
-# with "Sources": the sources it does cite first (numbered in the prose exactly
-# as before), then every other site the agent visited, from the run's own
-# tracking, in the order first seen, one link per line. A document citing more
-# keeps exactly what it had, and Claude's, which ends with its own list, is never
-# touched.
+# sources itself, and does not already end with a sources list of its own that
+# holds links, ends with "Sources": the sources it does cite first (numbered in
+# the prose exactly as before), then every other site the agent visited, from
+# the run's own tracking, in the order first seen, one link per line. A document
+# citing more keeps exactly what it had, and Claude's, which ends with its own
+# list, is never touched.
 #
 # ⛔⛔ ONLY PUBLIC PAGES, AND THIS IS THE PART THAT MATTERS MOST. The tracking is
 # read from the agents' own signed-in browsers: it can hold the chat the report
 # was written in, the sandbox frame the report renders in, a sign-in page, a
 # search page, a Google redirect carrying the real address in its query, the
 # owner's own Drive file. `_doc_public_source_url` is the one gate. It reuses
-# `_is_platform_host` (THE one list of the agents' own pages) and the F4 deny
-# list, and adds only what those two do not judge. ⛔ It does NOT add to
+# `_is_platform_host` (THE one list of the agents' own pages), the document
+# scrub's `_doc_link_is_private` and the F4 deny list, and adds only what those
+# do not judge. ⛔ It does NOT add to
 # `_HOST_DENYLIST`: that list is inlined byte for byte into ten page scripts
 # (`_js_platform_guard`), and sign-in and search pages are not the agents' own.
 
