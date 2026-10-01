@@ -30,8 +30,16 @@ from types import SimpleNamespace
 import pytest
 
 import research
-from test_nlm_customise_0930 import (  # noqa: F401  (chrome is a fixture)
-    NB_URL, _QuickAsyncio, _fixture_html, chrome)
+from test_nlm_customise_0930 import (  # noqa: F401  (_customise_chrome is a fixture)
+    NB_URL, _QuickAsyncio, _fixture_html, chrome as _customise_chrome)
+
+
+@pytest.fixture(scope="module")
+def chrome(request):
+    """test_nlm_customise_0930's headless Chrome, under the name these tests
+    ask for. Imported as `chrome` itself — or taken as an argument here — it
+    reads as a redefinition to the lint floor (F811, run with --ignore-noqa)."""
+    return request.getfixturevalue("_customise_chrome")
 
 
 def _card(fmt, dur, title):
