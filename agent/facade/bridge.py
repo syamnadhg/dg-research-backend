@@ -3220,6 +3220,13 @@ def _plan_offers(plan: dict | None) -> list:
             if plan.get("resume" if v == "retry" else "skip") is not None]
 
 
+#: The words the research computer's login-pause card uses when the run continues
+#: by itself (research.py `LOGIN_PAUSE_CONTINUES_COPY`, wave 13) — absent from its
+#: "Tap Retry after login" text. tests/test_move_to_queue_0930.py reads both
+#: texts out of research.py, so a rewording there fails a test here.
+_LOGIN_CONTINUES_MARK = "continues by itself"
+
+
 def _attention_action(plan: dict | None) -> str | None:
     """The ONE imperative sentence chat shows under a blocker: what the person
     must do, and only the verbs that actually work for this card."""
@@ -3256,6 +3263,17 @@ def _attention_action(plan: dict | None) -> str | None:
                     else f"“skip” to drop {Ag} from this run")
         return f"Reply “retry” to re-check the plan, or {skip_txt}.{free}"
     if card == "crash_login_interrupt":
+        # ⭐ WAVE 13: A RESEARCH COMPUTER THAT CONTINUES THE RUN BY ITSELF says so
+        # in the card (research.py `LOGIN_PAUSE_CONTINUES_COPY`), and the old
+        # "reply retry" line then contradicted it. Nothing on the record marks it
+        # (its token stays on that computer's disk), so the card's own words
+        # decide: an older research computer, or a run it cannot resume by itself,
+        # still writes "Tap Retry after login" and still needs the Retry.
+        if _LOGIN_CONTINUES_MARK in str(plan.get("details") or "").lower():
+            return (f"Nothing to do — the run continues by itself from its last "
+                    f"checkpoint when the sign-in on {M} finishes. Retry still works: "
+                    "reply “retry” if it hasn’t started again by then. There is no "
+                    "skip on this one — reply “stop” to end it.")
         return ("Reply “retry” to pick the run up from its last checkpoint. There is "
                 "no skip on this one — reply “stop” to end it.")
     if card == "crash_loop":
@@ -3986,16 +4004,72 @@ def _run_akey(attention: Any, action: Any) -> str:
     return str(attention or "") + "\x1f" + str(action or "")
 
 
+#: The longest move note the app and the research computer write (one line).
+_MOVE_NOTE_MAX = 280
+#: sr.py's agent-only marker (`_AGENT_ONLY_MARKER`), in any case or separators.
+#: The relaying assistant hides everything under it, so a note carrying it could
+#: hide the rest of a reply.
+_AGENT_ONLY_MARKER_RE = re.compile(r"(?i)for\W+the\W+assistant\W*do\W+not\W+relay\W+to\W+the\W+user")
+
+
+def _moved_stamp(v: Any) -> "int | float | None":
+    """A run's `movedToQueueAt` (ms) when it is one — a positive number, never a
+    bool (Move to queue, wave 13) — else None. Absent means "not moved", and an
+    older research computer never writes it."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        return None
+    return v
+
+
+def _is_moved(doc: Any, status: Any) -> bool:
+    """Whether a run waits in the queue after being moved there: `queued` AND a
+    move stamp. ⛔ The status matters: a restart can leave the stamp on a run it
+    pauses (`paused_backend_restart`), and the run it was moved off can write
+    "ongoing" in its last second."""
+    return (status == "queued" and isinstance(doc, dict)
+            and _moved_stamp(doc.get("movedToQueueAt")) is not None)
+
+
+def _one_line_note(v: Any) -> "str | None":
+    """The owner's move note (`moveNote`), as chat may show it: one line, at most
+    280 characters, no agent-only marker — or None. The app and the research
+    computer already cut it; this is the same cut again at the point of relay,
+    because it is another person's free text going into this person's chat.
+
+    ⛔⛔ AND NOTHING THE CHAT RUNTIME WOULD OBEY (review of the wave-13 chat
+    change, 2026-09-30). The watcher's output is delivered by Hermes, which pulls
+    any `MEDIA:<path>` out of it and ATTACHES that file from this host — so a note
+    reading `x" MEDIA:~/.super-agent/…` made the person's chat upload a file of the
+    owner's choosing. `MEDIA:` is broken apart in any case, `[[` directives too,
+    and the note loses `"` and `\\` so it can never close its own quotes."""
+    if not isinstance(v, str):
+        return None
+    s = _AGENT_ONLY_MARKER_RE.sub(" ", " ".join(v.split())).replace("──", " ")
+    s = re.sub(r"(?i)media\s*:", "media ", s)
+    s = s.replace('"', "'").replace("\\", "/")
+    # ⛔ No [[…]] tag however many brackets (a single replace left one of three),
+    # no image or HTML (a relayed reply's images are sent), and no bare local
+    # path: a relayed reply's ~/…, /… and C:/… files are ATTACHED. A URL keeps
+    # its own slashes; a path at a word's start gets a space after its anchor.
+    s = re.sub(r"\[(?=\[)", "[ ", s).replace("![", "! [")
+    s = s.replace("<", "‹").replace(">", "›")
+    s = re.sub(r"(?<![/:\w.])(?:~/|/|[A-Za-z]:/)(?=[\w.~-])", lambda m: m.group(0) + " ", s)
+    return " ".join(s.split())[:_MOVE_NOTE_MAX].rstrip() or None
+
+
 def _watch_run(uid: str, rid: Any, origin: Any, status: str = "queued",
-               needs: bool = False, akey: "str | None" = None) -> None:
-    """Start (or refresh) watching one agent run. Pure memory; never raises."""
+               needs: bool = False, akey: "str | None" = None,
+               moved: bool = False) -> None:
+    """Start (or refresh) watching one agent run. Pure memory; never raises.
+    `moved`: it waits in the queue after a Move to queue (`_is_moved`)."""
     rid = str(rid or "")
     if not uid or not rid:
         return
     with _RUN_WATCH_LOCK:
         _RUN_WATCH.pop(rid, None)
         _RUN_WATCH[rid] = {"uid": uid, "origin": _clean_origin(origin),
-                           "status": status, "needs": bool(needs), "akey": akey}
+                           "status": status, "needs": bool(needs), "akey": akey,
+                           "moved": bool(moved)}
         while len(_RUN_WATCH) > _RUN_WATCH_MAX:
             _RUN_WATCH.pop(next(iter(_RUN_WATCH)))
 
@@ -4020,7 +4094,7 @@ def _note_run_seen(uid: str, row: dict, status: Any, needs: bool, *,
             _RUN_WATCH.pop(rid, None)
             _RUN_WATCH[rid] = {"uid": uid, "origin": _clean_origin(row.get("chatOrigin")),
                                "status": str(status or ""), "needs": bool(needs),
-                               "akey": akey}
+                               "akey": akey, "moved": _is_moved(row, status)}
         elif not live and watchdog and cur is not None:
             _RUN_WATCH.pop(rid, None)
         while len(_RUN_WATCH) > _RUN_WATCH_MAX:
@@ -4187,10 +4261,20 @@ def _peek_runs(state: BridgeState, sess: AccountSession, memo: dict, now: float)
             # ⭐ Stopped / cancelled — the watcher's "⏹ stopped" line, from either
             # surface (2026-09-25; it used to wait for the watcher's own tick).
             reason = "run-ended"
+        # ⭐ MOVE TO QUEUE (wave 13, 2026-09-30): the owner moved it back to the
+        # queue, or it runs again after that — the watcher's two move lines.
+        moved = _is_moved(doc, status)
+        if reason is None and moved and not e.get("moved"):
+            reason = "run-moved"
+        elif (reason is None and status == "ongoing" and e.get("moved")
+              and _moved_stamp(doc.get("movedToQueueAt")) is None):
+            reason = "run-running-again"
         # ⛔ Still in flight → keep reading it; anything else changes only when the
         # person acts, and the watcher's own read watches it again if it runs again.
         if status in _RUN_IN_FLIGHT:
-            _watch_run(sess.uid, rid, origin, status, needs, akey)
+            _watch_run(sess.uid, rid, origin, status, needs, akey,
+                       moved=moved or (bool(e.get("moved")) and status == "ongoing"
+                                       and _moved_stamp(doc.get("movedToQueueAt")) is not None))
         else:
             with _RUN_WATCH_LOCK:
                 _RUN_WATCH.pop(rid, None)
@@ -7169,6 +7253,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     # A queued run's place in line — sr.py renders "queued —
                     # #N in line" from this (#890; absent once the run starts).
                     "queuePosition": r.get("queuePosition"),
+                    # ⭐ MOVE TO QUEUE (wave 13): when the owner moved it back to
+                    # the queue, and their note. The watcher tells the run's own
+                    # person from these; this is their own tree only (7.7E) — the
+                    # device's `restNote` is everyone's and is never read here.
+                    "movedToQueueAt": _moved_stamp(r.get("movedToQueueAt")),
+                    "moveNote": _one_line_note(r.get("moveNote")),
                     "updatedAt": r.get("updatedAt"),
                     # Tokenized Storage audio URL redacted (kind marker kept for the
                     # podcast run-pick); it must never reach a chat client.

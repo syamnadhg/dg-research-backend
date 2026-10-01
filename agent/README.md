@@ -124,12 +124,13 @@ empty list".
 
 Almost nothing, and that is the design. A **streaming watchdog** — armed by the
 client itself for the chat you're in (`arm-stream`), and scoped to the runs *you*
-started from chat — posts unprompted for exactly three things about runs: **one**
+started from chat — posts unprompted for exactly four things about runs: **one**
 completion message per run, carrying every phase's permanent, non-revocable Super
 Research link, plus "the results have been emailed" only when that run's email phase
 was on; a run that **needs you** (a sign-in, a verification, a snag, an error), with
-how to answer it from chat; and a run that was stopped or cancelled, from either
-surface. It also carries the one-shot notes the bridge parks for that chat — a
+how to answer it from chat; a run that was stopped or cancelled, from either
+surface; and a run the computer's owner **moved back to the queue** (with their note,
+once per move), then one line when it runs again. It also carries the one-shot notes the bridge parks for that chat — a
 sign-in, a public computer's owner saying yes, a support bundle landing (or still
 not, after half an hour). Where the chat runtime can compute cron expressions it
 ticks on every minute boundary, otherwise every minute from its last run; on Hermes
