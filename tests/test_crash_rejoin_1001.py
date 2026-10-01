@@ -89,20 +89,33 @@ class _Page:
 
 
 class _Browser:
-    """`open_isolated_tab(url)` hands back the page that address LANDS on."""
+    """`open_isolated_tab(url)` hands back the page that address LANDS on.
 
-    def __init__(self, lands=None, refuse=()):
+    `context` answers the dead-browser probe: a bare object reads as a live
+    Chrome (its cookie read fails with an error that is not a close)."""
+
+    def __init__(self, lands=None, refuse=(), error=None, context=None):
         self.page = None
-        self.context = object()
+        self.context = context if context is not None else object()
         self.opened = []
         self.lands = dict(lands or {})
         self.refuse = set(refuse)
+        self.error = error or (lambda _url: RuntimeError(
+            "Target page, context or browser has been closed"))
 
     async def open_isolated_tab(self, url=None):
         self.opened.append(url)
         if url in self.refuse:
-            raise RuntimeError("Target page, context or browser has been closed")
+            raise self.error(url)
         return self.lands.get(url) or _Page(url)
+
+
+class _DeadContext:
+    """The context of a Chrome that has died: its cookie read says so."""
+
+    async def cookies(self):
+        raise RuntimeError("BrowserContext.cookies: Target page, context or browser "
+                           "has been closed")
 
     async def switch_to_page(self, page):
         self.page = page
@@ -185,9 +198,12 @@ def p2(monkeypatch, tmp_path):
     monkeypatch.setattr(research, "_gemini_reload_identity_ok", _gm_ident)
     ns.adoptions = []
     ns.adopt_to = None
+    ns.adopt_raises = None
 
     async def _adopt(page, pasted_text, label, **kw):
         ns.adoptions.append(kw)
+        if ns.adopt_raises is not None:
+            raise ns.adopt_raises
         if ns.adopt_to is None:
             return page, False
         return ns.adopt_to, True
@@ -225,9 +241,14 @@ def p2(monkeypatch, tmp_path):
     monkeypatch.setattr(research, "poll_all_agents_round_robin", _poll)
     monkeypatch.setattr(research, "apply_off_topic_sweep", lambda *a, **k: 0)
 
-    def run(carried, *, browser, enabled=ALL, done=()):
-        """`_p2_run_with_resume` with `run_pipeline`'s attempt runner."""
+    def run(carried, *, browser, enabled=ALL, done=(), seeded=False):
+        """`_p2_run_with_resume` with `run_pipeline`'s attempt runner.
+
+        `seeded`: the retry's `_runtime` already holds the carried chats, as
+        `run_pipeline` puts them there at its start."""
         ns.brief_seen = BRIEF
+        if seeded:
+            research._runtime.p2_chat_urls.update(carried)
         for key in done:
             (q / "documents" / f"{key}.md").write_text(
                 f"# {research._agent_display_name(key)} Deep Research\n\n"
@@ -527,19 +548,25 @@ def crash(tmp_path, monkeypatch):
         return await _real_sleep(0)
     monkeypatch.setattr(research.asyncio, "sleep", _fast_sleep)
 
-    def _run(exc, *, at_phase=2, crash_retries=0):
+    def _run(exc, *, at_phase=2, crash_retries=0, rejoin=None, chats=CHATS, modes=None):
+        """`rejoin`: what this attempt was itself handed by the crash before it.
+        `chats`: what Phase 2 noted before Chrome died (None: it got nowhere).
+        `modes`: the agents' recorded modes at the crash."""
         def _emit(name, phase=None, **_kw):
             # The first thing the main `try` does is announce phase 0; the run is
             # put where the 09-30 crash found it, then Chrome dies.
             if name == "phase_start" and phase == 0:
                 research._runtime.phase = at_phase
-                research._runtime.agent_chat_urls = dict(CHATS)
-                research._runtime.p2_chat_urls = dict(CHATS)
+                if chats is not None:
+                    research._runtime.agent_chat_urls = dict(chats)
+                    research._runtime.p2_chat_urls = dict(chats)
+                if modes:
+                    research._runtime.agent_modes = dict(modes)
                 raise exc
         monkeypatch.setattr(research, "emit_event", _emit)
         asyncio.run(research.run_pipeline(
             topic="St Bernard", resume_dir=str(queue_dir), uid=None, email=None,
-            api_key="test-key", _crash_retries=crash_retries))
+            api_key="test-key", _crash_retries=crash_retries, _p2_rejoin=rejoin))
         return retries, cards
 
     yield _run
@@ -767,3 +794,296 @@ def test_the_first_phase_2_attempt_takes_the_carried_chats_and_no_other_call_doe
     assert len(mine) == 1
     assert {k.arg: ast.unparse(k.value) for k in mine[0].keywords}["rejoin"] == "_rejoin"
     assert not [k for c in calls if c not in mine for k in c.keywords if k.arg == "rejoin"]
+    # ⛔ And NOTHING ELSE touches the carried chats: one assignment, one take. A
+    # `_p2_rejoin_left.clear()` (or a reassignment) anywhere else empties the
+    # rejoin while every behaviour test above, which builds its own runner,
+    # stays green.
+    uses = [n for n in ast.walk(tree) if isinstance(n, ast.Name)
+            and n.id == "_p2_rejoin_left"]
+    assert len(uses) == 2, [ast.unparse(n) for n in uses]
+    assert len([n for n in ast.walk(attempt) if isinstance(n, ast.Name)
+                and n.id == "_p2_rejoin_left"]) == 1
+
+
+# ══ 11. the chat the TAB is on at the crash, not the one it was sent in ══════
+# 09-30 evening run.log:146 — Gemini's send landed on #1cb56678, the digest of
+# /app/3a6f3707328a6fa8. At 18:21:17 the tab navigated, and from 18:21:27 its plan
+# and its research were on /app/e91e413e201fee2a. Nothing in 2D notes the move;
+# Playwright keeps a page's last address after Chrome dies.
+
+GM_SENT = "https://gemini.google.com/app/3a6f3707328a6fa8"
+GM_HOME = "https://gemini.google.com/app"
+
+
+class _ChromeDied(RuntimeError):
+    def __init__(self):
+        super().__init__("Page.bring_to_front: Target page, context or browser has "
+                         "been closed")
+
+
+class _GonePage(_Page):
+    """A tab whose address can no longer be read once `gone`."""
+
+    def __init__(self, url, *a, **k):
+        self.gone = False
+        super().__init__(url, *a, **k)
+
+    @property
+    def url(self):
+        if self.gone:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return self._url
+
+    @url.setter
+    def url(self, value):
+        self._url = value
+
+
+@pytest.fixture
+def phase2(monkeypatch):
+    """The real `run_phase2`, its set-up and observer stubbed — as section 8."""
+    research._runtime.reset()
+    research._controls.reset()
+    monkeypatch.setattr(research._controls, "pro_warning_acknowledged", True)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_p2_run_dir", lambda: None)
+    monkeypatch.setattr(research, "_tracks_dir", None)
+    monkeypatch.setenv("DG_P2_STAGGER_SEC", "0")
+    yield monkeypatch
+    research._runtime.reset()
+    research._controls.reset()
+
+
+@pytest.mark.parametrize("sent_on", [GM_SENT, GM_HOME])
+def test_a_gemini_that_moved_chat_after_its_send_is_carried_on_the_chat_it_moved_to(
+        phase2, sent_on):
+    """Driven through the real 2C note: the brief goes in on `sent_on` (its own
+    chat, or Gemini's bare home before the address settles), the tab then moves to
+    the chat that holds the plan, and Chrome dies."""
+    page = _Page(sent_on)
+
+    async def _start(*a, **k):
+        return page, True
+
+    def _emit(kind, **kw):
+        if kw.get("agent") == "gemini" and kw.get("stage") == "planning":
+            page.url = GM_URL
+            raise _ChromeDied()
+    phase2.setattr(research, "start_agent_no_gemini_wait", _start)
+    phase2.setattr(research, "emit_event", _emit)
+    with pytest.raises(_ChromeDied):
+        asyncio.run(research.run_phase2(_Browser(), None, BRIEF, enabled_agents=["gemini"]))
+    assert research._p2_chats_to_rejoin() == {"gemini": GM_URL}
+
+
+@pytest.mark.parametrize("where", ["on Gemini's home", "unreadable"])
+def test_a_tab_off_its_chats_at_the_crash_carries_the_chat_its_brief_went_into(where):
+    """Mid-reset on a home page, or a tab whose address cannot be read: the
+    address noted at the send is what the retry gets."""
+    research._runtime.reset()
+    page = _GonePage(GM_SENT)
+    research._p2_note_chat("gemini", page)
+    if where == "unreadable":
+        page.gone = True
+    else:
+        page.url = GM_HOME
+    assert research._p2_chats_to_rejoin() == {"gemini": GM_SENT}
+    research._runtime.reset()
+
+
+def test_a_tab_registered_in_place_of_the_noted_one_is_the_one_read_at_the_crash():
+    """Gemini re-adopted from its sidebar, a hard retry's fresh tab: the NEW tab is
+    registered. The old one still reads the chat it was on, and must not win."""
+    research._runtime.reset()
+    research._p2_note_chat("gemini", _Page(GM_SENT))
+    research._runtime.register_page("gemini", _Page(GM_URL))
+    assert research._p2_chats_to_rejoin() == {"gemini": GM_URL}
+    research._runtime.reset()
+
+
+# ══ 12. the chats outlive a crash of the retry itself ════════════════════════
+
+@pytest.mark.parametrize("at_phase", [0, 2])
+def test_a_retry_that_crashes_before_it_gets_back_to_the_chats_hands_them_on(
+        crash, at_phase):
+    """Chrome dies again before the retry's Phase 2 reopened anything (its start,
+    or Phase 2 before the first attempt): the next retry gets the same chats, not
+    nothing — the 09-30 defect one retry later."""
+    retries, cards = crash(_chrome_died(), at_phase=at_phase, crash_retries=1,
+                           rejoin=CHATS, chats=None)
+    assert len(retries) == 1
+    assert retries[0]["_p2_rejoin"] == CHATS
+    assert retries[0]["_crash_retries"] == 2
+    assert cards == []
+
+
+@pytest.mark.parametrize("how", ["would not open", "cannot be proven"])
+def test_chrome_dying_during_the_rejoin_unwinds_and_keeps_every_chat(p2, how):
+    """ChatGPT is back on its chat; then Chrome dies as Claude's opens (or while
+    it is read). A dead browser is not an agent that cannot come back: nothing is
+    set up on it, the run unwinds as a crash, and the next retry gets all three —
+    the one not reached yet included."""
+    if how == "would not open":
+        browser = _Browser(_lands(), refuse={CL_URL}, context=_DeadContext())
+    else:
+        browser = _Browser(_lands(**{CL_URL: _Page(CL_URL, "")}), context=_DeadContext())
+    with pytest.raises(RuntimeError, match=r"\(browser crash\)") as died:
+        p2.run(CHATS, browser=browser, seeded=True)
+    assert research._is_browser_close_error(died.value)
+    assert research._runtime.last_failure_kind == "browser_crash"
+    assert p2.launched == []
+    assert GM_URL not in browser.opened
+    assert research._p2_chats_to_rejoin() == CHATS
+
+
+# ══ 13. an agent set up again leaves its old chat behind ═════════════════════
+
+def test_a_relaunch_that_dies_before_any_new_brief_carries_none_of_the_old_chats(phase2):
+    """A person's Retry or new input re-runs Phase 2: the chats the first attempt
+    noted are the ones being left. Chrome dies in ChatGPT's set-up, before Claude
+    and Gemini are reached — none of the three old chats may be carried."""
+    research._runtime.p2_chat_urls.update(CHATS)
+
+    async def _start(*a, **k):
+        raise _ChromeDied()
+    phase2.setattr(research, "start_agent_no_gemini_wait", _start)
+    with pytest.raises(_ChromeDied):
+        asyncio.run(research.run_phase2(_Browser(), None, BRIEF, enabled_agents=ALL))
+    assert research._p2_chats_to_rejoin() == {}
+
+
+def test_a_rejoin_that_could_not_prove_one_chat_still_carries_the_others(p2):
+    """Only the agent set up again leaves its chat: ChatGPT's is unprovable and it
+    starts again, Claude and Gemini stay carried."""
+    browser = _Browser(_lands(**{CG_URL: _Page(CG_URL, FOREIGN_TURN, done=True)}))
+    p2.run(CHATS, browser=browser, seeded=True)
+    assert p2.launched == ["ChatGPT"]
+    assert research._p2_chats_to_rejoin() == {"chatgpt": NEW_CG, "claude": CL_URL,
+                                               "gemini": GM_URL}
+
+
+class _Halt(BaseException):
+    """Stops the round-robin where the test has seen enough."""
+
+
+@pytest.fixture
+def hard_retry(monkeypatch):
+    """The REAL round-robin, one ChatGPT on its chat, with the person's Retry
+    (a hard retry) waiting for it."""
+    research._runtime.reset()
+    research._controls.reset()
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+
+    async def _no_sleep(*_a, **_k):
+        return None
+    monkeypatch.setattr(research.asyncio, "sleep", _no_sleep)
+    page = _Page(CG_URL)
+    research._p2_note_chat("chatgpt", page)
+    research._controls.retry_agents_hard.add("chatgpt")
+
+    def _run():
+        return asyncio.run(research.poll_all_agents_round_robin(
+            {"ChatGPT": {"page": page, "url": CG_URL, "verified": True}},
+            browser=None, cua_client=None))
+    yield monkeypatch, page, _run
+    research._runtime.reset()
+    research._controls.reset()
+
+
+def test_a_hard_retry_that_dies_in_its_set_up_does_not_carry_the_chat_it_left(hard_retry):
+    """The warm tab is reused for the restart and is off its chat when Chrome dies:
+    the chat the retry was leaving must not come back."""
+    monkeypatch, page, run = hard_retry
+
+    async def _restart(name, browser, cua, brief, path, verbose, reuse_page=None):
+        if reuse_page is not None:
+            reuse_page.url = "https://chatgpt.com/"
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    async def _dead(_browser):
+        return True
+    monkeypatch.setattr(research, "_restart_phase2_agent", _restart)
+    monkeypatch.setattr(research, "_browser_context_is_dead", _dead)
+    with pytest.raises(RuntimeError, match="hard retry"):
+        run()
+    assert research._p2_chats_to_rejoin() == {}
+
+
+def test_a_hard_retry_that_set_its_agent_up_again_carries_the_new_chat(hard_retry):
+    monkeypatch, page, run = hard_retry
+    fresh = _Page(NEW_CG)
+
+    async def _restart(name, browser, cua, brief, path, verbose, reuse_page=None):
+        return fresh, True
+
+    async def _observer(*_a, **_k):
+        raise _Halt()
+    monkeypatch.setattr(research, "_restart_phase2_agent", _restart)
+    monkeypatch.setattr(research, "inject_agent_observer", _observer)
+    with pytest.raises(_Halt):
+        run()
+    assert research._p2_chats_to_rejoin() == {"chatgpt": NEW_CG}
+
+
+# ══ 14. a Stop stops the rejoin ══════════════════════════════════════════════
+
+def test_a_stop_while_the_first_chat_is_proven_opens_no_other_chat(p2, monkeypatch):
+    async def _turn_then_stop(page, *a, **k):
+        research._controls.stop_event.set()
+        return getattr(page, "turn", "")
+    monkeypatch.setattr(research, "read_chatgpt_first_user_message", _turn_then_stop)
+    browser = _Browser(_lands())
+    with pytest.raises(_Launched):
+        p2.run(CHATS, browser=browser)
+    assert browser.opened == [CG_URL]
+
+
+def test_a_stop_while_gemini_is_proven_runs_no_sidebar_hunt(p2, monkeypatch):
+    """The hunt clicks rail entries — a page action after Stop (#737)."""
+    p2.adopt_to = _Page(GM_URL, started=True)
+
+    async def _ident_then_stop(page, convo_id, pasted_text, **_k):
+        research._controls.stop_event.set()
+        return False
+    monkeypatch.setattr(research, "_gemini_reload_identity_ok", _ident_then_stop)
+    with pytest.raises(_Launched):
+        p2.run(CHATS, browser=_Browser(_lands(**{GM_URL: _Page(GM_HOME, ours=False)})))
+    assert p2.adoptions == []
+
+
+# ══ 15. an agent in chat mode is not carried ═════════════════════════════════
+
+def test_an_agent_in_chat_mode_is_set_up_again_not_rejoined(crash):
+    """The retry's reset drops its mode and its keep/skip hold, and a rejoin puts
+    neither back: it would be read as a Deep Research. Its own set-up finds its
+    mode again, as before."""
+    retries, _cards = crash(_chrome_died(), modes={
+        "claude": {"requested": "research", "actual": "chat",
+                   "user_acknowledged_chat": True},
+        "chatgpt": {"requested": "research", "actual": "research",
+                    "user_acknowledged_chat": False}})
+    assert retries[0]["_p2_rejoin"] == {"chatgpt": CG_URL, "gemini": GM_URL}
+
+
+# ══ 16. no chat address reaches the run log from the rejoin ══════════════════
+
+def test_the_rejoin_lines_keep_chat_addresses_out_of_the_run_log(p2):
+    """Playwright's goto error holds the address twice, and Send logs uploads the
+    run log."""
+    def _goto_error(url):
+        return RuntimeError(f"Page.goto: net::ERR_ABORTED at {url}\nCall log:\n"
+                            f"  - navigating to \"{url}\", waiting until \"load\"")
+    p2.adopt_raises = RuntimeError(f"Page.goto: Timeout 30000ms exceeded at {GM_URL}")
+    browser = _Browser(_lands(**{GM_URL: _Page(GM_HOME, ours=False)}),
+                       refuse={CL_URL}, error=_goto_error)
+    with pytest.raises(_Launched):
+        p2.run(CHATS, browser=browser)
+    lines = _resume_lines(p2.logs)
+    assert any("would not open" in l for l in lines)
+    assert any("sidebar hunt raised" in l for l in lines)
+    for chat_id in ("4d24eb39", "e91e413e201fee2a"):
+        assert not [l for l in lines if chat_id in l], chat_id

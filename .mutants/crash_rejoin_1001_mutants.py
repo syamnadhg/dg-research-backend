@@ -2,19 +2,25 @@
 
 ⛔⛔ WHAT THIS CODE DECIDES (research.py).
   C*  the crash hands its chats to its own retry: only a Chrome death, only in
-      Phase 2, taken before the `finally` resets `_runtime`; the first Phase-2
-      attempt spends them, no other attempt and no other call gets them.
+      Phase 2 (or before it, on a retry still carrying them), taken before the
+      `finally` resets `_runtime`; the retry keeps carrying what it was handed
+      until it deals with it; the first Phase-2 attempt spends them, no other
+      attempt and no other call gets them; an agent in chat mode is not carried.
   R*  the retry's Phase 2 goes back into each chat first and sets up only the
-      rest; an agent already kept, or with no chat, is never opened.
+      rest; an agent already kept, or with no chat, is never opened; an agent set
+      up again (a relaunch, a hard retry) leaves its old chat; a Stop ends it.
   I*  a chat is this run's only on BOTH halves — its own id, and a first message
       holding what this run sent (the brief's head, or the line typed beside an
       attached brief); signed out, unopenable or unproven costs only that agent;
-      Gemini is found again by the sidebar hunt, scoped to its id.
+      a dead Chrome unwinds as a crash instead; Gemini is found again by the
+      sidebar hunt, scoped to its id, never after a Stop; no address is logged.
   S*  what the round-robin is handed: finished/researching verified, a Gemini plan
       not yet started watched for its Start; the tile set running; the chat noted
       again for a second crash.
-  N*  Phase 2 notes each chat as the brief goes in; a chat that moves is followed;
-      Phase 1's ChatGPT chat is never taken.
+  N*  Phase 2 notes each chat as the brief goes in, and its tab; at the crash the
+      tab's own chat wins (Gemini moves chat after the send), the noted address
+      when the tab is off its chats; a chat that moves is followed; Phase 1's
+      ChatGPT chat is never taken.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every
 mutated file must still COMPILE. Both are harness faults, counted OUT.
@@ -47,17 +53,17 @@ MUTANTS = [
      [('            _p2_rejoin_next = _p2_chats_to_rejoin()\n',
        '            pass\n')]),
     ('C2', RESEARCH, '⛔ any failure in Phase 2 carries chats, not only a Chrome death',
-     [('        if _captured_failure_kind == "browser_crash" and last_phase == 2:\n',
-       '        if last_phase == 2:\n')]),
+     [('        if _captured_failure_kind == "browser_crash" and last_phase <= 2:\n',
+       '        if last_phase <= 2:\n')]),
     ('C3', RESEARCH, '⛔ a Chrome death in any phase carries Phase-2 chats',
-     [('        if _captured_failure_kind == "browser_crash" and last_phase == 2:\n',
+     [('        if _captured_failure_kind == "browser_crash" and last_phase <= 2:\n',
        '        if _captured_failure_kind == "browser_crash":\n')]),
     ('C4', RESEARCH, '⛔⛔ the retry is not handed the chats',
      [('                           _p2_rejoin=_p2_rejoin_next)\n',
        '                           _p2_rejoin=None)\n')]),
     ('C5', RESEARCH, '⛔ the snapshot of the chats comes back empty',
-     [('    return {k: u for k, u in dict(_runtime.p2_chat_urls).items() if k and u}\n',
-       '    return {}\n')]),
+     [('    out = {}\n    for k, u in dict(_runtime.p2_chat_urls).items():\n',
+       '    return {}\n    for k, u in dict(_runtime.p2_chat_urls).items():\n')]),
     ('C6', RESEARCH, '⛔⛔ the retry drops what it was handed before Phase 2',
      [('    _p2_rejoin_left = dict(_p2_rejoin or {})\n',
        '    _p2_rejoin_left = {}\n')]),
@@ -73,14 +79,28 @@ MUTANTS = [
     ('C10', RESEARCH, "⛔ the attempt never says the person's input joined the brief",
      [('                                          new_input=bool(extra_ctx or fb2))\n',
        '                                          new_input=False)\n')]),
+    ('C11', RESEARCH, '⛔⛔ the retry forgets what it was handed — a second crash before '
+                      'the rejoin sends the brief to all three again',
+     [('    _runtime.p2_chat_urls.update(_p2_rejoin or {})\n',
+       '    pass\n')]),
+    ('C12', RESEARCH, '⛔ a retry that crashes before its Phase 2 hands nothing on',
+     [('        if _captured_failure_kind == "browser_crash" and last_phase <= 2:\n',
+       '        if _captured_failure_kind == "browser_crash" and last_phase == 2:\n')]),
+    ('C13', RESEARCH, '⛔ an agent in chat mode is rejoined as a Deep Research',
+     [('        if isinstance(_mode, dict) and _mode.get("actual") == "chat":\n'
+       '            continue\n',
+       '')]),
+    ('C14', RESEARCH, '⛔⛔ another statement in run_pipeline empties the carried chats',
+     [('    _p2_rejoin_left = dict(_p2_rejoin or {})\n    _p2_rejoin_next = {}\n',
+       '    _p2_rejoin_left = dict(_p2_rejoin or {})\n    _p2_rejoin_next = {}\n'
+       '    _p2_rejoin_left.clear()\n')]),
 
     # ── R: the retry's Phase 2 ──────────────────────────────────────────────
     ('R1', RESEARCH, '⛔⛔ Phase 2 never goes back into a chat',
-     [('    if rejoin and not _controls.is_stop():\n',
+     [('    if rejoin:  # a Stop, before or during it, ends it (`_p2_rejoin_chats`)\n',
        '    if False:\n')]),
-    ('R2', RESEARCH, '⛔ a Stop does not stop the rejoin',
-     [('    if rejoin and not _controls.is_stop():\n',
-       '    if rejoin:\n')]),
+    # R2 (a Stop before Phase 2 did not stop the rejoin) is R13 now: the rejoin
+    # loop checks Stop before every chat, the first one included.
     ('R3', RESEARCH, '⛔⛔ a rejoined agent is set up and sent the brief all the same',
      [('        enabled_agents = [a for a in _launch\n'
        '                          if _agent_display_name(a) not in rejoined]\n',
@@ -107,6 +127,24 @@ MUTANTS = [
        '        rejoined = await _p2_rejoin_chats(\n'
        '            browser, _p2_rejoin_plan(rejoin, _launch), _launch, brief_text)\n'
        '        _launch = [a for a in _launch if a in rejoin]\n')]),
+    ('R9', RESEARCH, '⛔ an agent set up again keeps its old chat — a crash before its '
+                     'new brief takes it back into the chat it was leaving',
+     [('        _p2_forget_chat(str(_a).lower())\n',
+       '        pass\n')]),
+    ('R10', RESEARCH, '⛔ the agents rejoined are forgotten with the ones set up again',
+     [('    for _a in (enabled_agents if enabled_agents is not None\n'
+       '               else ("chatgpt", "gemini", "claude")):\n',
+       '    for _a in ("chatgpt", "gemini", "claude"):\n')]),
+    ('R11', RESEARCH, "⛔ a hard retry keeps the chat it is leaving",
+     [('            _p2_forget_chat(_agent_key)\n',
+       '            pass\n')]),
+    ('R12', RESEARCH, "⛔ a hard retry's new chat is never noted",
+     [('                _p2_note_chat(_agent_key, new_page)  # 10-01: a crash retry rejoins it\n',
+       '                pass\n')]),
+    ('R13', RESEARCH, '⛔ a Stop does not stop the rejoin — chats open after it, pressed '
+                      'before Phase 2 or mid-rejoin',
+     [('        if _controls.is_stop():\n            break  # no page actions after Stop (#737)\n',
+       '')]),
 
     # ── I: the proof ────────────────────────────────────────────────────────
     ('I1', RESEARCH, '⛔⛔ a tab that landed on another chat is taken for ours',
@@ -142,9 +180,9 @@ MUTANTS = [
        '            ours = bool(adopted)\n')]),
     ('I10', RESEARCH, '⛔ the tab that could not be proven is left open',
      [('        log(f"[resume] {name}: {why} — starting it again", "WARN")\n'
-       '        try:\n            await page.close()\n',
+       '        if page is not None:\n            try:\n                await page.close()\n',
        '        log(f"[resume] {name}: {why} — starting it again", "WARN")\n'
-       '        try:\n            pass\n')]),
+       '        if page is not None:\n            try:\n                pass\n')]),
     ('I11', RESEARCH, "⛔ Claude's chat is read with ChatGPT's reader",
      [('    reader = (read_chatgpt_first_user_message if platform == "chatgpt"\n'
        '              else _claude_first_user_message)\n',
@@ -157,6 +195,21 @@ MUTANTS = [
        '                    await page.close()\n',
        '            if adopted and found is not page:\n                try:\n'
        '                    pass\n')]),
+    ('I14', RESEARCH, '⛔⛔ a Chrome that died mid-rejoin is taken for a chat that cannot '
+                      'come back — agents set up on a dead browser, their chats forgotten',
+     [('        if await _browser_context_is_dead(browser):\n'
+       '            _runtime.last_failure_kind = "browser_crash"\n',
+       '        if False:\n'
+       '            _runtime.last_failure_kind = "browser_crash"\n')]),
+    ('I15', RESEARCH, '⛔ the sidebar hunt still clicks through Gemini after a Stop',
+     [('        if not ours and not _controls.is_stop():\n',
+       '        if not ours:\n')]),
+    ('I16', RESEARCH, "⛔ a chat that would not open logs the error's address into run.log",
+     [('        return await _give_up(f"its chat would not open ({type(e).__name__})")\n',
+       '        return await _give_up(f"its chat would not open ({e})")\n')]),
+    ('I17', RESEARCH, "⛔ the sidebar hunt's error puts its address into run.log",
+     [('                log(f"[resume] {name}: the sidebar hunt raised ({type(e).__name__})",\n',
+       '                log(f"[resume] {name}: the sidebar hunt raised ({e})",\n')]),
 
     # ── S: what the round-robin is handed ───────────────────────────────────
     ('S1', RESEARCH, '⛔ a Gemini plan not yet started is called running',
@@ -215,6 +268,20 @@ MUTANTS = [
     ('N8', RESEARCH, '⛔ the typed line loses the space after its first sentence',
      [('        _P2_ATTACHED_BRIEF_ASK + " "\n',
        '        _P2_ATTACHED_BRIEF_ASK + ""\n')]),
+    ('N9', RESEARCH, "⛔⛔ the chat noted at the send is carried after Gemini's tab moved on "
+                     "to the chat holding its plan",
+     [('        out[k] = live if _p2_chat_id(k, live) else u\n',
+       '        out[k] = u\n')]),
+    ('N10', RESEARCH, '⛔ a tab off its chats (a home page) is carried instead of the chat',
+     [('        out[k] = live if _p2_chat_id(k, live) else u\n',
+       '        out[k] = live or u\n')]),
+    ('N11', RESEARCH, '⛔ the tab is not kept beside the chat noted at the send',
+     [('        _runtime.p2_chat_pages[platform] = page\n',
+       '        pass\n')]),
+    ('N12', RESEARCH, '⛔ a tab registered in place of the noted one is not followed — the '
+                      'old tab wins at the crash',
+     [('            if page is not None:\n                self.p2_chat_pages[platform] = page\n',
+       '            if False:\n                self.p2_chat_pages[platform] = page\n')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

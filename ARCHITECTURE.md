@@ -235,6 +235,15 @@ round-robin's start watch. An agent already recorded as finished is kept and nev
 opened; one with no chat, or whose chat cannot be opened or proven, is set up and
 sent the brief as before — only that agent. A person's Retry, Skip or new input
 re-runs the whole phase, so only the first attempt rejoins.
+The address carried is the one the agent's tab is on at the crash when that is one
+of its chats (Gemini moves a run to a new chat after the brief goes in; the tab is
+kept beside the address in `p2_chat_pages`), else the one noted at the send. The
+retry puts the chats it was handed back into `p2_chat_urls` at its start, so a
+second crash before or during the rejoin hands them on again, and a Chrome that
+dies during the rejoin unwinds as a crash rather than setting agents up on it. An
+agent leaves its chat only when it is set up again (`_p2_forget_chat`: a relaunch,
+a hard retry, a chat that failed its proof). An agent in chat mode is not carried,
+since the retry's reset drops its mode, and a Stop ends the rejoin.
 
 **B. One agent's tab dies inside the Phase 2 round-robin** — nothing is rebuilt
 and nothing resumes. The per-tick crash sweep runs before any per-agent work,
