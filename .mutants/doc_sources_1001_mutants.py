@@ -3,9 +3,10 @@ the sites they visited, public pages only.
 
 Each mutant takes back one piece of the change, or one protection around it —
 the privacy gate's rules, the one-list rules, the one-section rule (a report's
-own link-less trailing section is replaced, R1-R9), the field the web numbers
-from — and the tests in `tests/test_doc_visited_sources_1001.py` (plus the two pins
-that moved) must go red for every one.
+own link-less trailing section is replaced, and a lead never cuts the report,
+R1-R26), the field the web numbers from — and the tests in
+`tests/test_doc_visited_sources_1001.py` (plus the two pins that moved) must go
+red for every one.
 
 Safety, as the other harnesses here: refuses to start on a dirty tree, holds the
 original in memory, restores in `finally`, re-checks `git status` at the end.
@@ -78,31 +79,96 @@ MUTANTS = [
 
     # ── exactly one sources section (owner, 2026-10-01) ────────────────────
     ("R1", "keep-the-old-block: a link-less own section stays above our list",
-     [("    cut = len(md[:own_at].rstrip()) if extra and own_at is not None else None",
+     [("    cut = (len(md[:own_at].rstrip())\n"
+       "           if (extra or placements) and own_at is not None and not own_links else None)",
        "    cut = None")]),
     ("R2", "require-a-heading-only: no paragraph lead opens the own section",
      [('    return _doc_own_sources_lead(masked or "", last.end() if last is not None else 0)',
        "    return None")]),
     ("R3", "ignore-bold-led: a **Title** lead is not read",
-     [("    m = _DOC_BOLD_LEAD_RE.match(line)\n    if m:",
-       "    m = None\n    if m:")]),
+     [("    m = _DOC_BOLD_LEAD_RE.match(line) or _DOC_PLAIN_LEAD_RE.match(line)",
+       "    m = _DOC_PLAIN_LEAD_RE.match(line)")]),
     ("R4", "replace-even-when-linked: an own section with public links is replaced too",
      [("    own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))",
        "    own_links = False")]),
     ("R5", "a plain Title: lead is not read",
-     [("    m = _DOC_PLAIN_LEAD_RE.match(line)\n", "    m = None\n")]),
+     [("    m = _DOC_BOLD_LEAD_RE.match(line) or _DOC_PLAIN_LEAD_RE.match(line)",
+       "    m = _DOC_BOLD_LEAD_RE.match(line)")]),
+    # ⛔ The entry rule already refuses a lead with a heading after it, so what
+    # this measures is the other half: read from the top, a lead on the line
+    # right under the last heading is glued to that heading's paragraph.
     ("R6", "a lead is looked for from the top, not after the last heading",
      [('    return _doc_own_sources_lead(masked or "", last.end() if last is not None else 0)',
        '    return _doc_own_sources_lead(masked or "", 0)')]),
-    ("R7", "the word set is open-ended: any title STARTING with the word fits",
-     [("    r'[ \\t]*[.:]?[ \\t]*\\Z', re.IGNORECASE)",
-       "    r'[ \\t]*[.:]?', re.IGNORECASE)")]),
+    ("R7", "the heading word set is open-ended: any title STARTING with the word fits",
+     [("    + _DOC_SOURCES_TAIL + r'?'\n    r'[ \\t]*[.:]?[ \\t]*\\Z', re.IGNORECASE)",
+       "    + _DOC_SOURCES_TAIL + r'?'\n    r'[ \\t]*[.:]?', re.IGNORECASE)")]),
+    ("R7b", "the lead word set is open-ended: any title STARTING with the word fits",
+     [("    r'(?P<tail>' + _DOC_SOURCES_TAIL + r')?'\n    r'[ \\t]*[.:]?[ \\t]*\\Z', re.IGNORECASE)",
+       "    r'(?P<tail>' + _DOC_SOURCES_TAIL + r')?'\n    r'[ \\t]*[.:]?', re.IGNORECASE)")]),
     ("R8", "any link, private ones included, keeps the own section",
      [("    own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))",
        "    own_links = own_at is not None and bool(_FIND_BARE_URL_RE.search(masked[own_at:]))")]),
-    ("R9", "a lead counts on any line, not only a paragraph's first",
-     [("        if not blank and prev_blank and _doc_lead_is_sources(line):",
-       "        if not blank and _doc_lead_is_sources(line):")]),
+    ("R9", "a lead counts on any line of a paragraph, not only its first",
+     [('        kind = _doc_sources_lead_kind(text.split("\\n", 1)[0])',
+       "        kind = next(filter(None, map(_doc_sources_lead_kind, text.splitlines())), None)")]),
+
+    # ── review blocker, 2026-10-01: a lead never cuts the report ───────────
+    ("R10", "a lead's section runs to the end of the file whatever follows it",
+     [("        if kind and all(_doc_is_source_entry(t, kind) for _a, t in paras[i + 1:]):",
+       "        if kind:")]),
+    ("R11", "a bare word with words after it may be followed by entries",
+     [('    if kind == "line":\n        return False\n    first',
+       "    first")]),
+    ("R12", "bold-labelled entries follow any lead, not only a bibliography's",
+     [('    return (kind == "bib" and m is not None',
+       "    return (m is not None")]),
+    ("R13", "a singular word (a 'Source:' caption) leads a section",
+     [("    r'(?P<w>sources|references|citations|bibliography|works[ \\t]+cited'",
+       "    r'(?P<w>sources?|references?|citations?|bibliography|works[ \\t]+cited'")]),
+    ("R14", "bold emphasis in running prose counts as a lead",
+     [('    if w is None or (rest and not title.endswith((".", ":"))):',
+       "    if w is None:")]),
+    ("R21", "a paragraph holding a link is no source entry",
+     [("    if _DOC_LIST_ITEM_RE.match(first) or _FIND_BARE_URL_RE.search(text):",
+       "    if _DOC_LIST_ITEM_RE.match(first):")]),
+    ("R22", "a list item is no source entry",
+     [("    if _DOC_LIST_ITEM_RE.match(first) or _FIND_BARE_URL_RE.search(text):",
+       "    if _FIND_BARE_URL_RE.search(text):")]),
+    ("R23", "any bold paragraph is a bibliography's entry, a pseudo-heading included",
+     [('            and (m.group("t").rstrip().endswith(":") or m.group("p") == ":"))',
+       "            )")]),
+
+    # ── review, 2026-10-01: any list replaces it; the section's own links ──
+    ("R15", "the cut runs only when visited rows are added",
+     [("           if (extra or placements) and own_at is not None and not own_links else None)",
+       "           if extra and own_at is not None and not own_links else None)")]),
+    ("R16", "the own section's links are read from the WHOLE document",
+     [("    own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))",
+       "    own_links = own_at is not None and bool(_doc_cited_public_keys(masked))")]),
+
+    # ── review, 2026-10-01: heading shapes and the rest of the word set ────
+    ("R17", "emphasis stays in a heading's title",
+     [("    return re.sub(r'[*_]+', '', t).strip()", "    return t")]),
+    ("R18", "a closing # run stays in a heading's title",
+     [("    t = re.sub(r'[ \\t]+#+[ \\t]*\\Z', '', (text or \"\").strip())",
+       '    t = (text or "").strip()')]),
+    ("R19", "a roman or letter section number is not read",
+     [("    r'(?:(?:\\d{1,3}(?:\\.\\d{1,3})*[.)]?|(?:[ivxlc]{1,6}|[a-z])[.)])[ \\t]+)?'",
+       "    r'(?:\\d{1,3}(?:\\.\\d{1,3})*[.)]?[ \\t]+)?'")]),
+    ("R20", "the __Title__ bold form is not read",
+     [("_DOC_BOLD_LEAD_RE = re.compile(r'[ \\t]{0,3}(\\*\\*|__)",
+       "_DOC_BOLD_LEAD_RE = re.compile(r'[ \\t]{0,3}(\\*\\*)")]),
+    ("R24", "'reference list' leaves the heading word set",
+     [("    r'(?:sources?|references?|citations?|bibliography|works[ \\t]+cited'\n"
+       "    r'|reference[ \\t]+list)'",
+       "    r'(?:sources?|references?|citations?|bibliography|works[ \\t]+cited)'")]),
+    ("R25", "'list of' leaves the qualifiers",
+     [("                          r'|further|additional|list[ \\t]+of)')",
+       "                          r'|further|additional)')")]),
+    ("R26", "the 'and further reading/notes/…' tail leaves the word set",
+     [("                     r'|[ \\t]+and[ \\t]+(?:further[ \\t]+reading|notes|references|sources))')",
+       "                     r')')")]),
 
     # ── the field the web numbers from ─────────────────────────────────────
     ("S1", "save_meta reads the visited rows only when the document has no marker",
