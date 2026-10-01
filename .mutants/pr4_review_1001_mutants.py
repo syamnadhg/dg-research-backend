@@ -20,7 +20,12 @@
        dispatch thread. (Item 6.)
   T* — telemetry.py: a POST still out at the flush deadline keeps its events
        claimed — not adopted, and not renamed over, by our own next flush —
-       until its own thread settles them on the real outcome. (Item 7.)
+       until its own thread settles them on the real outcome; a POST thread
+       that will not start is a failed delivery, and an adopted file's events
+       past the batch cap go to the live spool. (Item 7.)
+  S* — telemetry.py `_trim_spool`: a trim takes the spool by rename before it
+       rewrites it, so a flush's claim in between never leaves the same events
+       in two files. (Item 3, its second case.)
   Item 8 is a decision with no code change.
 
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every mutated
@@ -217,6 +222,42 @@ MUTANTS = [
      "still out — that POST's events are lost if it then fails",
      [('    with _in_flight_lock:\n        if str(claimed) in _IN_FLIGHT:\n'
        '            return None\n', '')]),
+    # Added with the review of this change (2026-10-01).
+    ("T9", TELEMETRY, "⛔⛔ a POST thread that will not start raises out of flush — the "
+     "file stays marked in flight and this process never sends it again",
+     [('        return False\n    thread.join(max(0.1, float(deadline_sec)))\n',
+       '        raise\n    thread.join(max(0.1, float(deadline_sec)))\n')]),
+    ("T10", TELEMETRY, "⛔⛔ an adopted file's events past the batch cap are written back "
+     "into the adopted file itself, which is then deleted",
+     [('            _write_back(owed, _unclaimed_name(path))\n',
+       '            _write_back(owed, path)\n')]),
+
+    # ═══ S — telemetry: a trim never re-creates a claimed spool (item 3) ═══════
+    ("S1", TELEMETRY, "⛔⛔ the old trim: read, then rewrite in place — a claim between "
+     "the two re-creates the file and those events are sent twice",
+     [('    try:\n        os.replace(str(path), str(taken))\n'
+       '        lines = taken.read_text(encoding="utf-8").splitlines()\n'
+       '    except OSError:\n'
+       '        return            # a flush claimed it first: every one of them is being sent\n',
+       ''),
+      ('            with open(path, "a", encoding="utf-8") as fh:\n'
+       '                fh.write("\\n".join(keep) + "\\n")\n',
+       '            with open(path, "w", encoding="utf-8") as fh:\n'
+       '                fh.write("\\n".join(keep) + "\\n")\n')]),
+    ("S2", TELEMETRY, "⛔⛔ a trim that lost the rename to a claim writes its kept half "
+     "back anyway — sent twice",
+     [('        return            # a flush claimed it first: every one of them is being sent\n',
+       '        pass\n')]),
+    ("S3", TELEMETRY, "⛔ the small, newer file the rename took is trimmed as if it were "
+     "the old one — fresh events dropped, a drop reported",
+     [('    if len(lines) > SPOOL_MAX_LINES:\n        keep = _oldest_half_dropped(lines)\n',
+       '    if True:\n        keep = _oldest_half_dropped(lines)\n')]),
+    ("S4", TELEMETRY, "⛔⛔ the kept half overwrites an event recorded while the trim "
+     "held the file",
+     [('            with open(path, "a", encoding="utf-8") as fh:\n'
+       '                fh.write("\\n".join(keep) + "\\n")\n',
+       '            with open(path, "w", encoding="utf-8") as fh:\n'
+       '                fh.write("\\n".join(keep) + "\\n")\n')]),
 ]
 
 

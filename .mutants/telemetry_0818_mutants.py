@@ -234,9 +234,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
      [T_NOISE], SRC),
     ("T3", "under", "the drop is silent, so a count nobody can trust reads as a "
      "complete record",
-     [('''    keep.append(json.dumps(
-        _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": dropped}}),
-        separators=(",", ":")))''', '''    pass''')], [T], SRC),
+     [('''        keep.append(json.dumps(
+            _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": dropped}}),
+            separators=(",", ":")))''', '''        pass''')], [T], SRC),
     ("T4", "under", "the age cap goes, so month-old events are still delivered "
      "and a stale spool is never cleared",
      [('            if float(record.get("t", 0)) / 1000.0 < cutoff:\n                continue',
@@ -252,7 +252,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str], str]] = [
     ("T6", "under", "⛔⛔ FOUND BY MUTATION, AND IT WAS REAL. The events past the "
      "batch cap are deleted with the claimed file instead of staying owed — and "
      "an offline machine's spool is exactly where a batch hits that cap",
-     [('        if owed:\n            _write_back(owed, path)', '        pass')],
+     [('        if owed:\n            _write_back(owed, _unclaimed_name(path))', '        pass')],
      [T], SRC),
     ("T7", "under", "the write-back drops whatever arrived while the batch was in "
      "flight",

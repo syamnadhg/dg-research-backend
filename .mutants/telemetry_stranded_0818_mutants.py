@@ -75,7 +75,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW, T_TM]),
     ("S7", "under", "the owed remainder past the batch cap stops being written "
      "back, which is the loss this file was already fixed for once",
-     [("        if owed:\n            _write_back(owed, path)", "        if owed:\n            pass")],
+     [("        if owed:\n            _write_back(owed, _unclaimed_name(path))", "        if owed:\n            pass")],
      [T_NEW, T_TM]),
     ("S8", "over", "adoption stops checking whether the owner is alive, so two "
      "processes post the same batch",
