@@ -2,8 +2,9 @@
 the sites they visited, public pages only.
 
 Each mutant takes back one piece of the change, or one protection around it —
-the privacy gate's rules, the one-list rules, the field the web numbers from —
-and the tests in `tests/test_doc_visited_sources_1001.py` (plus the two pins
+the privacy gate's rules, the one-list rules, the one-section rule (a report's
+own link-less trailing section is replaced, R1-R9), the field the web numbers
+from — and the tests in `tests/test_doc_visited_sources_1001.py` (plus the two pins
 that moved) must go red for every one.
 
 Safety, as the other harnesses here: refuses to start on a dirty tree, holds the
@@ -74,6 +75,34 @@ MUTANTS = [
        "    r'\\n\\n%s[ \\t]+(?:%s|%s)[ \\t]*\\n\\n(?:\\d{1,3}\\. \\[.*\\n?)+\\Z'\n"
        '    % ("#" * _DOC_SOURCES_HEADING_LEVEL,\n'
        "       re.escape(_DOC_SOURCES_TITLE), re.escape(_DOC_SOURCES_TITLE)))")]),
+
+    # ── exactly one sources section (owner, 2026-10-01) ────────────────────
+    ("R1", "keep-the-old-block: a link-less own section stays above our list",
+     [("    cut = len(md[:own_at].rstrip()) if extra and own_at is not None else None",
+       "    cut = None")]),
+    ("R2", "require-a-heading-only: no paragraph lead opens the own section",
+     [('    return _doc_own_sources_lead(masked or "", last.end() if last is not None else 0)',
+       "    return None")]),
+    ("R3", "ignore-bold-led: a **Title** lead is not read",
+     [("    m = _DOC_BOLD_LEAD_RE.match(line)\n    if m:",
+       "    m = None\n    if m:")]),
+    ("R4", "replace-even-when-linked: an own section with public links is replaced too",
+     [("    own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))",
+       "    own_links = False")]),
+    ("R5", "a plain Title: lead is not read",
+     [("    m = _DOC_PLAIN_LEAD_RE.match(line)\n", "    m = None\n")]),
+    ("R6", "a lead is looked for from the top, not after the last heading",
+     [('    return _doc_own_sources_lead(masked or "", last.end() if last is not None else 0)',
+       '    return _doc_own_sources_lead(masked or "", 0)')]),
+    ("R7", "the word set is open-ended: any title STARTING with the word fits",
+     [("    r'[ \\t]*[.:]?[ \\t]*\\Z', re.IGNORECASE)",
+       "    r'[ \\t]*[.:]?', re.IGNORECASE)")]),
+    ("R8", "any link, private ones included, keeps the own section",
+     [("    own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))",
+       "    own_links = own_at is not None and bool(_FIND_BARE_URL_RE.search(masked[own_at:]))")]),
+    ("R9", "a lead counts on any line, not only a paragraph's first",
+     [("        if not blank and prev_blank and _doc_lead_is_sources(line):",
+       "        if not blank and _doc_lead_is_sources(line):")]),
 
     # ── the field the web numbers from ─────────────────────────────────────
     ("S1", "save_meta reads the visited rows only when the document has no marker",
