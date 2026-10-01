@@ -317,15 +317,22 @@ def test_an_address_with_brackets_is_written_safely(monkeypatch):
     assert "Hips.[\\[1\\]](https://en.wikipedia.org/wiki/Hip_dysplasia_%28canine%29)" in out
 
 
-def test_text_still_ending_with_our_list_is_never_linked_to_ours(monkeypatch):
-    """⛔⛔ A report that already ends with OUR list (a document numbered before
-    this wave: Claude's list, then "##### Sources (numbered)") has ours as its
-    last list. Its rows are not Claude's: a "[1]" linked there opens a page
-    Claude never numbered 1. Such text is left exactly as it is."""
+@pytest.mark.parametrize("ours", [
+    # the sites the agent visited, which replaced its own titles-only list
+    "\n\n##### Sources\n\n1. [akc.org/x](https://www.akc.org/x)\n"
+    "2. [ofa.org/y](https://www.ofa.org/y)\n",
+    # our numbered list under the alternate title, after the agent's own
+    "\n\n## Sources\n\n1. [A](https://a.example.org/one)\n"
+    "\n##### Sources (numbered)\n\n1. [z](https://z.example.org/prose)\n",
+], ids=["visited-list", "alternate-title"])
+def test_text_still_ending_with_our_list_is_never_linked_to_ours(ours, monkeypatch):
+    """⛔⛔ Text that already ends with OUR list has ours as its last list, and
+    its rows are not the agent's: a "[1]" linked there opens a page the agent
+    never numbered 1 — a visited site, say. Such text is left exactly as it is.
+    (A report whose own list of titles was replaced by the visited sites is
+    exactly this shape when it is written again.)"""
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
-    md = (_report("One.\\[1\\] See https://z.example.org/prose for more.",
-                  [(1, f"[A]({A})")]).rstrip()
-          + "\n\n##### Sources (numbered)\n\n1. [z](https://z.example.org/prose)\n")
+    md = "# Report\n\nOne.\\[1\\] Two.\\[2\\] See https://z.example.org/prose." + ours
     assert research._document_with_sources(md, label="Claude") == md
 
 
