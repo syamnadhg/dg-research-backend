@@ -78,11 +78,22 @@ def test_an_explicitly_later_alert_is_still_honoured():
         **{**DUE, "alert_sec": 600, "elapsed": 600}) is True
 
 
-def test_exhausted_regenerations_still_card_immediately():
-    """⭐ #921's whole point: three failed re-drafts is EVIDENCE, not a timer, and
-    it must reach the owner early instead of after a 17-minute ladder."""
+def test_exhausted_regenerations_card_once_the_wait_is_over_never_before():
+    """⛔ CHANGED 2026-10-01, by the owner: "wait for at least 10 minutes in that
+    planning session before raising anything." Three failed re-drafts used to
+    card at once (#921: evidence, not a timer); now they wait for the wait like
+    everything else — and still card the moment it is over."""
     assert research._gemini_plan_card_due(
-        **{**DUE, "elapsed": 5, "regen_capped": True}) is True
+        **{**DUE, "elapsed": 5, "regen_capped": True}) is False
+    assert research._gemini_plan_card_due(
+        **{**DUE, "elapsed": 299, "regen_capped": True}) is False
+    assert research._gemini_plan_card_due(
+        **{**DUE, "elapsed": 300, "regen_capped": True}) is True
+    # …and no later: with the alert second set past the wait, the evidence still
+    # cards the moment the wait is over, where the clock alone would not.
+    later = {**DUE, "alert_sec": 600, "elapsed": 300}
+    assert research._gemini_plan_card_due(**{**later, "regen_capped": True}) is True
+    assert research._gemini_plan_card_due(**{**later, "regen_capped": False}) is False
 
 
 def test_a_visibly_streaming_plan_is_never_carded():
@@ -121,18 +132,26 @@ def test_the_timer_arm_is_still_reachable_at_all():
     sits ABOVE the card block, so tying the alarm to the wait budget makes the
     timer arm unreachable from the block alone — the card would silently stop
     firing and #921's protection would be gone with no test to notice. It is
-    therefore ALSO raised at the break, and that call must come first in source
-    order because that is the branch that runs."""
+    therefore raised at the break.
+
+    ⭐ 2026-10-01: and ONLY there now. The in-loop site could fire before the
+    wait was over and nowhere else, and the owner ruled nothing is raised before
+    it — so it was retired, and the break is the one place the card goes up."""
     body = _p2_src()
-    at_break = body.index("our own plan-wait budget is spent")
-    at_block = body.index("plan clearly failed")
-    assert at_break < at_block, "the break-site raise must precede the loop body's"
-    assert body.count("_gemini_plan_card_due(") == 2
+    assert body.count("_gemini_plan_card_due(") == 1
+    at_due = body.index("_gemini_plan_card_due(")
+    at_raise = body.index('_raise_plan_alert("our own plan-wait budget is spent")')
+    at_break = body.index("break", at_raise)
+    budget = body.rindex("if _elapsed >= _start_wait_max_sec and not _streaming_recent:",
+                         0, at_due)
+    assert budget < at_due < at_raise < at_break, (
+        "the card is no longer raised inside the give-up branch, right before its break")
+    assert "plan clearly failed" not in body
 
 
 def test_the_card_is_raised_in_one_place_and_only_once():
-    """Two call sites, ONE emitter. The idempotence guard lives inside it, so a
-    third site could never double-card either.
+    """One call site (two until 2026-10-01), ONE emitter. The idempotence guard
+    lives inside it, so a second site could never double-card either.
 
     ⚠ `fail_agent("gemini", *_GEMINI_CANT_START)` legitimately appears twice in
     this function — the second is the TERMINAL failure after the CUA ladder,
@@ -144,9 +163,10 @@ def test_the_card_is_raised_in_one_place_and_only_once():
     assert raiser.count('fail_agent("gemini", *_GEMINI_CANT_START)') == 1
     assert "if _plan_alert_emitted or _controls.is_stop():" in raiser
     assert "_plan_alert_emitted = True" in raiser
-    # …and the two decision sites raise it rather than emitting their own.
+    # …and the decision site raises it rather than emitting its own (one site
+    # since 2026-10-01 — see test_the_timer_arm_is_still_reachable_at_all).
     after = body[body.index("def _retract_plan_alert("):]
-    assert after.count("_raise_plan_alert(") == 2
+    assert after.count("_raise_plan_alert(") == 1
     assert after.count('fail_agent("gemini", *_GEMINI_CANT_START)') == 1
 
 

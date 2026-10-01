@@ -356,18 +356,15 @@ MUTANTS = [
      "the gate widens from 'failed' to 'anything but ready', so the plain-chat stall and a visibly drafting plan both get clicked at",
      [('                if _verdict == "failed":\n                    (_redrafted',
        '                if _verdict != "ready":\n                    (_redrafted')]),
-    ('G6', RESEARCH, 'under',
-     '⛔ THE HOLD FLAG MOVES INSIDE THE POLL LOOP, so it resets on every tick the 45-second cooldown skips the re-draft branch — and the card fires in the gap between two clicks, the exact window it is meant to be held through',
-     [('        _redraft_pending = False\n        _logged_stall_diag = False',
-       '        _logged_stall_diag = False')]),
+    # ⛔ G6 and G8 RETIRED 2026-10-01, not re-anchored: their code is gone by
+    # design. The owner ruled nothing is raised before the plan wait is over, so
+    # the in-loop early card (G8's site) went, and the hold flag only it read
+    # (G6's declaration) went with it. The rule that replaced them is measured
+    # by .mutants/gemini_plan_wait_1001_mutants.py.
     ('G7', RESEARCH, 'over',
-     "⛔⛔ THE BREAK-SITE CARD IS HANDED THE HOLD FLAG AGAIN — the blocker two independent reviewers found. That site is the loop DECIDING TO STOP WAITING: the next statement is an unconditional break, so the alert is deferred to a retry the following line cancels. Nothing on screen at the moment the loop gives up, and the owner's first actionable surface arrives from the CUA ladder about twelve minutes later — the seventeen-minute ladder #921 exists to remove, deleted by a boolean instead of an edit",
+     "⛔⛔ THE BREAK-SITE CARD IS HELD AGAIN — the blocker two independent reviewers found. That site is the loop DECIDING TO STOP WAITING: the next statement is an unconditional break, so the alert is deferred to a retry the following line cancels. Nothing on screen at the moment the loop gives up, and the owner's first actionable surface arrives from the CUA ladder about twelve minutes later — the seventeen-minute ladder #921 exists to remove, deleted by a boolean instead of an edit. (Re-pointed 2026-10-01: the hold flag it used to hand over is gone, so the mutant holds the card outright.)",
      [('                        redraft_pending=False):\n                    _raise_plan_alert("our own plan-wait budget is spent")',
-       '                        redraft_pending=_redraft_pending):\n                    _raise_plan_alert("our own plan-wait budget is spent")')]),
-    ('G8', RESEARCH, 'under',
-     'the in-loop card stops being told about the hold, so the alert is beside the clicks again rather than after them',
-     [('                    start_clicked=bool(start_clicked),\n                    redraft_pending=_redraft_pending):\n                _raise_plan_alert("plan clearly failed")',
-       '                    start_clicked=bool(start_clicked)):\n                _raise_plan_alert("plan clearly failed")')]),
+       '                        redraft_pending=True):\n                    _raise_plan_alert("our own plan-wait budget is spent")')]),
     ('G9', RESEARCH, 'over',
      '⛔ THE COOLDOWN CLOCK GOES BACK TO ZERO, so it is already satisfied on the first tick and a re-draft can fire about two seconds after the brief was submitted — at a turn that is still painting',
      [("        _last_regen_at = time.time()      # re-draft can't burn the 3-cap",

@@ -83,9 +83,13 @@ def test_exhausted_attempts_outrank_a_pending_redraft():
     """⛔ ORDER IS THE CONTENT, AND THIS PAIR IS WHY THE ARM SITS WHERE IT DOES.
     Three spent re-drafts is evidence of failure, not a timer, and #921 exists
     so that evidence reaches the owner early. If the hold could outrank it, a
-    stale True would keep the card down for the rest of the run."""
+    stale True would keep the card down for the rest of the run.
+
+    ⛔ 2026-10-01: "early" now means "the moment the wait is over" — the owner
+    ruled nothing is raised before it, three spent re-drafts included."""
     assert _due(regen_capped=True, redraft_pending=True) is True
-    assert _due(regen_capped=True, redraft_pending=True, elapsed=5) is True
+    assert _due(regen_capped=True, redraft_pending=True, elapsed=5) is False
+    assert _due(regen_capped=True, redraft_pending=True, elapsed=300) is True
 
 
 def test_a_started_run_still_outranks_everything():
@@ -248,20 +252,7 @@ def test_the_start_presence_answer_comes_from_the_finder_that_just_ran():
     assert i_reset < i_set < i_use
 
 
-def test_the_hold_flag_survives_the_cooldown_between_attempts():
-    """⛔ IT MUST BE DECLARED OUTSIDE THE WHILE LOOP. 1b only runs once the 45s
-    cooldown has elapsed, so a per-tick variable would read False for the whole
-    window the card is supposed to be held through — and the card would fire in
-    the gap between two clicks."""
-    loop = _2d_loop()
-    i_decl = loop.index("_redraft_pending = False")
-    i_while = loop.index("while True:")
-    assert i_decl < i_while, (
-        "_redraft_pending is initialised inside the poll loop — it would reset "
-        "on every tick that the cooldown skips 1b")
-
-
-def test_the_break_site_never_holds_the_card_and_the_loop_body_always_can():
+def test_the_break_site_never_holds_the_card():
     """⛔⛔ THE DEFECT THIS REPLACES WAS A BLOCKER, AND TWO REVIEWERS FOUND IT
     INDEPENDENTLY. Both card sites were handed the hold flag — including the one
     inside `if _elapsed >= _start_wait_max_sec`, where the very next statement
@@ -274,26 +265,19 @@ def test_the_break_site_never_holds_the_card_and_the_loop_body_always_can():
 
     ⭐ The rule runs both ways: an alert that fires while its caller intends to
     keep waiting is wrong, and an alert held while its caller is giving up is
-    wrong too."""
-    loop = _2d_loop()
-    assert loop.count("_gemini_plan_card_due(") == 2
-    assert loop.count("redraft_pending=_redraft_pending") == 1, (
-        "only the in-loop card site may be held; the break site is the loop "
-        "deciding to stop waiting")
-    assert loop.count("redraft_pending=False") == 1
+    wrong too.
 
-    # And it is the BREAK site that passes False — pin which, not just how many.
+    ⛔ 2026-10-01: the in-loop card site, and the hold flag only it read, are
+    gone. The owner ruled nothing is raised before the wait is over, so there is
+    no early card left to hold; the break site is the one card site, and it
+    still passes False, explicitly."""
+    loop = _2d_loop()
+    assert loop.count("_gemini_plan_card_due(") == 1
+    assert loop.count("redraft_pending=False") == 1
+    assert "_redraft_pending" not in loop, "write-only state left behind"
+    i_due = loop.index("_gemini_plan_card_due(")
     i_break = loop.index("_raise_plan_alert(\"our own plan-wait budget is spent\")")
-    i_body = loop.index("_raise_plan_alert(\"plan clearly failed\")")
-    before_break = loop[:i_break]
-    before_body = loop[:i_body]
-    assert before_break.rindex("redraft_pending=False") > before_break.rfind(
-        "redraft_pending=_redraft_pending"), (
-        "the break-site call is being handed the hold flag again")
-    assert before_body.rindex("redraft_pending=_redraft_pending") > (
-        before_body.rfind("redraft_pending=False")), (
-        "the in-loop call has stopped being handed the hold flag, so the alert "
-        "is beside the clicks again rather than after them")
+    assert i_due < loop.index("redraft_pending=False") < i_break
 
 
 def test_the_loop_no_longer_blind_dumps_twelve_buttons():

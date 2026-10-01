@@ -151,11 +151,15 @@ def test_cua_completion_hint_describes_new_ui():
 
 # ── 2B/2C: plan-wait timing + guard + alert ──────────────────────────────────
 
-def test_plan_wait_caps_near_five_minutes_env_configurable():
-    assert 'os.environ.get("GEMINI_PLAN_WAIT_SEC", str(5 * 60))' in MODSRC, (
-        "the [2D] plan wait must cap ~5 min (env GEMINI_PLAN_WAIT_SEC), not a flat 10 min"
+def test_plan_wait_is_ten_minutes_env_configurable():
+    # ⭐ 2026-10-01, back to ten minutes by the owner ("wait for at least 10
+    # minutes in that planning session before raising anything"); still an env
+    # setting, never a flat literal. The wait itself is measured through the real
+    # launch in tests/test_gemini_plan_wait_1001.py.
+    assert 'os.environ.get("GEMINI_PLAN_WAIT_SEC", str(10 * 60))' in MODSRC, (
+        "the [2D] plan wait must default to 10 min (env GEMINI_PLAN_WAIT_SEC)"
     )
-    assert "_start_wait_max_sec = 10 * 60" not in MODSRC, "old flat 10-min cap must be gone"
+    assert "_start_wait_max_sec = 10 * 60" not in MODSRC, "the wait must stay env-settable"
 
 
 def test_plan_wait_polls_and_heartbeats_smoothly():
