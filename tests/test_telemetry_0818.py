@@ -560,7 +560,12 @@ def test_a_hanging_post_is_abandoned_at_the_deadline():
     started = time.monotonic()
     assert tm.flush(post=_hang, deadline_sec=0.4) == 0
     assert time.monotonic() - started < 5.0
-    assert len(_spooled()) == 1, "the events were lost to a hang"
+    # Not lost: held in the claimed file until the POST answers (it may still
+    # land — see test_pr4_review_1001.py for what happens when it does).
+    held = sorted(tm._telemetry_dir().glob("pending-*.sending.*.jsonl"))
+    assert len(held) == 1, "the events were lost to a hang"
+    assert len([ln for ln in held[0].read_text(encoding="utf-8").splitlines()
+                if ln.strip()]) == 1
 
 
 def test_the_flush_runs_on_a_daemon_thread():

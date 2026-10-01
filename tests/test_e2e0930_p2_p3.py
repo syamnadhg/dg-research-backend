@@ -402,6 +402,22 @@ def _walk(node):
         yield from _walk(k)
 
 
+class _ArmedBrowser:
+    """The browser's one-entry upload queue as the real one keeps it: arming a
+    file puts it there, and only a chooser the global handler answers (or a
+    clear) takes it out. The upload decides from that queue whether the chooser
+    already delivered the file, so a fake that never arms it lies about that."""
+
+    def __init__(self):
+        self._upload_queue = []
+
+    def set_upload_file(self, path):
+        self._upload_queue = [str(path)]
+
+    def clear_upload_file(self):
+        self._upload_queue = []
+
+
 @needs_node
 def test_an_upload_control_on_screen_ends_the_wait_and_is_pressed(monkeypatch):
     """The dialog that mounted at 05:32:59 held an "Upload files" button. The
@@ -410,8 +426,7 @@ def test_an_upload_control_on_screen_ends_the_wait_and_is_pressed(monkeypatch):
     monkeypatch.setattr(research, "asyncio", clock.asyncio())
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
     page = _DialogPage(clock, mounts_at=3)
-    browser = SimpleNamespace(set_upload_file=lambda p: None, clear_upload_file=lambda: None,
-                              _upload_queue=[])
+    browser = _ArmedBrowser()
     ok = _go(research._nlm_dom_add_files(browser, page, ["/q/chatgpt.md"]))
     assert ok is True and page.input.files == ["/q/chatgpt.md"], (page.pressed, clock.t)
     assert page.pressed and page.pressed[0] == "upload-files", page.pressed
