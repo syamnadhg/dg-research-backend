@@ -379,10 +379,10 @@ def test_a_number_in_code_in_a_links_text_or_in_the_list_is_not_linked(monkeypat
     one inside a link's words would nest a link in a link, and one in a row of
     the list is the list's own."""
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    # (no number here has a space before it — that rule would keep it plain on
+    # its own — so only the rule under test can)
     body = ("Prose.\\[1\\] More.\\[2\\]\n\n```\nprint('\\[2\\]')\n```\n\nInline `x\\[2\\]` and "
-            f"[see \\[2\\]]({B}) here. Read [the paper \\[2\\] in full]({D}).")
-    # (the row's own "\\[1\\]" has no space before it, so only the rule that the
-    # list is not linked keeps it plain)
+            f"[see it.\\[2\\]]({B}) here. Read [the paper\\[2\\] in full]({D}).")
     md = _report(body, [(1, f"[A]({A})"), (2, f"[B]({B}) — it builds on it.\\[1\\]")])
     out = research._document_with_sources(md)
     assert out == md.replace("Prose.\\[1\\] More.\\[2\\]",
