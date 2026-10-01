@@ -145,7 +145,7 @@ L_GEMINI = "        _p2_mark_agent_done(_p2_run_dir(), \"gemini\", False)"
 AFTER_2A_OPEN = "        # #905: stamp research start at SUBMIT time"
 #: The main Phase-2 entry — the decision itself is `_p2_run_with_resume` now, and
 #: what is left in `run_pipeline` is the call, the stop and the sweep.
-MAIN_CALL = "enabled_agents=_launch),"
+MAIN_CALL = "enabled_agents=_launch, rejoin=_rejoin),"
 MERGE = "    results.update(kept)"
 FILTER = "    return _p2_only_enabled(results, enabled_agents), user_skipped, False"
 FILTER_BODY = "    names = {_agent_display_name(a) for a in enabled_agents}"
@@ -301,7 +301,7 @@ MUTANTS = [
     # ── M: the phase itself, `_p2_run_with_resume` ──────────────────────────
     ("M1", "under", RESEARCH,
      "⛔⛔ the main call launches the roster, not the plan",
-     [(MAIN_CALL, "enabled_agents=enabled_agents),")]),
+     [(MAIN_CALL, "enabled_agents=enabled_agents, rejoin=_rejoin),")]),
     ("M2", "under", RESEARCH,
      "the kept results never join — the phase reports them as missing",
      [(MERGE, "    pass")]),
