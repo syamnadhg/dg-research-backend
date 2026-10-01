@@ -221,6 +221,21 @@ never auto-retry: `delivery.json` status in `completed` / `stopped` / `paused`, 
 a crash (a phase-0/1 crash was excluded by the legacy `1 < phase` gate — that was
 the #725 bug); a normal one-shot retry keeps the conservative 2-4 window.
 
+⭐ **In Phase 2 the retry goes back into each agent's own chat** (10-01). Phase 2
+notes the chat each agent is sent the brief in (`_runtime.p2_chat_urls`); at a
+Chrome death in Phase 2 the `except` takes that map before the `finally` resets
+`_runtime`, and hands it to the retry (`run_pipeline(_p2_rejoin=…)`). The retry's
+first Phase-2 attempt opens each chat in the new Chrome and keeps it only when the
+tab sits on that chat's own id AND its first message holds what this run sent (the
+brief's head, or the line typed beside an attached brief); Gemini, which does not
+reopen a chat from its address, is found again by the sidebar hunt scoped to that
+id. A proven chat goes to the round-robin as it is — finished ones are extracted
+there, running ones polled, and a Gemini plan not yet started gets the
+round-robin's start watch. An agent already recorded as finished is kept and never
+opened; one with no chat, or whose chat cannot be opened or proven, is set up and
+sent the brief as before — only that agent. A person's Retry, Skip or new input
+re-runs the whole phase, so only the first attempt rejoins.
+
 **B. One agent's tab dies inside the Phase 2 round-robin** — nothing is rebuilt
 and nothing resumes. The per-tick crash sweep runs before any per-agent work,
 tests each pending agent's page for `is_closed()`, and for a dead one writes
