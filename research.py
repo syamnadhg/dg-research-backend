@@ -46400,7 +46400,8 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             if name == "Claude":
                 extra_kw["artifact_panel_open"] = bool(getattr(_runtime, "claude_artifact_panel_open", False))
             # ChatGPT (2026-10-01): the text the done check read, so a read of
-            # Deep research's app frame can tell the whole report from a part.
+            # Deep research's app frame can tell when that frame lost text
+            # after the done check.
             if name == "ChatGPT" and done_text_len:
                 extra_kw["done_text_len"] = int(done_text_len)
             text = await extract_fn(page, browser=browser, cua_client=cua_client,
@@ -46659,6 +46660,14 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 log(f"[{name}] Retracted the stale failure card — agent completed")
             except Exception:
                 pass
+    elif n_chars <= 0 and await _browser_context_is_dead(browser):
+        # ⛔ 2026-10-01: nothing came back because the whole browser is gone.
+        # No "failed" status and no saved "errored": both callers unwind for
+        # checkpoint recovery next (`_p2_unwind_if_browser_gone`), and that
+        # retry is meant to be silent. On 10-01 the app showed ChatGPT red,
+        # "Content extraction failed — 0 chars", for a crash it then retried.
+        log(f"[{name}] no content, and the whole browser is gone — no failed "
+            "status; the crash path takes it", "WARN")
     else:
         # No content extracted OR no anchor OR Firestore write failed — emit
         # failed (FE keeps spinner, never flips ✓ without a reachable doc).
@@ -57326,11 +57335,15 @@ async def _chatgpt_link_citations(page, md: str, label="ChatGPT") -> str:
 # turned into markdown by the converter every HTML read uses
 # (`html_to_markdown`). Computer use downloads it, as on 09-30, only when the
 # frame does not hold it: no heading, too little text, less than the done check
-# read, or a sources list.
+# read there a moment before, or a sources list.
 # Where the report starts: going down from the frame's body into the one child
 # holding nearly all its text — past the app's counts line and header (title,
-# Export, Expand) — and never past a heading beside that child, so the report's
-# title stays in.
+# Export, Expand) — and never past a heading or more than a line of text beside
+# that child, so the report's title and an opening paragraph with no heading of
+# its own stay in.
+# What the page does not draw (display:none: a tooltip, a closed menu) and the
+# controls inside the report (a "Copy code" button) are left out of the copy
+# that becomes markdown, as innerText leaves them out of the lengths.
 # ⛔ ITS CITATIONS. In the 10-01 frame each is a button with its number only
 # (sup[role=button][data-citation-index]), and the frame held not one link. A
 # citation with no link in it is left out, as the export's token runs are when
@@ -57353,14 +57366,30 @@ _CHATGPT_DR_REPORT_JS = r"""(P) => {
         let best = null, bestLen = -1;
         for (const c of kids) { const n = len(c); if (n > bestLen) { best = c; bestLen = n; } }
         if (!best || bestLen < total * P.share) break;
-        if (kids.some((c) => c !== best && (c.matches(HEAD) || c.querySelector(HEAD)))) break;
+        if (kids.some((c) => c !== best && (len(c) > P.aside
+                || c.matches(HEAD) || c.querySelector(HEAD)))) break;
         root = best;
     }
     const out = root.cloneNode(true);
+    // The copy keeps what the page does not draw; the live element says.
+    // (Matched by position, before anything is taken out of the copy.)
+    const live = root.querySelectorAll('*'), copy = out.querySelectorAll('*');
+    const unseen = [];
+    for (let i = 0; i < live.length; i++) {
+        if (getComputedStyle(live[i]).display === 'none') unseen.push(copy[i]);
+    }
+    for (const el of unseen) el.remove();
     let cites = 0;
     for (const el of [...out.querySelectorAll('[data-citation-index]')]) {
         if (el.querySelector('a[href^="http"]')) continue;
         cites += 1;
+        el.remove();
+    }
+    // A control's label ("Copy code") is not report text. One holding a link
+    // or a heading, or more than a label's words, stays.
+    for (const el of [...out.querySelectorAll('button, [role="button"]')]) {
+        if (el.querySelector('a[href^="http"]') || el.querySelector(HEAD)) continue;
+        if ((el.textContent || '').trim().length > P.label) continue;
         el.remove();
     }
     // A citation link's name as the page shows it, without its "+2".
@@ -57380,8 +57409,20 @@ _CHATGPT_DR_REPORT_JS = r"""(P) => {
 #: Going down from the frame's body, the share of its text a child must hold to
 #: be gone into (the counts line and header are a few dozen characters).
 _CHATGPT_DR_REPORT_SHARE = 0.9
-#: The share of the text the done check read that the report must hold to be
-#: the whole report (that check reads the frame's body: header and counts in).
+#: Going down stops when an element beside that child holds more text than
+#: this: more than the counts line or the header's title (79 characters on
+#: 10-01), so it is part of the report, such as an opening paragraph.
+_CHATGPT_DR_REPORT_ASIDE = 200
+#: A button inside the report holding no more text than this is a control
+#: ("Copy code"), left out.
+_CHATGPT_DR_REPORT_LABEL = 60
+#: The share of the text the done check read that the frame must still hold.
+#: ⚠ That check read this same frame's body a moment before (header and counts
+#: in), so this catches only a frame that lost text after the done check. A
+#: frame that never held the whole report (a preview card, a list that draws
+#: only what is on screen) passes it; only the heading, length and sources-list
+#: checks stand against that, and the done census written every run is what
+#: would show such a frame.
 _CHATGPT_DR_REPORT_WHOLE = 0.9
 
 
@@ -57391,12 +57432,18 @@ def _cg_count(n: int, word: str) -> str:
 
 async def _chatgpt_dr_frame_report(page, label="ChatGPT", *, done_text_len=0) -> str:
     """The finished report, read off the Deep research app's frame as markdown,
-    or "" when no frame holds the whole report (the log says why). Presses
-    nothing and downloads nothing."""
+    or "" when the frame does not hold it (the log says why). Presses nothing
+    and downloads nothing.
+
+    `done_text_len` is what the done check read in this frame a moment before:
+    a frame holding much less has lost text since. ⚠ It cannot tell a frame
+    that never held the whole report (see `_CHATGPT_DR_REPORT_WHOLE`)."""
     best = None
+    args = {"share": _CHATGPT_DR_REPORT_SHARE, "aside": _CHATGPT_DR_REPORT_ASIDE,
+            "label": _CHATGPT_DR_REPORT_LABEL}
     for f in _chatgpt_dr_app_frames(page):
         try:
-            r = await f.evaluate(_CHATGPT_DR_REPORT_JS, {"share": _CHATGPT_DR_REPORT_SHARE})
+            r = await f.evaluate(_CHATGPT_DR_REPORT_JS, args)
         except Exception:
             continue
         if isinstance(r, dict) and int(r.get("text") or 0) > int((best or {}).get("text") or 0):
@@ -57408,13 +57455,15 @@ async def _chatgpt_dr_frame_report(page, label="ChatGPT", *, done_text_len=0) ->
     elif int(best.get("headings") or 0) < 1:
         why = f"no heading in the {text} characters it holds — not a report"
     else:
-        md = html_to_markdown(best.get("html") or "")
+        # The citation token runs the export's text carries are stripped here
+        # too, as every other tier does, should the frame ever show one.
+        md = _strip_chatgpt_citation_tokens(html_to_markdown(best.get("html") or ""))
         n = _doc_img_prose_len(md)
         if n <= 2000:
             why = f"only {n} characters of report"
         elif done_text_len and text < _CHATGPT_DR_REPORT_WHOLE * done_text_len:
             why = (f"it holds {text} of the {int(done_text_len)} characters the done check "
-                   "read — part of the report only (a card, or a list that draws what is on screen)")
+                   "read a moment before — the frame changed after the done check")
         elif _is_sources_not_document(md, platform="chatgpt"):
             why = f"what it holds reads as a sources list ({len(md)} chars), not the report"
     if why:
@@ -57476,7 +57525,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     Since 2026-10-01 the finished report is first read off the Deep research
     app's frame (`_chatgpt_dr_frame_report`), nothing pressed and nothing
     downloaded; `done_text_len` is the text the done check read there, so a
-    frame holding part of the report is not taken for the whole."""
+    frame that lost text after the done check is not taken for the report."""
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)

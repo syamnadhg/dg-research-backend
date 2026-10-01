@@ -4,14 +4,17 @@ app's frame, and no card for a dead browser.
 ⛔⛔ WHAT THIS CODE DECIDES (research.py).
   F*  the finished report is read off the app's frame before anything else —
       nothing pressed, nothing downloaded, no computer use: where the report
-      starts (past the app's header and counts, never past a heading, never
-      into the app's script), its citations with no link left out and those
-      with one kept (without the pill's "+1"), the diagram left out.
+      starts (past the app's header and counts, never past a heading or more
+      than a line of text, never into the app's script), its citations with no
+      link left out and those with one kept (without the pill's "+1"), the
+      diagram, hidden text and controls' labels left out, citation token runs
+      stripped.
   G*  what is not the whole report goes to computer use: no heading, too short,
-      less than the done check read (handed down from the poll loop), a
-      sources list.
+      less than the done check read a moment before (handed down from the poll
+      loop), a sources list.
   B*  an empty extraction on a dead browser takes the crash path with no card,
-      after the page said done and after computer use said done.
+      after the page said done and after computer use said done, and sends no
+      "failed" status and saves no "errored" first; a live one still does both.
 
 ⛔ The browser tests need patchright and Chrome; where they SKIP the baseline is
 not a measurement, so the runner refuses to score a skipped baseline.
@@ -52,8 +55,8 @@ MUTANTS = [
        "        const kids = [...root.children];\n")],
      "read"),
     ("F3", RESEARCH, "the read goes past the report's title into the element beside it",
-     [("        if (kids.some((c) => c !== best && (c.matches(HEAD) || c.querySelector(HEAD)))) break;\n",
-       "")],
+     [("                || c.matches(HEAD) || c.querySelector(HEAD)))) break;\n",
+       "                ))) break;\n")],
      "read"),
     ("F4", RESEARCH, "the read always goes down to the largest child — one paragraph",
      [("        if (!best || bestLen < total * P.share) break;\n",
@@ -72,6 +75,29 @@ MUTANTS = [
     ("F8", RESEARCH, "the diagram's labels land in the report as loose words",
      [("    for (const el of [...out.querySelectorAll('svg')]) el.remove();\n", "")],
      "read"),
+    ("F9", RESEARCH, "a citation token run in the frame reaches the document",
+     [("        md = _strip_chatgpt_citation_tokens(html_to_markdown(best.get(\"html\") or \"\"))\n",
+       "        md = html_to_markdown(best.get(\"html\") or \"\")\n")],
+     "read"),
+    ("F10", RESEARCH, "an opening paragraph with no heading, under a tenth of the text, is dropped",
+     [("        if (kids.some((c) => c !== best && (len(c) > P.aside\n",
+       "        if (kids.some((c) => c !== best && (false\n")],
+     "read"),
+    ("F11", RESEARCH, "the read stops at the counts line — the app's header lands in the report",
+     [("_CHATGPT_DR_REPORT_ASIDE = 200\n", "_CHATGPT_DR_REPORT_ASIDE = 0\n")],
+     "read"),
+    ("F12", RESEARCH, "text the page does not draw (a hidden tooltip) lands in the report",
+     [("        if (getComputedStyle(live[i]).display === 'none') unseen.push(copy[i]);\n", "")],
+     "read"),
+    ("F13", RESEARCH, "a control's label (\"Copy code\") lands in the report",
+     [("        if ((el.textContent || '').trim().length > P.label) continue;\n        el.remove();\n",
+       "        if ((el.textContent || '').trim().length > P.label) continue;\n")],
+     "read"),
+    ("F14", RESEARCH, "the controls go before the citations are counted — the log says none",
+     [("    let cites = 0;\n    for (const el of [...out.querySelectorAll('[data-citation-index]')]) {\n",
+       "    for (const el of [...out.querySelectorAll('button, [role=\"button\"]')]) el.remove();\n"
+       "    let cites = 0;\n    for (const el of [...out.querySelectorAll('[data-citation-index]')]) {\n")],
+     "read"),
 
     # ── G: not the whole report ─────────────────────────────────────────────
     ("G1", RESEARCH, "⛔⛔ the activity list (no heading) is taken for the report",
@@ -81,7 +107,7 @@ MUTANTS = [
      [("        if n <= 2000:\n            why = f\"only {n} characters of report\"\n",
        "        if False:\n            why = f\"only {n} characters of report\"\n")],
      "read"),
-    ("G3", RESEARCH, "⛔⛔ part of the report is taken for the whole",
+    ("G3", RESEARCH, "⛔ a frame that lost text after the done check is taken for the report",
      [("        elif done_text_len and text < _CHATGPT_DR_REPORT_WHOLE * done_text_len:\n",
        "        elif False:\n")],
      "read"),
@@ -129,6 +155,14 @@ MUTANTS = [
      [("        _runtime.last_failure_kind = \"browser_crash\"\n"
        "        raise RuntimeError(\"research browser died during a phase 2 extraction",
        "        raise RuntimeError(\"research browser died during a phase 2 extraction")],
+     "read"),
+    ("B6", RESEARCH, "⛔ a dead browser still shows ChatGPT failed and saves 'errored' (10-01)",
+     [("    elif n_chars <= 0 and await _browser_context_is_dead(browser):\n",
+       "    elif False:\n")],
+     "read"),
+    ("B7", RESEARCH, "a live browser's empty extraction no longer shows failed or saves 'errored'",
+     [("    elif n_chars <= 0 and await _browser_context_is_dead(browser):\n",
+       "    elif n_chars <= 0:\n")],
      "read"),
 ]
 
