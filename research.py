@@ -57360,8 +57360,17 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # pressed it, then "Export to Markdown"). The page presses the same two
     # controls when the frame shows them; computer use (Tier 1) only when not.
     # A census of the app's frames is written here too — the finished state.
+    # ⛔⛔ OFF BY DEFAULT SINCE 2026-10-01: Chrome 154 CRASHED (SIGSEGV in its
+    # browser main thread, crash report 18:34:03) at 18:33:45.28 — the instant
+    # this tier's press on "Export to Markdown" started the file. The browser
+    # died, the run read it as a crash and redid all of Phase 2. Computer use
+    # pressing the same two controls on 09-30 got the file (107,195 chars), so
+    # Tier 1 downloads again until a read that needs no download replaces this.
+    # SR_CHATGPT_DR_PAGE_DOWNLOAD=1 turns the press back on for a test.
+    _page_download = os.environ.get("SR_CHATGPT_DR_PAGE_DOWNLOAD", "") == "1"
     if _chatgpt_dr_app_frames(page):
         await _chatgpt_dr_census(page, "done", label=label)
+    if _page_download and _chatgpt_dr_app_frames(page):
         md = await _chatgpt_dr_dom_download(page, label)
         if md and len(md) >= 500:
             if _is_sources_not_document(md, platform="chatgpt"):

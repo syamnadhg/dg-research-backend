@@ -436,7 +436,9 @@ def test_the_link_goes_before_the_full_stop_of_the_cited_sentence():
 def test_the_report_is_downloaded_inside_the_app_frame(chrome, page, logs, run_dir, monkeypatch):
     """⭐ The finished app shows a download icon at its top right and a menu with
     "Export to Markdown" (what computer use pressed on 09-30): the page presses
-    both, the file is the report, and computer use is never asked."""
+    both, the file is the report, and computer use is never asked — when the
+    press is turned on (it is off by default since 10-01: see the next test)."""
+    monkeypatch.setenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", "1")
     _serve(chrome, page, _dr_host_html(35),
            _app_html("finished", download=True, report=_rendered(), export=_export()))
     cua = _NoCua("")
@@ -447,10 +449,29 @@ def test_the_report_is_downloaded_inside_the_app_frame(chrome, page, logs, run_d
     assert any("Extracted via T0 page download (Export to Markdown)" in m for _lv, m in logs)
 
 
+def test_by_default_the_page_never_presses_export_in_the_app(chrome, page, logs, run_dir,
+                                                              monkeypatch):
+    """⛔⛔ 2026-10-01: Chrome crashed (SIGSEGV in its browser main thread) the
+    instant the page pressed "Export to Markdown" in the app's frame, and the run
+    redid all of Phase 2. By default the page presses nothing in the frame —
+    computer use downloads, as it did on 09-30 — and the finished-state census
+    is still written."""
+    monkeypatch.delenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", raising=False)
+    _serve(chrome, page, _dr_host_html(35),
+           _app_html("finished", download=True, report=_rendered(), export=_export()))
+    cua = _NoCua(_export())
+    md = _extract(chrome, page, monkeypatch, cua)
+    assert _pressed_in_app(chrome, page) == [], "the page pressed inside the app's frame"
+    assert cua.calls == 1 and md.startswith("# Golden Retriever")
+    assert (run_dir / "chatgpt_dr_census_done.json").exists()
+    assert not any("T0 page download" in m for _lv, m in logs)
+
+
 def test_no_download_control_leaves_the_download_to_computer_use(chrome, page, logs, run_dir,
                                                                   monkeypatch):
     """No control in the frame: nothing is pressed, a census of the miss is
-    written, and computer use downloads it as before."""
+    written, and computer use downloads it as before (the press turned on)."""
+    monkeypatch.setenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", "1")
     _serve(chrome, page, _dr_host_html(35),
            _app_html("finished", download=False, report=_rendered()))
     cua = _NoCua(_export())
