@@ -642,7 +642,17 @@ def _oldest_half_dropped(lines: "list[str]") -> "list[str]":
 
 
 def _trim_spool(path: Path) -> None:
-    """Bound one spool file: drop the OLDEST half and say so."""
+    """Bound one spool file: drop the OLDEST half and say so.
+
+    ⛔⛔ THE TRIM TAKES THE FILE BY RENAME FIRST, the way a flush claims one.
+    A flush in any process claims every spool it finds, a live sibling worker's
+    included. A read-then-rewrite that a claim landed in the middle of re-created
+    the file holding events that claim was already sending, so they went out
+    twice, in different batches the sink cannot match. Now whichever rename wins
+    owns the events: if the flush won, there is nothing here to trim; if the trim
+    won, the flush finds no file. The kept half is then APPENDED, so an event
+    recorded while the trim held the file is kept too; it just sits ahead of
+    the older lines, and each event carries its own seq."""
     global _dropped
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -650,14 +660,27 @@ def _trim_spool(path: Path) -> None:
         return
     if len(lines) <= SPOOL_MAX_LINES:
         return
-    keep = _oldest_half_dropped(lines)
-    dropped = len(lines) - len(keep)
-    _dropped += dropped
-    keep.append(json.dumps(
-        _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": dropped}}),
-        separators=(",", ":")))
+    taken = path.with_name(f"{path.name}.trim.{os.getpid()}.{threading.get_ident()}")
     try:
-        path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        os.replace(str(path), str(taken))
+        lines = taken.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return            # a flush claimed it first: every one of them is being sent
+    keep = lines
+    # What the rename took can be a newer, small file: a claim landed between
+    # the two reads and new events started a fresh one. Nothing in it is old.
+    if len(lines) > SPOOL_MAX_LINES:
+        keep = _oldest_half_dropped(lines)
+        dropped = len(lines) - len(keep)
+        _dropped += dropped
+        keep.append(json.dumps(
+            _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": dropped}}),
+            separators=(",", ":")))
+    try:
+        if keep:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(keep) + "\n")
+        taken.unlink()
     except OSError:
         pass
 
@@ -892,8 +915,10 @@ def _settle(ok: bool, claimed: Path, path: Path, owed: "list[str]") -> bool:
     if ok:
         # Anything past the batch cap goes back in front of whatever arrived
         # while we were delivering, rather than dying with the claimed file.
+        # ⛔ Into the LIVE spool's name: for an adopted file `path` IS the claimed
+        # file, deleted two lines down, and everything past the cap went with it.
         if owed:
-            _write_back(owed, path)
+            _write_back(owed, _unclaimed_name(path))
         # ⛔ A crash between the 2xx and this unlink re-sends the batch. The
         # route's document id is a hash of the events, so a byte-identical
         # resend collapses onto the same document — at-least-once delivery
@@ -939,7 +964,14 @@ def _post_with_deadline(sender, batch: "list[dict]", deadline_sec: float,
                           type(exc).__name__)
 
     thread = threading.Thread(target=_run, name="telemetry-post", daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError as exc:
+        # A process out of threads, or one shutting down. The POST never left,
+        # so this is a plain failed delivery; raising would leave the file
+        # marked in flight, and this process would never send it again.
+        log.debug("telemetry: could not start a post (%s)", exc)
+        return False
     thread.join(max(0.1, float(deadline_sec)))
     # Decided under the lock, so a POST answering at this very moment is either
     # seen here or settled by its own thread — never both, never neither.

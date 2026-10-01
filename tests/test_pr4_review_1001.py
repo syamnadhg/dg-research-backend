@@ -5,13 +5,16 @@ waiter) is in agent/tests/test_selfupdate_waiter_path_1001.py.
   2. The narrator's callers no longer cap Gemini below the ceiling thinking
      needs, and an empty MAX_TOKENS answer counts toward the breaker.
   3. A serve process owns its own telemetry spool; a command never keeps a
-     worker id it inherited.
+     worker id it inherited; a trim never re-creates a spool a flush has
+     claimed.
   4. NotebookLM: a file the chooser already took is not set on the input too.
   5. An update started with no target version, killed after its install, says
      so and offers Restart.
   6. The phase notice fetches its token on its own thread, not the caller's.
   7. Telemetry: a POST that outlives the flush deadline is not re-spooled until
-     it has actually failed, so events it delivered are not sent again.
+     it has actually failed, so events it delivered are not sent again; a POST
+     thread that will not start does not stop later flushes; an adopted file
+     over the batch cap loses nothing.
 """
 from __future__ import annotations
 
@@ -583,3 +586,165 @@ def test_a_post_that_fails_after_the_deadline_loses_nothing(spool):
     assert not set(first) & set(during), during
     assert sorted(landed) == sorted(first + newer), (
         f"each event must land exactly once: {landed}")
+
+
+def _deliver(landed: list):
+    return lambda batch: landed.extend(r["seq"] for r in batch) or True
+
+
+def test_a_post_thread_that_will_not_start_does_not_stop_later_flushes(spool, monkeypatch):
+    """A long-lived serve that has run out of threads: the POST never leaves.
+    ⛔ Found by review of the late-POST change. The claimed file stayed marked as
+    in flight, so this process never sent it, or the live spool behind it,
+    again. Raising here is allowed; never sending again is not."""
+    tm.tm_emit(tm.Ev.LOGIN_STARTED)
+    real_start = threading.Thread.start
+    refused: list = []
+
+    def start(self):
+        if self.name == "telemetry-post" and not refused:
+            refused.append(self.name)
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    landed: list = []
+    try:
+        tm.flush(post=_deliver(landed), deadline_sec=2)
+    except RuntimeError:
+        pass
+    assert refused, "the POST thread was never started"
+    tm.tm_emit(tm.Ev.DOCTOR_RUN, count=1)
+    tm.flush(post=_deliver(landed), deadline_sec=2)
+    tm.flush(post=_deliver(landed), deadline_sec=2)
+    assert len(landed) == 2 and len(set(landed)) == 2, (
+        f"both events must land, once each: {landed}")
+    assert _claimed_files() == [] and _live_spool_seqs() == []
+
+
+def test_an_adopted_file_over_the_batch_cap_loses_nothing_when_it_lands(spool):
+    """A process died holding 600 claimed events. The first POST carries 500;
+    the other 100 belong in the live spool. They used to be written back into
+    the adopted file itself, which the next line then deleted."""
+    dead = 999_999
+    assert not tm._pid_alive(dead)
+    directory = tm._telemetry_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    now_ms = int(time.time() * 1000)
+    rows = [json.dumps({"v": tm.CATALOGUE_VERSION, "iuid": "iuid-test", "sid": "gone",
+                        "seq": n, "t": now_ms, "ev": int(tm.Ev.LOGIN_STARTED)})
+            for n in range(1, 601)]
+    (directory / f"pending-cli.sending.{dead}.jsonl").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8")
+    landed: list = []
+    for _ in range(3):
+        tm.flush(post=_deliver(landed), deadline_sec=2)
+    assert sorted(landed) == list(range(1, 601)), (
+        f"{600 - len(set(landed))} of 600 adopted events never landed")
+    assert _claimed_files() == [] and _live_spool_seqs() == []
+
+
+# ── 3, continued: a trim never re-creates a file a flush has claimed ──────────
+SIBLING = 4_000_001
+
+
+def _trim_race(monkeypatch, *, on_first_read=None, while_held=None):
+    """Worker 1's spool, capped at 6 lines; the 7th event trims it. The hooks
+    run inside that trim: `on_first_read` right after it reads the full spool,
+    `while_held` right after it has taken the file (the read of anything else
+    the spool's name now leads to)."""
+    monkeypatch.setenv("SR_WORKER_ID", "1")
+    monkeypatch.setattr(tm, "SPOOL_MAX_LINES", 6)
+    live = tm.spool_path(1)
+    for _ in range(6):
+        tm.tm_emit(tm.Ev.LOGIN_STARTED)
+    real_read = Path.read_text
+    armed = {"first": on_first_read, "held": while_held}
+
+    def read_text(self, *a, **k):
+        text = real_read(self, *a, **k)
+        if self == live and len(text.splitlines()) > tm.SPOOL_MAX_LINES:
+            hook, armed["first"] = armed["first"], None
+            if hook:
+                hook(live)
+        elif self.name.startswith(live.name) and self != live:
+            hook, armed["held"] = armed["held"], None
+            if hook:
+                hook(live)
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    tm.tm_emit(tm.Ev.LOGIN_STARTED)
+    monkeypatch.setattr(Path, "read_text", real_read)
+    return live
+
+
+def _sibling_claims(live):
+    os.replace(live, live.with_name(f"{live.stem}.sending.{SIBLING}{live.suffix}"))
+
+
+def _seqs_in(path) -> list:
+    if not path.exists():
+        return []
+    return [json.loads(ln)["seq"] for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+
+
+def _append_events(live, n: int) -> list:
+    """Events this process records from another thread mid-trim."""
+    seqs = []
+    with open(live, "a", encoding="utf-8") as fh:
+        for _ in range(n):
+            rec = tm._envelope({"ev": int(tm.Ev.DOCTOR_RUN), "d": {"count": 1}})
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            seqs.append(rec["seq"])
+    return seqs
+
+
+def _drop_markers(path) -> list:
+    if not path.exists():
+        return []
+    return [r for r in map(json.loads, path.read_text(encoding="utf-8").splitlines())
+            if r["ev"] == int(tm.Ev.TELEMETRY_DROPPED)]
+
+
+def test_a_trim_racing_a_claim_does_not_send_anything_twice(spool, monkeypatch):
+    """The review's second case for item 3. Every flush claims every spool it
+    finds, a live sibling worker's included. If that claim lands between the
+    trim's read and its rewrite, the rewrite re-created the file with events
+    the claim was already sending: they went out twice, in different batches."""
+    live = _trim_race(monkeypatch, on_first_read=_sibling_claims)
+    sending = _seqs_in(live.with_name(f"{live.stem}.sending.{SIBLING}{live.suffix}"))
+    left = _seqs_in(live)
+    assert len(sending) == 7, sending
+    assert not set(sending) & set(left), (
+        f"sent twice: {sorted(set(sending) & set(left))}")
+
+
+def test_events_that_arrive_after_a_claim_are_not_trimmed_as_the_old_file(spool, monkeypatch):
+    """The claim took the big file, and three new events started a fresh one
+    before the trim got to it. That small file is newer than anything the trim
+    measured: nothing in it is dropped, and no drop is reported."""
+    newer: list = []
+
+    def claim_then_record(live):
+        _sibling_claims(live)
+        newer.extend(_append_events(live, 3))
+
+    live = _trim_race(monkeypatch, on_first_read=claim_then_record)
+    sending = _seqs_in(live.with_name(f"{live.stem}.sending.{SIBLING}{live.suffix}"))
+    assert len(newer) == 3
+    assert sorted(_seqs_in(live)) == newer, (
+        f"the newer events were trimmed or mixed with claimed ones: "
+        f"{_seqs_in(live)} (claimed {sending})")
+    assert _drop_markers(live) == []
+
+
+def test_an_event_recorded_while_the_trim_holds_the_file_is_kept(spool, monkeypatch):
+    newer: list = []
+    live = _trim_race(monkeypatch,
+                      while_held=lambda live: newer.extend(_append_events(live, 1)))
+    assert len(newer) == 1, "the trim never took the file"
+    left = _seqs_in(live)
+    assert newer[0] in left, f"an event recorded mid-trim was lost: {left}"
+    assert len(_drop_markers(live)) == 1 and len(left) <= tm.SPOOL_MAX_LINES, left
