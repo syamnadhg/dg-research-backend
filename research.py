@@ -46342,7 +46342,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
 
 async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                                     elapsed_sec=0, verbose=False,
-                                    expected_text_len=0):
+                                    expected_text_len=0, done_text_len=0):
     """Per-agent extract + save + emit ladder. Returns a result dict
     the caller drops into results[]. Never raises — on any internal failure
     returns status='failed' so the poll loop can decide whether to retry.
@@ -46399,6 +46399,10 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             extra_kw = {}
             if name == "Claude":
                 extra_kw["artifact_panel_open"] = bool(getattr(_runtime, "claude_artifact_panel_open", False))
+            # ChatGPT (2026-10-01): the text the done check read, so a read of
+            # Deep research's app frame can tell the whole report from a part.
+            if name == "ChatGPT" and done_text_len:
+                extra_kw["done_text_len"] = int(done_text_len)
             text = await extract_fn(page, browser=browser, cua_client=cua_client,
                                      label=name, verbose=verbose, **extra_kw) or ""
         except Exception as e:
@@ -52580,6 +52584,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         elapsed_sec=int(elapsed),
                         verbose=verbose,
                         expected_text_len=int(_partial_text_len or 0),
+                        done_text_len=int(t1 or 0),
                     )
                     # 2026-04-25: markdown-as-primary. "done" means text>0 +
                     # in-app primary emitted. res["url"] is the conversation
@@ -52605,6 +52610,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # ladder in extract_chatgpt_response means a real
                     # transient blip would be caught by the ladder itself,
                     # not by retrying the whole extraction 3 times.
+                    # ⛔ 2026-10-01: a dead browser is the crash path, not a card.
+                    await _p2_unwind_if_browser_gone(browser, name)
                     log(f"[{name}] Extraction attempt {p['extraction_attempts']} "
                         f"returned no content — surfacing user decision", "WARN")
                     p["flat_history"] = []
@@ -53455,6 +53462,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # DOM extraction now primary in extract_chatgpt_response, an
                 # empty result here means the canvas DOM is genuinely missing
                 # — alert once, decide once.
+                # ⛔ 2026-10-01: a dead browser is the crash path, not a card.
+                await _p2_unwind_if_browser_gone(browser, name)
                 p.setdefault("empty_retries", 0)
                 p["empty_retries"] += 1
                 log(f"[{name}] CUA said done but extraction empty (attempt "
@@ -57308,7 +57317,120 @@ async def _chatgpt_link_citations(page, md: str, label="ChatGPT") -> str:
     return _strip_chatgpt_citation_tokens(out)
 
 
-async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
+# ⭐⭐ 2026-10-01 — THE FINISHED REPORT IS READ OFF THE APP'S FRAME: NOTHING
+# PRESSED, NOTHING DOWNLOADED. On 10-01 Chrome 154 crashed the instant the page
+# pressed "Export to Markdown" inside the app's frame, and the run redid all of
+# Phase 2. The report was already in that frame: the census of it at 18:33:42
+# read 88,718 characters and 37 headings, in a card 400 px tall that only CLIPS
+# the report (its whole text is in the page). So it is read from there and
+# turned into markdown by the converter every HTML read uses
+# (`html_to_markdown`). Computer use downloads it, as on 09-30, only when the
+# frame does not hold it: no heading, too little text, less than the done check
+# read, or a sources list.
+# Where the report starts: going down from the frame's body into the one child
+# holding nearly all its text — past the app's counts line and header (title,
+# Export, Expand) — and never past a heading beside that child, so the report's
+# title stays in.
+# ⛔ ITS CITATIONS. In the 10-01 frame each is a button with its number only
+# (sup[role=button][data-citation-index]), and the frame held not one link. A
+# citation with no link in it is left out, as the export's token runs are when
+# nothing matches them; one that holds a link keeps it (the converter writes it
+# as a markdown link, and the document's numbered sources are built from those
+# links). The log line counts both, so the next run says what the frame gave.
+_CHATGPT_DR_REPORT_JS = r"""(P) => {
+    const body = document.body;
+    if (!body) return null;
+    // ⛔ Drawn elements only: an element that is not drawn answers innerText
+    // with its whole source — the app's own script, 13 MB of it on 10-01.
+    const drawn = (el) => !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/i.test(el.tagName)
+        && getComputedStyle(el).display !== 'none';
+    const len = (el) => (el.innerText || '').length;
+    const HEAD = 'h1, h2, h3, h4, h5, h6';
+    const total = len(body);
+    let root = body;
+    for (let depth = 0; depth < 80; depth++) {
+        const kids = [...root.children].filter(drawn);
+        let best = null, bestLen = -1;
+        for (const c of kids) { const n = len(c); if (n > bestLen) { best = c; bestLen = n; } }
+        if (!best || bestLen < total * P.share) break;
+        if (kids.some((c) => c !== best && (c.matches(HEAD) || c.querySelector(HEAD)))) break;
+        root = best;
+    }
+    const out = root.cloneNode(true);
+    let cites = 0;
+    for (const el of [...out.querySelectorAll('[data-citation-index]')]) {
+        if (el.querySelector('a[href^="http"]')) continue;
+        cites += 1;
+        el.remove();
+    }
+    // A citation link's name as the page shows it, without its "+2".
+    for (const a of out.querySelectorAll('a[data-testid*="citation"]')) {
+        const w = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
+        let last = null, n;
+        while ((n = w.nextNode())) if (n.nodeValue.trim()) last = n;
+        if (last) last.nodeValue = last.nodeValue.replace(/\s*\+\d+\s*$/, '');
+    }
+    const diagrams = out.querySelectorAll('svg[role~="graphics-document"]').length;
+    for (const el of [...out.querySelectorAll('svg')]) el.remove();
+    return { total, text: len(root), headings: root.querySelectorAll(HEAD).length,
+             links: out.querySelectorAll('a[href^="http"]').length, cites, diagrams,
+             html: out.innerHTML };
+}"""
+
+#: Going down from the frame's body, the share of its text a child must hold to
+#: be gone into (the counts line and header are a few dozen characters).
+_CHATGPT_DR_REPORT_SHARE = 0.9
+#: The share of the text the done check read that the report must hold to be
+#: the whole report (that check reads the frame's body: header and counts in).
+_CHATGPT_DR_REPORT_WHOLE = 0.9
+
+
+def _cg_count(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+async def _chatgpt_dr_frame_report(page, label="ChatGPT", *, done_text_len=0) -> str:
+    """The finished report, read off the Deep research app's frame as markdown,
+    or "" when no frame holds the whole report (the log says why). Presses
+    nothing and downloads nothing."""
+    best = None
+    for f in _chatgpt_dr_app_frames(page):
+        try:
+            r = await f.evaluate(_CHATGPT_DR_REPORT_JS, {"share": _CHATGPT_DR_REPORT_SHARE})
+        except Exception:
+            continue
+        if isinstance(r, dict) and int(r.get("text") or 0) > int((best or {}).get("text") or 0):
+            best = r
+    md, why = "", ""
+    text = int((best or {}).get("text") or 0)
+    if not best:
+        why = "no text in the app's frames"
+    elif int(best.get("headings") or 0) < 1:
+        why = f"no heading in the {text} characters it holds — not a report"
+    else:
+        md = html_to_markdown(best.get("html") or "")
+        n = _doc_img_prose_len(md)
+        if n <= 2000:
+            why = f"only {n} characters of report"
+        elif done_text_len and text < _CHATGPT_DR_REPORT_WHOLE * done_text_len:
+            why = (f"it holds {text} of the {int(done_text_len)} characters the done check "
+                   "read — part of the report only (a card, or a list that draws what is on screen)")
+        elif _is_sources_not_document(md, platform="chatgpt"):
+            why = f"what it holds reads as a sources list ({len(md)} chars), not the report"
+    if why:
+        log(f"[{label}] Report not read from the Deep research app's frame: {why} — "
+            "computer use downloads it instead")
+        return ""
+    log(f"[{label}] Report read from the Deep research app's frame, nothing pressed: "
+        f"{len(md)} chars, {_cg_count(int(best.get('headings') or 0), 'heading')}, "
+        f"{_cg_count(int(best.get('links') or 0), 'link')}, "
+        f"{_cg_count(int(best.get('cites') or 0), 'citation')} had no link in the frame "
+        f"(left out), {_cg_count(int(best.get('diagrams') or 0), 'diagram')} left out")
+    return md
+
+
+async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False,
+                                   done_text_len=0):
     """Extract ChatGPT response — 3 Wayland-safe tiers (rewritten 2026-05-14).
 
     Per-agent extraction model is intentionally divergent (the PR body's
@@ -57349,7 +57471,12 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     `chatgpt_brief_via_copy`, called by run_phase1, never from here.
 
     ChatGPT Deep Research (P2) outputs a document/artifact card, not regular
-    chat text — which is why P2 passes browser+cua to enable Tier 1/3."""
+    chat text — which is why P2 passes browser+cua to enable Tier 1/3.
+
+    Since 2026-10-01 the finished report is first read off the Deep research
+    app's frame (`_chatgpt_dr_frame_report`), nothing pressed and nothing
+    downloaded; `done_text_len` is the text the done check read there, so a
+    frame holding part of the report is not taken for the whole."""
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
@@ -57365,11 +57492,17 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # this tier's press on "Export to Markdown" started the file. The browser
     # died, the run read it as a crash and redid all of Phase 2. Computer use
     # pressing the same two controls on 09-30 got the file (107,195 chars), so
-    # Tier 1 downloads again until a read that needs no download replaces this.
+    # Tier 1 downloads when the report cannot be read off the frame (below).
     # SR_CHATGPT_DR_PAGE_DOWNLOAD=1 turns the press back on for a test.
     _page_download = os.environ.get("SR_CHATGPT_DR_PAGE_DOWNLOAD", "") == "1"
     if _chatgpt_dr_app_frames(page):
         await _chatgpt_dr_census(page, "done", label=label)
+        # 2026-10-01: the report read off the app's frame — before any press.
+        md = await _chatgpt_dr_frame_report(page, label, done_text_len=done_text_len)
+        if md:
+            log(f"[{label}] Extracted via the Deep research app's frame (no download): "
+                f"{len(md)} chars")
+            return md
     if _page_download and _chatgpt_dr_app_frames(page):
         md = await _chatgpt_dr_dom_download(page, label)
         if md and len(md) >= 500:
@@ -77410,6 +77543,23 @@ def _is_browser_close_error(exc) -> bool:
         # is the half that cannot be lost by a `reset()`.
         or "(browser crash)" in msg
     )
+
+
+async def _p2_unwind_if_browser_gone(browser, name) -> None:
+    """Before Phase 2 turns an empty extraction into a card: when the whole
+    browser is gone, unwind for checkpoint recovery instead — the crash sweep's
+    own path — with no card.
+
+    ⛔⛔ 2026-10-01. Chrome crashed at 18:33:45 during ChatGPT's extraction; every
+    tier then failed on the closed browser, and the poll put up "Couldn't read
+    ChatGPT's report" — a card about a browser that was gone — a minute before
+    the crash sweep unwound the run anyway. A live browser falls through to the
+    card, as before."""
+    if await _browser_context_is_dead(browser):
+        log(f"[{name}] the whole browser is gone, not just this tab — no card; "
+            "unwinding for checkpoint recovery", "WARN")
+        _runtime.last_failure_kind = "browser_crash"
+        raise RuntimeError("research browser died during a phase 2 extraction (browser crash)")
 
 
 async def _p3_upload_failure_kind(exc, browser) -> str:
