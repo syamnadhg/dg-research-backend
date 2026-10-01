@@ -851,7 +851,14 @@ def _move_note(r: dict) -> "str | None":
     s = re.sub(r"(?i)for\W+the\W+assistant\W*do\W+not\W+relay\W+to\W+the\W+user", " ",
                " ".join(v.split())).replace("──", " ")
     s = re.sub(r"(?i)media\s*:", "media ", s)
-    s = s.replace('"', "'").replace("\\", "/").replace("[[", "[ [")
+    s = s.replace('"', "'").replace("\\", "/")
+    # ⛔ No [[…]] tag however many brackets (a single replace left one of three),
+    # no image or HTML (a relayed reply's images are sent), and no bare local
+    # path: a relayed reply's ~/…, /… and C:/… files are ATTACHED. A URL keeps
+    # its own slashes; a path at a word's start gets a space after its anchor.
+    s = re.sub(r"\[(?=\[)", "[ ", s).replace("![", "! [")
+    s = s.replace("<", "‹").replace(">", "›")
+    s = re.sub(r"(?<![/:\w.])(?:~/|/|[A-Za-z]:/)(?=[\w.~-])", lambda m: m.group(0) + " ", s)
     return " ".join(s.split())[:_MOVE_NOTE_MAX].rstrip() or None
 
 

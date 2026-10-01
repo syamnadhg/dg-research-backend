@@ -585,9 +585,6 @@ _PAUSED_STATUSES = ("paused", "paused_backend_restart", "paused_backend_restart_
 #: sr.py's agent-only marker, in any case or separators — never in another
 #: person's note.
 _AGENT_ONLY_MARKER_RE = re.compile(r"(?i)for\W+the\W+assistant\W*do\W+not\W+relay\W+to\W+the\W+user")
-#: Hermes' `MEDIA:<path>` directive, in any case: this script's output is
-#: delivered by Hermes, which ATTACHES the file it names from this host.
-_HERMES_MEDIA_RE = re.compile(r"(?i)media\s*:")
 
 
 def _moved_at(run: dict) -> "float | None":
@@ -611,8 +608,15 @@ def _move_note(run: dict) -> "str | None":
     if not isinstance(v, str):
         return None
     s = _AGENT_ONLY_MARKER_RE.sub(" ", " ".join(v.split())).replace("──", " ")
-    s = _HERMES_MEDIA_RE.sub("media ", s)
-    s = s.replace('"', "'").replace("\\", "/").replace("[[", "[ [")
+    s = re.sub(r"(?i)media\s*:", "media ", s)
+    s = s.replace('"', "'").replace("\\", "/")
+    # ⛔ No [[…]] tag however many brackets (a single replace left one of three),
+    # no image or HTML (a relayed reply's images are sent), and no bare local
+    # path: a relayed reply's ~/…, /… and C:/… files are ATTACHED. A URL keeps
+    # its own slashes; a path at a word's start gets a space after its anchor.
+    s = re.sub(r"\[(?=\[)", "[ ", s).replace("![", "! [")
+    s = s.replace("<", "‹").replace(">", "›")
+    s = re.sub(r"(?<![/:\w.])(?:~/|/|[A-Za-z]:/)(?=[\w.~-])", lambda m: m.group(0) + " ", s)
     return " ".join(s.split())[:_MOVE_NOTE_MAX].rstrip() or None
 
 
