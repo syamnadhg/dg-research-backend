@@ -452,19 +452,27 @@ CLAUDE_0930 = (FIXTURES / "claude.md").read_text(encoding="utf-8")
 #: The closed word set a sources section is titled with — PORTED here rather
 #: than read from the code, so the count below does not ask the code under test
 #: what a section is.
-_W = (r"(?:\d{1,3}(?:\.\d{1,3})*[.)]?[ \t]+)?"
-      r"(?:(?:key|main|principal|selected|cited-source|cited|full|further|additional"
+_W = (r"(?:(?:key|main|principal|selected|cited-source|cited|full|further|additional"
       r"|list[ \t]+of)[ \t]+)?"
       r"(?:sources?|references?|citations?|bibliography|works[ \t]+cited"
       r"|reference[ \t]+list)"
       r"(?:[ \t]+(?:cited|consulted|used)"
       r"|[ \t]+and[ \t]+(?:further[ \t]+reading|notes|references|sources))?")
+#: A paragraph lead's words are the PLURAL ones: "Source: OFA registry" is a
+#: table caption, not a section.
+_W_LEAD = _W.replace("sources?|references?|citations?", "sources|references|citations")
+assert _W_LEAD != _W
+#: A heading's section number: 14, 14.2, IV., A.
+_NUM = r"(?:(?:\d{1,3}(?:\.\d{1,3})*[.)]?|(?:[ivxlc]{1,6}|[a-z])[.)])[ \t]+)?"
+_EM = r"(?:\*\*|__|\*|_)?"
 #: Every heading, bold lead or plain lead that titles a sources section —
 #: our own alternate title included, so a kept block beside ours counts as two.
+#: A heading may wrap its title in emphasis and close with a `#` run.
 SECTION_TITLE_RE = re.compile(
-    r"^(?:#{1,6}[ \t]+" + _W + r"(?:[ \t]+\(numbered\))?[ \t]*[.:]?[ \t]*$"
-    r"|(?:\*\*|__)" + _W + r"[.:]?(?:\*\*|__)[.:]?(?:[ \t]|$)"
-    r"|" + _W + r":)",
+    r"^(?:#{1,6}[ \t]+" + _EM + _NUM + _W + r"(?:[ \t]+\(numbered\))?" + _EM
+    + r"[ \t]*[.:]?(?:[ \t]+#+)?[ \t]*$"
+    r"|(?:\*\*|__)" + _W_LEAD + r"[.:]?(?:\*\*|__)[.:]?(?:[ \t]|$)"
+    r"|" + _W_LEAD + r":)",
     re.IGNORECASE | re.MULTILINE)
 
 
@@ -484,14 +492,63 @@ LINKLESS_OWN = {
                             "- OFA, *Hip dysplasia*.\n",
     "bold-references": "**References:** AKC, *German Shepherd Dog*; OFA, *Hip dysplasia*.\n",
     "bold-then-colon": "**Selected sources**: AKC breed page; OFA hip page.\n",
-    "bold-no-stop-then-list": "**Sources consulted**\n\nAKC breed page; OFA hip page.\n",
+    # ⛔ a LIST under the title: a prose paragraph after a lead ends the match
+    # (see the kept shapes below), so a sources lead never cuts the report
+    "bold-no-stop-then-list": "**Sources consulted**\n\n- AKC breed page\n- OFA hip page\n",
     "plain-references": "References: AKC, German Shepherd Dog; OFA, Hip dysplasia.\n",
     "only-a-private-link": "## Sources\n\n1. [This conversation](https://chatgpt.com/c/68dc1f2e)\n",
+    # the heading's title read past emphasis, a closing `#` run and a roman or
+    # letter section number
+    "bold-in-the-heading": "## **References**\n\n1. AKC breed page.\n",
+    "italic-in-the-heading": "## *Works cited*\n\n1. AKC breed page.\n",
+    "closing-hashes": "## Sources ##\n\n- AKC breed page\n",
+    "roman-numbered": "## IV. References\n\n1. AKC breed page.\n",
+    "letter-numbered": "## A. Sources\n\n- AKC breed page\n",
+    # the rest of the closed set
+    "underscore-bold": "__Sources__\n\n- AKC breed page\n- OFA hip page\n",
+    "reference-list": "## Reference list\n\n1. AKC breed page.\n",
+    "list-of-sources": "**List of sources**\n\n- AKC breed page\n",
+    "and-further-reading": "## Sources and further reading\n\n- AKC breed page\n",
+    "bibliography-categories": "**Cited-source bibliography.** The principal sources.\n\n"
+                               "**Health:** OFA; AKC.\n\n**Behaviour:** AVSAB.\n",
 }
 
 
 def _with_visited(md, visited=("https://www.akc.org/dog-breeds/",)):
     return research._document_with_sources(md, visited=list(visited), label="ChatGPT")
+
+
+CHATGPT_HEADER = "# ChatGPT Deep Research\n\n"
+BIBLIOGRAPHY = "**Cited-source bibliography.**"
+
+
+def _chatgpt_0930_variant(kind):
+    """The owner's real 09-30 ChatGPT file, changed in one way a report plausibly
+    is (the reviewer's three shapes, 2026-10-01)."""
+    md = CHATGPT_0930
+    if kind == "caption-under-the-ledger":
+        # a table caption under its "Condensed evidence ledger"
+        at = md.index("\n\n**Most important unresolved")
+        return md[:at] + "\n\nSource: OFA program rules; VetCompass cohort." + md[at:]
+    if kind == "bold-titled-with-a-caption":
+        # its `##` headings written as bold leads (the bold-titled ChatGPT shape
+        # save_meta's fallback exists for), and a caption after its first table
+        md = re.sub(r"^## (.+)$", r"**\1**", md, flags=re.M)
+        at = md.index("\n\n", md.index("| Rating |"))
+        return md[:at] + "\n\nSource: AKC breed standard (2024)." + md[at:]
+    assert kind == "recommendation-after-the-bibliography"
+    start = md.index("**Final recommendation.**")
+    end = md.index("\n\n", start)
+    return md[:start] + md[end + 2:].rstrip() + "\n\n" + md[start:end] + "\n"
+
+
+def _citing(n):
+    """`n` paragraphs, each citing its own public page in its prose."""
+    return "".join(f"Finding {i} on the breed's hips is reported at "
+                   f"https://www.site{i}.org/paper{i} in full.\n\n" for i in range(n))
+
+
+MARKER_RE = re.compile(r"\[\\\[\d{1,3}\\\]\]\(")
 
 
 class TestExactlyOneSourcesSection:
@@ -521,6 +578,96 @@ class TestExactlyOneSourcesSection:
             "https://pubmed.ncbi.nlm.nih.gov/28770095/",
             "https://en.wikipedia.org/wiki/Hip_dysplasia_(canine)",
         ]
+
+    @pytest.mark.parametrize("kind", ["caption-under-the-ledger",
+                                      "bold-titled-with-a-caption"])
+    def test_a_caption_in_the_real_file_removes_nothing_but_the_bibliography(
+            self, run, kind):
+        """⛔⛔ REVIEW BLOCKER, 2026-10-01. A paragraph led by "Source:" opened
+        the report's "own sources section", which ran to the end of the file and
+        was cut: one caption under the evidence ledger took 5,566 characters,
+        "**Final recommendation.**" with them, and in the bold-titled shape a
+        caption after the first table took 84% of the report. Only the
+        bibliography goes now; every byte before it stays."""
+        md = _chatgpt_0930_variant(kind)
+        run.poll("chatgpt", CHATGPT_TRACKED)
+        local = run.write("ChatGPT", md[len(CHATGPT_HEADER):])
+        assert local == md[:md.index(BIBLIOGRAPHY)].rstrip() + TAIL + CHATGPT_ROWS
+        assert "**Final recommendation.**" in local
+        assert sources_sections(local) == ["##### Sources"]
+
+    def test_a_bibliography_the_report_goes_on_after_is_never_cut(self, run):
+        """⛔⛔ The same blocker's third shape: the real file with its "**Final
+        recommendation.**" after the bibliography. The bibliography is not the
+        trailing section any more, so nothing is removed and ours is added after
+        the report — two sections in this shape, and that is the price of never
+        cutting a report: losing the recommendation is worse."""
+        md = _chatgpt_0930_variant("recommendation-after-the-bibliography")
+        assert md.rstrip().endswith("contingency plans before they are needed.")
+        run.poll("chatgpt", CHATGPT_TRACKED)
+        local = run.write("ChatGPT", md[len(CHATGPT_HEADER):])
+        assert local == md.rstrip() + TAIL + CHATGPT_ROWS
+
+    @pytest.mark.parametrize("caption", [
+        "Source: OFA registry, 2024.", "**Source:** OFA registry, 2024.",
+        "Sources: OFA registry, 2024.", "**Sources:** OFA registry, 2024."])
+    @pytest.mark.parametrize("head", ["## Health", "**Health.**"])
+    @pytest.mark.parametrize("n", [3, 6])
+    @pytest.mark.parametrize("visited", [None, ["https://www.akc.org/dog-breeds/"]],
+                             ids=["no-visited", "visited"])
+    def test_a_caption_never_stops_the_citations_after_it_being_numbered(
+            self, caption, head, n, visited, monkeypatch):
+        """⛔ REVIEW, 2026-10-01 (the blocker's other face). With the caption as
+        the start of an "own section", every address cited after it counted as
+        LISTED: no number, and its links kept the list out — a report citing
+        public pages ended with no sources at all. Each citation keeps its number
+        and its row, and not a byte of the report goes."""
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        md = (CHATGPT_HEADER + head + "\n\n| Test | Result |\n|---|---|\n| Hips | Fair |\n\n"
+              + caption + "\n\n" + _citing(n))
+        out = research._document_with_sources(md, visited=visited, label="ChatGPT")
+        assert len(MARKER_RE.findall(out)) == n
+        rows = n + (1 if visited and n < 5 else 0)
+        assert out.count(TAIL) == 1
+        assert len(re.findall(r"^\d+\. \[", out.split(TAIL)[1], re.M)) == rows
+        assert research._document_without_sources(out) == md.rstrip()
+
+    @pytest.mark.parametrize("own", [
+        "**Cited-source bibliography.** The principal sources.\n\n**Health:** OFA; AKC.\n",
+        "## References\n\n1. OFA hip registry.\n2. AKC breed standard.\n",
+        "## Sources\n\n- BNEF, *Battery pack price survey*\n",
+    ], ids=["bold-bibliography", "references-heading", "sources-heading-titles"])
+    @pytest.mark.parametrize("visited", [None, ["https://www.akc.org/dog-breeds/"]],
+                             ids=["no-visited", "visited"])
+    def test_a_report_citing_five_sources_also_ends_with_one_section(
+            self, own, visited, monkeypatch):
+        """⛔ REVIEW, 2026-10-01. Five citations of its own, so no visited site is
+        added — and the cut used to run only when one was, so the report's own
+        link-less section stayed above our numbered list: two sections. It is
+        replaced whenever a list is added, visited sites or not."""
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        body = CHATGPT_HEADER + "## Findings\n\n" + _citing(5)
+        out = research._document_with_sources(body + own, visited=visited, label="ChatGPT")
+        assert sources_sections(out) == ["##### Sources"]
+        assert len(MARKER_RE.findall(out)) == 5
+        assert len(re.findall(r"^\d+\. \[", out, re.M)) == 5
+        assert research._document_without_sources(out) == body.rstrip()
+
+    def test_two_citations_and_a_linkless_references_line_end_with_one_section(
+            self, monkeypatch):
+        """Two citations of its own and a final "**References:** AKC; OFA." with
+        no link: the cut and the visited rows run together. The line is replaced,
+        and the one list holds the two cited rows first, then the visited site.
+        ⛔ The own section's links are read from THAT section: the prose's two
+        links must not count as the section holding links."""
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        body = CHATGPT_HEADER + "## Findings\n\n" + _citing(2)
+        out = _with_visited(body + "**References:** AKC; OFA.\n")
+        assert sources_sections(out) == ["##### Sources"]
+        assert re.findall(r"^\d+\. \[[^\]]*\]\(([^)]+)\)", out, re.M) == [
+            "https://www.site0.org/paper0", "https://www.site1.org/paper1",
+            "https://www.akc.org/dog-breeds/"]
+        assert research._document_without_sources(out) == body.rstrip()
 
     def test_the_real_0930_claude_document_is_byte_identical(self, run):
         """⛔⛔ Claude's own "## Sources" holds 76 links: it is the one list, and
@@ -554,7 +701,14 @@ class TestExactlyOneSourcesSection:
         "## Key sources\n\n- https://www.akc.org/dog-breeds/german-shepherd-dog/\n"
         "- https://pubmed.ncbi.nlm.nih.gov/28770095/\n",
         "References: https://www.akc.org/dog-breeds/german-shepherd-dog/\n",
-    ], ids=["bold-references-links", "key-sources-links", "plain-references-link"])
+        # Claude's shape: its own numbered "## Sources" of links, fewer than five
+        "## Sources\n\n1. [AKC](https://www.akc.org/dog-breeds/german-shepherd-dog/)\n"
+        "2. [OFA](https://www.ofa.org/diseases/hip-dysplasia/)\n",
+        # a bibliography lead whose entries are links
+        "**Works cited**\n\nAKC. https://www.akc.org/dog-breeds/german-shepherd-dog/\n\n"
+        "OFA. https://www.ofa.org/diseases/hip-dysplasia/\n",
+    ], ids=["bold-references-links", "key-sources-links", "plain-references-link",
+            "claude-shaped-sources", "works-cited-link-paragraphs"])
     def test_an_own_section_holding_links_is_untouched(self, own, monkeypatch):
         """Fewer than five links, so only its being the report's own section with
         a public link keeps the visited list out — and nothing is replaced."""
@@ -573,13 +727,58 @@ class TestExactlyOneSourcesSection:
         BODY + "\nReferences to the breed standard: the FCI wrote it in 1899.\n",
         BODY + "\nThe breed club publishes its data openly; see its\n"
         "**Selected references** page for the full list.\n",
+        BODY + "\nThe breed club publishes its data openly; it says\n"
+        "**Selected references:** the club's page lists them all.\n",
+        # ⛔⛔ the review blocker's shapes: each used to delete itself and
+        # everything after it
+        BODY + "\n**References:** ask the breeder for two previous puppy buyers.\n"
+        "\n**Contract:** get the return clause in writing.\n",
+        BODY + "\nReferences: ask the breeder for two previous buyers.\n"
+        "\nInsurance: get a quote before pickup.\n",
+        BODY + "\n1. Health: ask for the OFA results.\n"
+        "\n2. References: ask for two previous buyers.\n"
+        "\n3. Insurance: get a quote before pickup.\n",
+        BODY + "\nReference: FCI standard No. 166.\n"
+        "\nThe breed was first shown in 1882.\n",
+        BODY + "\n**Selected references** from the club are worth reading.\n"
+        "\nThe club also runs health clinics.\n",
+        BODY + "\n**References:** ask the breeder for two previous puppy buyers:\n"
+        "\n- a name\n- a phone number\n",
+        BODY + "\n**Sources:**\n\n**Breeders:** the club's list.\n"
+        "\n**Rescues:** the regional shelter.\n",
+        BODY + "\n**Sources consulted**\n\nAKC breed page; OFA hip page.\n",
+        BODY + "\n**Cited-source bibliography.** The principal sources.\n"
+        "\n**Health:** OFA; AKC.\n\nThis report is not veterinary advice.\n",
+        BODY + "\n**Cited-source bibliography.** The principal sources.\n"
+        "\n**Health:** OFA; AKC.\n\n**Final recommendation.** A fine breed.\n",
+        # the last paragraph, and still no section: a singular caption under
+        # the report's last table, and bold emphasis in running prose
+        BODY + "\n| Test | Result |\n|---|---|\n| Hips | Fair |\n"
+        "\nSource: OFA registry, 2024.\n",
+        BODY + "\n**Selected references** from the club are worth reading.\n",
     ], ids=["sources-of-funding", "sources-mid-report", "bold-sources-mid-report",
-            "last-heading-sources-of", "plain-references-to", "bold-on-a-wrapped-line"])
+            "last-heading-sources-of", "plain-references-to", "bold-on-a-wrapped-line",
+            "lead-on-a-wrapped-line", "breeder-references-then-contract",
+            "plain-references-then-insurance", "numbered-references-in-a-loose-list",
+            "singular-reference", "selected-references-running-prose",
+            "references-line-then-a-list", "bare-sources-then-bold-labels",
+            "sources-consulted-then-prose", "bibliography-then-a-disclaimer",
+            "bibliography-then-a-recommendation", "table-caption-at-the-end",
+            "running-prose-bold-at-the-end"])
     def test_a_section_like_title_that_is_not_the_trailing_section_is_untouched(
             self, md, monkeypatch):
         """Only the TRAILING section, and only a title in the closed set. A
         section ABOUT sources, or a sources section with the report going on
-        after it, stays; ours is added at the end as for any report."""
+        after it, stays; ours is added at the end as for any report.
+
+        ⛔⛔ AND A PARAGRAPH LEAD NEVER CUTS THE REPORT (review blocker,
+        2026-10-01). Only a bold or plain lead in the PLURAL set counts, and the
+        section it opens must be nothing but source entries to the end of the
+        file — a list, a paragraph holding a link, or (after a lead naming a
+        bibliography) a "**Category:**" paragraph. A bare "References:" with words
+        after it must be the last paragraph. Anything else after it — prose, a
+        pseudo-heading such as "**Final recommendation.**", the checklist's
+        "**Contract:**" — and nothing is removed."""
         monkeypatch.setattr(research, "log", lambda *a, **k: None)
         assert _with_visited(md) == md.rstrip() + TAIL + ONE_ROW
 

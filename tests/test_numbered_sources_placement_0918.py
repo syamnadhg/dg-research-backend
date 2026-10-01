@@ -334,6 +334,11 @@ def test_the_number_sits_at_the_end_of_the_line_that_cites():
 
 # ── a report that brought its own bibliography ────────────────────────────────
 
+#: ⛔ CHANGED 2026-10-01: its own list holds the LINK. A link-less own list
+#: ("- BNEF, *Battery pack price survey*", as this read before) is now REPLACED
+#: by ours — the owner's rule is exactly one sources section — so the two tests
+#: below, which measure our list beside a list the report keeps, need one the
+#: report keeps. The link-less shape is pinned in the third test.
 OWN_SOURCES_REPORT = (
     "# ChatGPT Deep Research\n"
     "\n"
@@ -344,11 +349,26 @@ OWN_SOURCES_REPORT = (
     "\n"
     "## Sources\n"
     "\n"
-    "- BNEF, *Battery pack price survey*\n"
+    "- [BNEF, *Battery pack price survey*](https://bnef.example.com/packs)\n"
 )
 
 
 class TestOneSourcesHeadingPerDocument:
+    def test_a_linkless_own_list_is_replaced_by_ours(self):
+        """2026-10-01, the owner: exactly one sources section. A list of the
+        report's own that no reader can open is replaced by ours, which carries
+        the link — not kept above it under a second heading."""
+        md = OWN_SOURCES_REPORT.replace(
+            "- [BNEF, *Battery pack price survey*](https://bnef.example.com/packs)",
+            "- BNEF, *Battery pack price survey*")
+        assert md != OWN_SOURCES_REPORT
+        out = research._document_with_sources(md)
+        assert re.findall(r"(?im)^#{1,6}[ \t]+(sources\b.*)$", out) == ["Sources"]
+        assert SOURCES_TAIL in out and ALT_SOURCES_TAIL not in out
+        assert "Battery pack price survey" not in out
+        assert _body(out) == md[:md.index("\n\n## Sources")].replace(
+            "since.", "since [\\[1\\]](https://bnef.example.com/packs).")
+
     def test_a_report_that_ends_with_its_own_sources_gets_no_second_one(self):
         """⛔⛔ Deep-research reports commonly end with a source list, so this is
         the COMMON case, and it shows in the document, the share and the Google
@@ -366,7 +386,8 @@ class TestOneSourcesHeadingPerDocument:
         which is what `save_meta` then reads."""
         out = research._document_with_sources(OWN_SOURCES_REPORT)
         stripped = research._strip_numbered_sources_section(out)
-        assert stripped.endswith("- BNEF, *Battery pack price survey*")
+        assert stripped.endswith(
+            "- [BNEF, *Battery pack price survey*](https://bnef.example.com/packs)")
         assert "Numbered sources" not in stripped
         assert stripped == _body(out)
         assert "## Sources" in stripped
