@@ -625,22 +625,34 @@ def test_every_document_write_site_routes_through_the_numbering_funnel():
     against a fake Firestore), so `run_pipeline` keeps the two regen sites and
     the helper owns one. Splitting the key is the whole point of counting per
     function: had the helper's site been folded into the old total, deleting it
-    and adding a regen site would still have read as three."""
+    and adding a regen site would still have read as three.
+
+    ⭐ 2026-10-01 — the two regen re-saves go through `_p2_regenerated_document`
+    now (it adds the sites the agent visited, from the run's own list), so
+    `run_pipeline` counts that call twice and the helper owns the one numbering
+    call. `run_pipeline` still counts ZERO direct numbering calls, so a new write
+    site there fails this as before. The helper is executed in
+    `tests/test_doc_visited_sources_1001.py`."""
     from conftest import code_only_deep
 
     sites = {fn.__name__: code_only_deep(fn).count("_document_with_sources(")
              for fn in (research.run_pipeline, research._p2_persist_reports,
-                        research.run_phase2, research.extract_and_record_agent)}
+                        research.run_phase2, research.extract_and_record_agent,
+                        research._p2_regenerated_document)}
     assert sites == {
-        # the two regen re-saves
-        "run_pipeline": 2,
+        # no direct site: the two regen re-saves go through the helper below
+        "run_pipeline": 0,
         # the finalize re-save, which wave 10.9 moved out of run_pipeline
         "_p2_persist_reports": 1,
         # nothing: phase 2 records through extract_and_record_agent
         "run_phase2": 0,
         # the per-agent save, the site the executed test above drives
         "extract_and_record_agent": 1,
+        # the two regen re-saves' one numbering call
+        "_p2_regenerated_document": 1,
     }
+    # the two regen re-saves themselves
+    assert code_only_deep(research.run_pipeline).count("_p2_regenerated_document(") == 2
 
 
 @pytest.mark.parametrize("bad", [

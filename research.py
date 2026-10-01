@@ -23639,6 +23639,11 @@ class PipelineRuntime:
         # the markdown report is written for an agent. Shape:
         # { agent_key: list[{"url": str, "snippet": str, "sourceTitle": str}] }
         self.agent_findings: dict = {}
+        # 2026-10-01: every public site the poll loop saw each agent visit, in
+        # the order first seen, never shrinking (`_p2_fold_visited_sources`).
+        # A report that cites almost nothing ends with it. Shape:
+        # { agent_key: list[str] }
+        self.agent_visited_sources: dict = {}
         # P2 → P3 handoff state. Populated at end of P2 (and as resume-safety
         # fallback at start of P3) by _build_phase2_to_phase3_handoff. P3
         # consumes these instead of doing its own per-agent reconciliation —
@@ -46519,7 +46524,11 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # ⭐ Wave 10 — the numbers a reader clicks. BEFORE both writes, so
             # the local .md, the Firestore mirror the Documents page renders and
             # the NotebookLM upload all carry the same bibliography.
-            md_content = _document_with_sources(md_content, findings=_findings)
+            # ⭐ 2026-10-01 — and a report that cites (almost) nothing ends with
+            # the sites this agent was seen visiting during the run.
+            md_content = _document_with_sources(
+                md_content, findings=_findings,
+                visited=_p2_visited_sources(agent_key), label=name)
             (documents_dir / fname).write_text(md_content, encoding="utf-8")
             local_saved = True
             log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
@@ -52374,6 +52383,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "partial_text_len": int(_partial_text_len or 0),
                         "current_focus": str(progress.get("progress", "") or "")[:200],
                     }
+                except Exception:
+                    pass
+                # ⭐ 2026-10-01 — and the run's own list of the sites this agent
+                # visited, which the snapshot above cannot be: it is replaced
+                # every time, and ChatGPT's panel reads empty once the report is
+                # up. A report that cites nothing ends with this list.
+                try:
+                    _p2_fold_visited_sources(agent_key, progress)
                 except Exception:
                     pass
 
@@ -75841,6 +75858,13 @@ _DOC_SOURCES_BLOCK_RE = re.compile(
     r'\n\n(?:%s|##)[ \t]+(?:%s|%s)[ \t]*\n\n(?:\d{1,3}\. \[.*\n?)+\Z'
     % ("#" * _DOC_SOURCES_HEADING_LEVEL,
        re.escape(_DOC_SOURCES_ALT_TITLE), re.escape(_DOC_SOURCES_TITLE)))
+#: The same tail with no marker in the document: the visited-sites list a
+#: document that cited nothing ends with. Our current level only, either title
+#: (the alternate when it follows the report's own list of titles).
+_DOC_VISITED_BLOCK_RE = re.compile(
+    r'\n\n%s[ \t]+(?:%s|%s)[ \t]*\n\n(?:\d{1,3}\. \[.*\n?)+\Z'
+    % ("#" * _DOC_SOURCES_HEADING_LEVEL,
+       re.escape(_DOC_SOURCES_ALT_TITLE), re.escape(_DOC_SOURCES_TITLE)))
 
 
 def _doc_sources_heading(title: str) -> str:
@@ -75987,6 +76011,355 @@ def _doc_sources_row(n: int, url: str, title: str) -> str:
                                _doc_markdown_url(url), tail)
 
 
+# ── THE SITES AN AGENT VISITED, WHEN ITS DOCUMENT CITES NONE (2026-10-01) ─────
+#
+# Owner, 2026-09-30, about to publish: "ChatGPT's documents wouldn't end with the
+# sources, even the Super Research ChatGPT documents. It needs to be fixed right
+# away in this release." Measured on that run: chatgpt.md and gemini.md held no
+# link at all — ChatGPT's export writes its citations as token runs that are
+# stripped, and Gemini's are numbered buttons — while the run had watched ChatGPT
+# open 68 pages and Gemini 90. The numbering above works from what a document
+# CITES, so a document citing nothing got no list.
+#
+# ⭐ THE RULE. A document that cites fewer than `_DOC_VISITED_MIN_CITED` public
+# sources itself, and does not already end with a sources list of its own, ends
+# with "Sources": the sources it does cite first (numbered in the prose exactly
+# as before), then every other site the agent visited, from the run's own
+# tracking, in the order first seen, one link per line. A document citing more
+# keeps exactly what it had, and Claude's, which ends with its own list, is never
+# touched.
+#
+# ⛔⛔ ONLY PUBLIC PAGES, AND THIS IS THE PART THAT MATTERS MOST. The tracking is
+# read from the agents' own signed-in browsers: it can hold the chat the report
+# was written in, the sandbox frame the report renders in, a sign-in page, a
+# search page, a Google redirect carrying the real address in its query, the
+# owner's own Drive file. `_doc_public_source_url` is the one gate. It reuses
+# `_is_platform_host` (THE one list of the agents' own pages) and the F4 deny
+# list, and adds only what those two do not judge. ⛔ It does NOT add to
+# `_HOST_DENYLIST`: that list is inlined byte for byte into ten page scripts
+# (`_js_platform_guard`), and sign-in and search pages are not the agents' own.
+
+#: Fewer citations than this and the document ends with the sites the agent
+#: visited. Five, because the measured failures cite none at all, and a report
+#: that links a couple of stray addresses is still a report whose sources
+#: nobody can see.
+_DOC_VISITED_MIN_CITED = 5
+
+#: Query keys that only say how a reader arrived. They come off a listed address.
+_DOC_TRACKING_PARAM_RE = re.compile(
+    r'^(?:utm_.*|gclid|gclsrc|dclid|gbraid|wbraid|fbclid|msclkid|yclid|igshid'
+    r'|mc_cid|mc_eid|_ga|_gl|_hsenc|_hsmi|mkt_tok|ref|ref_src|ref_url|srsltid)$',
+    re.IGNORECASE)
+#: Query keys that carry a session or a secret. An address holding one is never
+#: listed at all — taking the key off would still leave a page that only opened
+#: for whoever held it.
+_DOC_SECRET_PARAM_RE = re.compile(
+    r'^(?:token|access_token|id_token|refresh_token|auth|auth_token|authtoken'
+    r'|session|sessionid|session_id|sid|jsessionid|phpsessid|sig|signature'
+    r'|x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature'
+    r'|x-goog-credential|apikey|api_key|access_key|password|passwd|pwd|otp|jwt'
+    r'|ticket|client_secret|rlkey)$', re.IGNORECASE)
+#: A value that is a JSON web token, whatever its key is called.
+_DOC_JWT_VALUE_RE = re.compile(r'eyJ[\w-]{6,}\.[\w-]{6,}\.')
+#: The first label of a sign-in host: login.live.com, signin.aws.amazon.com …
+_DOC_SIGNIN_HOST_LABELS = frozenset({
+    "login", "signin", "accounts", "auth", "sso", "consent"})
+#: A path segment that is a sign-in, sign-up or account-settings page
+#: (platform.openai.com/settings/… is an account page; /docs/… beside it is not).
+_DOC_SIGNIN_PATH_SEGMENTS = frozenset({
+    "login", "signin", "sign-in", "sign_in", "log-in", "logon", "signup",
+    "sign-up", "sso", "authorize", "settings", "account", "billing", "api-keys"})
+#: Hosts that are somebody's own files, mail, workspace or console — never a
+#: public page. Matched on a label boundary, like `_is_platform_host`.
+#: ⭐ 2026-10-01 review: Gemini can read Workspace (Chat, Drive, Gmail) and
+#: ChatGPT its connectors (Atlassian, Notion, Box …), so a tracked list can hold
+#: pages only the owner's account opens. The user-content hosts not already in
+#: `_doc_link_is_private` (Claude's, Google's download and frame hosts) are here.
+_DOC_PRIVATE_HOSTS = (
+    "mail.google.com", "docs.google.com", "drive.google.com",
+    "calendar.google.com", "myaccount.google.com", "photos.google.com",
+    "keep.google.com", "contacts.google.com", "studio.youtube.com",
+    "outlook.live.com", "outlook.office.com", "outlook.office365.com",
+    "onedrive.live.com", "sharepoint.com", "app.slack.com",
+    # Google account, workspace and console pages
+    "chat.google.com", "script.google.com", "myactivity.google.com",
+    "takeout.google.com", "passwords.google.com", "payments.google.com",
+    "pay.google.com", "admin.google.com", "one.google.com", "meet.google.com",
+    "console.cloud.google.com", "console.firebase.google.com",
+    "lookerstudio.google.com", "datastudio.google.com", "analytics.google.com",
+    "aistudio.google.com",
+    # the platforms' user-content and download hosts
+    "usercontent.google.com", "usercontent.goog", "claude.site",
+    "claudeusercontent.com",
+    # other mail, workspace and file apps
+    "mail.yahoo.com", "mail.proton.me", "atlassian.net", "slack.com",
+    "notion.so", "linear.app", "app.hubspot.com", "app.box.com",
+    "teams.microsoft.com", "teams.live.com", "app.asana.com")
+#: A last label no public name ends with: reserved and in-house names
+#: (`intranet.corp`, `printer.lan`), so a host there is somebody's own network.
+_DOC_PRIVATE_SUFFIXES = (
+    ".localhost", ".local", ".internal", ".lan", ".home.arpa", ".home", ".corp",
+    ".intranet", ".private", ".localdomain", ".test", ".example", ".invalid")
+#: A search engine's own host. Everything it serves is a results page, a
+#: redirect, or its own furniture (Gemini's page links google.<tld>/intl/…/about).
+_DOC_SEARCH_HOST_RE = re.compile(
+    r'^(?:google\.[a-z]{2,3}(?:\.[a-z]{2})?|bing\.com|duckduckgo\.com'
+    r'|html\.duckduckgo\.com|search\.yahoo\.com|yandex\.[a-z]{2,3}|baidu\.com'
+    r'|search\.brave\.com|ecosia\.org|startpage\.com|search\.aol\.com)$')
+#: A site's own search page: `/search?q=…`, `/results?search_query=…`, `/?term=…`.
+_DOC_SEARCH_QUERY_KEYS = frozenset({
+    "q", "query", "search_query", "term", "keyword", "keywords", "search"})
+
+
+def _doc_unwrap_redirect(url: str) -> str:
+    """The address a Google redirect (`google.<tld>/url?q=…`) points at, or "".
+
+    Only Google's, because that is the one the agents' pages are measured to
+    carry; anything else on a search host is dropped by the search-host rule."""
+    try:
+        from urllib.parse import urlsplit, parse_qsl
+        s = urlsplit(url)
+        host = (s.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if not re.match(r'google\.[a-z]{2,3}(?:\.[a-z]{2})?\Z', host):
+            return ""
+        if s.path not in ("/url", "/imgres"):
+            return ""
+        q = dict(parse_qsl(s.query, keep_blank_values=True))
+        for key in ("q", "url", "imgrefurl"):
+            target = (q.get(key) or "").strip()
+            if re.match(r'https?://', target, re.IGNORECASE):
+                return target
+    except Exception:
+        return ""
+    return ""
+
+
+def _doc_public_source_url(u) -> str:
+    """The address as it may be LISTED in a document, or "" when it must not be.
+
+    Public http(s) pages only: never the agents' own pages, a sign-in or account
+    page, a search page, somebody's own files, a local or private address, or an
+    address carrying a session or a secret. A Google redirect is followed to the
+    page it names. Tracking keys and the fragment come off. Idempotent — a
+    cleaned address cleans to itself — so it is safe at every step."""
+    if not isinstance(u, str):
+        return ""
+    t = u.strip()
+    for _hop in range(3):
+        target = _doc_unwrap_redirect(t)
+        if not target:
+            break
+        t = target
+    if not _doc_is_linkable_url(t):
+        return ""
+    # The document scrub's own test: a platform's user-content file or sandbox
+    # frame, a conversation or notebook path, a data:/blob: address.
+    if _doc_link_is_private(t):
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit, unquote, parse_qsl
+        s = urlsplit(t)
+        host = (s.hostname or "").lower().rstrip(".")
+        if not host or s.username or s.password:
+            return ""
+        bare = host[4:] if host.startswith("www.") else host
+        # ⛔ An address, not a name — and `127.1` or `0x7f.1` is loopback to a
+        # browser while `ipaddress` refuses to read it. No public page is listed
+        # by number: a host whose last label is a number goes here, and an IPv6
+        # address (no dot) with the dotless names just below.
+        last_label = bare.rsplit(".", 1)[-1]
+        if last_label.isdigit() or last_label.startswith("0x"):
+            return ""
+        if (bare == "localhost" or "." not in bare
+                or bare.endswith(_DOC_PRIVATE_SUFFIXES)):
+            return ""
+        if _matches_security_deny_host(bare):
+            return ""
+        if any(bare == d or bare.endswith("." + d) for d in _DOC_PRIVATE_HOSTS):
+            return ""
+        if bare.split(".", 1)[0] in _DOC_SIGNIN_HOST_LABELS:
+            return ""
+        if _DOC_SEARCH_HOST_RE.match(bare):
+            return ""
+        if re.match(r'scholar\.google\.', bare) and s.path.startswith("/scholar"):
+            return ""
+        if ";jsessionid=" in s.path.lower():
+            return ""
+        segments = [seg.lower() for seg in s.path.split("/") if seg]
+        if any(seg in _DOC_SIGNIN_PATH_SEGMENTS for seg in segments):
+            return ""
+        kept, keys = [], set()
+        for pair in (s.query.split("&") if s.query else []):
+            if not pair:
+                continue
+            key = unquote(pair.split("=", 1)[0]).strip().lower()
+            value = unquote(pair.split("=", 1)[1]) if "=" in pair else ""
+            if _DOC_SECRET_PARAM_RE.match(key) or _DOC_JWT_VALUE_RE.search(value):
+                return ""
+            if _DOC_TRACKING_PARAM_RE.match(key):
+                continue
+            keys.add(key)
+            kept.append(pair)
+        last = segments[-1] if segments else ""
+        if (last in ("search", "results") or not segments) and (
+                keys & _DOC_SEARCH_QUERY_KEYS):
+            return ""
+        # ⛔ A WRAPPER IS ONLY AS PUBLIC AS WHAT IT WRAPS. A translate, archive or
+        # redirect address carries another address in its path or query
+        # (`translate.google.com/translate?u=https://docs.google.com/…`), and the
+        # listed link opens that page. Every address inside must pass this gate
+        # too, or the wrapper goes.
+        inner = []
+        path = unquote(s.path)
+        at = re.search(r'https?:/', path, re.IGNORECASE)
+        if at:
+            inner.append(path[at.start():])
+        for _k, v in parse_qsl("&".join(kept), keep_blank_values=True):
+            m = re.search(r'https?://\S+', v, re.IGNORECASE)
+            if m:
+                inner.append(m.group(0))
+        for i in inner:
+            if not _doc_public_source_url(re.sub(r'^(https?:/)(?!/)', r'\1/', i)):
+                return ""
+        return urlunsplit((s.scheme.lower(), s.netloc, s.path, "&".join(kept), ""))
+    except Exception:
+        return ""
+
+
+def _doc_fold_sources(rows, items) -> list:
+    """`rows` with every new public address in `items` appended, first seen first.
+
+    `items` may hold plain addresses or `{url, …}` rows (the panels' shape).
+    Deduplicated on `_find_normalize_url` of the CLEANED address, so a redirect
+    and the page it names, or a tagged and an untagged copy, are one site.
+    Capped at `_SOURCE_LIST_CAP`."""
+    out = list(rows or [])
+    seen = {_find_normalize_url(r) for r in out}
+    for it in items or []:
+        if len(out) >= _SOURCE_LIST_CAP:
+            break
+        raw = it.get("url") if isinstance(it, dict) else it
+        clean = _doc_public_source_url(raw)
+        if not clean:
+            continue
+        k = _find_normalize_url(clean)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(clean)
+    return out
+
+
+def _p2_fold_visited_sources(agent_key, progress) -> None:
+    """Add what this check tracked to the run's list of sites the agent visited.
+
+    ⛔⛔ THE LIST NEVER SHRINKS, AND THAT IS WHY IT EXISTS. The progress snapshot
+    is THIS check's view: on 2026-09-30 ChatGPT's activity panel listed 68
+    sites while the research ran and nothing once the report was up, so the
+    snapshot the document is written from had none left. Called wherever the
+    snapshot is written, from the same `progress`."""
+    if not agent_key or not isinstance(progress, dict):
+        return
+    store = getattr(_runtime, "agent_visited_sources", None)
+    if not isinstance(store, dict):
+        store = {}
+        try:
+            _runtime.agent_visited_sources = store
+        except Exception:
+            return
+    store[agent_key] = _doc_fold_sources(
+        store.get(agent_key),
+        list(progress.get("source_urls") or []) + list(progress.get("source_items") or []))
+
+
+def _p2_visited_sources(agent_key) -> list:
+    """Every public site the run saw this agent visit: the run's own list, then
+    anything the latest snapshot holds that it lacks (a read made at the finish
+    lands only there)."""
+    rows = (getattr(_runtime, "agent_visited_sources", None) or {}).get(agent_key) or []
+    snap = (getattr(_runtime, "agent_progress_snapshots", None) or {}).get(agent_key) or {}
+    return _doc_fold_sources(
+        rows, list(snap.get("source_urls") or []) + list(snap.get("source_items") or []))
+
+
+def _doc_visited_label(url: str) -> str:
+    """A visited site's link text: its host and path, as a reader would type it.
+
+    ⛔ NOT THE PANEL'S ANCHOR TEXT. ChatGPT's panel links read "Open source",
+    and a list of sixty identical names tells a reader nothing — the defect
+    `_doc_sources_row` records for headings. Nor the bare host: five pages of
+    one journal would read as one name five times."""
+    try:
+        from urllib.parse import urlsplit
+        s = urlsplit(url)
+        label = _doc_source_host(url) + s.path.rstrip("/")
+        if s.query:
+            label += "?" + s.query
+    except Exception:
+        label = ""
+    if len(label) > 100:
+        label = label[:99].rstrip() + "…"
+    return label or url
+
+
+def _doc_visited_row(n: int, url: str) -> str:
+    """One visited-site line, in the bibliography's own row shape (`n. [`), so
+    both strips — ours and the web's `MACHINE_SOURCES_TAIL_RE` — take it off."""
+    return "%d. [%s](%s)" % (n, _doc_escape_link_text(_doc_visited_label(url)),
+                             _doc_markdown_url(url))
+
+
+def _doc_cited_public_keys(masked: str) -> set:
+    """The public sources a document cites itself, as comparison keys."""
+    keys = set()
+    for m in _FIND_BARE_URL_RE.finditer(masked or ""):
+        clean = _doc_public_source_url(_find_trim_trailing_punct(m.group(0)))
+        if clean:
+            keys.add(_find_normalize_url(clean))
+    return keys
+
+
+def _doc_plain_parens(u: str) -> str:
+    """An address with its brackets written plainly — `_doc_markdown_url` undone."""
+    return re.sub(r'%29', ')', re.sub(r'%28', '(', u or "", flags=re.IGNORECASE),
+                  flags=re.IGNORECASE)
+
+
+#: One row of our sources list: its number and its LINK TARGET. Never its text:
+#: a visited row's text is the address as typed, and an address inside an
+#: archive or translate link would be read out of it as a source of its own.
+_DOC_LIST_ROW_RE = re.compile(
+    r'^(\d{1,3})\. \[(?:\\.|[^\]\\])*\]\((https?://[^()\s]+)\)', re.MULTILINE)
+#: Our inline marker's number.
+_DOC_MARK_NUMBER_RE = re.compile(r'\[\\\[(\d{1,3})\\\]\]\(')
+
+
+def _doc_listed_visited_sources(raw: str, content: str) -> list:
+    """The visited sites our list adds to a document: the rows numbered past the
+    last inline marker, read from the tail `_strip_numbered_sources_section`
+    took off (`raw[len(content):]`).
+
+    ⛔ PAST THE LAST MARKER, NOT "ONLY WHEN THERE IS NO MARKER". A report citing
+    one to four sources itself ends with those rows AND the visited ones in one
+    list; reading the tail only for a document with no marker left the visited
+    rows out of `sourceUrls` exactly then. The cited rows (1 … last marker) are
+    in the prose already. A document numbered before 2026-10-01 has no row past
+    its last marker, so it adds nothing."""
+    if not raw or len(content or "") >= len(raw):
+        return []
+    last = max((int(n) for n in _DOC_MARK_NUMBER_RE.findall(content or "")), default=0)
+    out = []
+    for m in _DOC_LIST_ROW_RE.finditer(raw[len(content or ""):]):
+        if int(m.group(1)) <= last:
+            continue
+        clean = _doc_public_source_url(m.group(2))
+        if clean:
+            out.append(clean)
+    return out
+
+
 #: A line that OPENS a block, so the line before it cannot be continued into it.
 #: ⛔⛔ WAVE 10 REPAIR. `_FIND_SENT_TAIL_RE` knows `[.!?]\s`, a blank line and a
 #: heading, and nothing about line or block structure — so in a bulleted list
@@ -76086,8 +76459,16 @@ def _doc_marker_position(md: str, masked: str, spans: list,
     return at if at > url_end else url_end
 
 
-def _number_document_sources(md: str, findings: list) -> str:
+def _number_document_sources(md: str, findings: list, visited=None,
+                             label: str = "") -> str:
     """Add an inline `[n]` link at each cited sentence, and a Sources list.
+
+    ⭐ 2026-10-01 — `visited` is the sites the run saw this agent visit
+    (`_p2_visited_sources`). A document that cites fewer than
+    `_DOC_VISITED_MIN_CITED` public sources itself and has no sources list of
+    its own ends with them, after its own numbered rows, in the same list.
+    `label` names the agent in the one log line that says so. Without
+    `visited` the output is exactly what it always was.
 
     ⛔⛔ THE SENTENCE IS A BLOCK'S SENTENCE — see `_doc_marker_position`. A bullet,
     a numbered item and a table cell each END one, whether or not they close with
@@ -76110,14 +76491,20 @@ def _number_document_sources(md: str, findings: list) -> str:
     Returns the markdown unchanged when there is nothing to number, and when it
     has been numbered already — and says so in the log when it bails, which is
     how an echoed marker would be noticed next time."""
-    if not md or not findings:
+    if not md or not (findings or visited):
         return md or ""
-    if _DOC_SOURCE_MARK_RE.search(md):
+    # ⛔ 2026-10-01 — THE VISITED LIST IS THE SENTINEL WHEN THERE IS NO MARKER.
+    # A document that cited nothing carries no marker, so without this a second
+    # pass read one of our own rows as a citation: it numbered the row in place
+    # and appended a second list under it — the "bibliography becomes findings"
+    # trap, one pass later.
+    if _DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md):
         # ⛔ NOT SILENT ANY MORE. This is the normal answer on a re-save of a
         # document we already numbered, so it is DEBUG rather than a warning —
         # but the one thing that must never happen again is this firing on an
         # agent report that merely echoed a marker and nobody knowing.
-        log("numbered sources: document already carries markers, left as it is",
+        log("numbered sources: document already carries markers or its sources "
+            "list, left as it is",
             "DEBUG")
         return md
     masked, spans = _mask_code_spans(md)
@@ -76140,7 +76527,7 @@ def _number_document_sources(md: str, findings: list) -> str:
     doc_end = len(md.rstrip())
     placements: list = []
     seen: set = set()
-    for f in findings:
+    for f in findings or []:
         if not isinstance(f, dict):
             continue
         url = (f.get("url") or "").strip()
@@ -76160,7 +76547,30 @@ def _number_document_sources(md: str, findings: list) -> str:
         # newline has no tail to find and `doc_end` is the answer.
         at = _doc_marker_position(md, masked, spans, url_end, doc_end)
         placements.append((at, url_end, url, _doc_source_title(f, url)))
-    if not placements:
+    # ⭐ 2026-10-01 — the sites the agent visited, for a document that cites
+    # (almost) none itself. ⛔ Never after a report's own sources list that
+    # holds addresses: that list is the one list (Claude's). A report's own list
+    # of bare TITLES is no list a reader can open — Gemini's copy ends "Works
+    # cited" with the links gone — so ours follows it, under the alternate title.
+    # (A document already ending with our list was returned as it is, above.)
+    extra: list = []
+    own_links = own_at is not None and bool(_doc_cited_public_keys(masked[own_at:]))
+    if visited and not own_links:
+        cited = len(_doc_cited_public_keys(masked))
+        if cited < _DOC_VISITED_MIN_CITED:
+            listed = [_doc_public_source_url(p[2]) or p[2] for p in placements]
+            extra = _doc_fold_sources(listed, visited)[len(listed):]
+            if extra:
+                who = label or "the agent"
+                if cited:
+                    log(f"[{who}] the document cites only {cited} source"
+                        f"{'' if cited == 1 else 's'} itself (fewer than "
+                        f"{_DOC_VISITED_MIN_CITED}) — ending it with the "
+                        f"{len(extra)} other sites {who} visited")
+                else:
+                    log(f"[{who}] the document cites no sources itself — ending "
+                        f"it with the {len(extra)} sites {who} visited")
+    if not placements and not extra:
         if own_at is not None:
             log("numbered sources: every source is only in the report's own "
                 "sources list — that list stays the one list", "DEBUG")
@@ -76173,7 +76583,8 @@ def _number_document_sources(md: str, findings: list) -> str:
         lead = "" if at <= 0 or md[at - 1].isspace() else " "
         out = out[:at] + lead + _doc_source_marker(i + 1, url) + out[at:]
     rows = "\n".join(
-        _doc_sources_row(i + 1, p[2], p[3]) for i, p in enumerate(placements))
+        [_doc_sources_row(i + 1, p[2], p[3]) for i, p in enumerate(placements)]
+        + [_doc_visited_row(len(placements) + j + 1, u) for j, u in enumerate(extra)])
     heading = _doc_sources_heading(
         _DOC_SOURCES_ALT_TITLE if own_at is not None else _DOC_SOURCES_TITLE)
     return "%s\n\n%s\n\n%s\n" % (out.rstrip(), heading, rows)
@@ -76197,8 +76608,16 @@ def _strip_numbered_sources_section(md: str) -> str:
     so the `^#{1,3}` count above can no longer see it even if this strip failed.
     The strip still runs: `sections` is built from the stripped text and our rows
     would otherwise arrive as section titles."""
-    if not md or not _DOC_SOURCE_MARK_RE.search(md):
-        return md or ""
+    if not md:
+        return ""
+    if not _DOC_SOURCE_MARK_RE.search(md):
+        # ⭐ 2026-10-01 — the visited-sites list carries no inline marker (the
+        # document cited nothing), so it is recognised by its own shape: our
+        # level-five "Sources" heading and nothing after it but `n. [` rows.
+        # ⛔ Level five ONLY. An agent's own list is `##` (Claude's is), and a
+        # pattern that took `##` here, with no marker to prove the tail is ours,
+        # would eat it.
+        return _DOC_VISITED_BLOCK_RE.sub("", md)
     return _DOC_SOURCES_BLOCK_RE.sub("", md)
 
 
@@ -76244,7 +76663,8 @@ def _document_without_sources(md: str) -> str:
     return _DOC_SOURCE_MARK_INLINE_RE.sub("", _strip_numbered_sources_section(md))
 
 
-def _document_with_sources(md: str, source_urls=None, findings=None) -> str:
+def _document_with_sources(md: str, source_urls=None, findings=None,
+                           visited=None, label: str = "") -> str:
     """The write-site face: number `md`, extracting its findings if none given.
 
     ⛔ The findings are read from the CLEAN document. Every caller that has them
@@ -76252,13 +76672,33 @@ def _document_with_sources(md: str, source_urls=None, findings=None) -> str:
     round, the appended bibliography's own links become "findings", and the
     Findings tab fills with rows whose snippet is a bibliography line.
 
+    ⭐ 2026-10-01 — `visited` and `label` go through to the numbering: a
+    document that cites (almost) nothing ends with the sites the agent visited.
+    ⛔ They are never findings: a finding needs a sentence that cites it, and a
+    site the agent only opened has none.
+
     Never raises — an un-numbered document is a smaller loss than a lost one."""
     try:
         rows = findings if findings else _extract_findings(md, list(source_urls or []))
-        return _number_document_sources(md, rows or [])
+        return _number_document_sources(md, rows or [], visited=visited, label=label)
     except Exception as _nse:
         log(f"numbered sources skipped ({type(_nse).__name__})", "DEBUG")
         return md
+
+
+def _p2_regenerated_document(name: str, text: str, why: str) -> str:
+    """A report re-run after Phase 2 (resume with new input, or Retry at the
+    Phase-3 gate), as it is written: our header, then the text, numbered, and
+    ending with the sites the agent visited when it cites almost none.
+
+    ⛔ ONE LIST, HOWEVER THE TEXT ARRIVED. Fresh text carries none; text read
+    back for a kept agent had ours taken off (`_document_without_sources`); and
+    text that somehow still ends with it is left as it is — the numbering never
+    adds a second list after its own (`_DOC_VISITED_BLOCK_RE`)."""
+    key = (name or "").lower().replace(" ", "")
+    return _document_with_sources(
+        f"# {name} Deep Research ({why})\n\n{text}",
+        visited=_p2_visited_sources(key), label=name)
 
 
 def _run_started_ms(queue_dir) -> int:
@@ -76499,7 +76939,8 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None,
             # removes only a tail this machine wrote, and since the wave 10
             # repair that tail's heading is level FIVE, which the count below
             # cannot see at all — belt as well as braces.
-            content = _strip_numbered_sources_section(md_file.read_text(encoding="utf-8"))
+            _raw_doc = md_file.read_text(encoding="utf-8")
+            content = _strip_numbered_sources_section(_raw_doc)
             # Extract sections — markdown headings + bold standalone lines (ChatGPT style)
             # ⭐ Wave 4: a heading's image markup is not its title; an image-only
             # heading is no section. ⛔ Titled BEFORE the count, the dedupe and the
@@ -76540,6 +76981,14 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None,
             # (loopback, reserved names) because a URL not written is gone and
             # this list is capped and never revisited.
             urls = [u for u in _sweep_source_urls(content) if not _find_is_platform_host(u)]
+            # ⭐ 2026-10-01 — THE SITES THE AGENT VISITED, which a report citing
+            # fewer than five sources ends with. The strip above took them off
+            # with the rest of our tail, and they are this agent's sources: the
+            # ones the web's Super Research document numbers from `sourceUrls`.
+            # They follow the report's own citations. Read off the FILE, not the
+            # run's memory: this save also runs on the late phase-3 thread, after
+            # the globals have moved to the next run, and after a restart.
+            urls += _doc_listed_visited_sources(_raw_doc, content)
             # ⛔⛔ UNION WITH THE PANEL, NOT INSTEAD OF IT — AND THE OLD RULE HAD
             # ITS REASONING RIGHT AND ITS FAILURE CASE MISSING. The fallback below
             # writes the live panel's captures only for an agent with NO report,
@@ -76556,22 +77005,34 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None,
             # panel FOLLOWS, and it answers a different question — what the model
             # opened and did not cite. Neither can replace the other, and the
             # union cannot be empty unless both rungs were.
+            # ⭐ 2026-10-01 — PUBLIC PAGES ONLY, through the one gate the
+            # documents' sites list uses (`_doc_public_source_url`). The panel is
+            # read from a signed-in browser — the 09-30 Gemini list opened with
+            # Google's own products page — and the web numbers the Super Research
+            # document's sources from this field. Tracking keys come off too,
+            # which is what lets the web see one page cited by two agents as one.
             _panel_urls = []
             try:
-                _panel_urls = [
+                _panel_urls = _doc_fold_sources([], [
                     u for u in (getattr(_rt, "agent_progress_snapshots", {})
                                 .get(platform, {}) or {}).get("source_urls", []) or []
-                    if isinstance(u, str) and u.lower().startswith(("http://", "https://"))
-                    and not _find_is_platform_host(u)
-                ]
+                    if isinstance(u, str)
+                ])
             except Exception:
                 _panel_urls = []
             # ⛔ DEDUPED ON THE NORMALISED KEY, NOT THE RAW STRING. The panel row
             # and the report's own citation of one page differ by the tracking tag
             # the platform adds on the way out, so a raw dedupe lists the same
             # source twice and inflates the count the user is shown.
+            # ⛔ 2026-10-01 — AND ONE PAGE HAS ONE SPELLING. A link this machine
+            # writes has its brackets percent-encoded (`_doc_markdown_url`), so
+            # the inline markers and the visited rows say
+            # `Hip_dysplasia_%28canine%29` where the prose, the panel and the
+            # other agents say `(canine)`; neither this key nor the web's treats
+            # the two as one page. Every address is stored with plain brackets.
             _seen_keys, unique_urls = set(), []
             for _u in urls + _panel_urls:
+                _u = _doc_plain_parens(_u)
                 _k = _find_normalize_url(_u)
                 if _k in _seen_keys:
                     continue
@@ -77538,8 +77999,11 @@ async def _p2_persist_reports(results, queue_dir, topic, brief_text) -> None:
             except Exception:
                 _findings = []
             # ⭐ Wave 10 — numbered sources, on the same document both
-            # writes below carry.
-            _agent_md = _document_with_sources(_agent_md, findings=_findings)
+            # writes below carry (and, 2026-10-01, the visited sites when
+            # the report cites almost none — the same list as the first write).
+            _agent_md = _document_with_sources(
+                _agent_md, findings=_findings,
+                visited=_p2_visited_sources(_agent_lc), label=name)
             (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
             # Sync to Firestore documents subcollection — doc_type is the
             # agent key (chatgpt / gemini / claude), consistent with the
@@ -80851,8 +81315,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # ⭐ Wave 10 — a regenerated report is numbered like
                             # any other. No findings are in hand here, so they
                             # come from the report's own citations.
-                            _regen_md = _document_with_sources(
-                                f"# {name} Deep Research (regenerated)\n\n{r['text']}")
+                            _regen_md = _p2_regenerated_document(
+                                name, r["text"], "regenerated")
                             (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                             save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
                     # Build links from round-robin results — prefer in-app primary
@@ -80993,8 +81457,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if r.get("text"):
                         fname = name.lower().replace(" ", "") + ".md"
                         # ⭐ Wave 10 — numbered sources on the retry copy too.
-                        _regen_md = _document_with_sources(
-                            f"# {name} Deep Research (retry)\n\n{r['text']}")
+                        _regen_md = _p2_regenerated_document(name, r["text"], "retry")
                         (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                         save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
                 # Re-check gate using the same source scan helper.
