@@ -82,3 +82,13 @@ agent/uv.lock
 # away from committing the repo into itself, and this project has already pushed
 # a stray artefact to the org remote that way.
 org-stage/
+
+# .mutants/ is NOT ignored, on purpose — it is source, not tool output. Each
+# *_mutants.py is a mutation harness written alongside a fix: the source edits
+# that must break that fix's tests, and the tests that must catch each one. CI reads every
+# harness through tests/test_mutation_harness_anchors.py, which imports them and
+# fails unless more than 400 anchors are compared, so untracking the directory
+# turns the suite red. CI's ruff floor lints these files like any other source,
+# and that is wanted: a harness that cannot import measures nothing. The one
+# local artefact in there, the in-progress marker, is ignored by
+# .mutants/.gitignore.

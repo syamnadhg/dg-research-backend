@@ -460,9 +460,33 @@ def test_the_ask_never_blocks_the_run_and_never_raises():
     assert "try:" in _emit_event_src()[max(0, at - 200):at]
 
 
-def test_a_machine_with_no_credentials_still_runs():
+def test_a_machine_with_no_credentials_still_runs(monkeypatch):
     """⛔ An unpaired or revoked machine must skip the ask, not fail the phase.
-    The browser's own notifier remains the backstop."""
-    src = inspect.getsource(research._post_fe_phase_notice)
-    at = src.index("if not id_token:")
-    assert "return False" in src[at:at + 300]
+    The browser's own notifier remains the backstop.
+
+    Executed rather than read: the token is now fetched on the dispatch thread
+    (see test_pr4_review_1001.py), so the skip is a quiet return there — no
+    request goes out and nothing reaches the caller."""
+    import threading
+    import types
+
+    import requests
+
+    posts = []
+    monkeypatch.setattr(research, "_fresh_user_mode_id_token", lambda: None)
+    monkeypatch.setattr(research, "_is_incognito_research", lambda rid: False)
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    monkeypatch.setattr(requests, "post",
+                        lambda *a, **k: posts.append(k)
+                        or types.SimpleNamespace(status_code=200, text="{}"))
+
+    class _Inline:
+        def __init__(self, target=None, **kw):
+            self._t = target
+
+        def start(self):
+            self._t()
+    monkeypatch.setattr(threading, "Thread", _Inline)
+    research._post_fe_phase_notice("uid-1", "chat_1755500000000_3", 2,
+                                   "phase_complete", 7)
+    assert posts == [], "a machine with no token still sent the ask"

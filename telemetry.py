@@ -642,7 +642,17 @@ def _oldest_half_dropped(lines: "list[str]") -> "list[str]":
 
 
 def _trim_spool(path: Path) -> None:
-    """Bound one spool file: drop the OLDEST half and say so."""
+    """Bound one spool file: drop the OLDEST half and say so.
+
+    ⛔⛔ THE TRIM TAKES THE FILE BY RENAME FIRST, the way a flush claims one.
+    A flush in any process claims every spool it finds, a live sibling worker's
+    included. A read-then-rewrite that a claim landed in the middle of re-created
+    the file holding events that claim was already sending, so they went out
+    twice, in different batches the sink cannot match. Now whichever rename wins
+    owns the events: if the flush won, there is nothing here to trim; if the trim
+    won, the flush finds no file. The kept half is then APPENDED, so an event
+    recorded while the trim held the file is kept too; it just sits ahead of
+    the older lines, and each event carries its own seq."""
     global _dropped
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -650,14 +660,27 @@ def _trim_spool(path: Path) -> None:
         return
     if len(lines) <= SPOOL_MAX_LINES:
         return
-    keep = _oldest_half_dropped(lines)
-    dropped = len(lines) - len(keep)
-    _dropped += dropped
-    keep.append(json.dumps(
-        _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": dropped}}),
-        separators=(",", ":")))
+    taken = path.with_name(f"{path.name}.trim.{os.getpid()}.{threading.get_ident()}")
     try:
-        path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        os.replace(str(path), str(taken))
+        lines = taken.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return            # a flush claimed it first: every one of them is being sent
+    keep = lines
+    # What the rename took can be a newer, small file: a claim landed between
+    # the two reads and new events started a fresh one. Nothing in it is old.
+    if len(lines) > SPOOL_MAX_LINES:
+        keep = _oldest_half_dropped(lines)
+        dropped = len(lines) - len(keep)
+        _dropped += dropped
+        keep.append(json.dumps(
+            _envelope({"ev": int(Ev.TELEMETRY_DROPPED), "d": {"count": dropped}}),
+            separators=(",", ":")))
+    try:
+        if keep:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(keep) + "\n")
+        taken.unlink()
     except OSError:
         pass
 
@@ -685,6 +708,13 @@ def _claimed_pid(path: Path) -> "int | None":
     return int(match.group(1)) if match else None
 
 
+# Claimed files whose POST is still out, in THIS process — including one a flush
+# gave up waiting for at its deadline. `_adoptable` reads this so our own next
+# flush cannot post the same file again while that POST may still land.
+_IN_FLIGHT: "set[str]" = set()
+_in_flight_lock = threading.Lock()
+
+
 def _adoptable(path: Path) -> bool:
     """Is this claimed file abandoned rather than in flight?
 
@@ -692,7 +722,10 @@ def _adoptable(path: Path) -> bool:
     B's glob sees the claimed name and posts it too. Not data loss — the sink
     collapses byte-identical resends — but it doubles the traffic of the quietest
     thing in the product, for no reason. A file is adopted only once its owner is
-    gone."""
+    gone, and never while this process still has a POST out for it."""
+    with _in_flight_lock:
+        if str(path) in _IN_FLIGHT:
+            return False
     pid = _claimed_pid(path)
     if pid is None:
         return False
@@ -710,6 +743,14 @@ def _claim(path: Path) -> "Path | None":
     within a directory, so after this call the claimed file is ours alone and new
     appends land in a fresh `pending-*.jsonl`."""
     claimed = path.with_name(f"{path.stem}.sending.{os.getpid()}{path.suffix}")
+    # ⛔⛔ NEVER OVER A CLAIM OF OURS WHOSE POST IS STILL OUT. The claimed name is
+    # per PROCESS, so this rename would replace that file — and with it the
+    # events the late POST is carrying: lost outright if that POST then fails.
+    # Found by mutation, the day the late POST stopped re-spooling. The live
+    # spool waits for a flush after that POST has answered.
+    with _in_flight_lock:
+        if str(claimed) in _IN_FLIGHT:
+            return None
     try:
         os.replace(str(path), str(claimed))
         return claimed
@@ -809,9 +850,18 @@ def flush(post=None, deadline_sec: float = FLUSH_DEADLINE_SEC,
     ⛔ THE DEADLINE IS WALL-CLOCK, ON A DAEMON THREAD. `requests`' timeout does
     not bound `getaddrinfo`, and a machine with dead DNS can sit inside a name
     lookup far longer than any command should wait. So the POST runs on a thread
-    this function JOINS with a timeout — if it is still going, we abandon it and
-    the events stay owed. A telemetry flush must never be the reason a command
-    feels broken."""
+    this function JOINS with a timeout — if it is still going, we stop waiting
+    for it. A telemetry flush must never be the reason a command feels broken.
+
+    ⛔⛔ STOPPING WAITING IS NOT A FAILED DELIVERY. That POST can still land. Its
+    events used to go straight back into the spool, and the next flush sent them
+    again inside a DIFFERENT batch — which the sink's batch-hash de-duplication
+    cannot see, so they were stored twice. They now stay in the claimed file, which
+    nothing re-posts or renames over while the POST is out (`_IN_FLIGHT`; the live
+    spool it came from waits for a later flush), and the POST's own thread
+    settles them when it ends: deleted if it landed, merged back if it failed. If
+    the process exits first, the file is adopted later and re-sent as the SAME
+    batch, which the sink does collapse."""
     if not enabled():
         return 0
     sender = post or _post_batch
@@ -838,32 +888,63 @@ def flush(post=None, deadline_sec: float = FLUSH_DEADLINE_SEC,
             except OSError:
                 pass
             continue
-        ok = _post_with_deadline(sender, batch, deadline_sec)
-        if ok:
-            # Anything past the batch cap goes back in front of whatever arrived
-            # while we were delivering, rather than dying with the claimed file.
-            if owed:
-                _write_back(owed, path)
-            # ⛔ A crash between the 2xx and this unlink re-sends the batch. The
-            # route's document id is a hash of the events, so a byte-identical
-            # resend collapses onto the same document — at-least-once delivery
-            # with an idempotent sink, which is the honest guarantee.
+        key = str(claimed)
+        with _in_flight_lock:
+            _IN_FLIGHT.add(key)
+
+        def _settle_late(ok: bool, claimed=claimed, path=path, owed=owed,
+                         key=key) -> None:
             try:
-                claimed.unlink()
-            except OSError:
-                pass
+                _settle(ok, claimed, path, owed)
+            finally:
+                with _in_flight_lock:
+                    _IN_FLIGHT.discard(key)
+
+        ok = _post_with_deadline(sender, batch, deadline_sec, on_late=_settle_late)
+        if ok is None:
+            continue      # still out — its thread settles the file when it ends
+        with _in_flight_lock:
+            _IN_FLIGHT.discard(key)
+        if _settle(ok, claimed, path, owed):
             landed += len(batch)
-        else:
-            _merge_back(claimed, _unclaimed_name(path))
     return landed
 
 
-def _post_with_deadline(sender, batch: "list[dict]", deadline_sec: float) -> bool:
-    result: "list[bool]" = []
+def _settle(ok: bool, claimed: Path, path: Path, owed: "list[str]") -> bool:
+    """Finish one claimed file once its POST has answered. Returns `ok`."""
+    if ok:
+        # Anything past the batch cap goes back in front of whatever arrived
+        # while we were delivering, rather than dying with the claimed file.
+        # ⛔ Into the LIVE spool's name: for an adopted file `path` IS the claimed
+        # file, deleted two lines down, and everything past the cap went with it.
+        if owed:
+            _write_back(owed, _unclaimed_name(path))
+        # ⛔ A crash between the 2xx and this unlink re-sends the batch. The
+        # route's document id is a hash of the events, so a byte-identical
+        # resend collapses onto the same document — at-least-once delivery
+        # with an idempotent sink, which is the honest guarantee.
+        try:
+            claimed.unlink()
+        except OSError:
+            pass
+        return True
+    _merge_back(claimed, _unclaimed_name(path))
+    return False
+
+
+def _post_with_deadline(sender, batch: "list[dict]", deadline_sec: float,
+                        on_late=None) -> "bool | None":
+    """POST on a daemon thread, waiting at most `deadline_sec`.
+
+    True or False when the POST answered in time. None when it was still going at
+    the deadline: then `on_late(ok)` is called from the POST's own thread once it
+    does answer, so the caller can settle the events on what really happened."""
+    lock = threading.Lock()
+    state: dict = {}          # "ok" once the POST answered; "late" once we stop waiting
 
     def _run() -> None:
         try:
-            result.append(bool(sender(batch)))
+            ok = bool(sender(batch))
         except BaseException as exc:
             # ⭐ BaseException, not Exception. A Ctrl+C landing while a flush is
             # in flight would otherwise escape this daemon thread and print a
@@ -871,15 +952,36 @@ def _post_with_deadline(sender, batch: "list[dict]", deadline_sec: float) -> boo
             # from the quietest thing in the process. Recording the failure is
             # enough: the events stay owed and go out next time.
             log.debug("telemetry: post failed (%s)", type(exc).__name__)
-            result.append(False)
+            ok = False
+        with lock:
+            state["ok"] = ok
+            late = state.get("late", False)
+        if late and on_late is not None:
+            try:
+                on_late(ok)
+            except Exception as exc:
+                log.debug("telemetry: settling a late post failed (%s)",
+                          type(exc).__name__)
 
     thread = threading.Thread(target=_run, name="telemetry-post", daemon=True)
-    thread.start()
-    thread.join(max(0.1, float(deadline_sec)))
-    if thread.is_alive():
-        log.debug("telemetry: post abandoned at the %.1fs deadline", deadline_sec)
+    try:
+        thread.start()
+    except RuntimeError as exc:
+        # A process out of threads, or one shutting down. The POST never left,
+        # so this is a plain failed delivery; raising would leave the file
+        # marked in flight, and this process would never send it again.
+        log.debug("telemetry: could not start a post (%s)", exc)
         return False
-    return bool(result and result[0])
+    thread.join(max(0.1, float(deadline_sec)))
+    # Decided under the lock, so a POST answering at this very moment is either
+    # seen here or settled by its own thread — never both, never neither.
+    with lock:
+        if "ok" in state:
+            return state["ok"]
+        state["late"] = True
+    log.debug("telemetry: stopped waiting for a post at the %.1fs deadline — its "
+              "events stay claimed until it answers", deadline_sec)
+    return None
 
 
 def _post_batch(batch: "list[dict]") -> bool:

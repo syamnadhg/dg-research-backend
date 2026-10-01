@@ -45,8 +45,10 @@ _TEST_TIMEOUT_S = 180
 MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     ("S1", "under", "⭐⭐ THE DEFECT ITSELF — the destination is the claimed name "
      "again, so an adopted file is merged into itself and unlinked",
-     [("            _merge_back(claimed, _unclaimed_name(path))",
-       "            _merge_back(claimed, path)")],
+     # RE-ANCHORED 2026-10-01 (org PR #4 review, item 7): the merge-back and the
+     # write-back (S7) moved into `_settle`, one indent shallower.
+     [("    _merge_back(claimed, _unclaimed_name(path))",
+       "    _merge_back(claimed, path)")],
      [T_NEW]),
     ("S2", "under", "the self-merge guard is removed, so one careless call site "
      "destroys a batch again",
@@ -73,7 +75,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW, T_TM]),
     ("S7", "under", "the owed remainder past the batch cap stops being written "
      "back, which is the loss this file was already fixed for once",
-     [("            if owed:\n                _write_back(owed, path)", "            if owed:\n                pass")],
+     [("        if owed:\n            _write_back(owed, _unclaimed_name(path))", "        if owed:\n            pass")],
      [T_NEW, T_TM]),
     ("S8", "over", "adoption stops checking whether the owner is alive, so two "
      "processes post the same batch",
