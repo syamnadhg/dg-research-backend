@@ -695,6 +695,16 @@ class TestExactlyOneSourcesSection:
         assert out == BODY.rstrip() + TAIL + ONE_ROW
         assert sources_sections(out) == ["##### Sources"]
 
+    def test_a_lead_on_the_line_right_under_the_last_heading(self, monkeypatch):
+        """No blank line between the last heading and the lead: the lead is
+        still its paragraph's first line, because paragraphs are read from the
+        END of that heading. Only the lead's section goes; the heading stays."""
+        monkeypatch.setattr(research, "log", lambda *a, **k: None)
+        md = BODY + "\n## Appendices\n**References:** AKC, *German Shepherd Dog*; OFA.\n"
+        out = _with_visited(md)
+        assert out == BODY + "\n## Appendices" + TAIL + ONE_ROW
+        assert sources_sections(out) == ["##### Sources"]
+
     @pytest.mark.parametrize("own", [
         "**References:** [AKC](https://www.akc.org/dog-breeds/german-shepherd-dog/); "
         "[OFA](https://www.ofa.org/diseases/hip-dysplasia/).\n",
