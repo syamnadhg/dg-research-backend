@@ -270,15 +270,92 @@ def _report(body, rows):
 A, B, C = "https://a.example.org/one", "https://b.example.org/two", "https://c.example.org/three"
 
 
-def test_a_number_with_no_row_or_no_link_stays_as_written(monkeypatch):
-    """A number past the list, and a row that is only a title or is the agent's
-    own chat, have nothing safe to open: they stay `\\[n\\]`."""
+def test_a_row_with_no_link_stays_as_written(monkeypatch):
+    """A row that is only a title, or is the agent's own chat, has nothing safe
+    to open: its number stays `\\[n\\]`, and the rest are linked.
+    ⭐ Review, 2026-10-01: this used to cite a "\\[4\\]" past the end of the
+    list too and expect the rest linked. A number past the end is the sign that
+    the list is not the full one, so that now links nothing (the test below)."""
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
-    md = _report("One.\\[1\\] Two.\\[2\\] Three.\\[3\\] Four.\\[4\\]",
+    md = _report("One.\\[1\\] Two.\\[2\\] Three.\\[3\\]",
                  [(1, f"[One]({A})"), (2, "A paper with no link."),
                   (3, "[This chat](https://claude.ai/chat/1b2c)")])
     out = research._document_with_sources(md, label="Claude")
     assert out == md.replace("One.\\[1\\]", f"One.[\\[1\\]]({A})")
+
+
+D, E = "https://d.example.org/four", "https://e.example.org/five"
+
+
+#: Claude's list, then a second, shorter list: the last section is not the one
+#: the numbers count.
+TWO_LISTS = ("One.\\[1\\] Two.\\[2\\] Three.\\[3\\]\n\n## Sources\n\n"
+             f"1. [A]({A})\n2. [B]({B})\n3. [C]({C})\n\n## Additional sources\n\n"
+             f"1. [D]({D})\n2. [E]({E})\n")
+
+
+@pytest.mark.parametrize("md", [
+    # a number past the end of the list
+    _report("One.\\[1\\] Two.\\[2\\] Three.\\[3\\] Four.\\[4\\]",
+            [(1, f"[A]({A})"), (2, f"[B]({B})"), (3, f"[C]({C})")]),
+    # a row nobody cites
+    _report("One.\\[1\\] Two.\\[2\\]",
+            [(1, f"[A]({A})"), (2, f"[B]({B})"), (3, f"[C]({C})")]),
+    "# Report\n\n" + TWO_LISTS,
+    # a partial list under the last heading
+    "# Report\n\nOne.\\[1\\] Four.\\[4\\] Seven.\\[7\\]\n\n## Key sources\n\n"
+    f"1. [D]({D})\n2. [E]({E})\n",
+], ids=["past-the-end", "a-row-not-cited", "two-lists", "key-sources"])
+def test_numbers_that_do_not_match_the_list_one_for_one_link_nothing(md, monkeypatch):
+    """⛔⛔ A WRONG LINK IS WORSE THAN NO FOOTNOTE (review, 2026-10-01). The
+    numbers are linked only when every number cited has a row and every row is
+    cited — what both saved Claude files measure (164 and 110 numbers, 52 and 76
+    rows). Any other shape, and above all a last list that is not the one the
+    numbers count, keeps every number as written.
+    (In the two-list shape the addresses in the FIRST list sit before the last
+    section, so the older numbering numbers them where they are, as it always
+    has; no number opens a row of the second list.)"""
+    logs = []
+    monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    out = research._document_with_sources(md, label="Claude")
+    assert any("[Claude] left its own citation numbers as written" in m for m in logs), logs
+    assert out.split("\n\n## ")[0] == md.split("\n\n## ")[0]
+    assert not [u for _n, u in MARKER_RE.findall(out) if u in (D, E)]
+    if "Additional sources" not in md:
+        assert out == md
+
+
+def test_the_two_list_shape_through_the_per_agent_write(run):
+    """The two-list shape through the real write: Claude's numbers stay as it
+    wrote them, and no number opens a row of the second list, on disk or in
+    the app."""
+    local = run.write("Claude", TWO_LISTS)
+    assert "\n\nOne.\\[1\\] Two.\\[2\\] Three.\\[3\\]\n\n## Sources\n\n" in local
+    assert not [u for _n, u in MARKER_RE.findall(local) if u in (D, E)]
+    assert documents_written(run.sink, "claude") == [local]
+
+
+def test_a_bracketed_number_after_a_space_is_not_a_citation(monkeypatch):
+    """"Step \\[1\\]" or "clause \\[2\\]" is a label, not a citation: MEASURED,
+    none of the 274 numbers in the two saved Claude files has a space before
+    it. It stays as written, and the citations around it are still linked."""
+    monkeypatch.setattr(research, "log", lambda *a, **k: None)
+    md = _report("One.\\[1\\] Two.\\[2\\] Follow Step \\[1\\] then Step \\[2\\].",
+                 [(1, f"[A]({A})"), (2, f"[B]({B})")])
+    out = research._document_with_sources(md, label="Claude")
+    assert out == md.replace("One.\\[1\\] Two.\\[2\\]",
+                             f"One.[\\[1\\]]({A}) Two.[\\[2\\]]({B})")
+    # …and a text whose only bracketed numbers are labels links nothing
+    labels = _report("Follow Step \\[1\\] then Step \\[2\\].",
+                     [(1, f"[A]({A})"), (2, f"[B]({B})")])
+    assert research._document_with_sources(labels, label="Claude") == labels
+    # ⛔ The space is read off the text as written: right after inline code or a
+    # link is a citation (the 10-01 file has "`jev-1.13.0`\\[13\\]")
+    glued = _report(f"Run `make`\\[1\\] and read [the docs]({C})\\[2\\].",
+                    [(1, f"[A]({A})"), (2, f"[B]({B})")])
+    assert research._document_with_sources(glued, label="Claude") == glued.replace(
+        "`make`\\[1\\]", f"`make`[\\[1\\]]({A})").replace(
+        f"({C})\\[2\\]", f"({C})[\\[2\\]]({B})")
 
 
 def test_rows_that_do_not_count_one_two_three_link_nothing(monkeypatch):
@@ -302,11 +379,14 @@ def test_a_number_in_code_in_a_links_text_or_in_the_list_is_not_linked(monkeypat
     one inside a link's words would nest a link in a link, and one in a row of
     the list is the list's own."""
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
-    body = ("Prose.\\[1\\]\n\n```\nprint('\\[2\\]')\n```\n\nInline `x\\[2\\]` and "
-            f"[see \\[2\\]]({B}) here.")
-    md = _report(body, [(1, f"[A]({A})"), (2, f"[B]({B}) — it builds on \\[1\\]")])
+    body = ("Prose.\\[1\\] More.\\[2\\]\n\n```\nprint('\\[2\\]')\n```\n\nInline `x\\[2\\]` and "
+            f"[see \\[2\\]]({B}) here. Read [the paper \\[2\\] in full]({D}).")
+    # (the row's own "\\[1\\]" has no space before it, so only the rule that the
+    # list is not linked keeps it plain)
+    md = _report(body, [(1, f"[A]({A})"), (2, f"[B]({B}) — it builds on it.\\[1\\]")])
     out = research._document_with_sources(md)
-    assert out == md.replace("Prose.\\[1\\]", f"Prose.[\\[1\\]]({A})")
+    assert out == md.replace("Prose.\\[1\\] More.\\[2\\]",
+                             f"Prose.[\\[1\\]]({A}) More.[\\[2\\]]({B})")
 
 
 def test_an_address_with_brackets_is_written_safely(monkeypatch):
@@ -339,6 +419,9 @@ def test_text_still_ending_with_our_list_is_never_linked_to_ours(ours, monkeypat
 def test_linking_twice_is_linking_once(monkeypatch):
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
     once = research._document_with_sources(CLAUDE_1001, visited=["https://x.example.org/"])
+    # ⛔ The first pass linked every number: equal-to-itself is not a pin on a
+    # pass that linked nothing.
+    assert len(MARKER_RE.findall(once)) == 164
     assert research._document_with_sources(once, visited=["https://y.example.org/"]) == once
 
 
@@ -373,6 +456,8 @@ def test_the_finalize_resave_writes_the_same_linked_document(run, monkeypatch):
     asyncio.run(research._p2_persist_reports(
         {"Claude": {"text": text, "status": "done"}}, run.dir, "Jev", "a brief"))
     again = (run.dir / "documents" / "claude.md").read_text(encoding="utf-8")
+    # ⛔ The same AND linked: two writes that both lost the links would agree.
+    assert len(MARKER_RE.findall(again)) == 164
     assert again == first
     assert documents_written(run.sink[before:], "claude") == [first]
 
@@ -650,6 +735,14 @@ def test_the_0928_fixture_brief_numbers_all_twenty_chips(monkeypatch):
      "has the rest.\n",
      "Prices fell. [\\[1\\]](https://a.example.org/x)\n\n[The full table](https://b.example.org/y) "
      "has the rest [\\[2\\]](https://b.example.org/y).\n"),
+    # …nor when it is all its paragraph holds (it ends its line, like a chip)
+    ("Prices fell. [Site A](https://a.example.org/x)\n\n[The full table](https://b.example.org/y)\n",
+     "Prices fell. [\\[1\\]](https://a.example.org/x)\n\n[The full table](https://b.example.org/y) "
+     "[\\[2\\]](https://b.example.org/y)\n"),
+    # ⛔ words between two links after a stop: neither is a chip
+    ("Prices fell. [The survey](https://a.example.org/x) and [the table](https://b.example.org/y)\n",
+     "Prices fell. [The survey](https://a.example.org/x) and [the table](https://b.example.org/y) "
+     "[\\[1\\]](https://a.example.org/x) [\\[2\\]](https://b.example.org/y)\n"),
     # a chip after a quoted, bold title
     ("Start from **“Introducing Jev.”** [TypeSafe AI+2](https://a.example.org/x)\n",
      "Start from **“Introducing Jev.”** [\\[1\\]](https://a.example.org/x)\n"),
@@ -663,8 +756,43 @@ def test_the_0928_fixture_brief_numbers_all_twenty_chips(monkeypatch):
     ("See [a](https://a.example.org/x) and [Dr. Who](https://b.example.org/y) here.\n",
      "See [a](https://a.example.org/x) and [\\[1\\]](https://a.example.org/x) "
      "[Dr. Who](https://b.example.org/y) here [\\[2\\]](https://b.example.org/y).\n"),
-], ids=["mid-sentence", "after-a-colon", "two-chips", "next-paragraph", "after-a-title",
-        "same-address-twice", "a-stop-inside-a-link"])
+    # ⛔⛔ review, 2026-10-01 — a link with words after it is never a chip, even
+    # right after a stop: a numbered item's own number…
+    ("1. [The official model docs](https://a.example.org/x) — the reference.\n",
+     "1. [The official model docs](https://a.example.org/x) — the reference "
+     "[\\[1\\]](https://a.example.org/x).\n"),
+    # …an abbreviation…
+    ("Use registries, e.g. [the OFA database](https://a.example.org/x), and clubs.\n",
+     "Use registries, e.g. [the OFA database](https://a.example.org/x), and clubs "
+     "[\\[1\\]](https://a.example.org/x).\n"),
+    # …a sentence that opens with a link…
+    ("Prices fell last year. [The BNEF survey](https://a.example.org/x) has the detail.\n",
+     "Prices fell last year. [The BNEF survey](https://a.example.org/x) has the detail "
+     "[\\[1\\]](https://a.example.org/x).\n"),
+    # …a bold lead…
+    ("1. **Docs.** [TypeSafe docs](https://a.example.org/x) are the spec.\n",
+     "1. **Docs.** [TypeSafe docs](https://a.example.org/x) are the spec "
+     "[\\[1\\]](https://a.example.org/x).\n"),
+    # …and an address an earlier chip numbered: the row is titled from that
+    # chip, so folded, these words would be nowhere in the reader's copy
+    ("TypeSafe ships a spec. [TypeSafe AI+2](https://a.example.org/x)\n\nRead it first. "
+     "[The full TypeSafe specification, version 2](https://a.example.org/x) is the contract.\n",
+     "TypeSafe ships a spec. [\\[1\\]](https://a.example.org/x)\n\nRead it first. "
+     "[The full TypeSafe specification, version 2](https://a.example.org/x) is the contract "
+     "[\\[1\\]](https://a.example.org/x).\n"),
+    # ⛔ and ending its line is not enough after a stop that ends no sentence:
+    # a numbered item that is only a link…
+    ("1. [The official model docs](https://a.example.org/x)\n",
+     "1. [The official model docs](https://a.example.org/x) [\\[1\\]](https://a.example.org/x)\n"),
+    # …or an abbreviation right before the link
+    ("Use a registry, e.g. [the OFA database](https://a.example.org/x)\n",
+     "Use a registry, e.g. [the OFA database](https://a.example.org/x) "
+     "[\\[1\\]](https://a.example.org/x)\n"),
+], ids=["mid-sentence", "after-a-colon", "two-chips", "next-paragraph",
+        "next-paragraph-a-link-alone", "words-between-two-links", "after-a-title",
+        "same-address-twice", "a-stop-inside-a-link", "a-list-item", "an-abbreviation",
+        "a-sentence-opening-with-a-link", "a-bold-lead", "a-repeat-address-with-words",
+        "a-list-item-that-is-only-a-link", "an-abbreviation-ending-the-line"])
 def test_the_chip_rule(md, want, monkeypatch):
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
     out = research._brief_numbered_copy(BRIEF_HEADER + md)
@@ -679,12 +807,31 @@ def test_the_chip_rule(md, want, monkeypatch):
     # its own list of links is the one list
     BRIEF_HEADER + "Prices fell. [Site A](https://a.example.org/x)\n\n## Sources\n\n"
     "- [Site A](https://a.example.org/x)\n",
+    # ⛔ review, 2026-10-01 — its own sources section with no link in it is still
+    # its own: ours after it was a second sources section
+    BRIEF_HEADER + "Prices fell. [Site A](https://a.example.org/x)\n\n## Sources\n\n"
+    "- Prefer primary sources.\n- Cite each claim.\n",
     # already carrying our marker: numbered once is numbered
     BRIEF_HEADER + "Prices fell. [\\[1\\]](https://a.example.org/x)\n",
-], ids=["no-links", "in-code", "an-image", "a-chat-link", "own-list", "our-marker"])
+], ids=["no-links", "in-code", "an-image", "a-chat-link", "own-list", "own-section-no-links",
+        "our-marker"])
 def test_a_brief_with_nothing_to_number_is_left_as_it_is(md, monkeypatch):
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
     assert research._brief_numbered_copy(md) == md
+
+
+def test_a_brief_ending_with_its_own_sources_section_is_saved_as_written(monkeypatch):
+    """Through the real Firestore writer: a brief whose last section is its own
+    "## Sources" — guidance, no link — is saved as ChatGPT wrote it, with one
+    sources section, and the log says why."""
+    logs = []
+    monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    sink = _firestore(monkeypatch)
+    brief = (BRIEF_HEADER + "Prices fell. [Site A](https://a.example.org/x)\n\n## Sources\n\n"
+             "- Prefer primary sources.\n- Cite each claim.\n")
+    assert research.save_document_to_firestore("brief", brief, "Research Brief")
+    assert documents_written(sink, "brief") == [brief]
+    assert any("[Brief] it ends with its own sources section" in m for m in logs), logs
 
 
 def test_only_the_brief_is_numbered_by_the_firestore_writer(monkeypatch):

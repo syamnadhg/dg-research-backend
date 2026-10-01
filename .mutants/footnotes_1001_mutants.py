@@ -45,9 +45,8 @@ MUTANTS = [
        "        linked = _doc_link_own_numbers(md, label)",
        "    if md:\n"
        "        linked = _doc_link_own_numbers(md, label)")]),
-    ("C5", "a number that is already a link's text is linked again",
-     [(r"_DOC_OWN_NUMBER_RE = re.compile(r'(?<![\[\\])\\\[(\d{1,3})\\\](?!\]\()')",
-       r"_DOC_OWN_NUMBER_RE = re.compile(r'\\\[(\d{1,3})\\\]')")]),
+    # C5 moved to footnotes_review_1001_mutants.py (N4): the review repair
+    # rewrote its line.
     ("C6", "numbers inside code are linked",
      [("    masked = _mask_code_spans(md)[0]\n    rows = _doc_own_list_rows(md, masked)",
        "    masked = md\n    rows = _doc_own_list_rows(md, masked)")]),
@@ -57,9 +56,7 @@ MUTANTS = [
     ("C8", "a `<url>` row is not read",
      [('        url = (link.group("u") or link.group("a") or "") if link else ""',
        '        url = (link.group("u") or "") if link else ""')]),
-    ("C9", "numbers inside the list's own rows are linked too",
-     [("    for m in _DOC_OWN_NUMBER_RE.finditer(masked, 0, own_at):",
-       "    for m in _DOC_OWN_NUMBER_RE.finditer(masked):")]),
+    # C9 moved to footnotes_review_1001_mutants.py (N5).
 
     # ── R: the read-backs ───────────────────────────────────────────────────
     ("R1", "the crash-retry read-back deletes Claude's numbers again",
@@ -87,16 +84,12 @@ MUTANTS = [
     ("B4", "the '+2' stays in the row's title",
      [("                title = re.sub(r'\\s+', ' ', _BRIEF_CHIP_MORE_RE.sub(\"\", md[m.start(\"t\"):m.end(\"t\")]))",
        "                title = re.sub(r'\\s+', ' ', md[m.start(\"t\"):m.end(\"t\")])")]),
-    ("B5", "no chip folds into its number (every chip keeps its site name)",
-     [("            if _BRIEF_CHIP_AFTER_RE.search(before) or (",
-       "            if False and _BRIEF_CHIP_AFTER_RE.search(before) or (")]),
+    # B5 moved to footnotes_review_1001_mutants.py (K8).
     ("B6", "a link after a colon is taken for a chip and loses its words",
      [("_BRIEF_CHIP_AFTER_RE = re.compile(r'[.!?][", "_BRIEF_CHIP_AFTER_RE = re.compile(r'[.!?:][")]),
     ("B7", "a link opening the next paragraph is taken for a chip",
      [("_BRIEF_CHIP_GAP_RE = re.compile(r'[ \\t]*\\Z')", "_BRIEF_CHIP_GAP_RE = re.compile(r'\\s*\\Z')")]),
-    ("B8", "a brief ending with its own list of links is numbered anyway",
-     [("        if not links or (own_at is not None and any(m.start() >= own_at for m in links)):",
-       "        if not links:")]),
+    # B8 moved to footnotes_review_1001_mutants.py (K7).
     ("B9", "a brief already carrying our marker is numbered again",
      [("        if not md or _DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md):",
        "        if not md:")]),

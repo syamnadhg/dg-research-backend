@@ -76701,10 +76701,11 @@ def _doc_marker_position(md: str, masked: str, spans: list,
 #
 # ⭐ THE RULE. When the text holds escaped numbers outside code AND the document
 # ends with its own sources section whose numbered rows count 1, 2, 3 … with no
-# gap, each `\[n\]` whose row n holds a link becomes our marker,
-# `[\[n\]](address of row n)`, in place. Nothing is added and nothing moves. A
-# number with no row, or a row with no link we would put behind a number, stays
-# as it is. The agent's own list stays the one list.
+# gap, AND the numbers and the rows match one for one — every number cited has a
+# row, every row is cited — each `\[n\]` whose row n holds a link becomes our
+# marker, `[\[n\]](address of row n)`, in place. Nothing is added and nothing
+# moves. A row with no link we would put behind a number keeps its number as it
+# is. The agent's own list stays the one list.
 #
 # ⛔⛔ ROW n IS THE ROW WRITTEN "n.", AND ONLY WHILE THE WRITTEN NUMBERS COUNT
 # 1, 2, 3 … A markdown viewer numbers an ordered list from its first item and
@@ -76712,13 +76713,20 @@ def _doc_marker_position(md: str, masked: str, spans: list,
 # reader sees the third row as "3." and a "[4]" linked to it would open the row
 # the reader reads as 3. Any other shape is left alone.
 #
+# ⛔⛔ AND ONLY ONE FOR ONE (review, 2026-10-01). The last sources section is not
+# always the list the numbers count: "## Sources" then "## Additional sources",
+# or a short "## Key sources" under a text citing 1, 4 and 7. Linked anyway, a
+# "[1]" opened row 1 of the WRONG list. A number past the end of the list, or a
+# row nobody cites, is the sign, and then nothing is linked. Both saved Claude
+# files match one for one, so this costs none of their 274 links.
+#
 # ⛔ A WRONG LINK IS WORSE THAN NO FOOTNOTE. A number only ever links to an
 # address in that document's own list.
 
 #: An agent's own citation number, escaped the way Claude's export writes it.
-#: ⛔ Never a number that is already a link's text: our marker `[\[7\]](…)` holds
-#: one, and linking it again would put a link inside a link.
-_DOC_OWN_NUMBER_RE = re.compile(r'(?<![\[\\])\\\[(\d{1,3})\\\](?!\]\()')
+#: ⛔ Never one inside a link's words, nor one with a space right before it —
+#: see `_doc_link_own_numbers`.
+_DOC_OWN_NUMBER_RE = re.compile(r'(?<!\\)\\\[(\d{1,3})\\\]')
 #: An item at the top level of an ordered list, and the number written on it.
 _DOC_OWN_ROW_NUMBER_RE = re.compile(r'^[ \t]{0,3}(\d{1,3})[.)][ \t]', re.MULTILINE)
 #: …and the link the item opens with: `[title](address)`, one level of brackets
@@ -76768,8 +76776,30 @@ def _doc_link_own_numbers(md: str, label: str = "") -> str:
     if not rows:
         return md
     own_at = _doc_own_sources_start(masked)
+    # ⛔ A number inside a link's words ("[the paper \[2\] in full](…)") is that
+    # link's text, wherever in the words it sits: linked, it would put a link
+    # inside a link, and the reader would see the outer one as brackets and a
+    # raw address. Every link before the list is blanked first (same length).
+    text = _BRIEF_LINK_RE.sub(lambda m: " " * len(m.group(0)), masked[:own_at])
+    # ⛔ "Step \[1\]" or "clause \[2\]" — a space right before it — is a label,
+    # not a citation. MEASURED: none of the 274 numbers in the two saved Claude
+    # files has a space or a line break before it. Read off the text AS WRITTEN:
+    # in the masked text the code before "`jev-1.13.0`\[13\]" is spaces, and so
+    # is a link before "[the docs](…)\[2\]".
+    numbers = [m for m in _DOC_OWN_NUMBER_RE.finditer(text)
+               if not (m.start() and md[m.start() - 1].isspace())]
+    cited = {int(m.group(1)) for m in numbers}
+    if not cited:
+        return md
+    who = label or "the agent"
+    written = {int(n) for n in _DOC_OWN_ROW_NUMBER_RE.findall(masked[own_at:])}
+    if cited != written:
+        log(f"[{who}] left its own citation numbers as written — they do not match "
+            f"its own sources list one for one ({len(cited)} numbers cited, "
+            f"{len(written)} rows)")
+        return md
     out, last, linked, missing = [], 0, 0, set()
-    for m in _DOC_OWN_NUMBER_RE.finditer(masked, 0, own_at):
+    for m in numbers:
         n = int(m.group(1))
         url = rows.get(n)
         if not url:
@@ -76782,11 +76812,10 @@ def _doc_link_own_numbers(md: str, label: str = "") -> str:
     if not linked:
         return md
     out.append(md[last:])
-    who = label or "the agent"
     log(f"[{who}] linked {linked} of its own citation numbers to its own sources "
         f"list ({len(rows)} rows)"
-        + (f" — {len(missing)} number{'' if len(missing) == 1 else 's'} with no "
-           f"row stay as written" if missing else ""))
+        + (f" — {len(missing)} number{'' if len(missing) == 1 else 's'} whose row "
+           f"has no link stay as written" if missing else ""))
     return "".join(out)
 
 
@@ -77103,31 +77132,69 @@ def _document_with_sources(md: str, source_urls=None, findings=None,
 #
 # ⭐ THE RULE. One row per linked address, in the order first met, titled with
 # the chip's text without its "+N". A chip — a link right after the end of a
-# sentence, or right after another chip — becomes its number, so "+2" goes (the
+# sentence, or right after another chip, with nothing after it but spaces and
+# more chips to the end of its line — becomes its number, so "+2" goes (the
 # owner's choice: it opens its first source). A later chip for an address
 # already numbered shows that same number. Any other link keeps its words and
 # gets its number at the end of its sentence, where the agent reports put theirs.
 # Nothing is ever cut: a reader's copy must not lose text the agents still see.
+#
+# ⛔⛔ A CHIP ENDS ITS LINE (review, 2026-10-01). The first build took any link
+# after a stop for a chip, and folded the words of "1. [The model docs](…) — the
+# reference.", "e.g. [the OFA database](…), and clubs." and "Prices fell. [The
+# survey](…) has the detail." into a number. MEASURED: all 38 chips in the three
+# saved briefs (10-01, St Bernard 09-30, the 09-28 fixture) end their line.
+#
+# ⛔ A brief that ends with its own sources section — links or none — is left as
+# ChatGPT wrote it: ours after it would be a second sources section.
 
-#: A link in the brief, never an image: its text `t` and its address `u`.
+#: A markdown link, never an image: its text `t` and its address `u`. The
+#: brief's chips, and the links whose words `_doc_link_own_numbers` keeps out.
+#: ⛔ Never opening on an escaped bracket: from the `[` of "\[1\] and read [the
+#: docs](…)" it took the citation and the link for one link.
 _BRIEF_LINK_RE = re.compile(
-    r'(?<!!)\[(?P<t>(?:\\.|[^\]\\\n])*)\]'
+    r'(?<![!\\])\[(?P<t>(?:\\.|[^\]\\\n])*)\]'
     r'\((?P<u>(?:[^\s()]|\([^\s()]*\))+)(?:[ \t]+"[^"\n]*")?\)')
 #: The end of a sentence right before a chip: its stop, any closing quote,
 #: bracket, backtick or emphasis, then the space.
 #: ⛔ Not a colon: "See: [the launch post](…)" is a link with words a reader
 #: needs, and a chip would have taken them.
 _BRIEF_CHIP_AFTER_RE = re.compile(r'[.!?][\'"”’)\]`*_]*[ \t]+\Z')
+#: …and a stop that ends no sentence: a numbered item's own "1." ("1. [The
+#: model docs](…)" alone on its line) or a short abbreviation ("e.g. [the OFA
+#: database](…)"). A link after one keeps its words even when it ends its line.
+_BRIEF_NOT_A_STOP_RE = re.compile(
+    r'(?:(?:\A|\n)[ \t]{0,3}\d{1,9}'
+    r'|(?<![A-Za-z.])(?:e\.g|i\.e|cf|vs|viz|dr|mr|mrs|ms|prof|st|u\.s|u\.k))\.[ \t]+\Z',
+    re.IGNORECASE)
 #: Only spaces between two chips — never a line break.
 _BRIEF_CHIP_GAP_RE = re.compile(r'[ \t]*\Z')
 #: A chip's "+2": the sources behind it that the chip names and does not link.
 _BRIEF_CHIP_MORE_RE = re.compile(r'[ \t]*\+\d{1,3}[ \t]*\Z')
 
 
+def _brief_ends_its_line(md: str, end: int, link_spans: list) -> bool:
+    """Is there nothing after `end` but spaces and links, to the end of its line?
+    (`link_spans` in page order; a link never crosses a line.)"""
+    line_end = md.find("\n", end)
+    if line_end == -1:
+        line_end = len(md)
+    at = end
+    for start, stop in link_spans:
+        if start < end:
+            continue
+        if start >= line_end:
+            break
+        if md[at:start].strip():
+            return False
+        at = stop
+    return not md[at:line_end].strip()
+
+
 def _brief_numbered_copy(md: str) -> str:
     """The brief as the Documents page shows it — see the block above. Returns
     `md` itself when there is nothing to number, when it is numbered already,
-    and when it ends with its own sources list of links. Never raises."""
+    and when it ends with its own sources section. Never raises."""
     try:
         if not md or _DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md):
             return md
@@ -77135,7 +77202,11 @@ def _brief_numbered_copy(md: str) -> str:
         own_at = _doc_own_sources_start(masked)
         links = [m for m in _BRIEF_LINK_RE.finditer(masked)
                  if _doc_is_linkable_url(md[m.start("u"):m.end("u")])]
-        if not links or (own_at is not None and any(m.start() >= own_at for m in links)):
+        if not links:
+            return md
+        if own_at is not None:
+            log("[Brief] it ends with its own sources section — the copy in the app "
+                "stays as ChatGPT wrote it")
             return md
         link_spans = [(m.start(), m.end()) for m in links]
         doc_end = len(md.rstrip())
@@ -77150,8 +77221,10 @@ def _brief_numbered_copy(md: str) -> str:
                 numbers[key] = len(rows)
             n = numbers[key]
             before = md[:m.start()]
-            if _BRIEF_CHIP_AFTER_RE.search(before) or (
-                    chip_end >= 0 and _BRIEF_CHIP_GAP_RE.match(before, chip_end)):
+            if (_brief_ends_its_line(md, m.end(), link_spans)
+                    and not _BRIEF_NOT_A_STOP_RE.search(before)
+                    and (_BRIEF_CHIP_AFTER_RE.search(before) or (
+                        chip_end >= 0 and _BRIEF_CHIP_GAP_RE.match(before, chip_end)))):
                 edits.append((m.start(), 1, i, m.end(), _doc_source_marker(n, url)))
                 chip_end = m.end()
                 continue
