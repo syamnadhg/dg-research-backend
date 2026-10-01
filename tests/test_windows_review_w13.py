@@ -223,6 +223,35 @@ def test_a_processs_age_comes_from_psutil(monkeypatch):
     assert age is not None and 119.0 <= age <= 125.0
 
 
+def test_a_profiles_chrome_is_found_name_first(monkeypatch, tmp_path):
+    """⛔ `_chrome_procs_for_profile` (the login-resume waiter, every 5 s, and the
+    --login close) read every process's command line: 5.2 s a scan from an
+    elevated terminal on the owner's box, against 0.00 s name-first — and the
+    login-resume tests timed out on it. Only a Chrome's command line is read now."""
+    reads = []
+
+    class P:
+        def __init__(self, pid, name, args):
+            self.pid, self.info, self._args = pid, {"pid": pid, "name": name}, args
+
+        def cmdline(self):
+            reads.append(self.pid)
+            if self._args is None:
+                raise PermissionError("access denied")
+            return list(self._args)
+
+    prof = str(tmp_path / "browser-profile").replace("\\", "/")
+    procs = [P(1, "chrome.exe", ["chrome", f"--user-data-dir={prof}"]),
+             P(2, "LsaIso.exe", None),
+             P(3, "notepad.exe", ["notepad", prof]),
+             P(4, "chrome.exe", ["chrome", "--user-data-dir=C:/elsewhere"])]
+    monkeypatch.setitem(sys.modules, "psutil",
+                        types.SimpleNamespace(process_iter=lambda attrs=None: iter(procs)))
+    got = research._chrome_procs_for_profile(prof)
+    assert [p.pid for p in got] == [1]
+    assert sorted(reads) == [1, 4], f"a non-Chrome's command line was read: {reads}"
+
+
 # ══ 2. the supervisor above a venv launcher, and what an update stops ═════════
 
 DAEMON, LAUNCHER, ME, SIBLING, ONE_OFF = 500, 600, 700, 800, 900

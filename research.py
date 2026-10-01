@@ -87233,11 +87233,19 @@ def _chrome_procs_for_profile(profile_dir: str) -> list:
         resolved = raw
     targets = {t for t in (raw, resolved) if t}
     procs = []
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+    # ⛔ THE NAME FIRST, THE COMMAND LINE ONLY FOR A CHROME (Windows sync review,
+    # 2026-10-01). Asking psutil for every process's command line costs about a
+    # second per protected process (LsaIso, NgcIso, vmmemWSL — psutil retries the
+    # refused read) when the backend holds SeDebugPrivilege, as one started from
+    # an elevated terminal does: 5.2 s a scan on the owner's box against 0.00 s
+    # name-first, for the same 21 Chrome processes. The login-resume waiter scans
+    # every 5 s, and the --login close path once per close.
+    for proc in psutil.process_iter(["pid", "name"]):
         try:
             if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
                 continue
-            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
+            args = proc.info["cmdline"] if "cmdline" in proc.info else proc.cmdline()
+            cmdline = " ".join(args or []).lower().replace("\\", "/")
             if any(_profile_matches_cmdline(t, cmdline) for t in targets):
                 procs.append(proc)
         except Exception:
