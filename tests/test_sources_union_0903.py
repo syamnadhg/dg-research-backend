@@ -96,6 +96,21 @@ def test_one_page_seen_by_both_rungs_is_one_source(run_dir, monkeypatch):
     assert got["sources"] == 1
 
 
+def test_one_page_seen_by_both_rungs_is_one_source_when_the_report_has_the_tag(
+        run_dir, monkeypatch):
+    """The other way round, and the shape ChatGPT's reports actually have: the
+    REPORT keeps the tag on its link and the panel's row is clean. ⭐ 2026-10-01
+    — the panel's rows now pass the public-page gate, which takes tracking tags
+    off, so the test above no longer tells a raw dedupe from a normalised one;
+    this one still does."""
+    _write_report(run_dir, "chatgpt",
+                  "See https://docs.nvidia.com/guide?utm_source=chatgpt.com for detail.")
+    got = _agents(run_dir, {"chatgpt": {"source_urls": ["https://docs.nvidia.com/guide"]}},
+                  monkeypatch)["chatgpt"]
+    assert got["sourceUrls"] == ["https://docs.nvidia.com/guide?utm_source=chatgpt.com"]
+    assert got["sources"] == 1
+
+
 def test_the_panel_cannot_smuggle_in_the_agents_own_pages(run_dir, monkeypatch):
     """The union is a second way in, so it needs the same host rule the report
     side got — otherwise #277's fix has a door beside it."""

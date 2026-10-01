@@ -76132,7 +76132,7 @@ def _doc_unwrap_redirect(url: str) -> str:
             if re.match(r'https?://', target, re.IGNORECASE):
                 return target
     except Exception:
-        return ""
+        pass
     return ""
 
 

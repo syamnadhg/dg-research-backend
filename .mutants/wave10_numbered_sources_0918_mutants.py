@@ -149,7 +149,9 @@ MARKER = r'    return "[\\[%d\\]](%s)" % (n, _doc_markdown_url(url))'
 #: The separating space in front of a marker.
 LEAD = '        lead = "" if at <= 0 or md[at - 1].isspace() else " "'
 #: The idempotency sentinel's gate, inside `_number_document_sources`.
-SENTINEL = '    if _DOC_SOURCE_MARK_RE.search(md):'
+#: ⚠ 2026-10-01 re-anchored: our visited-sites list is the sentinel too, for a
+#: document that cited nothing and so carries no marker.
+SENTINEL = '    if _DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md):'
 #: The one call that both masks code and remembers WHERE the code was.
 MASK = '    masked, spans = _mask_code_spans(md)'
 #: Ascending order, so the numbers a reader meets count up.
@@ -178,8 +180,11 @@ ALT_TITLE = ('    heading = _doc_sources_heading(\n'
 #: The heading level — read by three web surfaces, see `_doc_sources_heading`.
 LEVEL = '_DOC_SOURCES_HEADING_LEVEL = 5'
 #: The strip's gate: it only ever removes a tail carrying OUR markers.
-STRIP_GATE = ('    if not md or not _DOC_SOURCE_MARK_RE.search(md):\n'
-              '        return md or ""')
+#: ⚠ 2026-10-01 re-anchored: with no marker it removes only our level-five
+#: visited-sites list (`_DOC_VISITED_BLOCK_RE`), never a `##` list; the mutant
+#: below hands that branch the marker-gated pattern, which takes `##` too.
+STRIP_GATE = ('        return _DOC_VISITED_BLOCK_RE.sub("", md)\n'
+              '    return _DOC_SOURCES_BLOCK_RE.sub("", md)')
 #: The brief the agents RECEIVE, written unnumbered on purpose.
 BRIEF_WRITE = ('                brief_path.write_text(f"# Research Brief\\n\\n{brief_text}",\n'
                '                                      encoding="utf-8")')
@@ -321,7 +326,8 @@ MUTANTS = [
      "KILLED BY tests/test_numbered_sources_0918.py::"
      "TestTheStripOnlyEverRemovesOurOwnTail::"
      "test_an_agents_own_sources_section_is_left_alone",
-     [(STRIP_GATE, '    if not md:\n        return md or ""')]),
+     [(STRIP_GATE, '        return _DOC_SOURCES_BLOCK_RE.sub("", md)\n'
+                   '    return _DOC_SOURCES_BLOCK_RE.sub("", md)')]),
     ("N17", "under",
      "⛔ HANDED FINDINGS ARE THROWN AWAY AND THE DOCUMENT IS RE-EXTRACTED. The "
      "callers extract from the CLEAN report before numbering it, deliberately; "
