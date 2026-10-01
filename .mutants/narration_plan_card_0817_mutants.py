@@ -9,9 +9,10 @@
 
 ⭐ THE OVER-CORRECTIONS ARE THE SHARP END, because both fixes make things STRICTER
 and a strict gate with no floor is how a live surface goes silent:
-  N1  — the timer arm is tied so hard the operator's setting is ignored.
-  N4  — the regen arm is tied to the clock too, so PROOF of failure has to wait
-        out a timer and #921's whole point is lost.
+  N2  — the timer arm is tied so hard the operator's setting is ignored.
+  N4  — the regen arm is tied to the alert clock too, so PROOF of failure has to
+        wait out a timer past the plan wait and #921's point is lost.
+  (N1 and N8 retired 2026-10-01 — see their entries.)
   N9  — the card is never raised at the give-up point, which (because the break
         sits above the card block) makes the timer arm unreachable and silently
         deletes the protection.
@@ -44,11 +45,12 @@ PY = str(ROOT / ".venv" / "bin" / "python")
 
 MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # ── the plan card ───────────────────────────────────────────────────────
-    ("N1", "over", "⛔ THE ORIGINAL FALSE ALARM — the timer arm is untied from "
-     "the loop's own patience and cries wolf 52s early again",
-     [("    return elapsed >= max(float(alert_sec), float(wait_max_sec))",
-       "    return elapsed >= float(alert_sec)")],
-     [T_NEW]),
+    # ⛔ N1 RETIRED 2026-10-01 as EQUIVALENT ("the timer arm is untied from the
+    # loop's own patience"). Since the owner's ten-minute rule, the predicate
+    # refuses every arm while `elapsed < wait_max_sec`, so by the last line
+    # `max(alert, wait)` and `alert` can no longer differ. The tie N1 measured
+    # is now that floor, and .mutants/gemini_plan_wait_1001_mutants.py W1
+    # removes it.
     ("N2", "over", "the operator's setting is discarded, so an explicitly "
      "quieter card becomes a louder one",
      [("    return elapsed >= max(float(alert_sec), float(wait_max_sec))",
@@ -59,38 +61,31 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      [("    return elapsed >= max(float(alert_sec), float(wait_max_sec))",
        "    return elapsed >= max(float(alert_sec), float(wait_max_sec)) * 10")],
      [T_NEW]),
-    ("N4", "over", "⛔⛔ EXHAUSTED RE-DRAFTS HAVE TO WAIT OUT THE CLOCK — #921 "
-     "exists precisely so proof of failure does not",
+    ("N4", "over", "⛔⛔ EXHAUSTED RE-DRAFTS HAVE TO WAIT OUT THE ALERT CLOCK — "
+     "#921 exists precisely so proof of failure does not (since 2026-10-01 it "
+     "waits for the plan wait, and no longer than that)",
      [("    if regen_capped:\n        return True",
        "    if regen_capped:\n        pass")],
      [T_NEW]),
     ("N5", "under", "a visibly streaming plan is carded again — the 2026-07-09 "
      "false alarm that auto-skipped a working Gemini",
-     [("    if streaming_recent:\n        return False\n    if regen_capped:",
-       "    if False:\n        return False\n    if regen_capped:")],
+     [("    if streaming_recent:\n        return False\n    if elapsed < float(wait_max_sec):",
+       "    if False:\n        return False\n    if elapsed < float(wait_max_sec):")],
      [T_NEW]),
     ("N6", "over", "the regen cap outranks live streaming, so a plan drafting in "
      "front of us is declared dead on its history",
-     [("    if streaming_recent:\n        return False\n    if regen_capped:\n        return True",
-       "    if regen_capped:\n        return True\n    if streaming_recent:\n        return False")],
+     [("    if streaming_recent:\n        return False\n    if elapsed < float(wait_max_sec):\n"
+       "        return False\n    if regen_capped:\n        return True",
+       "    if regen_capped:\n        return True\n    if streaming_recent:\n        return False\n"
+       "    if elapsed < float(wait_max_sec):\n        return False")],
      [T_NEW]),
     ("N7", "over", "a clicked Start still cards — an alert about something that "
      "has already happened",
      [("    if start_clicked:\n        return False", "    if False:\n        return False")],
      [T_NEW]),
-    ("N8", "under", "the card site goes back to comparing the two numbers "
-     "itself, so the tie is only in a helper nothing calls",
-     [("""            if _gemini_plan_card_due(
-                    elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
-                    alert_sec=_PLAN_ALERT_SEC, regen_capped=_regen_cap_emitted,
-                    streaming_recent=_streaming_recent,
-                    start_clicked=bool(start_clicked),
-                    redraft_pending=_redraft_pending):
-                _raise_plan_alert("plan clearly failed")""",
-       """            if (not start_clicked and not _streaming_recent
-                    and (_regen_cap_emitted or _elapsed > _PLAN_ALERT_SEC)):
-                _raise_plan_alert("plan clearly failed")""")],
-     [T_NEW]),
+    # ⛔ N8 RETIRED 2026-10-01, not re-anchored: its site (the in-loop early
+    # card) is gone by design — the owner ruled nothing is raised before the plan
+    # wait is over, and the break below is now the one place the card goes up.
     ("N9", "under", "⛔⛔ the card is not raised at the give-up point — and since "
      "the break sits ABOVE the card block, the timer arm becomes unreachable "
      "and #921's protection is silently gone",
