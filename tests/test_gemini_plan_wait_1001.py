@@ -38,7 +38,7 @@ import test_claude_usage_limit_0916 as base
 chrome = base.chrome
 
 APP = "http://fixture.invalid/gemini.google.com/app"
-OURS, OTHER = "ours1234abcd", "other5678efgh"
+OURS, OTHER, NEW = "ours1234abcd", "other5678efgh", "new9876zyxw"
 
 BRIEF = ("Research mandate: the economic history of the Hanseatic League and its "
          "Baltic trade routes between 1300 and 1600. ") * 6
@@ -101,7 +101,7 @@ def launch(chrome, monkeypatch, tmp_path):
     def _since():
         return clock.t - t0.get("at", clock.t)
 
-    lines, events, cards, looks, handed = [], [], [], [], []
+    lines, events, cards, looks, handed, beats = [], [], [], [], [], []
 
     def _log(m, level="INFO"):
         m = str(m)
@@ -113,6 +113,8 @@ def launch(chrome, monkeypatch, tmp_path):
         events.append((name, k))
         if name == "pipeline_error" and k.get("agent") == "gemini":
             cards.append((_since(), k))
+        if name == "agent_progress" and k.get("agent") == "gemini" and "at" in t0:
+            beats.append(_since())
 
     monkeypatch.setattr(research, "time", clock)
     monkeypatch.setattr(research, "asyncio", _FastAsyncio())
@@ -154,7 +156,7 @@ def launch(chrome, monkeypatch, tmp_path):
 
     monkeypatch.setattr(research, "poll_all_agents_round_robin", _round_robin)
 
-    def run(script, *, start=OURS, on_tick=None):
+    def run(script, *, start=OURS, on_tick=None, app=APP):
         """`script(chat_id, nth_load)` is the page each load of a chat address
         gets; `start` is the chat the brief landed in ("" = Gemini's bare /app)."""
         loads, clicks, urls, opened = Counter(), [], [], []
@@ -165,7 +167,7 @@ def launch(chrome, monkeypatch, tmp_path):
                 clicks.append(path.rsplit("/", 1)[1])
                 await route.fulfill(status=204, body="")
                 return
-            m = re.fullmatch(r"/gemini\.google\.com/app/?([A-Za-z0-9_-]*)", path)
+            m = re.fullmatch(r"/gemini\.google\.com/(?:u/\d+/)?app/?([A-Za-z0-9_-]*)", path)
             if m is None:
                 await route.abort()
                 return
@@ -177,7 +179,7 @@ def launch(chrome, monkeypatch, tmp_path):
         async def _open(browser, cua_client, url, *a, **k):
             pg = await chrome.ctx.new_page()
             await pg.route("**/*", _answer)
-            await pg.goto(f"{APP}/{start}" if start else APP)
+            await pg.goto(f"{app}/{start}" if start else app)
             opened.append(pg)
             return pg, True
 
@@ -211,7 +213,8 @@ def launch(chrome, monkeypatch, tmp_path):
                 except Exception:
                     pass
         return SimpleNamespace(lines=lines, events=events, cards=cards, looks=looks,
-                               handed=handed, loads=loads, clicks=clicks, urls=urls)
+                               handed=handed, loads=loads, clicks=clicks, urls=urls,
+                               beats=beats)
 
     return run
 
@@ -291,6 +294,8 @@ def test_a_chat_is_refreshed_at_most_once_per_two_minutes(launch):
     assert all(b - a >= 120 for a, b in zip(times, times[1:])), times
     assert out.loads[OURS] == len(times) + 1
     assert out.cards and out.cards[0][0] >= 600
+    # The 10-01 drafting screen (nothing running, no Stop) is not "still working".
+    assert not said(out, "Handing off to the round-robin")
 
 
 # ── The right chat, every time ───────────────────────────────────────────────
@@ -337,15 +342,44 @@ def test_no_refresh_until_gemini_gives_the_chat_an_address(launch):
 
 
 def test_a_chat_that_never_proves_it_is_ours_is_never_refreshed(launch):
-    """The tab has an address but the chat there holds another brief: its address
-    is never taken as the run's, so it is never refreshed and the wait says why.
-    A plan arriving on it is not ours to start either way, so this run behaves
-    exactly as it did before refreshing existed."""
-    out = launch(lambda cid, n: page(SILENT, brief=FOREIGN), start=OTHER)
+    """The tab has an address but its first turn cannot be read: its address is
+    never taken as the run's, so it is never refreshed and the wait says why.
+    "Cannot tell" is read as before — not as somebody else's chat, even though the
+    page's other text (Gemini's side list here) is long enough to judge."""
+    out = launch(lambda cid, n: page(SILENT, brief="", rail=(OTHER, NEW)), start=OTHER)
     assert out.loads == Counter({OTHER: 1}), out.loads
     held = said(out, "not refreshing")
     assert len(held) == 1 and "could not be proven to be this run's" in held[0][1], held
     assert not said(out, "This run's chat has its address")
+    assert not said(out, "holds another brief")
+
+
+@pytest.mark.parametrize("how", ["landed_there", "drifted_there"])
+def test_a_chat_holding_another_brief_is_never_pressed_before_the_address_is_taken(
+        launch, how):
+    """⭐ Right chat, every time — also before Gemini has given the run's chat its
+    address. The tab is on another chat whose plan has its own 'Start research':
+    nothing on it is pressed, no computer use is pointed at it, and the card comes
+    at ten minutes. Before: that chat's Start was pressed."""
+    drifted = []
+
+    def script(cid, n):
+        return page(PLAN, brief=FOREIGN) if cid == OTHER else page(SILENT)
+
+    async def drift(elapsed, pg):
+        if elapsed >= 30 and not drifted:
+            drifted.append(elapsed)
+            await pg.goto(f"{APP}/{OTHER}")
+
+    if how == "landed_there":
+        out = launch(script, start=OTHER)
+    else:
+        out = launch(script, start="", on_tick=drift)
+    assert out.clicks == [], out.clicks
+    held = said(out, "holds another brief")
+    assert len(held) == 1, held
+    assert out.looks == [] and said(out, "no computer use on it")
+    assert out.cards and out.cards[0][0] >= 600, out.cards[:1]
 
 
 def test_a_drifted_tab_is_not_believed_while_it_waits_to_go_back(launch):
@@ -374,6 +408,87 @@ def test_a_drifted_tab_is_not_believed_while_it_waits_to_go_back(launch):
     assert not said(out, "finished its research on its own")
     assert out.clicks == [OURS]
     assert out.loads == Counter({OURS: 3, OTHER: 1}), out.loads
+
+
+@pytest.mark.parametrize("how", ["page_load", "in_place"])
+def test_gemini_moving_the_runs_chat_to_a_new_address_is_followed(launch, how):
+    """⭐⭐ THE OWNER'S 10-01 RUN. The brief landed on one address; at 111 s the
+    tab moved, and the plan with 'Start research' was on ANOTHER address — which
+    holds this run's brief, so it is this run's chat, moved by Gemini. It is
+    followed and its Start is pressed, as base did at 115 s. Before this fix it
+    was called a drift: the tab was taken back to the old address, Start was
+    never pressed, and the card went up at ten minutes."""
+    moved = []
+
+    def script(cid, n):
+        return page(PLAN) if cid == NEW else page(SILENT)
+
+    async def move(elapsed, pg):
+        if elapsed >= 111 and not moved:
+            moved.append(elapsed)
+            if how == "page_load":
+                await pg.goto(f"{APP}/{NEW}")
+            else:
+                await pg.evaluate(
+                    "([p, html]) => { history.pushState(null, '', p);"
+                    " document.querySelector('message-content').innerHTML = html; }",
+                    [f"/gemini.google.com/app/{NEW}", PLAN])
+
+    out = launch(script, on_tick=move)
+    follow = said(out, "Gemini moved this run's chat to a new address — following it")
+    assert len(follow) == 1 and 111 <= follow[0][0] < 130, follow
+    assert out.clicks == [NEW], out.clicks
+    assert not said(out, "drifted to another chat")
+    assert out.cards == [] and out.looks == []
+    assert out.loads == (Counter({OURS: 1, NEW: 1}) if how == "page_load"
+                         else Counter({OURS: 1})), out.loads
+
+
+def test_a_refresh_that_gemini_answers_at_a_new_address_is_followed(launch):
+    """The run's chat is refreshed and Gemini's app answers the load at a new
+    address (it rewrites the address as the page loads), holding this run's brief
+    and its plan. The refresh believes it there and then, and its Start is
+    pressed. Before: the refresh called the page not the run's own, and every
+    later look dragged the tab back to the old address."""
+    moved = ("<script>history.replaceState(null, '', "
+             f"'/gemini.google.com/app/{NEW}')</script>")
+    out = launch(lambda cid, n: page(SILENT) if n == 1 else page(PLAN, extra=moved))
+    assert said(out, "refreshing its chat (#1)")
+    follow = said(out, "following it")
+    assert len(follow) == 1, follow
+    back = said(out, "back on the run's own chat")
+    assert back and "a plan with 'Start research' showing" in back[0][1], back
+    assert not said(out, "not provably the run's own chat")
+    assert out.clicks == [NEW], out.clicks
+    assert out.cards == [] and out.looks == []
+
+
+def test_a_new_address_holding_a_finished_report_is_not_followed(launch):
+    """A retry pastes the same brief, so an earlier attempt's FINISHED chat also
+    holds it. Before 'Start research', a report is an earlier run's: the tab is
+    not followed there, that report is not taken for this run's, and the tab goes
+    back to the run's own chat, where the plan is started."""
+    from test_gemini_finished_on_its_own_w13 import DONE_LINE
+    finished = page(f"<p>{DONE_LINE}</p>", extra="<button>Contents</button>"
+                    "<button>Share &amp; Export</button><button>Create</button>")
+    moved = []
+
+    def script(cid, n):
+        if cid == NEW:
+            return finished
+        return page(SILENT if n == 1 else PLAN)
+
+    async def move(elapsed, pg):
+        if elapsed >= 111 and not moved:
+            moved.append(elapsed)
+            await pg.goto(f"{APP}/{NEW}")
+
+    out = launch(script, on_tick=move)
+    assert not said(out, "following it")
+    assert not said(out, "finished its research on its own")
+    assert said(out, "drifted to another chat — going back to ours (#1;")
+    assert out.clicks == [OURS], out.clicks
+    assert out.loads == Counter({OURS: 2, NEW: 1}), out.loads
 
 
 def test_our_own_redraft_press_restarts_the_quiet_clock(launch):
@@ -463,6 +578,87 @@ def test_a_page_that_is_moving_or_shows_a_plan_is_never_refreshed(launch, kind):
         assert said(out, "Gemini's page now reads: nothing running and nothing finished")
     assert out.loads == Counter({OURS: 1}), out.loads
     assert not said(out, "refreshing its chat")
+
+
+#: The 10-01 crash retry's screen: Gemini's 'Stop response' button showing, and a
+#: short reply that does not change (171 characters from 0 s to the card at 306 s).
+VISIBLE_STOP = '<button aria-label="Stop response" style="width:24px;height:24px">■</button>'
+STILL_REPLY = "<p>" + "I'm researching the import rules and the breeding sources now. " * 2 + "</p>"
+
+
+def test_a_visible_stop_hands_gemini_off_at_six_minutes(launch):
+    """⭐ The 10-01 crash retry: Gemini's own Stop was showing for the whole wait
+    (very likely its research, already running) and the heartbeat's stop test
+    misses that button. It is Gemini still working: #953 hands it to the
+    round-robin at six minutes, with the late-Start watch armed — no card, no
+    computer use, no refresh. Before: the card at ten minutes, then the ladder,
+    and ChatGPT and Claude unpolled until about sixteen."""
+    out = launch(lambda cid, n: page(STILL_REPLY, extra=VISIBLE_STOP))
+    hand = said(out, "Handing off to the round-robin")
+    assert len(hand) == 1 and 360 <= hand[0][0] < 380, hand
+    assert out.cards == [] and out.looks == [] and out.clicks == []
+    assert out.loads == Counter({OURS: 1}), out.loads
+    assert out.handed and out.handed[0]["Gemini"]["gemini_watch_start"] is True
+
+
+def test_a_stop_read_on_a_tab_no_longer_believed_does_not_count(launch):
+    """The run's chat showed its Stop, then the tab went to another chat and
+    every load after it is not provably ours. The last reading from our chat is
+    not news from the tab now: no hand-off as though Gemini were still working,
+    and the card comes at ten minutes."""
+    drifted = []
+
+    def script(cid, n):
+        if cid == OTHER:
+            return page(SILENT, brief=FOREIGN)
+        return page(STILL_REPLY, extra=VISIBLE_STOP) if n == 1 else page(SILENT, brief=FOREIGN)
+
+    async def drift(elapsed, pg):
+        if elapsed >= 100 and not drifted:
+            drifted.append(elapsed)
+            await pg.goto(f"{APP}/{OTHER}")
+
+    out = launch(script, on_tick=drift)
+    assert said(out, "going back to ours (#1;")
+    assert not said(out, "Handing off to the round-robin")
+    assert out.cards and out.cards[0][0] >= 600, out.cards[:1]
+
+
+def test_a_shorter_wait_set_by_hand_still_cards_where_it_gives_up(launch, monkeypatch):
+    """GEMINI_PLAN_WAIT_SEC set to five minutes on its own: the card still goes
+    up where that wait gives up. Before: the alert stayed at ten minutes, so the
+    only card was the ladder's, at about eleven."""
+    monkeypatch.setenv("GEMINI_PLAN_WAIT_SEC", "300")
+    out = launch(lambda cid, n: page(WITH_BUTTON), start="")
+    assert out.cards and 300 <= out.cards[0][0] < 330, out.cards[:1]
+
+
+def test_the_tile_hears_from_the_wait_while_the_tab_is_not_provably_ours(launch):
+    """After a refresh the run's chat cannot be proven, for the rest of the wait.
+    Nothing on it is read, but the tile still gets its planning update about every
+    fifteen seconds and the log its 'Still waiting' line. Before: both stopped
+    after the refresh until the wait was over."""
+    out = launch(lambda cid, n: page(SILENT) if n == 1 else page(SILENT, brief=FOREIGN))
+    assert said(out, "not provably the run's own chat")
+    beats = [t for t in out.beats if t < 600]
+    assert beats and beats[-1] > 560, beats[-3:]
+    assert all(b - a <= 45 for a, b in zip(beats, beats[1:])), beats
+    waits = [t for t, _m in said(out, "Still waiting for Gemini research plan")]
+    assert waits and waits[-1] > 580, waits[-3:]
+    assert all(b - a <= 45 for a, b in zip(waits, waits[1:])), waits
+
+
+def test_a_chat_under_an_account_index_is_refreshed_too(launch):
+    """A profile signed in to more than one Google account opens Gemini under
+    /u/<n>/app/<id>. That is the run's chat as much as /app/<id> is: it is
+    refreshed and its plan started. Before: it was read as having no address,
+    so it was never refreshed and the card went up at ten minutes."""
+    out = launch(lambda cid, n: page(SILENT if n == 1 else PLAN),
+                 app="http://fixture.invalid/gemini.google.com/u/1/app")
+    assert said(out, "This run's chat has its address")
+    assert said(out, "refreshing its chat (#1)")
+    assert out.clicks == [OURS], out.clicks
+    assert out.cards == []
 
 
 def test_an_auto_started_gemini_is_handed_off_untouched(launch):

@@ -13,6 +13,12 @@ quiet chat refreshed, always on the run's own chat (2026-10-01).
             first, address second), never refreshed in place; a page that cannot
             be proven after a load is never pressed — not by the wait, not by the
             recovery after it.
+  W27-W39 — review round 1: a chat Gemini moves to a new address is followed
+            (never an earlier attempt's finished one); a visible Stop is
+            "still working" for the #953 hand-off; the alert follows the wait;
+            the tile hears from the wait on an unproven tab; /u/<n>/app/ is a
+            chat address; before the address is taken, a chat holding another
+            brief is not believed (and "cannot tell" still is).
 
 ⛔ DELIBERATELY ABSENT: the alert default (600 → 240). The card predicate refuses
 every arm before the wait is over, so an alert second at or under the wait
@@ -140,6 +146,65 @@ MUTANTS = [
        "                                           if True else (False, _gemini_state))")]),
     ("W26", RESEARCH, "⛔ the side-list press takes the first chat it sees, not ours",
      [(".endsWith('/app/' + id)) {", ".includes('/app/')) {")]),
+
+    # ── W27-W39: review round 1 ─────────────────────────────────────────────
+    ("W27", RESEARCH, "⛔⛔ the owner's 10-01 run: Gemini moves the run's chat to a "
+     "new address and it is called a drift — Start is never pressed",
+     [("    elif await _gemini_plan_follow(page, chat, url, brief):\n"
+       "        return True\n", "")]),
+    ("W28", RESEARCH, "⛔ a refresh Gemini answers at a new address is called not "
+     "the run's own",
+     [("        ok = await _gemini_plan_follow(page, chat, now_url, brief)\n",
+       "        ok = False\n")]),
+    ("W29", RESEARCH, "⛔⛔ an earlier attempt's FINISHED chat (same brief) is "
+     "followed — its report taken for this run's",
+     [("    if (await _gemini_done_read(page))[0]:\n        return False\n"
+       '    chat["convo"], chat["url"], chat["trusted"] = here, url, True',
+       '    chat["convo"], chat["url"], chat["trusted"] = here, url, True')]),
+    ("W30", RESEARCH, "⛔⛔ any other address is followed without the proof — "
+     "another chat's Start is pressed",
+     [("    if not await _gemini_reload_identity_ok(page, here, brief):\n"
+       "        return False\n", "")]),
+    ("W31", RESEARCH, "⛔⛔ Gemini's visible Stop is not 'still working' — no hand-off "
+     "at six minutes, the card and the ladder instead",
+     [('            if _chat_ok and _gemini_state.startswith("stop_btn_present"):\n',
+       "            if False:\n")]),
+    ("W32", RESEARCH, "⛔ a Stop read before the tab stopped being believed keeps "
+     "Gemini 'working' — handed off with no evidence",
+     [('if _chat_ok and _gemini_state.startswith("stop_btn_present"):',
+       'if _gemini_state.startswith("stop_btn_present"):')]),
+    ("W33", RESEARCH, "⛔ the alert is fixed at ten minutes — a shorter wait set "
+     "by hand gives up with no card",
+     [('os.environ.get("GEMINI_PLAN_ALERT_SEC",\n'
+       "                                             str(_start_wait_max_sec))",
+       'os.environ.get("GEMINI_PLAN_ALERT_SEC",\n'
+       '                                             "600")')]),
+    ("W34", RESEARCH, "⛔ the tile hears nothing while the tab is not provably ours",
+     [("                if time.time() - _last_plan_emit >= 15:\n"
+       "                    try:\n"
+       '                        emit_event("agent_progress"',
+       "                if False:\n"
+       "                    try:\n"
+       '                        emit_event("agent_progress"')]),
+    ("W35", RESEARCH, "⛔ the log says nothing while the tab is not provably ours",
+     [('                log(f"[2D] Still waiting for Gemini research plan... '
+       '({_elapsed}s / "\n',
+       '                (f"[2D] Still waiting for Gemini research plan... '
+       '({_elapsed}s / "\n')]),
+    ("W36", RESEARCH, "⛔ a chat under /u/<n>/app/ has no address — never refreshed",
+     [("gemini\\.google\\.com/(?:u/\\d+/)?app/", "gemini\\.google\\.com/app/")]),
+    ("W37", RESEARCH, "⛔⛔ before the address is taken, another brief's chat is "
+     "believed — its Start is pressed",
+     [("_gemini_conversation_ownership(txt, brief, from_turn=from_turn) is False:",
+       "False:")]),
+    ("W38", RESEARCH, "⛔⛔ 'cannot tell' is read as somebody else's chat — a page "
+     "that has not painted its turn is not believed",
+     [("_gemini_conversation_ownership(txt, brief, from_turn=from_turn) is False:",
+       "_gemini_conversation_ownership(txt, brief, from_turn=from_turn) is not True:")]),
+    ("W39", RESEARCH, "⛔ Gemini's own page text condemns a chat whose turn could "
+     "not be read",
+     [("_gemini_conversation_ownership(txt, brief, from_turn=from_turn) is False:",
+       "_gemini_conversation_ownership(txt, brief, from_turn=True) is False:")]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

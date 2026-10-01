@@ -48446,8 +48446,9 @@ _GEMINI_STALE_RELOAD_SEC = int(os.environ.get("DG_GEMINI_STALE_RELOAD_SEC", str(
 # the right owner for a tab that three reloads did not cure.
 _GEMINI_STALE_RELOAD_MAX = int(os.environ.get("DG_GEMINI_STALE_RELOAD_MAX", "3"))
 
-# A Gemini conversation URL carries its id in the path: /app/<id>.
-_GEMINI_APP_CONVO_RE = re.compile(r"gemini\.google\.com/app/([A-Za-z0-9_-]{4,})")
+# A Gemini conversation URL carries its id in the path: /app/<id>, or
+# /u/<n>/app/<id> on a profile signed in to more than one Google account.
+_GEMINI_APP_CONVO_RE = re.compile(r"gemini\.google\.com/(?:u/\d+/)?app/([A-Za-z0-9_-]{4,})")
 
 
 def _gemini_convo_url_id(url: str) -> str:
@@ -61912,6 +61913,13 @@ async def _gemini_plan_refresh(page, chat: dict, brief: str, why: str, *,
                     "page as it is", "WARN")
     await asyncio.sleep(settle_sec)
     ok = await _gemini_reload_identity_ok(page, ours, brief)
+    if not ok:
+        # Gemini can answer a load of the chat at a new address of its own.
+        try:
+            now_url = page.url or ""
+        except Exception:
+            now_url = ""
+        ok = await _gemini_plan_follow(page, chat, now_url, brief)
     chat["trusted"] = ok
     if ok:
         _, state = await _gemini_done_read(page)
@@ -61928,14 +61936,42 @@ async def _gemini_plan_refresh(page, chat: dict, brief: str, why: str, *,
     return ok
 
 
+async def _gemini_plan_follow(page, chat: dict, url: str, brief: str) -> bool:
+    """Has Gemini moved this run's chat to the address the tab is on? If so the
+    plan wait takes that address as the run's chat, and True.
+
+    ⭐⭐ MEASURED in the owner's 10-01 run: the brief landed on one /app/<id>,
+    and the plan with 'Start research' showed — and was pressed — on another,
+    after a navigation at 111 s. A new address that proves it holds this run's
+    brief is this run's chat moved, not a drift. Taking it back to the old
+    address instead meant Start was never pressed.
+    ⛔ NOT a chat holding a finished report. A retry pastes the same brief, so an
+    earlier attempt's finished chat proves "ours" too; before Start, a report
+    is an earlier run's, which is why the send path's adoption refuses it.
+    """
+    here = _gemini_convo_url_id(url)
+    if not here or here == chat.get("convo"):
+        return False
+    if not await _gemini_reload_identity_ok(page, here, brief):
+        return False
+    if (await _gemini_done_read(page))[0]:
+        return False
+    chat["convo"], chat["url"], chat["trusted"] = here, url, True
+    log("[2D] Gemini moved this run's chat to a new address — following it")
+    return True
+
+
 async def _gemini_plan_chat_ok(page, chat: dict, brief: str) -> bool:
     """May this look at Gemini's tab be believed — is it the run's own chat?
 
       · Until the chat has an address there is nothing to compare, and the page
-        is read as it always was. The address is taken the first time the page
-        PROVES it is ours (address and brief), never from the address bar alone.
+        is read as it always was — unless its first turn provably holds another
+        brief. The address is taken the first time the page PROVES it is ours
+        (address and brief), never from the address bar alone.
       · Once it has one, a tab anywhere else is not believed, and it is taken
-        back to ours as soon as a load is allowed (one per refresh window).
+        back to ours as soon as a load is allowed (one per refresh window) —
+        unless that other address proves it is this run's chat, moved by Gemini
+        (`_gemini_plan_follow`).
       · A tab back on our address by any route — our load, or Gemini's own — is
         believed again only once it is proven.
 
@@ -61955,6 +61991,19 @@ async def _gemini_plan_chat_ok(page, chat: dict, brief: str) -> bool:
         if here and await _gemini_reload_identity_ok(page, here, brief, attempts=1):
             chat["convo"], chat["url"] = here, url
             log("[2D] This run's chat has its address — every refresh comes back to it")
+        elif here:
+            # ⛔ Before the address is taken, a chat whose first turn PROVABLY
+            # holds another brief is still somebody else's — its 'Start research'
+            # is not ours to press. "Cannot tell" is read as before; the landing
+            # check after Send asks the same question the same way.
+            txt, from_turn = await _gemini_read_conversation_text(page)
+            if _gemini_conversation_ownership(txt, brief, from_turn=from_turn) is False:
+                if chat.get("foreign_at") != here:
+                    chat["foreign_at"] = here
+                    log(f"[2D] Gemini's tab is on a chat that holds another brief "
+                        f"({redacted_chat_url(url)}) — nothing on it is read or "
+                        "pressed; still waiting", "WARN")
+                return False
         return True
     if here == chat["convo"]:
         if chat.get("trusted", True):
@@ -61963,6 +62012,8 @@ async def _gemini_plan_chat_ok(page, chat: dict, brief: str) -> bool:
             chat["trusted"] = True
             log("[2D] …back on the run's own chat (proven on a later look)")
             return True
+    elif await _gemini_plan_follow(page, chat, url, brief):
+        return True
     else:
         chat["trusted"] = False
     if not _gemini_plan_refresh_due(time.time(), quiet_since=0.0,
@@ -70132,9 +70183,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # ⭐ 2026-10-01: never before the wait is over, three re-drafts or not —
         # the card now goes up where the wait gives up (see 1d below).
         _plan_alert_emitted = False
-        # ⭐ 2026-10-01: ten minutes, the same as the wait — nothing is raised
-        # before it (was 240 s). `_gemini_plan_card_due` takes the later of the two.
-        _PLAN_ALERT_SEC = int(os.environ.get("GEMINI_PLAN_ALERT_SEC", "600"))
+        # ⭐ 2026-10-01: the wait itself — ten minutes, and nothing is raised
+        # before it (was 240 s). `_gemini_plan_card_due` takes the later of the
+        # two, so a fixed default here would silently drop the card where a
+        # shorter GEMINI_PLAN_WAIT_SEC gives up.
+        _PLAN_ALERT_SEC = int(os.environ.get("GEMINI_PLAN_ALERT_SEC",
+                                             str(_start_wait_max_sec)))
         # #929: plan-STREAMING hold-off. The flat 300s budget + 4-min card
         # fired on a healthy plan that simply took >5 min to draft
         # (2026-07-09 live false alarm → card → auto-skip of a working
@@ -70239,6 +70293,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     f"({_elapsed}s, no 'Start research' was needed) — handing it to "
                     "the round-robin to collect the report", "INFO")
                 break
+            # ⭐ 2026-10-01: Gemini's own VISIBLE 'Stop response' is streaming too.
+            # The heartbeat's stop test (scrape_progress_gemini) is case-sensitive
+            # and misses it, so a Gemini already researching behind it read as a
+            # dead plan: no #953 hand-off at six minutes — the whole wait, the card
+            # and the ladder instead (the 10-01 crash retry). Only the visible one:
+            # a hidden Stop or a leftover animation can stay on a page for good
+            # (08-19), and would hand a dead plan off past its card.
+            if _chat_ok and _gemini_state.startswith("stop_btn_present"):
+                _last_stream_seen_at = time.time()
             _streaming_recent = (time.time() - _last_stream_seen_at) < 45
             # #953: still streaming past the hand-off point → the research
             # (almost certainly) auto-started — hand off to the round-robin
@@ -70325,7 +70388,18 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             if not _chat_ok:
                 # Not provably the run's chat: nothing on it is read or pressed
                 # on this look. The top of the loop takes it back when a load is
-                # allowed again.
+                # allowed again. The tile and the log still hear from the wait,
+                # without a reading of a page that may be somebody else's.
+                if time.time() - _last_plan_emit >= 15:
+                    try:
+                        emit_event("agent_progress", phase=2, agent="gemini",
+                                   status="generating", stage="planning",
+                                   progress="Gemini drafting research plan...")
+                    except Exception:
+                        pass
+                    _last_plan_emit = time.time()
+                log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / "
+                    f"{_start_wait_max_sec}s)")
                 await asyncio.sleep(10)
                 continue
             _reply = await _gemini_regen_read(gemini_page)
