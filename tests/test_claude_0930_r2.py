@@ -365,7 +365,10 @@ def test_the_report_is_opened_and_downloaded_by_the_page(chrome, open_page, line
     panel (`[role=region][aria-label^="Artifact panel"]`), "Copy options", then
     "Download as Markdown" (`export-download`). Computer use is THERE and must
     not be called: on 09-30 it opened the report (3 steps) and downloaded it
-    (2), and the mount probe never once saw Claude's panel in the corpus."""
+    (2), and the mount probe never once saw Claude's panel in the corpus.
+    The page's own download is off by default since 10-01 (the next test); this
+    is the path with it turned on."""
+    monkeypatch.setenv("SR_CLAUDE_PAGE_DOWNLOAD", "1")
     cua = []
 
     async def _cua(*a, **k):
@@ -398,6 +401,43 @@ def test_the_report_is_opened_and_downloaded_by_the_page(chrome, open_page, line
     assert any("Download as Markdown" in m for _, m in lines), lines
     # Claude's own left sidebar is not an open panel to close first.
     assert not any("Closing artifact panel" in m for _, m in lines), lines
+
+
+def test_by_default_computer_use_downloads_the_report_as_on_0930(chrome, open_page, lines,
+                                                                 monkeypatch):
+    """⛔⛔ 2026-10-01: a page-pressed download on ChatGPT's app crashed Chrome the
+    instant its file started, and every good run got Claude's report by computer
+    use's download. By default the page still opens the report, but it never
+    presses Copy options or Download as Markdown: computer use downloads."""
+    monkeypatch.delenv("SR_CLAUDE_PAGE_DOWNLOAD", raising=False)
+    calls = []
+
+    async def _cua(*a, **k):
+        return {"text": ""}
+
+    async def _cua_download(*a, **k):
+        calls.append("cua_download")
+        return P.REPORT_MD
+
+    async def _agent_loop(*a, **k):
+        return {}
+
+    class _Browser:
+        async def switch_to_page(self, page):
+            return None
+
+    monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
+    monkeypatch.setattr(research, "_extract_via_cua_download", _cua_download)
+    monkeypatch.setattr(research, "agent_loop", _agent_loop)
+    page = open_page(finished=True)
+    text = chrome.run(research.extract_claude_response(page, browser=_Browser(),
+                                                       cua_client=object()))
+    assert calls == ["cua_download"], (calls, lines)
+    assert P.REPORT_MD[:200] in text, (text[:200], lines)
+    presses = _presses(chrome, page)
+    for what in ("copy-options", "download-md"):
+        assert not any(p.get("what") == what for p in presses), (what, presses)
+    assert not any("Extracted via the page's Download as Markdown" in m for _, m in lines), lines
 
 
 # ═════════════════════════════════════════════════════════════════════════════

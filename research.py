@@ -58682,8 +58682,14 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # gate so a missed pre-click doesn't silently skip everything.
 
         # ── Tier 1 by the page: Copy options → Download as Markdown ──
-        # ⭐ 2026-09-30 round 2. Computer use below is the fallback only.
-        md_page = await _claude_download_report_by_page(page, label)
+        # ⭐ 2026-09-30 round 2. ⛔ OFF BY DEFAULT SINCE 2026-10-01: the same
+        # kind of page-pressed download on ChatGPT's app crashed Chrome 154 the
+        # instant its file started, and every good run (09-20, 09-30) got this
+        # report by computer use's download below. SR_CLAUDE_PAGE_DOWNLOAD=1
+        # turns the page press back on for a test.
+        md_page = ""
+        if os.environ.get("SR_CLAUDE_PAGE_DOWNLOAD", "") == "1":
+            md_page = await _claude_download_report_by_page(page, label)
         if md_page:
             if _is_sources_not_document(md_page, platform="claude"):
                 log(f"[{label}] page download is the sources list, not the report "
