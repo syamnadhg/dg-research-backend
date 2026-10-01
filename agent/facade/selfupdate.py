@@ -686,6 +686,51 @@ def _waiter_python() -> "str | None":
     return shutil.which("python3") or shutil.which("python") or sys.executable
 
 
+def _waiter_path_dirs() -> "list[str]":
+    """Standard homes for `uv` and the pipx shim, in priority order — the same list
+    the backend's update waiter puts first on its PATH (`_lifecycle_path_dirs` in
+    research.py). A supervisor's own PATH is far narrower."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        return [
+            os.path.join(home, ".local", "bin"),        # uv's own installer + pipx
+            os.path.join(local, "Programs", "uv"),
+            os.path.join(local, "uv", "bin"),
+            os.path.join(home, ".cargo", "bin"),        # `cargo install uv`
+        ]
+    return [
+        "/opt/homebrew/bin",                            # Apple-silicon Homebrew
+        "/usr/local/bin",                               # Intel Homebrew + manual installs
+        os.path.join(home, ".local", "bin"),            # uv's own installer + pipx
+        os.path.join(home, ".cargo", "bin"),
+    ]
+
+
+def _waiter_env() -> dict:
+    """Our environment with the uv and pipx homes put first on PATH, for the
+    detached reconnect waiter.
+
+    pipx replays the backend a venv was BUILT with, and for a uv-built venv it finds
+    uv only through PATH. The bridge runs under launchd (whose plist sets no PATH,
+    so launchd's /usr/bin:/bin:/usr/sbin:/sbin) or a systemd user unit (much the
+    same), and the waiter inherited that — so on a host whose uv lives in
+    ~/.local/bin or /opt/homebrew/bin, `pipx install --force` failed, the
+    uninstall/reinstall rung failed the same way, the old build reconnected and the
+    host said "updated" while still on the old version. The backend's waiter was
+    fixed the same way; this is the agent's copy of that fix."""
+    env = dict(os.environ)
+    parts: "list[str]" = []
+    seen: "set[str]" = set()
+    for d in [*_waiter_path_dirs(), *(env.get("PATH") or os.defpath).split(os.pathsep)]:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 # How long to wait for the cgroup-escape front-end to report whether systemd
 # ACCEPTED the transient unit. `systemd-run` submits and exits in milliseconds, so
 # this ceiling only bounds the pathological case; it is the longest the
@@ -753,7 +798,8 @@ def agent_resolvable() -> bool:
         return False
 
 
-def _spawn_detached(cmd: list, log_name: str, *, confirm_exit: "float | None" = None) -> bool:
+def _spawn_detached(cmd: list, log_name: str, *, confirm_exit: "float | None" = None,
+                    env: "dict | None" = None) -> bool:
     """Launch `cmd` fully detached (survives this process), logging to
     ~/.super-agent/<log_name>. Returns True if it launched. Stdlib only;
     cross-platform (Windows DETACHED_PROCESS / POSIX start_new_session).
@@ -765,6 +811,8 @@ def _spawn_detached(cmd: list, log_name: str, *, confirm_exit: "float | None" = 
     the deadline counts as launched: that is the normal case for the long-lived
     waiter, and it is why this is opt-in rather than the default — polling a child
     that by design outlives us would turn every spawn into a timeout.
+
+    `env` is the child's environment; None inherits ours.
     """
     logf = subprocess.DEVNULL
     try:
@@ -780,7 +828,8 @@ def _spawn_detached(cmd: list, log_name: str, *, confirm_exit: "float | None" = 
         kwargs["start_new_session"] = True
     try:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
+                                stdin=subprocess.DEVNULL, creationflags=creationflags,
+                                env=env, **kwargs)
     except Exception:
         return False
     finally:
@@ -862,6 +911,14 @@ def spawn_detached_reconnect() -> bool:
     # output still lands in self-update.log (systemd-run would divert it to the
     # journal).
     escape = _cgroup_escape_prefix() if supervised else []
+    # PATH widened so pipx can find uv — see `_waiter_env`. On systemd the
+    # transient unit gets the user manager's environment, not ours, so the PATH is
+    # handed over explicitly, spliced in before the prefix's trailing `--`. The
+    # plain detached child (macOS, Windows, an unsupervised serve, or the fallback
+    # below) gets it through Popen's env.
+    env = _waiter_env()
+    if escape:
+        escape = escape[:-1] + [f"--setenv=PATH={env['PATH']}"] + escape[-1:]
     waiter = [py, "-c", _RECONNECT_WAITER, str(os.getpid()), cfg]
     # CONFIRM, don't assume. `systemd-run` submits a transient unit and exits — it is
     # a front-end, not the waiter — so a bare Popen success only means the FRONT-END
@@ -878,7 +935,7 @@ def spawn_detached_reconnect() -> bool:
     if escape and _spawn_detached(escape + waiter, "self-update.log",
                                   confirm_exit=_ESCAPE_CONFIRM_SECS):
         return True
-    return _spawn_detached(waiter, "self-update.log")
+    return _spawn_detached(waiter, "self-update.log", env=env)
 
 
 def spawn_detached_backend_install() -> bool:

@@ -210,7 +210,10 @@ def test_spawn_detached_reconnect_escapes_cgroup_on_linux(tmp_path, monkeypatch)
                         or types.SimpleNamespace(poll=lambda: 0))
     assert selfupdate.spawn_detached_reconnect() is True
     cmd = seen["cmd"]
-    assert cmd[:5] == _ESCAPE
+    # The prefix, with the waiter's PATH spliced in before its `--` (see
+    # test_selfupdate_waiter_path_1001.py), then the waiter itself.
+    assert cmd[:4] == _ESCAPE[:4]
+    assert cmd[cmd.index("--") + 1] == "python3"
     assert "python3" in cmd and "-c" in cmd  # the waiter still runs, just re-parented
 
 
@@ -237,9 +240,9 @@ def test_a_rejected_cgroup_escape_falls_back_to_a_plain_detached_child(tmp_path,
     monkeypatch.setattr(selfupdate.subprocess, "Popen", fake_popen)
     assert selfupdate.spawn_detached_reconnect() is True
     assert len(calls) == 2, "a rejected escape must be retried unescaped"
-    assert calls[0][:5] == _ESCAPE
+    assert calls[0][:4] == _ESCAPE[:4]
     assert calls[1][0] == "python3", "the fallback must run the waiter directly"
-    assert calls[1][:5] != _ESCAPE
+    assert "systemd-run" not in calls[1]
 
 
 def test_the_unescaped_spawn_is_not_polled_for_an_exit_status(tmp_path, monkeypatch):
