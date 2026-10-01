@@ -241,7 +241,7 @@ MUTANTS = [
     ("G14", "a search engine's own pages pass",
      [('        if _DOC_SEARCH_HOST_RE.match(bare):\n            return ""',
        '        if False:\n            return ""')]),
-    ("L1", "a one-line bibliography lead opens a bibliography again — "
+    ("W1", "a one-line bibliography lead opens a bibliography again — "
            "'**Key sources:** OFA.' then '**Budget:** …' is cut from the report",
      [('        return "line" if (rest and title.endswith(":")) else "bib"\n',
        '        return "bib"\n')]),
