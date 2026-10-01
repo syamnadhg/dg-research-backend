@@ -89,7 +89,9 @@ TURN = ("        if (%s) return;\n"
 CLAUDE = ("                    if (h && h.length < 500 && !%s && !seen.has(h)) {"
           % (_G % "h"))
 PYRULE = '    return any(h == d or h.endswith("." + d) for d in _HOST_DENYLIST)'
-WRITER = ("            urls = [u for u in _sweep_source_urls(content) "
+#: ⭐ Wave 14: the sweep reads `_report_text` (an agent's own linked numbers
+#: turned back into what it wrote); the filter is the same.
+WRITER = ("            urls = [u for u in _sweep_source_urls(_report_text) "
           "if not _find_is_platform_host(u)]")
 SWEEP = ("    return [\n"
          "        _find_trim_trailing_punct(raw)\n"
@@ -144,12 +146,12 @@ MUTANTS = [
      "⛔⛔ the writer stops filtering, so the Sources list and the Findings list "
      "answer differently about the same URL in the same run — one says the page is "
      "a source, the other says it is not",
-     [(WRITER, "            urls = _sweep_source_urls(content)")]),
+     [(WRITER, "            urls = _sweep_source_urls(_report_text)")]),
     ("W2", "over",
      "⛔⛔ the filter moves INTO the sweep, which sounds tidier and is destructive: "
      "that list is capped and never revisited, so the moment the host rule is wrong "
      "once a real citation is gone with nothing to notice it",
-     [(WRITER, "            urls = _sweep_source_urls(content)"),
+     [(WRITER, "            urls = _sweep_source_urls(_report_text)"),
       (SWEEP, "    return [\n"
               "        _find_trim_trailing_punct(raw)\n"
               "        for raw in _FIND_BARE_URL_RE.findall(_mask_code(md))\n"

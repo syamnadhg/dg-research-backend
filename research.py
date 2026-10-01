@@ -16531,6 +16531,11 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
         return False
     if not content or not content.strip():
         return False
+    # ⭐ Wave 14 — the brief is numbered HERE and only here: this is the copy the
+    # Documents page, its share and the Google Doc show. brief.md and the text
+    # the agents are handed stay unnumbered (`_brief_numbered_copy`).
+    if doc_type == "brief":
+        content = _brief_numbered_copy(content)
     _expire_at = _incognito_expire_at(_fb_research_id)
     try:
         _grpc_write_with_heal(
@@ -75894,8 +75899,11 @@ _DOC_SOURCES_ALT_TITLE = "Sources (numbered)"
 #: funding" or "References to the breed standard" is a section ABOUT something,
 #: and a title that merely starts with the word would remove it. The parts are
 #: shared by the heading test and the lead test below, so the two cannot drift.
+#: ⭐ Wave 14 — "prioritized": ChatGPT's 10-01 report ends "**Prioritized
+#: sources.**" over fifteen names with no link, and the document ended with that
+#: AND our list, two sections.
 _DOC_SOURCES_QUALIFIER = (r'(?:key|main|principal|selected|cited-source|cited|full'
-                          r'|further|additional|list[ \t]+of)')
+                          r'|further|additional|prioritized|list[ \t]+of)')
 _DOC_SOURCES_TAIL = (r'(?:[ \t]+(?:cited|consulted|used)'
                      r'|[ \t]+and[ \t]+(?:further[ \t]+reading|notes|references|sources))')
 #: …on a HEADING's text (`_doc_heading_title`): an optional section number —
@@ -75941,10 +75949,17 @@ _DOC_SOURCES_HEADING_LEVEL = 5
 #: level or a generic "sources" title would, the first time it ran on a document
 #: whose tail had already come off, eat the AGENT's own sources list instead. The
 #: alternate title comes first: it is the longer of the two.
+#: ⛔⛔ Wave 14, 2026-10-01 — AND `##` ONLY UNDER THE ALTERNATE TITLE. A plain
+#: "## Sources" over `n. [title](url)` rows is exactly Claude's own list, and
+#: once its numbers are linked the document carries our marker, so this strip
+#: ran on it: MEASURED, `save_meta`'s read took 10,144 characters (Claude's whole
+#: list) off the 09-30 shape. "## Sources (numbered)" is ours alone, so the old
+#: form a document numbered before the wave 10 repair carries still comes off.
 _DOC_SOURCES_BLOCK_RE = re.compile(
-    r'\n\n(?:%s|##)[ \t]+(?:%s|%s)[ \t]*\n\n(?:\d{1,3}\. \[.*\n?)+\Z'
+    r'\n\n(?:%s[ \t]+(?:%s|%s)|##[ \t]+%s)[ \t]*\n\n(?:\d{1,3}\. \[.*\n?)+\Z'
     % ("#" * _DOC_SOURCES_HEADING_LEVEL,
-       re.escape(_DOC_SOURCES_ALT_TITLE), re.escape(_DOC_SOURCES_TITLE)))
+       re.escape(_DOC_SOURCES_ALT_TITLE), re.escape(_DOC_SOURCES_TITLE),
+       re.escape(_DOC_SOURCES_ALT_TITLE)))
 #: The same tail with no marker in the document: the visited-sites list a
 #: document that cited nothing ends with. Our current level only, either title
 #: (the alternate stays readable: a build of 2026-10-01 wrote it after a
@@ -76671,6 +76686,110 @@ def _doc_marker_position(md: str, masked: str, spans: list,
     return at if at > url_end else url_end
 
 
+# ── AN AGENT'S OWN NUMBERS, LINKED TO ITS OWN LIST (Wave 14, 2026-10-01) ─────
+#
+# Owner, 2026-10-01: "ChatGPT and Claude documents produced by a Super Research
+# run don't have footnotes. It needs to be an openable reference link in between
+# the document — the links of the sources."
+#
+# Claude's "Download as Markdown" writes every citation as an escaped number,
+# `\[7\]`, and ends with its own numbered "## Sources" list of links. Nothing
+# tied one to the other, so the reader saw a "[7]" that opened nothing.
+# MEASURED on both saved documents: 164 numbers (52 distinct) against 52 rows on
+# 10-01, 110 (76 distinct) against 76 rows on 09-30. Every number has a row,
+# every row is cited, and number n is row n.
+#
+# ⭐ THE RULE. When the text holds escaped numbers outside code AND the document
+# ends with its own sources section whose numbered rows count 1, 2, 3 … with no
+# gap, each `\[n\]` whose row n holds a link becomes our marker,
+# `[\[n\]](address of row n)`, in place. Nothing is added and nothing moves. A
+# number with no row, or a row with no link we would put behind a number, stays
+# as it is. The agent's own list stays the one list.
+#
+# ⛔⛔ ROW n IS THE ROW WRITTEN "n.", AND ONLY WHILE THE WRITTEN NUMBERS COUNT
+# 1, 2, 3 … A markdown viewer numbers an ordered list from its first item and
+# ignores every number written after it, so in a list written "1. 2. 4." the
+# reader sees the third row as "3." and a "[4]" linked to it would open the row
+# the reader reads as 3. Any other shape is left alone.
+#
+# ⛔ A WRONG LINK IS WORSE THAN NO FOOTNOTE. A number only ever links to an
+# address in that document's own list.
+
+#: An agent's own citation number, escaped the way Claude's export writes it.
+#: ⛔ Never a number that is already a link's text: our marker `[\[7\]](…)` holds
+#: one, and linking it again would put a link inside a link.
+_DOC_OWN_NUMBER_RE = re.compile(r'(?<![\[\\])\\\[(\d{1,3})\\\](?!\]\()')
+#: An item at the top level of an ordered list, and the number written on it.
+_DOC_OWN_ROW_NUMBER_RE = re.compile(r'^[ \t]{0,3}(\d{1,3})[.)][ \t]', re.MULTILINE)
+#: …and the link the item opens with: `[title](address)`, one level of brackets
+#: allowed inside the address (a Wikipedia page has them), or `<address>`.
+_DOC_OWN_ROW_LINK_RE = re.compile(
+    r'[ \t]{0,3}\d{1,3}[.)][ \t]+'
+    r'(?:\[(?:\\.|[^\]\\\n])*\]\((?P<u>(?:[^\s()]|\([^\s()]*\))+)(?:[ \t]+"[^"\n]*")?\)'
+    r'|<(?P<a>[^<>\s]+)>)')
+#: Our marker as the own-numbers step writes it, with no space in front: the
+#: re-entry read-back turns it back into the agent's `\[n\]`.
+_DOC_OWN_MARK_RE = re.compile(r'\[\\\[(\d{1,3})\\\]\]\([^()\s]*\)')
+
+
+def _doc_own_list_rows(md: str, masked: str = None) -> dict:
+    """`{n: address}` for the rows of the document's own trailing sources section
+    (`_doc_own_sources_start`) that open with a link we would put behind a
+    number — or {} when there is no such section, or its numbered rows do not
+    count 1, 2, 3 … (see the block above)."""
+    if masked is None:
+        masked = _mask_code_spans(md or "")[0]
+    own_at = _doc_own_sources_start(masked)
+    if own_at is None:
+        return {}
+    section = masked[own_at:]
+    items = list(_DOC_OWN_ROW_NUMBER_RE.finditer(section))
+    if not items or [int(m.group(1)) for m in items] != list(range(1, len(items) + 1)):
+        return {}
+    rows = {}
+    for m in items:
+        start = own_at + m.start()
+        end = md.find("\n", start)
+        link = _DOC_OWN_ROW_LINK_RE.match(md[start: len(md) if end == -1 else end])
+        url = (link.group("u") or link.group("a") or "") if link else ""
+        if _doc_is_linkable_url(url):
+            rows[int(m.group(1))] = url
+    return rows
+
+
+def _doc_link_own_numbers(md: str, label: str = "") -> str:
+    """Each escaped `\\[n\\]` outside code, before the document's own sources
+    section, linked to row n of that section — see the block above. Returns `md`
+    itself when nothing is linked."""
+    if not md or "\\[" not in md:
+        return md
+    masked = _mask_code_spans(md)[0]
+    rows = _doc_own_list_rows(md, masked)
+    if not rows:
+        return md
+    own_at = _doc_own_sources_start(masked)
+    out, last, linked, missing = [], 0, 0, set()
+    for m in _DOC_OWN_NUMBER_RE.finditer(masked, 0, own_at):
+        n = int(m.group(1))
+        url = rows.get(n)
+        if not url:
+            missing.add(n)
+            continue
+        out.append(md[last:m.start()])
+        out.append(_doc_source_marker(n, url))
+        last = m.end()
+        linked += 1
+    if not linked:
+        return md
+    out.append(md[last:])
+    who = label or "the agent"
+    log(f"[{who}] linked {linked} of its own citation numbers to its own sources "
+        f"list ({len(rows)} rows)"
+        + (f" — {len(missing)} number{'' if len(missing) == 1 else 's'} with no "
+           f"row stay as written" if missing else ""))
+    return "".join(out)
+
+
 def _number_document_sources(md: str, findings: list, visited=None,
                              label: str = "") -> str:
     """Add an inline `[n]` link at each cited sentence, and a Sources list.
@@ -76707,9 +76826,20 @@ def _number_document_sources(md: str, findings: list, visited=None,
     SPANS are kept as well as the mask, because a position derived from masked
     text is not automatically a position outside code.
 
+    ⭐ Wave 14, 2026-10-01 — AN AGENT THAT NUMBERS ITS OWN CITATIONS KEEPS ITS
+    NUMBERS. A report whose text carries `\\[n\\]` and that ends with its own
+    numbered list of links (Claude's) has each number linked to its own row n
+    first (`_doc_link_own_numbers`), and nothing else is done to it: its own
+    list is the one list. ⛔ Not on a document that already carries our marker
+    or ends with our list — there the last list is ours, not the agent's.
+
     Returns the markdown unchanged when there is nothing to number, and when it
     has been numbered already — and says so in the log when it bails, which is
     how an echoed marker would be noticed next time."""
+    if md and not (_DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md)):
+        linked = _doc_link_own_numbers(md, label)
+        if linked is not md:
+            return linked
     if not md or not (findings or visited):
         return md or ""
     # ⛔ 2026-10-01 — THE VISITED LIST IS THE SENTINEL WHEN THERE IS NO MARKER.
@@ -76901,8 +77031,36 @@ def _document_without_sources(md: str) -> str:
     ⚠ Trailing whitespace does not come back — the numbering rstrips the document
     before appending its list — so this is the extraction's text, not its bytes.
 
-    ⛔ ORDER: the strip is gated on the markers being present, so it runs FIRST."""
+    ⛔ ORDER: the strip is gated on the markers being present, so it runs FIRST.
+
+    ⛔⛔ Wave 14, 2026-10-01 — AN AGENT'S OWN NUMBERS GO BACK TO WHAT IT WROTE.
+    In a document that ends with its own numbered list of links and no list of
+    ours (Claude's), every marker was written by `_doc_link_own_numbers` over
+    the agent's own `\\[n\\]`, so each one turns back into `\\[n\\]` instead of
+    coming out. MEASURED before this: the crash-retry read-back took 9,905
+    characters out of the 10-01 Claude report — every one of its 164 numbers —
+    and on the 09-30 shape 18,774, its whole list with them."""
+    unlinked = _doc_own_numbers_unlinked(md)
+    if unlinked is not md:
+        return unlinked
     return _DOC_SOURCE_MARK_INLINE_RE.sub("", _strip_numbered_sources_section(md))
+
+
+def _doc_own_numbers_unlinked(md: str) -> str:
+    """A document whose own numbered list of links is its one list (no list of
+    ours after it), with every marker turned back into the agent's `\\[n\\]` —
+    the text `_doc_link_own_numbers` was handed. Any other document is returned
+    as it is (`md` itself).
+
+    ⛔ ALSO WHAT `save_meta` READS ADDRESSES FROM. Claude cites in pairs,
+    `\\[2\\]\\[4\\]`, and linked that is `[\\[2\\]](a)[\\[4\\]](b)` with no space
+    between: the address sweep stops at `]`, not `[`, so it read
+    `a)[\\[4\\` as one address. MEASURED: the 10-01 report's `sourceUrls` went
+    from its 52 addresses to 79."""
+    if (md and _DOC_SOURCE_MARK_RE.search(md)
+            and _strip_numbered_sources_section(md) == md and _doc_own_list_rows(md)):
+        return _DOC_OWN_MARK_RE.sub(lambda m: "\\[%s\\]" % m.group(1), md)
+    return md
 
 
 def _document_with_sources(md: str, source_urls=None, findings=None,
@@ -76925,6 +77083,98 @@ def _document_with_sources(md: str, source_urls=None, findings=None,
         return _number_document_sources(md, rows or [], visited=visited, label=label)
     except Exception as _nse:
         log(f"numbered sources skipped ({type(_nse).__name__})", "DEBUG")
+        return md
+
+
+# ── THE BRIEF, NUMBERED IN THE COPY PEOPLE READ (Wave 14, 2026-10-01) ─────────
+#
+# ChatGPT's brief cites with source chips: a site name after the sentence it
+# supports, sometimes with "+2" for the sources behind it. The page read turns
+# each chip into a plain link ("[TypeSafe AI+2](…)"), so the brief had word
+# links and no numbers. MEASURED on 10-01: 12 chips, 11 addresses, three "+2".
+#
+# ⛔⛔ ONLY THE COPY IN THE APP. `brief.md` on disk is the file the agents are
+# handed (attached, or pasted on a hard retry) and the paste text is the same
+# string; the wave 10 repair took the numbering off it because one echoed marker
+# silently cost a whole agent report its numbers. So only the copy
+# `save_document_to_firestore` writes for the Documents page is numbered here,
+# and the two copies differ on purpose. Nothing reads the Firestore brief back
+# into an agent.
+#
+# ⭐ THE RULE. One row per linked address, in the order first met, titled with
+# the chip's text without its "+N". A chip — a link right after the end of a
+# sentence, or right after another chip — becomes its number, so "+2" goes (the
+# owner's choice: it opens its first source). A later chip for an address
+# already numbered shows that same number. Any other link keeps its words and
+# gets its number at the end of its sentence, where the agent reports put theirs.
+# Nothing is ever cut: a reader's copy must not lose text the agents still see.
+
+#: A link in the brief, never an image: its text `t` and its address `u`.
+_BRIEF_LINK_RE = re.compile(
+    r'(?<!!)\[(?P<t>(?:\\.|[^\]\\\n])*)\]'
+    r'\((?P<u>(?:[^\s()]|\([^\s()]*\))+)(?:[ \t]+"[^"\n]*")?\)')
+#: The end of a sentence right before a chip: its stop, any closing quote,
+#: bracket, backtick or emphasis, then the space.
+#: ⛔ Not a colon: "See: [the launch post](…)" is a link with words a reader
+#: needs, and a chip would have taken them.
+_BRIEF_CHIP_AFTER_RE = re.compile(r'[.!?][\'"”’)\]`*_]*[ \t]+\Z')
+#: Only spaces between two chips — never a line break.
+_BRIEF_CHIP_GAP_RE = re.compile(r'[ \t]*\Z')
+#: A chip's "+2": the sources behind it that the chip names and does not link.
+_BRIEF_CHIP_MORE_RE = re.compile(r'[ \t]*\+\d{1,3}[ \t]*\Z')
+
+
+def _brief_numbered_copy(md: str) -> str:
+    """The brief as the Documents page shows it — see the block above. Returns
+    `md` itself when there is nothing to number, when it is numbered already,
+    and when it ends with its own sources list of links. Never raises."""
+    try:
+        if not md or _DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md):
+            return md
+        masked, code = _mask_code_spans(md)
+        own_at = _doc_own_sources_start(masked)
+        links = [m for m in _BRIEF_LINK_RE.finditer(masked)
+                 if _doc_is_linkable_url(md[m.start("u"):m.end("u")])]
+        if not links or (own_at is not None and any(m.start() >= own_at for m in links)):
+            return md
+        link_spans = [(m.start(), m.end()) for m in links]
+        doc_end = len(md.rstrip())
+        numbers, rows, edits, chip_end, placed = {}, [], [], -1, set()
+        for i, m in enumerate(links):
+            url = md[m.start("u"):m.end("u")]
+            key = _find_normalize_url(url)
+            if key not in numbers:
+                title = re.sub(r'\s+', ' ', _BRIEF_CHIP_MORE_RE.sub("", md[m.start("t"):m.end("t")]))
+                title = re.sub(r'\\(.)', r'\1', title).strip()[:160]
+                rows.append((url, title or _doc_source_host(url) or url))
+                numbers[key] = len(rows)
+            n = numbers[key]
+            before = md[:m.start()]
+            if _BRIEF_CHIP_AFTER_RE.search(before) or (
+                    chip_end >= 0 and _BRIEF_CHIP_GAP_RE.match(before, chip_end)):
+                edits.append((m.start(), 1, i, m.end(), _doc_source_marker(n, url)))
+                chip_end = m.end()
+                continue
+            at = _doc_marker_position(md, masked, code + link_spans, m.end(), doc_end)
+            if (at, n) in placed:
+                continue
+            placed.add((at, n))
+            space = "" if md[at - 1].isspace() else " "
+            edits.append((at, 0, i, at, space + _doc_source_marker(n, url)))
+        out, last = [], 0
+        for start, _kind, _i, end, text in sorted(edits):
+            out.append(md[last:start])
+            out.append(text)
+            last = end
+        out.append(md[last:])
+        body = "".join(out).rstrip()
+        listing = "\n".join(_doc_sources_row(n + 1, u, t) for n, (u, t) in enumerate(rows))
+        log(f"[Brief] the copy in the app numbers its {len(rows)} source"
+            f"{'' if len(rows) == 1 else 's'} ({len(links)} citations); brief.md "
+            f"and the agents' copy stay as ChatGPT wrote them")
+        return "%s\n\n%s\n\n%s\n" % (body, _doc_sources_heading(_DOC_SOURCES_TITLE), listing)
+    except Exception as _bne:
+        log(f"brief numbering skipped ({type(_bne).__name__})", "DEBUG")
         return md
 
 
@@ -77222,7 +77472,10 @@ def save_meta(queue_dir, topic, phase, status="ongoing", *, research=None,
             # make on the write side: `_sweep_source_urls` still refuses the rest
             # (loopback, reserved names) because a URL not written is gone and
             # this list is capped and never revisited.
-            urls = [u for u in _sweep_source_urls(content) if not _find_is_platform_host(u)]
+            # ⭐ Wave 14 — off the text with an agent's own numbers unlinked
+            # (`_doc_own_numbers_unlinked`): a linked pair reads as one address.
+            _report_text = _doc_own_numbers_unlinked(content)
+            urls = [u for u in _sweep_source_urls(_report_text) if not _find_is_platform_host(u)]
             # ⭐ 2026-10-01 — THE SITES THE AGENT VISITED, which a report citing
             # fewer than five sources ends with. The strip above took them off
             # with the rest of our tail, and they are this agent's sources: the
@@ -80778,9 +81031,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # ⭐ Wave 4: rehost the brief's images before either write.
                 brief_text = await _rehost_document_images(brief_text, label="Brief")
                 # ⛔⛔ WAVE 10 REPAIR — NOT NUMBERED: same file, same reason as
-                # the `_brief_from_file` branch above. The disk copy phase 2
-                # attaches and the Firestore copy the app renders still agree,
-                # which is what this ordering was for.
+                # the `_brief_from_file` branch above. ⭐ Wave 14: the two copies
+                # now differ ON PURPOSE. The disk copy phase 2 attaches stays as
+                # ChatGPT wrote it; the Firestore copy the app renders is
+                # numbered inside `save_document_to_firestore`
+                # (`_brief_numbered_copy`).
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 # Sync to Firestore documents subcollection — this is the

@@ -450,9 +450,10 @@ CLAUDE_0930 = (FIXTURES / "claude.md").read_text(encoding="utf-8")
 
 #: The closed word set a sources section is titled with — PORTED here rather
 #: than read from the code, so the count below does not ask the code under test
-#: what a section is.
+#: what a section is. ⭐ Wave 14: "prioritized" (ChatGPT's 10-01 "**Prioritized
+#: sources.**").
 _W = (r"(?:(?:key|main|principal|selected|cited-source|cited|full|further|additional"
-      r"|list[ \t]+of)[ \t]+)?"
+      r"|prioritized|list[ \t]+of)[ \t]+)?"
       r"(?:sources?|references?|citations?|bibliography|works[ \t]+cited"
       r"|reference[ \t]+list)"
       r"(?:[ \t]+(?:cited|consulted|used)"
@@ -668,14 +669,23 @@ class TestExactlyOneSourcesSection:
             "https://www.akc.org/dog-breeds/"]
         assert research._document_without_sources(out) == body.rstrip()
 
-    def test_the_real_0930_claude_document_is_byte_identical(self, run):
-        """⛔⛔ Claude's own "## Sources" holds 76 links: it is the one list, and
-        the document does not change by a byte, sites tracked or not."""
+    def test_the_real_0930_claude_document_keeps_its_one_list(self, run):
+        """⛔⛔ Claude's own "## Sources" holds 76 links: it is the one list,
+        sites tracked or not.
+
+        ⭐ CHANGED IN WAVE 14, AND ON PURPOSE. This test used to say the
+        document does not change by a byte. The owner, 2026-10-01: footnotes
+        "should be there for all the documents of Phase 1 and Phase 2" — so
+        Claude's 110 numbers are now links to their own rows, and every other
+        byte is as it was (pinned pair by pair in
+        `tests/test_footnotes_1001.py`)."""
         assert len(re.findall(r"^\d+\. \[[^\]]+\]\(https?://", CLAUDE_0930, re.M)) == 76
         run.poll("claude", CHATGPT_TRACKED)
         local = run.write("Claude", CLAUDE_0930[len("# Claude Deep Research\n\n"):])
-        assert local == CLAUDE_0930
-        assert _with_visited(CLAUDE_0930, CHATGPT_TRACKED) == CLAUDE_0930
+        assert len(MARKER_RE.findall(local)) == 110
+        assert re.sub(r"\[\\\[(\d+)\\\]\]\([^()\s]*\)", r"\\[\1\\]", local) == CLAUDE_0930
+        assert sources_sections(local) == ["## Sources"]
+        assert _with_visited(CLAUDE_0930, CHATGPT_TRACKED) == local
 
     def test_a_gemini_document_ending_with_an_empty_sources_heading(self, run):
         """Gemini-shaped, through the real write: "## Sources" with nothing

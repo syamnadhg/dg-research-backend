@@ -227,8 +227,12 @@ def test_the_sources_list_and_the_findings_list_now_agree():
 def test_the_writer_applies_the_filter():
     """A behaviour test cannot see `save_meta`'s comprehension without a whole
     run, so the call site is pinned. It is the ONE host judgement made on the
-    write side, and the sweep must stay host-blind beneath it."""
-    assert ("urls = [u for u in _sweep_source_urls(content) "
+    write side, and the sweep must stay host-blind beneath it.
+
+    ⭐ Wave 14: the sweep reads `_report_text`, the document with an agent's
+    own linked numbers turned back into what it wrote
+    (`tests/test_footnotes_1001.py`); the filter is unchanged."""
+    assert ("urls = [u for u in _sweep_source_urls(_report_text) "
             "if not _find_is_platform_host(u)]") in SRC
 
 
