@@ -152,12 +152,9 @@ def test_click_once_then_patient_watch():
     assert "asyncio.sleep(3)" in blk
 
 
-def test_cua_prompt_forbids_grayed_click_and_double_click():
-    p = research.PROMPT_GEMINI_START_RESEARCH.lower()
-    assert "grayed" in p
-    assert "research already running" in p
-    assert "once" in p
-    assert "never click a grayed/disabled button" in p
+# (test_cua_prompt_forbids_grayed_click_and_double_click went in wave 15, 10-02,
+# with the prompt it read: no computer use is pointed at a Gemini plan any more —
+# tests/test_w15_gemini_waits_1002.py drives the hard retry that last used it.)
 
 
 def test_gemini_start_hotspot_hint_matches():

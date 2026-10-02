@@ -212,11 +212,25 @@ class _Enough(BaseException):
     """The round-robin has run as long as the test needs."""
 
 
+#: A 'Start research' that counts its presses on the page itself (the DOM is
+#: what the program's isolated script world and the page's own world share).
+LATE_START = ('<button aria-label="Start research" style="width:90px;height:24px" '
+              'onclick="document.body.dataset.pressed = '
+              'String(Number(document.body.dataset.pressed || 0) + 1); this.remove()">'
+              'Start research</button>')
+
+
 @pytest.fixture
 def round_robin(chrome, monkeypatch):
     """`run(watch, minutes)` runs the REAL round-robin over one Gemini on its
     planning screen for `minutes` of the program's own time. Returns what it
-    asked computer use for, and the cards it raised."""
+    asked computer use for, and the cards it raised.
+
+    `retry` queues the person's Retry on Gemini before the first leg — the real
+    hard retry runs, its setup stood in for: "brief-in" (the brief went into a
+    new chat, which stays on the planning screen) or "brief-not-in" (the set-up
+    failed). `start_at` puts a LATE_START on the page at that minute;
+    `pressed` is how many times it was pressed. `emits` is every event."""
     clock = _Clock()
 
     class _FastAsyncio:
@@ -228,32 +242,49 @@ def round_robin(chrome, monkeypatch):
             clock.t += float(delay or 0)
             if clock.t - start["t"] > start["limit"]:
                 raise _Enough()
+            if (start.get("start_at") is not None and not start.get("start_shown")
+                    and clock.t - start["t"] >= start["start_at"] * 60):
+                start["start_shown"] = True
+                await start["page"].evaluate(
+                    "(h) => document.querySelector('message-content')"
+                    ".insertAdjacentHTML('beforeend', h)", LATE_START)
             await asyncio.sleep(0)
 
     start = {"t": clock.t, "limit": 0}
-    looks, cards, lines = [], [], []
+    looks, cards, lines, emits, cua = [], [], [], [], []
     monkeypatch.setattr(research, "time", clock)
     monkeypatch.setattr(research, "asyncio", _FastAsyncio())
     monkeypatch.setattr(research, "log", lambda m, level="INFO": lines.append(str(m)))
-    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(research, "emit_event",
+                        lambda name, *a, **k: emits.append((name, dict(k))))
     monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
     monkeypatch.setattr(research, "fail_agent", lambda *a, **k: cards.append(a))
     monkeypatch.setattr(research, "_tracks_dir", None)
+    monkeypatch.setattr(research, "_AGENT_ERROR_CARD_TS", {})
+    monkeypatch.setattr(research, "_clear_pending_decision", lambda *a, **k: None)
 
     async def _look(page, **k):
         looks.append(k.get("hotspot_id"))
         return {"text": "CONCLUSION: working\nCONCLUSION: generating"}
 
+    async def _computer_use(*a, **k):
+        cua.append(a[2] if len(a) > 2 else k.get("system_prompt"))
+        return ""
+
     monkeypatch.setattr(research, "_shadow_observed_cua", _look)
+    monkeypatch.setattr(research, "agent_loop", _computer_use)
     ctl = research._controls
     monkeypatch.setattr(ctl, "skipped_agents", set())
+    monkeypatch.setattr(ctl, "retry_agents_hard", set())
     monkeypatch.setattr(ctl, "is_stop", lambda: False)
     monkeypatch.setattr(ctl, "is_pause", lambda: False)
 
-    def run(*, watch, minutes):
+    def run(*, watch, minutes, html=PLANNING, entry=None, retry=None, start_at=None):
+        for seen in (looks, cards, lines, emits, cua):
+            seen.clear()
         pg = chrome.run(chrome.ctx.new_page())
         try:
-            chrome.run(pg.set_content(PLANNING))
+            chrome.run(pg.set_content(html))
 
             class _Browser:
                 context = chrome.ctx
@@ -265,20 +296,32 @@ def round_robin(chrome, monkeypatch):
                 async def screenshot(self):
                     return "iVBORw0KGgo="
 
-            start["t"], start["limit"] = clock.t, minutes * 60
+            async def _set_up_again(browser, cua_client, *a, reuse_page=None, **k):
+                # The person's Retry: the same tab, a new chat, the brief in (or not).
+                return reuse_page, retry == "brief-in"
+
+            monkeypatch.setattr(research, "start_agent_no_gemini_wait", _set_up_again)
+            if retry:
+                ctl.request_retry_agent_hard("gemini")
+            start.update(t=clock.t, limit=minutes * 60, start_at=start_at,
+                         start_shown=False, page=pg)
             agents = {"Gemini": {"page": pg, "verified": False,
                                  "url": "https://gemini.google.com/app/ours1234abcd",
                                  "research_started_at": clock.t, "brief": "brief " * 40,
-                                 "needs_start_verify": False, "gemini_watch_start": watch}}
+                                 "needs_start_verify": False, "gemini_watch_start": watch,
+                                 **(entry or {})}}
             try:
                 chrome.run(asyncio.wait_for(research.poll_all_agents_round_robin(
                     agents, _Browser(), object(), max_wait_min=600, poll_interval=60),
                     timeout=120))
             except _Enough:
                 pass
+            pressed = int(chrome.run(pg.evaluate(
+                "() => document.body.dataset.pressed || '0'")))
         finally:
             chrome.run(pg.close())
-        return SimpleNamespace(looks=looks, cards=cards, lines=lines)
+        return SimpleNamespace(looks=looks, cards=cards, lines=lines, emits=emits,
+                               cua=cua, pressed=pressed)
 
     return run
 
@@ -297,3 +340,70 @@ def test_a_gemini_whose_research_has_not_started_is_left_to_wait(round_robin):
     out2 = round_robin(watch=False, minutes=40)
     assert "poll-stuck-arbiter" in out2.looks, out2.looks
     assert [m for m in out2.lines if "CUA checking completion" in m], out2.lines[-20:]
+
+
+# ══ a person's Retry on Gemini ═══════════════════════════════════════════════
+
+def _said_rr(out, words):
+    return [m for m in out.lines if words in m]
+
+
+def test_after_a_persons_retry_gemini_just_waits_too(round_robin):
+    """⭐⭐ THE OTHER DOOR TO THE PLANNING ALERT. A person's Retry gives Gemini a
+    new chat, and its plan is still being drafted. Before: ninety seconds, then
+    computer use pointed at the plan, then two more minutes, then "Gemini
+    couldn't start Deep Research" — the card the plan wait no longer raises — and
+    an unwatched Gemini that the "seems stuck" check looked at. Now it goes back
+    to the round-robin to wait, watched: forty minutes with no card, no computer
+    use and no look, and the 'Start research' that appears at minute 20 is
+    pressed, once.
+    ⛔ Beside it, the other side: a Retry whose brief did not go in (its set-up's
+    own card is up) is not watched — the watch presses, and that tab is not
+    provably the run's chat — so its 'Start research' is left alone and the
+    round-robin's ordinary checks run."""
+    out = round_robin(watch=False, minutes=40, retry="brief-in", start_at=20)
+    assert _said_rr(out, "Hard retry #1"), out.lines[:20]
+    assert out.cards == [], out.cards
+    assert out.cua == [], out.cua
+    assert out.looks == [], out.looks
+    assert out.pressed == 1, out.pressed
+    assert _said_rr(out, "its research has not started yet")
+    assert _said_rr(out, "late 'Start research' appeared — clicked #1/3")
+
+    out2 = round_robin(watch=False, minutes=40, retry="brief-not-in", start_at=20)
+    assert _said_rr(out2, "Hard retry #1"), out2.lines[:20]
+    assert out2.pressed == 0, out2.pressed
+    assert "poll-stuck-arbiter" in out2.looks, out2.looks
+
+    # And a plan that is already there: its Start is pressed by the retry itself,
+    # one look confirms the research is running, and nothing is left to watch.
+    ready = (PLANNING.replace("</message-content>", LATE_START + "</message-content>")
+             .replace("</main>", VISIBLE_STOP + "</main>"))
+    out3 = round_robin(watch=False, minutes=5, retry="brief-in", html=ready)
+    assert out3.pressed == 1, out3.pressed
+    assert _said_rr(out3, "Hard retry successful ✓"), out3.lines[:20]
+    assert not _said_rr(out3, "its research has not started yet")
+    assert out3.cards == [] and out3.cua == [], (out3.cards, out3.cua)
+
+
+def test_a_start_confirmed_a_leg_late_raises_no_recovered_notice(round_robin):
+    """⛔ 2D pressed Start and its one instant look could not confirm it, so the
+    round-robin's first legs re-check. When it confirms, nothing is said unless a
+    card is up: the app takes a retraction only for a live card and shows
+    anything else as a notice of its own — "Gemini recovered and began its deep
+    research" about a Gemini nothing went wrong with (the plan wait raises no
+    card, so this is the usual case). Beside it, the same confirmation with a
+    card up takes that card down, once, by its own alert id."""
+    researching = PLANNING.replace("</main>", VISIBLE_STOP + "</main>")
+    out = round_robin(watch=False, minutes=3, html=researching,
+                      entry={"needs_start_verify": True})
+    assert _said_rr(out, "confirmed on round-robin re-check"), out.lines[-20:]
+    assert not [k for n, k in out.emits if n == "pipeline_warning"], out.emits
+
+    research._AGENT_ERROR_CARD_TS["gemini"] = 1.0
+    out2 = round_robin(watch=False, minutes=3, html=researching,
+                       entry={"needs_start_verify": True})
+    took = [k for n, k in out2.emits if n == "pipeline_warning"]
+    assert len(took) == 1, took
+    assert took[0]["alert_id"] == "phase2_agent_gemini_error" and took[0]["actions"] == []
+    assert "gemini" not in research._AGENT_ERROR_CARD_TS

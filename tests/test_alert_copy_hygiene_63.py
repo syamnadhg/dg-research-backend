@@ -7,7 +7,8 @@ structure rather than driving a live pipeline):
 
   1. GEMINI "couldn't start Deep Research" copy → `_GEMINI_CANT_START`. Five
      emit sites carried a byte-identical (title, details); a future edit to one
-     could silently drift the other four. Now one constant, referenced 5×.
+     could silently drift the other four. Now one constant — referenced twice
+     since wave 15 (10-02), when the plan wait's and the Retry's cards went.
 
   2. BRIEF "Couldn't send the brief to {platform}" copy → `_brief_send_fail_copy`.
      Four emit sites, two detail bodies (default hand-off failure + the
@@ -59,13 +60,18 @@ def test_gemini_copy_has_no_duplicated_inline_literals():
     assert src.count("Gemini didn't begin its research — likely a platform-side glitch.") == 1
 
 
-def test_all_five_gemini_sites_use_the_constant():
+def test_every_gemini_couldnt_start_site_uses_the_constant():
     src = _module_src()
-    # 5 emit sites all spread the constant (the definition line does NOT match
+    # Every emit site spreads the constant (the definition line does NOT match
     # this pattern, so the count is exactly the call sites).
-    assert src.count('fail_agent("gemini", *_GEMINI_CANT_START)') == 5, (
-        "all five Gemini couldn't-start emit sites must call "
-        "fail_agent('gemini', *_GEMINI_CANT_START)."
+    # ⛔ Wave 15 (10-02): TWO now, not five. The plan wait's two cards (2D) and
+    # the person's-Retry card went: Gemini starts its research by itself, and a
+    # plan still being drafted is not a failure. What is left is the brief that
+    # never landed in a conversation ([2C]: the stale chat it could not leave,
+    # and the re-submits that all failed) — a send that failed, not a plan.
+    assert src.count('fail_agent("gemini", *_GEMINI_CANT_START)') == 2, (
+        "every Gemini couldn't-start emit site must call "
+        "fail_agent('gemini', *_GEMINI_CANT_START), and only the brief's send has one."
     )
 
 

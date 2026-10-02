@@ -128,7 +128,6 @@ from prompts import (
     PROMPT_FIX_ISSUE,
     PROMPT_GEMINI_COPY_CONTENTS,
     PROMPT_GEMINI_DEEP_RESEARCH,
-    PROMPT_GEMINI_START_RESEARCH,
     PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
     PROMPT_NOTEBOOKLM_RENAME,
     PROMPT_NOTEBOOKLM_REUPLOAD,
@@ -46357,7 +46356,10 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
     agent's own setup in isolation.
 
     Returns `(new_page, verified_bool)` or `None` on hard failure (including
-    paste/setup failure where start_agent_no_gemini_wait returned ok=False)."""
+    paste/setup failure where start_agent_no_gemini_wait returned ok=False).
+    ⭐ Wave 15: for Gemini the second item is `None` when its brief went in and
+    its research has not started yet — Gemini starts it by itself, and the
+    caller hands it to the round-robin's late-Start watch (no card)."""
     # Re-deliver user source docs on hard-retry too (read from disk so the
     # retried agent gets the same attachments the original run did).
     source_paths = _read_p2_source_paths()
@@ -46407,13 +46409,19 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         await browser.switch_to_page(new_page)
         await asyncio.sleep(2)
 
-        # Gemini needs an extra click: wait up to 90s for "Start research"
-        # button, click via JS, fall back to CUA if JS can't find it.
-        # #953 (audit): use the module-hoisted, #905-hardened finder
-        # (_GEMINI_CLICK_START_JS: enabled + visible + role/aria) — the old
-        # inline `<button>`-only match here clicked disabled skeleton buttons
-        # (a DOM no-op that reported success) and today's auto-start makes the
-        # disabled Start the COMMON state on this path.
+        # ⭐⭐ WAVE 15 (10-02) — AFTER A PERSON'S RETRY, GEMINI JUST WAITS TOO.
+        # This path pointed computer use at a plan still being drafted and, about
+        # four minutes in, raised the couldn't-start card (_GEMINI_CANT_START) —
+        # the planning alert the plan wait (2D) no longer raises. Gemini starts its
+        # research by itself on a timer, and a plan can take far longer than four
+        # minutes (10-01: 47). So, as in 2D: a 'Start research' that appears in
+        # the first ninety seconds is pressed; a Gemini that started by itself is
+        # researching; anything else goes to the round-robin NOT STARTED (None),
+        # where the late-Start watch presses a late 'Start research' and the
+        # research is left to finish. No computer use, no Redo, no card.
+        # #953 (audit): the module-hoisted, #905-hardened finder
+        # (_GEMINI_CLICK_START_JS: enabled + visible + role/aria) — never a
+        # disabled skeleton button, which today's auto-start leaves behind.
         start_clicked = False
         _auto_started = False
         for attempt in range(45):
@@ -46432,59 +46440,27 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             except Exception:
                 pass
             await asyncio.sleep(2)
-        if not start_clicked and not _auto_started and cua_client:
-            await browser.switch_to_page(new_page)
-            # agent_loop CLICK dismisses the plan-FAIL screen; return text unused (#776).
-            # #953: the mission forbids clicking a grayed/disabled Start (that
-            # adds nothing and, on the auto-start layout, means research is
-            # already running) — aligned with PROMPT_GEMINI_START_RESEARCH.
-            await agent_loop(cua_client, browser,
-                PROMPT_GEMINI_START_RESEARCH,
-                "If an ENABLED (blue) 'Start research' button is visible, click it "
-                "ONCE. If it is grayed/disabled or research is already running, do "
-                "NOT click — say 'research already running'. Do NOT type.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
-            # #776: confirm the click via the DOM, not the CUA narration (see the
-            # 2D note) — re-poll the deterministic JS after the CUA returns so a
-            # post-Retry re-draft's fresh "Start research" button is actually
-            # clicked, instead of inferring success from prose like "clicked retry".
-            for _i in range(24):   # ~120s — covers a slow post-Retry re-draft
-                if _controls.is_stop():
-                    break
-                if await _gemini_research_started(new_page):
-                    _auto_started = True
-                    break
-                try:
-                    _rb = await new_page.evaluate(_GEMINI_CLICK_START_JS)
-                except Exception:
-                    _rb = False
-                if _rb:
-                    start_clicked = True
-                    await asyncio.sleep(5)
-                    break
-                await asyncio.sleep(5)
-
-        # #776: don't let the spinner-based verify stamp a not-yet-started run as
-        # researching when "Start research" was never confirmed-clicked. Returning
-        # verified=False keeps the tab in the round-robin (it doesn't drop a
-        # not-verified agent) so the wall-clock cap can surface an honest failure.
-        # #953: an auto-started research needs no click — treat it as started so
-        # the fresh retry isn't failed while it's genuinely researching.
         if _auto_started:
             log("[2C-retry] Gemini researching after auto-start — handing to round-robin", "INFO")
             return (new_page, True)
-        if not start_clicked:
-            # The user-retry's fresh chat ALSO failed to produce a startable plan
-            # — re-raise the Retry/Skip alert immediately (close the gap where a
-            # second failure silently dropped to the wall-clock cap). dedup-safe.
-            if not _controls.is_stop():
-                fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
-            return (new_page, False)
-        verified = await wait_until_verified(
-            verify_gemini_generating, new_page, "2C-retry",
-            browser=browser, cua_client=cua_client,
-            max_retries=15, interval=3, verbose=verbose)
-        return (new_page, verified)
+        if start_clicked:
+            # One instant look, as 2D takes after its press: `verify_gemini_
+            # generating` cannot tell a drafting plan from a research, so it is
+            # asked only once Start was pressed — and when it does not confirm,
+            # the round-robin's watch does (it clears itself once the research
+            # shows, and presses again while an enabled Start is still there).
+            try:
+                if await verify_gemini_generating(new_page):
+                    return (new_page, True)
+            except Exception:
+                pass
+            log("[2C-retry] 'Start research' pressed; the round-robin confirms the "
+                "research started", "INFO")
+        else:
+            log("[2C-retry] No 'Start research' to press yet — Gemini starts its "
+                "research by itself. Handing it to the round-robin, which presses a "
+                "late 'Start research' if one appears (nothing refreshed, no card)", "INFO")
+        return (new_page, None)
 
     return None
 
@@ -50467,6 +50443,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # no cadence at all — and a hard retry is exactly the run most
                 # likely to need one.
                 "brief": _brief_text_hr or "",
+                # ⭐ Wave 15: a Gemini handed back before its research started
+                # (`_restart_phase2_agent` → None) is watched for its late
+                # 'Start research', and left to wait — no "seems stuck" check,
+                # no computer-use look — exactly as after the plan wait.
+                "gemini_watch_start": _agent_name == "Gemini" and verified_h is None,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -50502,6 +50483,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
                 log(f"[{_agent_name}] Hard retry successful ✓")
+            elif verified_h is None:
+                log(f"[{_agent_name}] Hard retry: the brief is in and its research has not "
+                    "started yet — it starts by itself; the round-robin waits for it", "INFO")
             else:
                 log(f"[{_agent_name}] Hard retry tab opened but not verified yet — polling will re-check", "WARN")
 
@@ -50766,17 +50750,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         # work but verified a beat too late. This is where that
                         # verification lands, so it is where the card's claim
                         # becomes true. Same alert_id, so it is the same
-                        # retraction and a no-op if 2D already did it.
-                        try:
-                            emit_event("pipeline_warning", phase=2, agent="gemini",
-                                       error="Gemini's research plan started",
-                                       details="Gemini recovered and began its deep research.",
-                                       actions=[],
-                                       alert_id=_agent_error_alert_id("gemini", 2),
-                                       auto_clear_on_resume=True)
-                            _clear_pending_decision("gemini")
-                        except Exception:
-                            pass
+                        # retraction.
+                        # ⛔⛔ Wave 15 (10-02): ONLY WHEN A CARD IS UP. It is not a
+                        # no-op without one: the app takes a retraction only for
+                        # a live card, and otherwise shows it as a notice of its
+                        # own — "Gemini recovered and began its deep research"
+                        # about a Gemini nothing had gone wrong with. The plan
+                        # wait raises no card any more, so this is the common case.
+                        if _AGENT_ERROR_CARD_TS.get("gemini"):
+                            try:
+                                emit_event("pipeline_warning", phase=2, agent="gemini",
+                                           error="Gemini's research plan started",
+                                           details="Gemini recovered and began its deep research.",
+                                           actions=[],
+                                           alert_id=_agent_error_alert_id("gemini", 2),
+                                           auto_clear_on_resume=True)
+                                _clear_pending_decision("gemini")
+                                _AGENT_ERROR_CARD_TS.pop("gemini", None)
+                            except Exception:
+                                pass
                         try:
                             await inject_agent_observer(p["page"], "gemini")
                         except Exception:

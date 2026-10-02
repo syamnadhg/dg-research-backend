@@ -176,16 +176,21 @@ def test_start_research_click_is_verified_before_trusting():
     assert "_reclicks == 0" in MODSRC, "at most one re-click after the patient watch"
 
 
-def test_plan_failure_raises_retry_skip_alert_promptly():
-    # [2C] submit-exhaustion, [2D] CUA-recovery-exhaustion, AND a failed user-retry
-    # (hard retry) each raise the Retry/Skip alert (no silent drop to wall-clock cap).
-    # #921: title tightened to "Gemini couldn't start Deep Research" (unified
-    # across all sites — the [2C] submit exhaustion, the [2D] early + terminal
-    # cards, and the failed-user-retry all share it).
-    # #63: the couldn't-start copy now lives in the _GEMINI_CANT_START constant;
-    # the [2C], [2D], and failed-user-retry sites (≥3 of the 5) spread it.
+def test_a_brief_that_never_landed_still_raises_the_retry_skip_alert():
+    # [2C] submit-exhaustion raises the Retry/Skip alert (no silent drop to the
+    # wall-clock cap). #921/#63: its copy lives in _GEMINI_CANT_START.
+    # ⛔ Wave 15 (10-02): ONLY the send. The [2D] plan wait and a person's Retry
+    # no longer card a plan still being drafted — Gemini starts its research by
+    # itself on a timer, and the owner: "keep it simple without making it
+    # complicated and causing alerts" (tests/test_w15_gemini_waits_1002.py
+    # drives both). The two [2C] sites — the stale chat it could not leave, and
+    # the re-submits that all failed — sit in the send itself.
     assert research._GEMINI_CANT_START[0] == "Gemini couldn't start Deep Research"
-    assert MODSRC.count('fail_agent("gemini", *_GEMINI_CANT_START)') >= 3, (
-        "fail_agent for an unstartable Gemini plan must fire at [2C], [2D], and on a "
-        "failed user-retry"
+    send_src = inspect.getsource(research.start_agent_no_gemini_wait)
+    assert send_src.count('fail_agent("gemini", *_GEMINI_CANT_START)') == 2, (
+        "a Gemini brief that never landed must still raise the Retry/Skip alert"
     )
+    assert 'fail_agent("gemini", *_GEMINI_CANT_START)' not in inspect.getsource(
+        research._restart_phase2_agent)
+    assert 'fail_agent("gemini", *_GEMINI_CANT_START)' not in inspect.getsource(
+        research.run_phase2)
