@@ -23603,6 +23603,17 @@ class PipelineRuntime:
         self.active_pages: dict = {}  # platform → page object
         self.agent_statuses: dict = {}  # platform → 'generating'|'done'|'failed'
         self.agent_chat_urls: dict = {}  # platform → URL (conversation/chat)
+        # ⭐ WAVE 13 (10-01) — platform → the chat PHASE 2 sent this run's brief
+        # into, and nothing else. Read once, at a Phase-2 browser crash, so the
+        # retry goes back into each agent's own chat instead of sending the
+        # brief again (`_p2_rejoin_chat`). ⛔ Not `agent_chat_urls`: Phase 1
+        # registers ChatGPT's brief chat in that map too, and until the
+        # round-robin registers the Phase-2 tabs a crash would carry it.
+        self.p2_chat_urls: dict = {}
+        # platform → the TAB that chat is in. At the crash the tab's last
+        # address wins when it is one of the agent's chats: Gemini moves a run
+        # to a new chat after the brief goes in (`_p2_chats_to_rejoin`).
+        self.p2_chat_pages: dict = {}
         # ⭐ STRETCH 7.5 — platform → the tokens that identify the brief we
         # pasted into that platform's tab. Written ONCE per platform, by
         # `verified_paste_brief`, and read by the identity check that replaced
@@ -23738,6 +23749,13 @@ class PipelineRuntime:
                 self.agent_chat_urls[platform] = page.url
             except Exception:
                 pass
+        # A chat Phase 2 sent the brief into follows its tab when the tab moves
+        # (a hard retry's new chat, Gemini's re-adopted one). Phase 1's ChatGPT
+        # tab is never in `p2_chat_urls`, so it is never added here.
+        if platform in self.p2_chat_urls and self.agent_chat_urls.get(platform):
+            self.p2_chat_urls[platform] = self.agent_chat_urls[platform]
+            if page is not None:
+                self.p2_chat_pages[platform] = page
         self.agent_statuses[platform] = "generating"
 
     def unregister_page(self, platform, final_status="done"):
@@ -50205,6 +50223,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _bre:
                     log(f"[{_agent_name}] Hard retry: brief.md read failed ({_bre})", "WARN")
             old_page = p.get("page")
+            # 10-01: the chat it is leaving is not one a crash retry may go back
+            # into; its new chat is noted once the set-up below hands it over.
+            _p2_forget_chat(_agent_key)
             # Gap #3 (2026-07-15): reuse the warm, challenge-passed tab for the
             # restart (same-tab New chat) instead of a cold load, which is a
             # Cloudflare bot-score event. Fall back to a FRESH tab when the page
@@ -50348,6 +50369,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
+            if new_page is not None:
+                _p2_note_chat(_agent_key, new_page)  # 10-01: a crash retry rejoins it
             # Gap #1: a hard-retry that landed in chat mode (DR still
             # unavailable) left a chat_mode_pending marker; re-seed the
             # kind="chat_mode" park on the rebuilt entry (a marker on the old `p`
@@ -66142,13 +66165,21 @@ async def _ensure_brief_attached(browser, page, brief_path, platform, label,
     return False
 
 
+#: The first sentence of the message typed beside an attached brief — and of the
+#: computer-use fallback's, which opens with the same words. When the brief goes
+#: as a file, this sentence is what the chat's first message holds, so it is what
+#: a crash retry recognises the chat by (`_p2_turn_holds_our_send`).
+_P2_ATTACHED_BRIEF_ASK = ("Please perform deep research on the topic described "
+                          "in the attached brief.")
+
+
 async def type_short_inline_prompt(page, platform, label):
     """Type a short inline prompt instructing the agent to research the
     attached brief. Keeps the platform's 'Deep Research' mode as the
     operative instruction; the full brief content lives in the file."""
     # One message, short enough that no platform converts it to an attachment.
     prompt = (
-        "Please perform deep research on the topic described in the attached brief. "
+        _P2_ATTACHED_BRIEF_ASK + " "
         "Use the brief as the complete context — objectives, scope, sections, sources to target. "
         "Produce a comprehensive research report. " + _P2_CITE_SENTENCE
     )
@@ -70015,7 +70046,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     return page, True
 
 
-async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None):
+async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None,
+                     rejoin=None):
     """Phase 2: ChatGPT → Claude → Gemini (submit+plan) → scrape-pass → Gemini (Start) → Poll all.
 
     Sequence change: Gemini moved to last of the setup trio. One round-robin scrape
@@ -70025,7 +70057,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     main-rotation poll tick. Gemini stays in 'planning' (never 'complete') until its
     'Start research' button is clicked — gated by scrape_progress_gemini's planning-gate.
 
-    enabled_agents: list of agent keys to run (e.g. ["chatgpt", "gemini"]). None = all."""
+    enabled_agents: list of agent keys to run (e.g. ["chatgpt", "gemini"]). None = all.
+
+    rejoin: {agent key: chat URL} a browser-crash retry carried over (10-01). Each
+    of those agents is taken back into its own chat and handed to the round-robin
+    as it is; only the rest are set up and sent the brief."""
     log("=" * 60)
     log("PHASE 2: Deep Research")
     if enabled_agents:
@@ -70084,6 +70120,24 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     if source_paths:
         log(f"Phase 2: delivering {len(source_paths)} user source doc(s) to each agent: "
             f"{[Path(p).name for p in source_paths]}")
+
+    # ⭐ 10-01: a browser-crash retry goes back into each agent's own chat FIRST.
+    # An agent it is back with is not set up again below; one it is not (no chat,
+    # signed out, not provably this run's) is, exactly as before.
+    rejoined = {}
+    if rejoin:  # a Stop, before or during it, ends it (`_p2_rejoin_chats`)
+        _launch = (list(enabled_agents) if enabled_agents is not None
+                   else ["chatgpt", "gemini", "claude"])
+        rejoined = await _p2_rejoin_chats(
+            browser, _p2_rejoin_plan(rejoin, _launch), _launch, brief_text)
+        enabled_agents = [a for a in _launch
+                          if _agent_display_name(a) not in rejoined]
+    # 10-01: every agent set up below leaves the chat it had (a person's Retry or
+    # new input, a crash retry's chat that could not be proven). A crash before
+    # its new brief goes in must not carry the chat it was leaving.
+    for _a in (enabled_agents if enabled_agents is not None
+               else ("chatgpt", "gemini", "claude")):
+        _p2_forget_chat(str(_a).lower())
 
     agents = {}
     chatgpt_page = None
@@ -70159,6 +70213,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                        stage="researching",
                        progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
+            _p2_note_chat("chatgpt", chatgpt_page)  # 10-01: a crash retry rejoins it
             await inject_agent_observer(chatgpt_page, "chatgpt")
         else:
             # 2026-05-14: page-alive gating before fail_agent. If the URL
@@ -70198,6 +70253,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="generating",
                            stage="researching",
                            progress="ChatGPT DR submitted — verifying via round-robin polling")
+                _p2_note_chat("chatgpt", chatgpt_page)  # 10-01, as above
                 await inject_agent_observer(chatgpt_page, "chatgpt")
             elif _controls.is_stop():
                 # #737: a user Stop during the setup/chat-mode pause returns
@@ -70332,6 +70388,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                        stage="researching",
                        progress="Claude deep research started and verified")
             log("[2B] Claude is running ✓")
+            _p2_note_chat("claude", claude_page)  # 10-01: a crash retry rejoins it
             await inject_agent_observer(claude_page, "claude")
         else:
             # 2026-05-14: mirror Fix #5 from ChatGPT 2A. If the URL
@@ -70353,6 +70410,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_progress", phase=2, agent="claude", status="generating",
                            stage="researching",
                            progress="Claude DR submitted — verifying via round-robin polling")
+                _p2_note_chat("claude", claude_page)  # 10-01, as above
                 await inject_agent_observer(claude_page, "claude")
             elif _controls.is_stop():
                 # #737: a user Stop during the setup/chat-mode pause returns
@@ -70430,6 +70488,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             source_paths=source_paths)
         if gemini_setup_ok:
             log("[2C] Gemini brief submitted — letting it generate research plan")
+            _p2_note_chat("gemini", gemini_page)  # 10-01: a crash retry rejoins it
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", stage="planning", progress="Gemini generating research plan...")
             # #893 tier backstop: with verification off by default, the P0
             # walk + gate tier checks no longer run — this DOM read on the
@@ -71548,6 +71607,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log("[2D] Gemini streaming hand-off — round-robin takes it from here")
         elif not _gemini_2d_skipped:
             log("[2D] Gemini may not be running", "WARN")
+
+    # 10-01: the agents a crash retry is back with join the ones just started,
+    # in the usual order, and the round-robin takes them all the same way.
+    if rejoined:
+        agents.update(rejoined)
+        agents = {n: agents[n] for n in ("ChatGPT", "Claude", "Gemini") if n in agents}
 
     # ── Verify all launched agents are running ──
     total = len(agents)
@@ -78638,8 +78703,9 @@ def detect_resume_phase(queue_dir):
 # the agent's latest attempt. It is a file because the in-process status map
 # dies with the daemon.
 #
-# ⚠ Not covered: an agent still GENERATING when Chrome died is re-run from zero
-# (reattaching it through the pause checkpoint's addresses is a separate change).
+# ⭐ An agent still GENERATING when Chrome died — or finished but not yet
+# extracted — is not re-run either: the crash retry goes back into its own chat
+# (`_p2_rejoin_chat`, 10-01). Only an agent it cannot get back to starts again.
 _P2_AGENTS_DONE_FILE = "phase2_agents_done.json"
 
 
@@ -78893,6 +78959,312 @@ def _p2_only_enabled(results, enabled_agents) -> dict:
         return dict(results or {})
     names = {_agent_display_name(a) for a in enabled_agents}
     return {n: r for n, r in (results or {}).items() if n in names}
+
+
+# ── A Phase-2 browser crash goes back into each agent's own chat (10-01) ─────
+# ⛔⛔ THE 09-30 EVENING RUN. Chrome crashed at 18:33:45 with ChatGPT's report
+# finished on its page and Claude and Gemini researching; the crash retry then
+# set all three up again and sent the brief three more times, which threw away
+# seventeen minutes of three Deep Researches and bought them again. The record
+# above keeps an agent only once its report is EXTRACTED, and ChatGPT's
+# extraction was what the crash interrupted.
+#
+# ⭐ SO THE RETRY REJOINS. The serve process outlives Chrome, and at the crash it
+# still knows the chat each agent was sent the brief in (`p2_chat_urls`). The
+# retry opens each one in the new Chrome, proves it is this run's, and hands it to
+# the round-robin like a freshly started agent: a finished one is extracted there,
+# a running one is polled, and a Gemini whose plan still waits for "Start
+# research" gets the round-robin's start watch, which presses it. An agent with no
+# chat, or one whose chat cannot be opened or proven, starts again the usual way
+# — only that agent.
+#
+# ⛔ ONLY THE CRASH RETRY CARRIES CHATS, and only into its first Phase-2 attempt.
+# A person's Retry, Skip or new input re-runs the whole phase, as before.
+#
+# ⭐ THE CHATS STAY CARRIED UNTIL THE RETRY HAS DEALT WITH THEM. `run_pipeline`
+# puts the chats it was handed back into `p2_chat_urls` at its start, so a second
+# crash before the rejoin, or during it, hands them on again. An agent leaves its
+# chat only when it is set up again (`_p2_forget_chat`): then the chat it had is
+# the one somebody, or a failed proof, chose to leave.
+
+def _p2_note_chat(platform: str, page) -> None:
+    """Phase 2 sent `platform` the brief in this tab: remember the chat, and
+    the tab, whose own address is read again at a crash."""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if url:
+        _runtime.p2_chat_urls[platform] = url
+        _runtime.p2_chat_pages[platform] = page
+
+
+def _p2_forget_chat(platform: str) -> None:
+    """`platform` is being set up again: the chat it is leaving is not one a
+    crash retry may go back into."""
+    _runtime.p2_chat_urls.pop(platform, None)
+    _runtime.p2_chat_pages.pop(platform, None)
+
+
+def _p2_chats_to_rejoin() -> dict:
+    """{platform: chat URL} for a Phase-2 crash retry, as `_runtime` holds them
+    now. Taken before the run's `finally` resets `_runtime`.
+
+    The chat is the one the agent's TAB is on at the crash, when that is one of
+    its chats. 09-30: Gemini's brief went in on /app/3a6f…, and two minutes later
+    the same tab held its plan and its research on /app/e91e…; nothing in 2D
+    notes the move. Playwright keeps a page's last address after Chrome dies.
+    The address noted at the send is the fallback: a tab that cannot be read, or
+    one off its chats (a home page, mid-reset).
+
+    ⛔ An agent in chat mode is left out. The retry resets its mode and its
+    keep/skip hold, and a rejoin puts neither back, so its plain chat answer would
+    be read as a Deep Research. Its own set-up finds its mode again."""
+    out = {}
+    for k, u in dict(_runtime.p2_chat_urls).items():
+        if not k or not u:
+            continue
+        _mode = _runtime.agent_modes.get(k)
+        if isinstance(_mode, dict) and _mode.get("actual") == "chat":
+            continue
+        try:
+            live = _runtime.p2_chat_pages[k].url or ""
+        except Exception:
+            live = ""
+        out[k] = live if _p2_chat_id(k, live) else u
+    return out
+
+
+def _p2_take_rejoin(left: dict, *, new_input: bool) -> dict:
+    """The carried chats for ONE Phase-2 attempt, and none for any after it: a
+    person's Retry, Skip or new input re-runs the whole phase. None at all when
+    this entry added the person's input to the brief — the old chats never saw
+    it."""
+    taken = {} if new_input else dict(left or {})
+    if left:
+        left.clear()
+    return taken
+
+
+_CLAUDE_CHAT_URL_RE = re.compile(r"claude\.ai/chat/([0-9A-Za-z-]{8,})")
+
+
+def _p2_chat_id(platform: str, url: str) -> str:
+    """The chat's own id in `url`, or "" when `url` is not one of its chats."""
+    if platform == "chatgpt":
+        return _chatgpt_convo_id(url) or ""
+    if platform == "gemini":
+        return _gemini_convo_url_id(url)
+    if platform == "claude":
+        m = _CLAUDE_CHAT_URL_RE.search((url or "").split("?", 1)[0])
+        return m.group(1) if m else ""
+    return ""
+
+
+def _p2_rejoin_plan(carried, launch) -> dict:
+    """{platform: chat URL} to rejoin: the agents this attempt would launch that
+    the crash left a chat for. A URL that is not a chat (a bare home page) is
+    nothing to rejoin."""
+    out = {}
+    for agent in launch or ():
+        key = str(agent).lower()
+        url = (carried or {}).get(key) or ""
+        if _p2_chat_id(key, url):
+            out[key] = url
+    return out
+
+
+def _p2_turn_holds_our_send(turn_text: str, brief_text: str) -> bool:
+    """Does a chat's first message hold what this run sent there?
+
+    The brief's head when the brief was pasted; the line typed beside it when the
+    brief went as a file (`_P2_ATTACHED_BRIEF_ASK`). Positive evidence only — an
+    empty or unreadable message is not this run's chat."""
+    if conversation_holds_brief(turn_text, brief_fingerprint(brief_text)) is True:
+        return True
+    return conversation_holds_brief(
+        turn_text, brief_fingerprint(_P2_ATTACHED_BRIEF_ASK)) is True
+
+
+#: Claude's first user message — never the page's own text, for the reason
+#: `read_chatgpt_first_user_message` gives.
+_CLAUDE_FIRST_USER_MSG_JS = (
+    "(cap) => { const n = document.querySelector('[data-testid=\"user-message\"]');"
+    " return (n && n.innerText || '').slice(0, cap); }")
+
+
+async def _claude_first_user_message(page, cap: int = 4000) -> str:
+    """The FIRST user message in the open Claude chat, or "". Never raises."""
+    try:
+        return (await page.evaluate(_CLAUDE_FIRST_USER_MSG_JS, cap)) or ""
+    except Exception:
+        return ""
+
+
+#: A reopened chat's first message mounts after its URL settles: read it this
+#: many times, this far apart, before the chat counts as not this run's.
+_P2_REJOIN_READS = 4
+_P2_REJOIN_SETTLE_SEC = 2.5
+
+
+async def _p2_rejoined_page_is_ours(page, platform: str, want: str,
+                                    brief_text: str) -> bool:
+    """ChatGPT and Claude: the tab is on the saved chat's own id AND its first
+    message holds what this run sent there. Both halves, every read."""
+    reader = (read_chatgpt_first_user_message if platform == "chatgpt"
+              else _claude_first_user_message)
+    for i in range(_P2_REJOIN_READS):
+        try:
+            live = page.url or ""
+        except Exception:
+            live = ""
+        if _p2_chat_id(platform, live) == want:
+            if _p2_turn_holds_our_send(await reader(page), brief_text):
+                return True
+        if i < _P2_REJOIN_READS - 1:
+            await asyncio.sleep(_P2_REJOIN_SETTLE_SEC)
+    return False
+
+
+async def _p2_rejoined_state(page, platform: str) -> str:
+    """What a rejoined chat shows: "finished", "researching", or (Gemini only)
+    "plan" — a plan not yet started. Read once, for the log line and the
+    round-robin's entry; the round-robin's own detectors still decide."""
+    if platform == "gemini":
+        if (await _gemini_done_read(page))[0]:
+            return "finished"
+        return "researching" if await _gemini_research_started(page) else "plan"
+    try:
+        done, _reason, _snap = await DETECT_FNS[_agent_display_name(platform)](page)
+    except Exception:
+        done = False
+    return "finished" if done else "researching"
+
+
+_P2_REJOIN_WORDS = {
+    "finished": ("finished, extracting",
+                 "collecting the report it finished"),
+    "researching": ("still researching", "still researching"),
+    "plan": ("its plan has not started — the round-robin presses 'Start research'",
+             "starting the research its plan is waiting on"),
+}
+
+
+async def _p2_rejoin_chat(browser, platform: str, url: str, brief_text: str):
+    """Open one agent's own chat in the relaunched Chrome and prove it is this
+    run's. Returns its round-robin entry, or None — and None costs only this
+    agent, which then starts again the usual way.
+
+    Gemini does not reopen a chat from its address (#897a: it lands on its
+    home), so a Gemini that is not back in its chat is found again by the
+    sidebar hunt that already exists, scoped to the chat's id, and must then sit
+    on that same id."""
+    name = _agent_display_name(platform)
+    want = _p2_chat_id(platform, url)
+    page = None
+
+    async def _give_up(why: str):
+        # ⛔ A Chrome that died is not a chat that cannot come back. Setting the
+        # agent up again would send its brief into a browser that is gone, and
+        # forget its chat. Unwind as a crash instead: the next retry is handed
+        # this chat, and every one not reached yet.
+        if await _browser_context_is_dead(browser):
+            _runtime.last_failure_kind = "browser_crash"
+            raise RuntimeError("research browser died while going back into the "
+                               "phase 2 chats (browser crash)")
+        log(f"[resume] {name}: {why} — starting it again", "WARN")
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        return None
+
+    try:
+        page = await browser.open_isolated_tab(url)
+    except Exception as e:
+        # The error's own text holds the address twice, and Send logs uploads
+        # the run log: its kind is enough here.
+        return await _give_up(f"its chat would not open ({type(e).__name__})")
+
+    await asyncio.sleep(_P2_REJOIN_SETTLE_SEC)
+    try:
+        await check_auth(page, platform)
+    except SessionExpiredError:
+        return await _give_up("signed out")
+    if platform == "gemini":
+        ours = await _gemini_reload_identity_ok(page, want, brief_text)
+        # The hunt clicks rail entries: none after a Stop (#737).
+        if not ours and not _controls.is_stop():
+            try:
+                found, adopted = await _gemini_adopt_lost_conversation(
+                    page, brief_text, name, post_start=True, lost_convo_id=want)
+            except Exception as e:
+                found, adopted = page, False
+                log(f"[resume] {name}: the sidebar hunt raised ({type(e).__name__})",
+                    "WARN")
+            if adopted and found is not page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                page = found
+            try:
+                live = page.url or ""
+            except Exception:
+                live = ""
+            ours = bool(adopted) and _p2_chat_id(platform, live) == want
+    else:
+        ours = await _p2_rejoined_page_is_ours(page, platform, want, brief_text)
+    if not ours:
+        return await _give_up("the chat that opened is not provably this run's")
+
+    state = await _p2_rejoined_state(page, platform)
+    _log_words, _app_words = _P2_REJOIN_WORDS[state]
+    log(f"[resume] {name}: back on its own chat — {_log_words}")
+    _p2_note_chat(platform, page)
+    try:
+        _write_agent_terminal_status(platform, "running", force=True)
+    except Exception:
+        pass
+    emit_event("agent_progress", phase=2, agent=platform, status="generating",
+               stage=("planning" if state == "plan" else "researching"),
+               progress=f"Back on its own chat after Chrome restarted — {_app_words}")
+    try:
+        await inject_agent_observer(page, platform)
+    except Exception:
+        pass
+    try:
+        live = page.url or url
+    except Exception:
+        live = url
+    entry = {"page": page, "verified": state != "plan", "url": live,
+             "research_started_at": time.time()}
+    if platform == "gemini":
+        # The stale-reload prover reads it, as it does on 2D's own entry.
+        entry["brief"] = brief_text
+        entry["gemini_watch_start"] = state == "plan"
+    return entry
+
+
+async def _p2_rejoin_chats(browser, plan: dict, launch, brief_text: str) -> dict:
+    """{display name: round-robin entry} for each agent in `plan` whose own chat
+    the relaunched Chrome is back on. One log line per agent of `launch`."""
+    rejoined = {}
+    launching = {str(a).lower() for a in (launch or ())}
+    for key in ("chatgpt", "claude", "gemini"):
+        if key not in launching:
+            continue
+        if _controls.is_stop():
+            break  # no page actions after Stop (#737)
+        if key not in plan:
+            log(f"[resume] {_agent_display_name(key)}: no chat of its own to go "
+                f"back to — starting it the usual way")
+            continue
+        entry = await _p2_rejoin_chat(browser, key, plan[key], brief_text)
+        if entry is not None:
+            rejoined[_agent_display_name(key)] = entry
+    return rejoined
 
 
 async def _p2_run_with_resume(queue_dir, enabled_agents, research_brief, *,
@@ -79503,8 +79875,13 @@ def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        api_key=None, email=None, resume_dir=None, config=None,
                        run_id=None, uid=None, research_id=None, brief_text="",
-                       user_sources=None, user_links=None, _crash_retries=0):
+                       user_sources=None, user_links=None, _crash_retries=0,
+                       _p2_rejoin=None):
     """Run the full pipeline. Supports resume from a previous queue directory.
+
+    _p2_rejoin (10-01): {agent key: chat URL} — the chats a Phase-2 browser crash
+    left, handed over by that crash's own retry so the first Phase-2 attempt goes
+    back into them instead of sending the brief again. Nothing else passes it.
 
     brief_text (2026-04): inline brief content passed from the frontend when
     the user toggled Phase 1 off. Written to the new run's
@@ -79560,6 +79937,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # ── Initialize pipeline controls + Firestore bridge ──
     _controls.reset()
     _runtime.reset()
+    # 10-01: the chats a Phase-2 crash handed this retry stay carried until this
+    # attempt goes back into them or sets their agents up again, so a crash
+    # before that, or during the rejoin, hands them on instead of nothing.
+    _runtime.p2_chat_urls.update(_p2_rejoin or {})
     # #955 Phase 2 (adversarial findings #1/#2/#3/#5): wipe the auto-skip
     # deadline registry at every run entry. It's a MODULE global (not owned by
     # _runtime), and jobs run sequentially in one long-lived worker process, so
@@ -80426,6 +80807,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # wipes last_failure_kind) and read by the post-finally auto-retry block.
     # Pre-initialized so the clean-exit path (no exception) reads "".
     _captured_failure_kind = ""
+    # 10-01: the chats the previous attempt's Phase-2 crash left, spent by this
+    # attempt's FIRST Phase-2 attempt only (`_p2_attempt`) — and the ones THIS
+    # attempt leaves if Chrome dies in Phase 2, taken in the except below while
+    # `_runtime` still holds them.
+    _p2_rejoin_left = dict(_p2_rejoin or {})
+    _p2_rejoin_next = {}
     # Wave 13: set only when the login command paused this run and it can
     # continue by itself once the login finishes (see the end of this function).
     _login_resume = None
@@ -81998,10 +82385,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
             async def _p2_attempt(_launch, _brief):
                 """One Phase-2 attempt, under the phase's active-time ceiling."""
+                # 10-01: a crash retry's chats, for the first attempt only.
+                _rejoin = _p2_take_rejoin(_p2_rejoin_left,
+                                          new_input=bool(extra_ctx or fb2))
                 return await _await_phase_with_active_deadline(
                     2, PHASE_2_MAX_MIN,
                     lambda: run_phase2(browser, cua_client, _brief, verbose,
-                                       enabled_agents=_launch),
+                                       enabled_agents=_launch, rejoin=_rejoin),
                     soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
                 )
 
@@ -83609,6 +83999,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # block runs. (This is the latent half of the #725 bug: even the
         # poll-loop's browser_crash tag was being wiped before it was read.)
         _captured_failure_kind = getattr(_runtime, "last_failure_kind", "") or ""
+        # 10-01: and the chats Chrome took with it in Phase 2 — the crash
+        # retry goes back into them instead of sending the brief again. Before
+        # Phase 2 they are the ones a crash retry was itself handed (none on a
+        # first attempt); after it, there is nothing to go back into.
+        if _captured_failure_kind == "browser_crash" and last_phase <= 2:
+            _p2_rejoin_next = _p2_chats_to_rejoin()
         # Will the post-finally block silently re-run this from checkpoint? If
         # so, SUPPRESS the user-facing card — the silent-self-heal rule says we
         # only show Retry/Skip AFTER auto-retries are exhausted. Same predicate
@@ -83901,7 +84297,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            # retry — the attempt most likely to be the one worth
                            # sending — attributable to nobody.
                            _submitted_by=_run_submitted_by(),
-                           _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries))
+                           _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries),
+                           # 10-01: empty unless Chrome died in Phase 2.
+                           _p2_rejoin=_p2_rejoin_next)
     # ⭐ WAVE 13: a run the login command paused waits for the login to finish,
     # then continues from its checkpoint by itself. Started HERE, after the
     # `finally` closed this attempt and the auto-retry above stood down — a
