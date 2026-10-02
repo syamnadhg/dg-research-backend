@@ -1033,5 +1033,35 @@
    "cls": "superscript",
    "before": "While the Public Benefit Corporation model establishes a legal framework requiring fiduciaries to balance societal welfa"
   }
+ ],
+ "chipLinkCount": 103,
+ "chipLinks": [
+  {
+   "under": "Sources read but not used in the report",
+   "href": "https://openai.com/our-structure/",
+   "text": "openai.com Our Structure | OpenAI",
+   "attrs": [
+    "data-test-id=browse-chip-link",
+    "href=https://openai.com/our-structure/"
+   ]
+  },
+  {
+   "under": "Sources read but not used in the report",
+   "href": "https://openai.com/index/built-to-benefit-everyone/",
+   "text": "openai.com Built to benefit everyone - OpenAI",
+   "attrs": [
+    "data-test-id=browse-chip-link",
+    "href=https://openai.com/index/built-to-benefit-everyone/"
+   ]
+  },
+  {
+   "under": "Sources read but not used in the report",
+   "href": "https://openai.com/index/statement-on-openai-nonprofit-and-pbc/",
+   "text": "openai.com Statement on OpenAI's Nonprofit and PBC",
+   "attrs": [
+    "data-test-id=browse-chip-link",
+    "href=https://openai.com/index/statement-on-openai-nonprofit-and-pbc/"
+   ]
+  }
  ]
 }

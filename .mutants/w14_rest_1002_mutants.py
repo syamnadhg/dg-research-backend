@@ -189,9 +189,9 @@ MUTANTS = [
     ("G4", RESEARCH, "a page with no list is read anyway",
      [("    if used is None:\n        return _no(", "    if False:\n        return _no(")],
      "gemini"),
-    ("G5", RESEARCH, "⛔ the rows of \"read but not used\" are read as the list's",
-     [("        if at is None or at >= next_at:\n", "        if at is None:\n")],
-     "gemini"),
+    # (G5, G58 and G59 ended the list at the next list's title. The review of
+    # 10-02 bounds it by its own box instead: its mutants are in
+    # gemini_sources_box_1002_mutants.)
     # (G6-G10, G12, G21-G23, G26, G27 were the dormant join's — a number only on a
     # row that carries it, every row cited, a row's host off its title. The
     # owner's 18:45 recording proved the join by place: G32 on are its mutants.)
@@ -354,14 +354,6 @@ MUTANTS = [
      "gemini"),
     ("G57", RESEARCH, "the first of two toggles is pressed",
      [("  if (used.length !== 1) return", "  if (!used.length) return")],
-     "gemini"),
-    ("G58", RESEARCH, "the report's own links count as the list's rows — a closed list stays closed",
-     [("      follows(b, a) && (!next || follows(a, next))).length;\n",
-       "      (!next || follows(a, next))).length;\n")],
-     "gemini"),
-    ("G59", RESEARCH, "\"read but not used\" rows count as the list's — a closed list stays closed",
-     [("      follows(b, a) && (!next || follows(a, next))).length;\n",
-       "      follows(b, a)).length;\n")],
      "gemini"),
     ("G60", RESEARCH, "a list that opened with no row in it is left open",
      [("      : rows > 0 || open;\n", "      : rows > 0;\n")],

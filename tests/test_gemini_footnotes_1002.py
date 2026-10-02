@@ -16,10 +16,11 @@ page order, and the number shown on screen is not N.
 row N's address, and the document ends with ONE "Sources" list: all of Gemini's
 rows in its order, row N written as number N. "Read but not used" is not in it.
 ⛔ On any doubt — a number with no row, a number 0 or none, a row with no web
-address or two, a link in the list outside a row — no number and no list are
-written: the document is today's, and one log line says why.
+address or two, a link or words in the list outside a row — no number and no
+list are written: the document is today's, and one log line says why. The list
+ends where the box holding its rows ends, never at the next list's title.
 ⛔ A closed list is opened for the read by a press of its own toggle, and closed
-again after it.
+again after it — also when it opens only after the read stopped waiting.
 
 Every page here is built from the recordings' own markup (`_gemini_1002_pages`),
 runs in real headless Chrome through Gemini's production extraction, and
@@ -58,6 +59,13 @@ ROW_RE = re.compile(r"- (?:\[(?P<t>[^\]]*)\]\((?P<u>[^()\s]+)\) — .+|(?P<p>.+?
 #: A link in the report's own words (the 10-01 recording's `bodyLinks`).
 BODY_LINK = ("<p>The plugin model is documented in <a href='https://docs.example.org/"
              "relay/plugins'>the configuration guide</a> in full.</p>")
+#: The second list's title, worded otherwise than Gemini's.
+OTHER_TITLE = "Sources read but not cited in the report"
+#: A row drawn by another element, with no web address (ASSUMED: no recording
+#: holds one) — an uploaded file, say.
+FILE_ROW = ('<browse-file-item class="ng-star-inserted"><div class="browse-item">'
+            '<div data-test-id="sub-title" class="sub-title">governance-memo.pdf</div>'
+            '</div></browse-file-item>')
 
 
 @pytest.fixture
@@ -201,6 +209,64 @@ def test_a_rows_inner_element_of_the_same_kind_is_the_same_row(chrome, page, fas
         (n, "" if n in NOT_LISTED else r["href"]) for n, r in enumerate(USED, 1)]
 
 
+@pytest.mark.parametrize("second", ["titled-otherwise", "none"])
+def test_the_list_ends_where_its_own_box_ends(chrome, page, fast, lines, second):
+    """⭐ The list ends where the box holding its rows ends (the recorded
+    `div.source-list.used-sources`), not at the next list's title. With that
+    title worded otherwise, the other list's rows are not this list's; with no
+    second list, nor are the thinking trace's site links after it. Either way the
+    one Sources list is Gemini's 66 rows, every number its own. (Before: 72 rows,
+    the other list's after them; or, with no second list, no number linked.)"""
+    after = (G.recorded_sources(unused_title=OTHER_TITLE) if second != "none" else
+             G.recorded_sources(unused_title=None,
+                                thoughts="".join(G.chip_link(i) for i in range(3))))
+    md = _extract(chrome, page, after=after)
+    assert [(n, u) for n, u, _t in _rows(md)] == [
+        (n, "" if n in NOT_LISTED else r["href"]) for n, r in enumerate(USED, 1)]
+    for r in REC["unused"]:
+        assert r["href"] not in md
+    assert _said(lines, "its 66 sources listed in its order")
+
+
+def test_spaces_and_notes_between_rows_are_not_words(chrome, page, fast, lines):
+    """Between its rows the recorded list holds Angular's empty notes
+    (`<!---->`). Spaces, a line break, or a note with words in it there
+    (ASSUMED) are neither a row nor words in no row: the list is still joined."""
+    rows = [G.recorded_row(r["href"], r["text"]) for r in USED]
+    rows[3] += "\n   <!--ng-container *ngFor=\"let source of sources\"-->\n  "
+    md = _extract(chrome, page, after=G.recorded_sources(rows))
+    assert [(n, u) for n, u, _t in _rows(md)] == [
+        (n, "" if n in NOT_LISTED else r["href"]) for n, r in enumerate(USED, 1)]
+
+
+def test_a_number_past_the_list_never_opens_the_next_lists_row(chrome, page, fast, lines):
+    """⛔ With the next list's title worded otherwise, a number one past the end
+    of Gemini's list (67, of 66 rows) is past its end — never the other list's
+    first row."""
+    report = G.recorded_report(extra=f"<p>One more claim.{G.recorded_chip(67)}</p>")
+    md = _extract(chrome, page, report=report, after=G.recorded_sources(unused_title=OTHER_TITLE))
+    assert md == _today(chrome, page)
+    assert REC["unused"][0]["href"] not in md
+    said = _said(lines, "[Gemini] Gemini's citations stay as they are: ")
+    assert len(said) == 1 and "number 67 is past the end of its list" in said[0], said
+
+
+def test_a_closed_list_never_takes_the_next_lists_rows(chrome, page, fast, lines):
+    """⛔⛔ Closed, the next list's title worded otherwise, and the press never
+    answered: the only rows after the toggle are the OTHER list's (here as many
+    as Gemini's own: ASSUMED). Read as this list's, every number would open the
+    wrong page. That list's title is words in no row, so the document is today's.
+    (Before, the toggle was not even pressed, and every number opened a row of
+    the other list.)"""
+    other = USED[::-1]
+    md = _extract(chrome, page, after=G.recorded_sources(closed=True, unused=other,
+                                                         unused_title=OTHER_TITLE))
+    assert md == _today(chrome, page)
+    said = _said(lines, "[Gemini] Gemini's citations stay as they are: ")
+    assert len(said) == 1 and "words in its list are in no row" in said[0], said
+    assert _said(lines, "pressed it open, but it showed no row")
+
+
 def test_a_tables_raw_marks_are_the_same_numbers(chrome, page, fast, lines):
     """Where Gemini draws no chip (a table, in the 10-01 recording) it leaves its
     raw mark, "[cite: 5, 13]": the same numbers, glued to the word before them,
@@ -284,12 +350,63 @@ def test_the_toggle_is_left_alone(chrome, page, fast, lines, name):
 
 def test_a_list_that_does_not_open_keeps_todays_document(chrome, page, fast, lines):
     """⛔ A press that shows no row (here nothing answers it): the read goes on,
-    the document is today's, and the line says the list showed no row."""
+    the document is today's, and the line says the list showed no row. After
+    the read the list is watched as long again; it stays closed, so it is not
+    pressed again, and the line says it was left as it was found."""
     md = _extract(chrome, page, after=G.recorded_sources(closed=True))
     assert md == _today(chrome, page)
     assert _said(lines, "pressed it open, but it showed no row in 3 s")
     said = _said(lines, "[Gemini] Gemini's citations stay as they are: ")
     assert len(said) == 1 and "its list shows no row (a closed list?)" in said[0], said
+    assert _said(lines, "[Gemini] Gemini's \"Sources used in the report\" stayed closed after "
+                        "the read — left as it was found")
+    assert not _said(lines, "closed again") and not _said(lines, "did not close again")
+
+
+def test_a_list_that_opens_after_the_read_gave_up_is_closed_again(chrome, page, lines):
+    """⛔ The list opens only after the read stopped waiting for its rows (the
+    toggle answers a second after the read's own wait; NO `fast`: these are the
+    run's real waits). The read goes on with today's document, and the close
+    step keeps watching as long again: it presses the list the moment it shows,
+    so the tab ends as it was found — closed, no row, two presses — and, as the
+    list is still open when the close step's own wait ends, one warning says so.
+    (Before, the close step looked once, saw nothing, and the list opened after
+    it and stayed open.)"""
+    wait = research._GEMINI_SOURCES_WAIT_S
+    delay_ms = int(wait * 1000) + 1000
+    md = _extract(chrome, page, after=G.recorded_sources(closed=True),
+                  outside=G.toggle_script(delay_ms=delay_ms))
+    assert _said(lines, f"pressed it open, but it showed no row in {wait:g} s")
+    assert _said(lines, "[Gemini] Gemini's \"Sources used in the report\" did not close again")
+    assert not _said(lines, "stayed closed after the read")
+    # The close press's own answer comes `delay_ms` after it.
+    for _ in range(int(delay_ms / 100) + 20):
+        if _state(chrome, page)["expanded"] == "false":
+            break
+        chrome.run(asyncio.sleep(0.1))
+    assert _state(chrome, page) == {"expanded": "false", "rows": 0, "presses": "2",
+                                    "url": "about:blank"}
+    assert md == _today(chrome, page)
+
+
+@pytest.mark.parametrize("second", ["titled-otherwise", "none"])
+def test_a_closed_list_is_opened_whatever_follows_it(chrome, page, fast, lines, second):
+    """⭐ The toggle counts the rows in its own list's box, never every link
+    after it. Closed, with the next list's title worded otherwise, or with no
+    second list and the thinking trace's site links after it (the 18:45
+    recording: 103 of them after both lists), the list shows no row: it is
+    opened, read — Gemini's 66 rows, every number its own — and closed again.
+    (Before, those links counted as its rows, and it was never opened.)"""
+    assert REC["chipLinkCount"] == 103
+    after = (G.recorded_sources(closed=True, unused_title=OTHER_TITLE) if second != "none" else
+             G.recorded_sources(closed=True, unused_title=None,
+                                thoughts="".join(G.chip_link(i) for i in range(3))))
+    md = _extract(chrome, page, after=after, outside=G.toggle_script())
+    assert _state(chrome, page) == {"expanded": "false", "rows": 0, "presses": "2",
+                                    "url": "about:blank"}
+    assert [(n, u) for n, u, _t in _rows(md)] == [
+        (n, "" if n in NOT_LISTED else r["href"]) for n, r in enumerate(USED, 1)]
+    assert _said(lines, "opened it for the read (66 rows)")
 
 
 def test_a_list_that_opens_empty_is_closed_again(chrome, page, fast, lines):
@@ -327,6 +444,12 @@ def _variant(name):
     elif name == "rows-of-another-kind":
         rows = [r.replace("browse-web-item", "div") for r in rows]
         why = "a link in its list is in no row"
+    elif name == "row-of-another-kind-without-address":
+        # ⛔ Row 5 drawn by another element, with no link (a file, say: ASSUMED —
+        # in no recording). Skipped, every number from 5 on would open the row
+        # after its own; its words are in no row.
+        rows.insert(4, FILE_ROW)
+        why = "words in its list are in no row (in <browse-file-item class>)"
     if why:
         return report, G.recorded_sources(rows), why
     if name == "number-0":
@@ -357,7 +480,8 @@ def _variant(name):
 
 @pytest.mark.parametrize("name", [
     "list-shorter-than-a-number", "row-without-address", "row-not-a-web-address",
-    "row-two-addresses", "link-in-no-row", "rows-of-another-kind", "number-0", "mark-0",
+    "row-two-addresses", "link-in-no-row", "rows-of-another-kind",
+    "row-of-another-kind-without-address", "number-0", "mark-0",
     "chip-without-number", "no-list", "after-a-bullet", "own-list-with-links",
     "at-a-line-start"])
 def test_any_doubt_keeps_todays_document(chrome, page, fast, lines, name):

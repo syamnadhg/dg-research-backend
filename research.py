@@ -58994,10 +58994,14 @@ async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose,
 # (`_doc_link_own_numbers`); the crash-retry read-back turns them back.
 # ⛔ CHECKED BEFORE ANYTHING IS WRITTEN, because a place that is off by one links
 # every number after it to the wrong page: every chip and mark names a number,
-# and none is 0; every row of the list is Gemini's own row element holding
-# exactly one web address, and no link in the list is outside a row; the list
-# has a row for the highest number cited; no number is glued to a line's bullet,
-# list number or heading mark; and every number written links at the write.
+# and none is 0; the list is its title and the box its first row sits in, and it
+# ends where that box ends (never at the next list's title: a title worded
+# otherwise, or no second list, then adds nothing to it); every row of the list
+# is Gemini's own row element holding exactly one web address, and no link and
+# no words in the list are outside a row (a row drawn by another element, with
+# no address, would shift every number after it); the list has a row for the
+# highest number cited; no number is glued to a line's bullet, list number or
+# heading mark; and every number written links at the write.
 # ⛔ A row whose address we never put in a document (an agent's own page; the
 # owner's own Drive or Gmail, which Gemini reads) is listed by its title only, and
 # its number stays text. The 10-02 report has two: cdn.openai.com, rows 30, 58.
@@ -59008,7 +59012,11 @@ async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose,
 # is open (the 10-01 recording: closed, 0 rows). When the report cites and the
 # list shows no row, the read presses the list's own toggle (a button, never a
 # link, never a download), waits for its rows, reads, and presses it again, so
-# the page is left as it was found (`_gemini_used_sources`).
+# the page is left as it was found (`_gemini_used_sources`). Its rows are the
+# links in the element right after the toggle's own holder (the recorded
+# `collapsible-button`, then `div.source-list.used-sources`), never every link
+# after the toggle. A list that opens only after the read gave up on it is
+# watched for as long again and pressed closed the moment it shows.
 
 #: A sources section's title, as Gemini's button shows it.
 _GEMINI_SECTION_TITLE_RE = re.compile(
@@ -59105,13 +59113,29 @@ def _gemini_footnoted(html: str, label: str = "Gemini"):
         return _no("a citation names number 0")
     if used is None:
         return _no("the page holds no \"Sources used in the report\" list")
-    # The list: each of Gemini's own row elements, and every link in the section.
-    row_els, row_ids, links = [], set(), []
-    for node in used.next_elements:
-        at = order.get(id(node))
-        if at is None or at >= next_at:
-            break
+
+    def _after_title(end):
+        """The page after the list's title, up to `end` (a place in it)."""
+        for node in used.next_elements:
+            if order[id(node)] >= end:
+                return
+            yield node
+
+    # ⭐ The list ends where the box its first row sits in ends (the 18:45
+    # recording's `div.source-list.used-sources` holds every row), never at the
+    # next list's title: a title worded otherwise, or no second list at all (the
+    # thinking trace's 103 site links follow), adds no row and no link to it.
+    # Its first row is looked for before the next list's title only.
+    row1 = next((n for n in _after_title(next_at)
+                 if getattr(n, "name", None) == _GEMINI_ROW_TAG), None)
+    end_at = next_at if row1 is None else order[id(list(row1.parent.descendants)[-1])] + 1
+    # The list: each of Gemini's own row elements, every link, and any words in no row.
+    row_els, row_ids, links, loose = [], set(), [], []
+    for node in _after_title(end_at):
         if getattr(node, "name", None) is None:
+            if (not isinstance(node, Comment) and node.strip()
+                    and not any(id(p) in row_ids for p in node.parents)):
+                loose.append(node)
             continue
         href = str(node.get("href") or "") if node.name == "a" else ""
         if re.match(r"https?://", href, re.I):
@@ -59138,6 +59162,15 @@ def _gemini_footnoted(html: str, label: str = "Gemini"):
         rows.append((_doc_public_source_url(next(iter(urls))), title))
     if any(id(a) not in in_rows for a in links):
         return _no("a link in its list is in no row", len(row_els), first)
+    # ⛔ A row Gemini draws with another element and no address (a file, say) is
+    # no row here, and every number after it would open the row after its own:
+    # its words are in no row, so it is refused (the recorded list's words are
+    # all in its rows). What holds them is named — the element in the list's box
+    # they sit in, else their own — never the words.
+    if loose:
+        held = next((p for p in loose[0].parents if p.parent is first.parent), loose[0].parent)
+        return _no(f"words in its list are in no row (in {_gemini_shape(held)})",
+                   len(row_els), first)
     if max(cited) > len(rows):
         return _no(f"number {max(cited)} is past the end of its list", len(row_els), first)
     # Each number where it stood, a mark at the start of the list, then markdown.
@@ -59199,19 +59232,20 @@ def _gemini_report_markdown(html: str, label: str = "Gemini") -> str:
 #: that title, and never one inside a link (a link opens a page or downloads a
 #: file): "open" only when the report cites (a `source-footnote`) and the list is
 #: closed with no row shown, "close" only while the list shows rows or says it is
-#: open. `rows` is the links between that button and the next list's ("read but
-#: not used"), where only this list's rows are.
+#: open. `rows` is the links in the list's own box: the element right after the
+#: button's holder (the recorded `collapsible-button`, then `div.source-list
+#: .used-sources`). ⛔ Never every link after the button: with no "read but not
+#: used" list, or one titled otherwise, the thinking trace's site links (103 in
+#: the 18:45 recording) or the other list's rows counted as this list's, and a
+#: closed list was never opened.
 _GEMINI_USED_SOURCES_JS = r"""(want) => {
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
   const buttons = [...document.querySelectorAll('button')];
   const used = buttons.filter((b) => /^sources used in the report$/i.test(norm(b.textContent)));
   if (used.length !== 1) return {state: 'none', toggles: used.length};
   const b = used[0];
-  const follows = (x, y) => !!(x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING);
-  const next = buttons.find((x) => follows(b, x)
-      && /^sources read but not used in the report$/i.test(norm(x.textContent)));
-  const rows = [...document.querySelectorAll('a[href]')].filter((a) =>
-      follows(b, a) && (!next || follows(a, next))).length;
+  const box = b.parentElement ? b.parentElement.nextElementSibling : null;
+  const rows = box ? box.querySelectorAll('a[href]').length : 0;
   const open = b.getAttribute('aria-expanded') === 'true';
   if (want === 'count') return {state: 'count', rows, open};
   if (b.closest('a')) return {state: 'not a toggle', rows, open};
@@ -59231,11 +59265,29 @@ async def _gemini_used_sources(page, label: str, want: str) -> bool:
     its rows to show (or go). True when the toggle was pressed, so a list pressed
     open is always pressed closed again. Never raises."""
     who = label or "Gemini"
-    try:
-        got = await page.evaluate(_GEMINI_USED_SOURCES_JS, want)
-    except Exception as e:
-        log(f"[{who}] Gemini's sources list could not be read ({type(e).__name__})", "DEBUG")
-        return False
+
+    async def _ask(w):
+        try:
+            return await page.evaluate(_GEMINI_USED_SOURCES_JS, w)
+        except Exception as e:
+            log(f"[{who}] Gemini's sources list could not be read ({type(e).__name__})", "DEBUG")
+            return None
+
+    got = await _ask(want)
+    # ⛔ A list pressed open that showed no row before the read gave up on it can
+    # still open after it: it is watched for as long again, and pressed closed the
+    # moment it shows a row or says it is open (the page script's own "close"
+    # rule), so the owner's tab is not left with it open.
+    if want == "close" and isinstance(got, dict) and got.get("state") == "left":
+        for _tick in range(int(_GEMINI_SOURCES_WAIT_S / 0.2)):
+            await asyncio.sleep(0.2)
+            got = await _ask("close")
+            if not isinstance(got, dict) or got.get("state") != "left":
+                break
+        else:
+            log(f"[{who}] Gemini's \"Sources used in the report\" stayed closed after the "
+                "read — left as it was found")
+            return False
     if not isinstance(got, dict) or got.get("state") != "pressed":
         return False
     done, rows = False, 0

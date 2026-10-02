@@ -17,6 +17,11 @@ and the run unwinds. Claude's one silent re-read (#777, for a clipboard that cam
 back empty on a live browser) comes after the browser is asked, so a dead browser
 never gets it — and never a card either.
 
+⭐ A browser closed before the read stops Gemini's reader at its first scroll,
+before Wave 14's step that presses Gemini's closed sources list open — so that
+step is measured on its own case: the read presses the list open on a live page
+(built from the owner's 10-02 recordings, offline) and Chrome dies right after.
+
 ── How it is measured ──────────────────────────────────────────────────────
 As for ChatGPT: the statements of each of `poll_all_agents_round_robin`'s two
 read blocks are lifted out of research.py's parse tree at test time
@@ -35,6 +40,7 @@ import pytest
 
 import research
 import test_chatgpt_dr_read_1001 as dr
+import _gemini_1002_pages as G
 
 chrome = dr.chrome
 fast = dr.fast
@@ -56,14 +62,32 @@ def run_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _read_on_a_dead_browser(chrome, monkeypatch, name, marker):
-    """Run one read block for `name` on a browser that died just before it.
+def _read_on_a_dead_browser(chrome, monkeypatch, name, marker, presses=None):
+    """Run one read block for `name` on a browser that died just before it —
+    or, given `presses` (a list), on Gemini's finished report with its sources
+    list closed, the browser dying right after the read pressed that list open;
+    each call of the press step is put in `presses` as (want, what it returned).
     Returns (the error the block raised or None, cards, emits, saved, runtime)."""
     ctx = chrome.run(chrome.ctx.browser.new_context())
     pg = chrome.run(ctx.new_page())
-    chrome.run(pg.set_content(REPORT))
-    chrome.run(ctx.close())
-    assert pg.is_closed(), "the browser did not die"
+    if presses is None:
+        chrome.run(pg.set_content(REPORT))
+        chrome.run(ctx.close())
+        assert pg.is_closed(), "the browser did not die"
+    else:
+        G.offline(chrome, pg)
+        chrome.run(pg.set_content(G.report_page(
+            G.recorded_report(), after=G.recorded_sources(closed=True),
+            outside=G.toggle_script())))
+        real = research._gemini_used_sources
+
+        async def _dies_after_the_open_press(page, label, want):
+            out = await real(page, label, want)
+            presses.append((want, out))
+            if want == "open":
+                await ctx.close()
+            return out
+        monkeypatch.setattr(research, "_gemini_used_sources", _dies_after_the_open_press)
 
     shell = ast.parse("async def _go():\n    for name in [NAME]:\n        pass\n")
     shell.body[0].body[0].body = dr._extraction_block(marker)
@@ -128,3 +152,32 @@ def test_a_dead_browser_is_a_crash_not_a_card_for_claude_and_gemini(
     assert dr._said(logs, f"[{name}] the whole browser is gone, not just this tab")
     assert not dr._said(logs, "surfacing user decision")
     assert not dr._said(logs, "silent re-extraction before alerting")
+
+
+@pytest.mark.parametrize("marker", [PAGE_DONE, CUA_DONE], ids=["page-said-done", "cua-said-done"])
+def test_chrome_dying_right_after_geminis_sources_press_is_a_crash_not_a_card(
+        chrome, fast, logs, monkeypatch, marker):
+    """⭐ Wave 14's step that opens Gemini's closed sources list, REACHED. In the
+    test above Chrome is gone before the read, so Gemini's reader stops at its
+    first scroll and never gets to the press. Here the read presses the list
+    open on a live page and Chrome dies right after: the press step's "close"
+    runs on the dead browser and raises nothing, the reader's own tiers come
+    back empty, and the run unwinds as a crash — no card, Gemini not shown
+    "failed", nothing saved "errored"."""
+    presses = []
+    err, cards, emits, saved, runtime = _read_on_a_dead_browser(
+        chrome, monkeypatch, "Gemini", marker, presses=presses)
+    assert presses == [("open", True), ("close", False)], presses
+    assert dr._said(logs, "[Gemini] Gemini's \"Sources used in the report\" was closed — "
+                          "opened it for the read (66 rows)")
+    # ⛔ The press step never raises: the reader went on to its own empty end,
+    # it was not cut short by an error out of the press.
+    assert not dr._said(logs, "[Gemini] Content extraction error"), logs
+    assert dr._said(logs, "[Gemini] All extraction tiers failed")
+    assert cards == [], f"a card was put up for Gemini on a dead browser: {cards}"
+    assert err is not None and research._is_browser_close_error(err), err
+    assert runtime.last_failure_kind == "browser_crash"
+    assert ("agent_progress", "gemini", "extracting") in emits, emits
+    assert ("agent_progress", "gemini", "failed") not in emits
+    assert ("gemini", "errored") not in saved
+    assert dr._said(logs, "[Gemini] no content, and the whole browser is gone")

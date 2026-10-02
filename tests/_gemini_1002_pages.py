@@ -35,7 +35,9 @@ holding one `a[data-test-id="browse-web-item-link"]` with its host and its
 `unused`: the first 6 of 136). Each row here is that recorded row with its own
 address, host and title put in (`recorded_row`). The recording's 118 chips are
 there too, in order: each one's index, the number it SHOWS, its class and the
-first words of the block it sits in (`chips`).
+first words of the block it sits in (`chips`); and the first three of the 103
+site links the thinking trace holds after both lists, each an `a` with
+`data-test-id="browse-chip-link"` (`chipLinks`, `chip_link`).
 
 ASSUMED, and said so where it is built: the report's words, its headings and
 tables, where a chip stands in a sentence, the markup of "Sources read but not
@@ -195,23 +197,43 @@ def used_list(rows=None) -> str:
     return _parts()[2] + body + "</div>"
 
 
-def recorded_sources(rows=None, *, closed: bool = False) -> str:
+def recorded_sources(rows=None, *, closed: bool = False, unused=None,
+                     unused_title=UNUSED_TITLE, thoughts: str = "") -> str:
     """Gemini's two sources lists as the recording shows them, then its
     "Thoughts". `closed`: the used list as a closed one is — its toggle says so
     and its rows are not in the page. ASSUMED: "read but not used" is the used
-    list's own markup with its own title (open, as it was in the recording)."""
+    list's own markup with its own title (open, as it was in the recording).
+    `unused`: that list's rows (as `used_list` takes them; the recorded 6 by
+    default), `unused_title` its title (None: the page has no second list), and
+    `thoughts` markup in the thinking trace after its words."""
     rec = sources_recording()
     opening, toggle, list_open = _parts()
     assert toggle.count('aria-expanded="true"') == 1
-    unused_toggle = (toggle.replace(f">{USED_TITLE}<", f">{UNUSED_TITLE}<")
-                     .replace("used-sources", "unused-sources"))
-    unused = (unused_toggle + list_open.replace("used-sources", "unused-sources")
-              + rec["between"].join(recorded_row(r["href"], r["text"]) for r in rec["unused"])
-              + "</div>")
+    unused_rows = rec["unused"] if unused is None else unused
+    second = ""
+    if unused_title is not None:
+        unused_toggle = (toggle.replace(f">{USED_TITLE}<", f">{html.escape(unused_title)}<")
+                         .replace("used-sources", "unused-sources"))
+        second = (unused_toggle + list_open.replace("used-sources", "unused-sources")
+                  + rec["between"].join(r if isinstance(r, str) else
+                                        recorded_row(r["href"], r["text"]) for r in unused_rows)
+                  + "</div>")
     used = (toggle.replace('aria-expanded="true"', 'aria-expanded="false"') if closed
             else toggle + used_list(rows))
-    return (opening + used + unused + "</deep-research-source-lists>"
-            "<div class='thoughts'><button>Thoughts</button><p>Researching websites…</p></div>")
+    return (opening + used + second + "</deep-research-source-lists>"
+            "<div class='thoughts'><button>Thoughts</button><p>Researching websites…</p>"
+            + thoughts + "</div>")
+
+
+def chip_link(n: int = 0) -> str:
+    """The thinking trace's site link: the 18:45 recording holds 103 of them,
+    after both lists, each an `a` carrying `data-test-id="browse-chip-link"` and
+    its address (`chipLinks`: the first three). ASSUMED: the rest of its markup —
+    here its recorded words alone."""
+    rec = sources_recording()["chipLinks"][n]
+    assert rec["attrs"][0] == "data-test-id=browse-chip-link", rec
+    return (f'<a data-test-id="browse-chip-link" href="{html.escape(rec["href"], quote=True)}">'
+            f'{html.escape(rec["text"])}</a>')
 
 
 def toggle_script(rows=None, delay_ms: int = 150) -> str:
