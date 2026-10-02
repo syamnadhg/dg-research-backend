@@ -32163,6 +32163,59 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None, *,
 # generic one would overwrite the specific message).
 _AGENT_ERROR_CARD_TS: dict = {}
 
+#: agent key → (research id, phase) of the card `fail_agent` last raised for it.
+_AGENT_ERROR_CARD_OF: dict = {}
+
+
+def _retract_crashed_attempt_cards(research_id) -> list:
+    """A crash retry has started: take down every Phase-2 agent card the
+    crashed attempt raised for this research. Returns the agents whose card was
+    taken down.
+
+    ⛔⛔ 10-01. Chrome died during ChatGPT's extraction and the attempt put up
+    "Couldn't read ChatGPT's report"; the retry relaunched Chrome and carried on
+    with the card still up, and it stayed up fifteen minutes, until ChatGPT
+    finished again and its completion took it down. The attempt that raised it
+    was gone; its Retry and Skip were about a browser that no longer existed.
+
+    ⭐ The same retraction the completion uses: the card's own alert id, no
+    actions, `auto_clear_on_resume` (the app's sign that an agent recovered by
+    itself — it clears the card and the pause), the durable decision cleared,
+    and the stamp dropped. The tile is set running again — never over a
+    finished or skipped agent (`_write_agent_terminal_status` refuses both).
+
+    ⛔ ONLY THIS RESEARCH'S CARDS, ONLY PHASE 2's. The stamps outlive a run in a
+    long-lived worker, so a card another research raised earlier must not be
+    "retracted" into this one; and the app reads a retraction only for a Phase-2
+    agent card — on any other phase it would put up a new notice instead."""
+    rid = str(research_id or "")
+    if not rid:
+        return []
+    taken = []
+    for agent_key, (card_rid, phase) in list(_AGENT_ERROR_CARD_OF.items()):
+        if card_rid != rid or phase != 2 or agent_key not in _AGENT_ERROR_CARD_TS:
+            continue
+        name = _agent_display_name(agent_key)
+        try:
+            emit_event("pipeline_warning", phase=2, agent=agent_key,
+                       error=f"{name} is going again",
+                       details=(f"Chrome restarted and the run carried on; the earlier "
+                                f"alert about {name} no longer applies."),
+                       actions=[], alert_id=_agent_error_alert_id(agent_key, 2),
+                       auto_clear_on_resume=True)
+            _clear_pending_decision(agent_key)
+            _write_agent_terminal_status(agent_key, "running")
+        except Exception as e:
+            log(f"[restart] could not take down {name}'s card ({type(e).__name__})", "WARN")
+            continue
+        _AGENT_ERROR_CARD_TS.pop(agent_key, None)
+        _AGENT_ERROR_CARD_OF.pop(agent_key, None)
+        taken.append(agent_key)
+    if taken:
+        log("[restart] Chrome restarted — took down the card(s) the crashed attempt "
+            f"raised: {', '.join(_agent_display_name(a) for a in taken)}")
+    return taken
+
 
 def _agent_error_recently_carded(agent_key: str, within: float = 45.0) -> bool:
     """True if fail_agent emitted a card for this agent in the last `within`
@@ -32333,6 +32386,9 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # brief to ChatGPT" and then clobbered it with "ChatGPT didn't start".
     # Monotonic clock (paired with _agent_error_recently_carded).
     _AGENT_ERROR_CARD_TS[agent_key] = time.monotonic()
+    # Wave 15: whose card it is and on which phase, so a crash retry takes down
+    # only the cards its own crashed attempt raised (`_retract_crashed_attempt_cards`).
+    _AGENT_ERROR_CARD_OF[agent_key] = (str(_fb_research_id or ""), _eff_phase)
     # Tile/Icon Consistency: persist errored status. If user picks Retry
     # and the agent eventually completes, the phase_complete handler
     # overwrites this with "complete". If they pick Skip, the
@@ -79997,10 +80053,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # ── Initialize pipeline controls + Firestore bridge ──
     _controls.reset()
     _runtime.reset()
-    # 10-01: the chats a Phase-2 crash handed this retry stay carried until this
-    # attempt goes back into them or sets their agents up again, so a crash
-    # before that, or during the rejoin, hands them on instead of nothing.
-    _runtime.p2_chat_urls.update(_p2_rejoin or {})
     # #955 Phase 2 (adversarial findings #1/#2/#3/#5): wipe the auto-skip
     # deadline registry at every run entry. It's a MODULE global (not owned by
     # _runtime), and jobs run sequentially in one long-lived worker process, so
@@ -80037,6 +80089,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # Clear dedup cache — stale keys from a prior run in the same process
     # would otherwise suppress early events in this run.
     _last_progress.clear()
+    # 10-01: the chats a Phase-2 crash handed this retry stay carried until this
+    # attempt goes back into them or sets their agents up again, so a crash
+    # before that, or during the rejoin, hands them on instead of nothing.
+    # (After the cross-run wipes above, which leave `_runtime` alone.)
+    _runtime.p2_chat_urls.update(_p2_rejoin or {})
     # Stamp the live per-run id into the env so Vision shadow + observe-only records
     # carry the REAL run id (both paths read DG_RUN_ID from the env at log time).
     # Without this they inherit whatever DG_RUN_ID was last set to in the environment
@@ -80073,6 +80130,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     if uid:
         # Use frontend research_id for Firestore paths (not run_id which is the backend dir name)
         setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop(), run_id=run_id)
+        # ⭐ Wave 15: a crash's own retry takes down the cards the crashed
+        # attempt raised — a crash that recovers leaves no alert behind.
+        if _crash_retries > 0:
+            _retract_crashed_attempt_cards(research_id or run_id)
     if _cli_mode:
         # CLI mode has no Firestore command listener — wire stdin instead so
         # the user can resume/skip/stop from the same terminal.
