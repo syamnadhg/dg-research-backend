@@ -156,22 +156,36 @@ def test_the_rung_does_not_return_early_past_the_rest_of_phase_3():
     after the download block. A first draft of this rung returned as soon as it had
     the file, which would have traded a missing podcast for a missing link — the
     same outage wearing a different message."""
-    block = _download_block()
-    # Scoped to the RUNG, ending at the narration ticker — not at the CUA call.
-    # The wider window swept in the nested `_audio_download_cua()` helper, whose
-    # `return await agent_loop(...)` is a perfectly correct return from a closure
-    # and has nothing to do with returning out of phase 3.
-    rung_start = block.index("_dl_via_dom = False")
-    rung = block[rung_start:block.index("_stop_d, _task_d = start_narration_ticker")]
-    # COMMENTS STRIPPED FIRST. The comment above the rung explains why it must not
-    # return early — and therefore contains the word — so a raw search matched the
-    # explanation and failed against correct code. This project has hit that exact
-    # shape before: a comment quoting the asserted text defeats a search for it.
-    rung = "\n".join(ln for ln in rung.splitlines() if not ln.lstrip().startswith("#"))
-    assert "return " not in rung, (
+    # ⭐ PARSED, wave 15. The rung's press became a closure (`_dom_press_download`,
+    # pressed again when the podcast cannot be fetched from its address), and a
+    # closure's `return` is a correct return from the closure — as the nested
+    # `_audio_download_cua()` helper's always was. What must not exist is a
+    # `return` of `run_phase3_audio` ITSELF between the rung and the narration
+    # ticker: so the Return nodes are collected from the phase's own body, not
+    # from the functions nested in it.
+    import ast
+    lines = SRC.splitlines()
+    first = next(i for i, ln in enumerate(lines, 1) if "_dl_via_dom = False" in ln)
+    last = next(i for i, ln in enumerate(lines, 1)
+                if i > first and "_stop_d, _task_d = start_narration_ticker" in ln)
+    fn = next(n for n in ast.walk(ast.parse(SRC))
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "run_phase3_audio")
+
+    def _own_returns(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(child, ast.Return):
+                yield child
+            yield from _own_returns(child)
+
+    early = [r.lineno for r in _own_returns(fn) if first <= r.lineno <= last]
+    assert early == [], (
         "the DOM rung must not return out of phase 3 — the transcode, the cleanup and "
-        "the share-link extract still have to run:\n" + rung
-    )
+        f"the share-link extract still have to run (returns at lines {early})")
+    # And the window holds the rung: the press, and the check of its answer.
+    window = "\n".join(lines[first - 1:last])
+    assert "_dl_via_dom = await _dom_press_download()" in window
 
 
 def test_the_storage_upload_still_follows_the_download():
@@ -352,7 +366,8 @@ def test_a_file_already_on_disk_does_not_buy_a_30_second_wait_for_an_event():
     in hand. It then times out into a scan that finds the file we already found.
     """
     block = _collect_block()
-    assert '_dl_wait_s = 0.5 if _dl_evidence == "file" else 30' in block, block
+    # Wave 15: and a podcast fetched from its address is in hand already too.
+    assert '_dl_wait_s = 0.5 if _dl_evidence in ("file", "fetched") else 30' in block, block
     assert "timeout=_dl_wait_s" in block, (
         "the computed wait has to be the one actually used"
     )

@@ -72857,6 +72857,194 @@ def _find_recent_audio(dirs, *, min_bytes=4096):
     return (best[1], best[2], best[3])
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# THE PODCAST WITHOUT A CHROME DOWNLOAD (wave 15, 10-02)
+# ─────────────────────────────────────────────────────────────────────────────
+# ⛔⛔ A NOTEBOOKLM AUDIO DOWNLOAD IS THE SAME CRASH CLASS AS A REPORT EXPORT.
+# Chrome 154 crashes in its own downloads button while a download updates
+# (#Dev/wave15/crash/crash-analysis-1001.json), and on 09-16 two NotebookLM audio
+# downloads killed the browser the instant the page pressed them ("Download
+# save failed: Download.save_as: Target page, context or browser has been
+# closed", 12:57:54 and 13:35:58). Every run until now still downloaded the
+# podcast in Chrome ("Audio downloaded via Playwright: ….m4a").
+# ⭐ WHAT THE DOWNLOAD IS. This Mac's agent-profile download history: every
+# NotebookLM audio download (ids 85-118, 3 MB to 120 MB) starts at
+# `https://lh3.googleusercontent.com/notebooklm/<token>=m140-dv-mp2?authuser=0`
+# and is redirected to `drum.usercontent.google.com/download/…`, which serves it
+# to the signed-in account (its cookies).
+# ⭐ SO: while the page's own Download is pressed, the browser context stops the
+# request for that address before Chrome can start a download, keeps the
+# address, and the file is fetched straight from it with the context's own
+# request API — cookies included, redirects followed, and nothing in Chrome's
+# downloads at all. If no address comes, or the fetch fails, the catch comes off
+# and the download goes through Chrome as before, with one log line saying so.
+#: The audio's own address. Images and the player's stream (the same host) are
+#: never stopped — only the request that would become a download.
+_NLM_AUDIO_URL_RE = re.compile(r"^https://lh3\.googleusercontent\.com/notebooklm/")
+#: How long the press waits for the page to ask for that address.
+_NLM_AUDIO_CATCH_WAIT_S = 10.0
+#: How long the fetch may take (120 MB on 09-30) — the request API's own limit, ms.
+_NLM_AUDIO_FETCH_TIMEOUT_MS = 10 * 60 * 1000
+#: Smaller than this is not an audio overview (the shortest on record is 3.2 MB).
+_NLM_AUDIO_MIN_BYTES = 64 * 1024
+
+
+class _NlmAudioCatch:
+    """While armed, the browser context stops NotebookLM's audio request before
+    Chrome can make it a download, and keeps its address (`url`).
+
+    ⛔ A page route, not a page listener: a `download` event arrives only after
+    Chrome has started the download — the thing that crashes it. The route is on
+    the CONTEXT, so a Download the page opens in a new tab is stopped too, and
+    that tab is closed. It is taken off again (`disarm`) before anything else
+    may download."""
+
+    def __init__(self, browser, label="Audio"):
+        self.browser, self.label = browser, label
+        self.url = ""
+        self._ctx = None
+        self._tabs_before: set = set()
+
+    async def arm(self) -> bool:
+        ctx = getattr(self.browser, "context", None)
+        if ctx is None:
+            return False
+        try:
+            # The tabs open before the press: only a tab the press itself opened
+            # is closed afterwards, never one of the run's own.
+            self._tabs_before = {id(p) for p in (getattr(ctx, "pages", None) or [])}
+            await ctx.route(_NLM_AUDIO_URL_RE, self._on_route)
+        except Exception as e:
+            log(f"[{self.label}] the audio catch could not be put on the browser "
+                f"({type(e).__name__}) — Chrome downloads the podcast, as before", "WARN")
+            return False
+        self._ctx = ctx
+        return True
+
+    async def _on_route(self, route, request=None):
+        req = request if request is not None else route.request
+        try:
+            kind = str(req.resource_type or "")
+        except Exception:
+            kind = ""
+        if kind in ("image", "media") or self.url:
+            try:
+                await route.fallback()
+            except Exception:
+                pass
+            return
+        self.url = str(req.url or "")
+        # ⛔ ANSWERED "204 No Content", NOT ABORTED. An aborted navigation commits
+        # Chrome's error page in its place — a Download that follows a link in the
+        # notebook's own tab would leave the tab on that error page, and the rest
+        # of Phase 3 with no notebook. A 204 is the one answer a browser neither
+        # navigates to nor downloads.
+        try:
+            await route.fulfill(status=204, body="")
+        except Exception:
+            try:
+                await route.abort()
+            except Exception:
+                pass
+        # A Download the page opened in a tab of its own: that tab now holds an
+        # error page and nothing else — close it.
+        try:
+            tab = req.frame.page
+            if id(tab) not in self._tabs_before:
+                await tab.close()
+        except Exception:
+            pass
+
+    async def disarm(self) -> None:
+        if self._ctx is None:
+            return
+        try:
+            await self._ctx.unroute(_NLM_AUDIO_URL_RE, self._on_route)
+        except Exception:
+            pass
+        self._ctx = None
+
+    async def wait(self, seconds: float = _NLM_AUDIO_CATCH_WAIT_S) -> str:
+        """The address the press asked for, or "" when none came in `seconds`."""
+        for _ in range(max(1, int(seconds / 0.25))):
+            if self.url:
+                break
+            await asyncio.sleep(0.25)
+        return self.url
+
+
+def _nlm_audio_name(disposition: str, kind: str) -> str:
+    """A file name for the fetched audio: the server's own, made safe for
+    ffmpeg as the download path's is, else a plain one — with the extension the
+    content says."""
+    m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", disposition or "", re.I)
+    name = ""
+    if m:
+        try:
+            from urllib.parse import unquote
+            name = unquote(m.group(1))
+        except Exception:
+            name = m.group(1)
+    name = re.sub(r'[^\w\s.-]', '', Path(name).name).strip()
+    stem = Path(name).stem if name else "audio_overview"
+    return f"{stem or 'audio_overview'}{kind or '.m4a'}"
+
+
+async def _nlm_fetch_audio(browser, url: str, dest_dir: Path, label="Audio"):
+    """Fetch the podcast from its address with the browser context's own request
+    API (its cookies, its redirects) into `dest_dir`. The saved file, or None —
+    and None logs why, in one line, without the address (it is a credential)."""
+    ctx = getattr(browser, "context", None)
+    if ctx is None or not url:
+        return None
+    resp = None
+    try:
+        resp = await ctx.request.get(url, timeout=_NLM_AUDIO_FETCH_TIMEOUT_MS)
+        status = int(resp.status)
+        if not resp.ok:
+            log(f"[{label}] fetching the audio from its address was refused (HTTP "
+                f"{status})", "WARN")
+            return None
+        body = await resp.body()
+        headers = dict(resp.headers or {})
+    except Exception as e:
+        log(f"[{label}] fetching the audio from its address failed "
+            f"({type(e).__name__}: {str(e)[:120]})", "WARN")
+        return None
+    finally:
+        if resp is not None:
+            try:
+                await resp.dispose()
+            except Exception:
+                pass
+    if len(body) < _NLM_AUDIO_MIN_BYTES:
+        log(f"[{label}] the audio's address answered {len(body)} bytes — not an audio "
+            "overview", "WARN")
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dest_dir / ".audio_fetch.part"
+    try:
+        tmp.write_bytes(body)
+        kind = _audio_kind(tmp, trusted=True)
+        if not kind:
+            log(f"[{label}] what the audio's address answered is not audio "
+                f"({headers.get('content-type') or 'no type'}, {len(body)} bytes)", "WARN")
+            tmp.unlink(missing_ok=True)
+            return None
+        dest = dest_dir / _nlm_audio_name(headers.get("content-disposition", ""), kind)
+        os.replace(tmp, dest)
+    except Exception as e:
+        log(f"[{label}] the fetched audio could not be saved ({type(e).__name__})", "WARN")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    log(f"Audio fetched straight from its address, no Chrome download: {dest.name} "
+        f"({len(body)} bytes)")
+    return dest
+
+
 def _audio_search_plan(browser):
     """Where to look for the podcast, and what we are allowed to do there.
 
@@ -73673,36 +73861,64 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # (The ROW is chosen by label. The CARD is the picker's: with two audio
         # cards the menu opened is `_target_ord`'s, never simply the topmost.)
         _dl_via_dom = False
-        try:
-            _dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)
-            if _dl_menu.get("verified"):
-                _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
-                # `blocked` is ADVISORY — the denied rows the picker filtered out
-                # and skipped — and it is returned ALONGSIDE `clicked: true`. The
-                # audio menu always contains Delete, so it is always non-empty.
-                # Treating it as a failure (as the first version of this rung did)
-                # meant the rung clicked Download, reported failure, and the visual
-                # agent then clicked Download again: two files, one run. `clicked`
-                # is the only field that says what happened. The share flow below
-                # has always read it this way.
-                if _dl_pick.get("blocked"):
-                    log(f"[Audio] download menu skipped destructive row(s): "
-                        f"{_dl_pick.get('blocked')}", "DEBUG")
-                if _dl_pick.get("clicked"):
-                    _dl_via_dom = True
-                    log(f"[dom] p3 notebooklm.download_audio: verified "
-                        f"via={_dl_pick.get('via')!r}")
-                else:
+
+        async def _dom_press_download() -> bool:
+            try:
+                _dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)
+                if _dl_menu.get("verified"):
+                    _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
+                    # `blocked` is ADVISORY — the denied rows the picker filtered out
+                    # and skipped — and it is returned ALONGSIDE `clicked: true`. The
+                    # audio menu always contains Delete, so it is always non-empty.
+                    # Treating it as a failure (as the first version of this rung did)
+                    # meant the rung clicked Download, reported failure, and the visual
+                    # agent then clicked Download again: two files, one run. `clicked`
+                    # is the only field that says what happened. The share flow below
+                    # has always read it this way.
+                    if _dl_pick.get("blocked"):
+                        log(f"[Audio] download menu skipped destructive row(s): "
+                            f"{_dl_pick.get('blocked')}", "DEBUG")
+                    if _dl_pick.get("clicked"):
+                        log(f"[dom] p3 notebooklm.download_audio: verified "
+                            f"via={_dl_pick.get('via')!r}")
+                        return True
                     log(f"[dom] p3 notebooklm.download_audio: missed "
                         f"({_dl_pick.get('reason', 'no Download row')}) — CUA will drive it",
                         "WARN")
                     await _nlm_close_dialogs(browser.page, label="Audio")
-            else:
-                log(f"[dom] p3 notebooklm.download_audio: menu not opened "
-                    f"({_dl_menu.get('why', 'unknown')}) — CUA will drive it", "WARN")
-        except Exception as _dl_dom_err:
-            log(f"[dom] p3 notebooklm.download_audio: errored "
-                f"({type(_dl_dom_err).__name__}) — CUA will drive it", "WARN")
+                else:
+                    log(f"[dom] p3 notebooklm.download_audio: menu not opened "
+                        f"({_dl_menu.get('why', 'unknown')}) — CUA will drive it", "WARN")
+            except Exception as _dl_dom_err:
+                log(f"[dom] p3 notebooklm.download_audio: errored "
+                    f"({type(_dl_dom_err).__name__}) — CUA will drive it", "WARN")
+            return False
+
+        # ⭐⭐ Wave 15 (10-02): THE PODCAST IS FETCHED FROM ITS ADDRESS, NOT
+        # DOWNLOADED BY CHROME (`_NlmAudioCatch`). The catch is on the browser
+        # while the page's own Download is pressed; the address that press asks
+        # for is fetched with the context's request API. With no address, or a
+        # fetch that fails, the catch comes off and the download goes through
+        # Chrome exactly as before — pressed again by the page when the catch
+        # had stopped the first press. Computer use, when the page could not
+        # press it, downloads through Chrome as before too.
+        _audio_catch = _NlmAudioCatch(browser, "Audio")
+        _catch_on = await _audio_catch.arm()
+        _fetched = None
+        try:
+            _dl_via_dom = await _dom_press_download()
+            _addr = (await _audio_catch.wait()) if (_catch_on and _dl_via_dom) else ""
+        finally:
+            await _audio_catch.disarm()
+        if _addr:
+            _fetched = await _nlm_fetch_audio(browser, _addr, queue_dir / "podcasts")
+            if _fetched is None:
+                log("[Audio] the audio could not be fetched from its address — "
+                    "pressing Download again, and Chrome downloads it as before", "WARN")
+                _dl_via_dom = await _dom_press_download()
+        elif _catch_on and _dl_via_dom:
+            log("[Audio] the page's Download asked for no audio address this run "
+                "knows — Chrome downloads it, as before", "WARN")
 
         # ── did the click actually download something? ──
         #
@@ -73730,7 +73946,12 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # nothing, after we have already held the finished file in our hand.
         _dl_seen = False
         _dl_evidence = ""
-        if _dl_via_dom:
+        if _fetched is not None:
+            # Wave 15: the file is already ours — no visual agent, no wait.
+            _dl_seen, _dl_evidence = True, "fetched"
+            if not download_future.done():
+                download_future.set_result(_fetched)
+        if _dl_via_dom and not _dl_seen:
             _dl_deadline = time.time() + 25
             while time.time() < _dl_deadline:
                 if download_future.done() and download_future.result() is not None:
@@ -73808,7 +74029,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # from Playwright with no scan at all. When it doesn't, the timeout falls
         # into the very same scan that would have run at 30s, having found the same
         # file — the fallback below is unchanged and still owns every other path.
-        _dl_wait_s = 0.5 if _dl_evidence == "file" else 30
+        _dl_wait_s = 0.5 if _dl_evidence in ("file", "fetched") else 30
         try:
             audio_path = await asyncio.wait_for(download_future, timeout=_dl_wait_s)
             # Track-B success-path observe (P3 audio download). Page still alive here
