@@ -58740,32 +58740,40 @@ async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose,
 # document ended with the sites the run saw Gemini open — no number opened
 # anything.
 #
-# ⛔⛔ WHICH ROW IS NUMBER N IS NOT KNOWN FROM ANY FILE ON DISK, so no number is
-# ever joined to a row by its POSITION. The recording holds no row of the list
-# (the section was closed: 0 rows), the saved documents hold none (it was cut
-# off), and no fixture holds one. And the one chip the recording shows with a
-# number drawn on it shows "1" where its index is 7: the number a reader sees and
-# the index are not one thing, so "row N" could be the wrong row.
-# ⭐ THE RULE. A number is joined to a row only where the PAGE says which row it
-# is: a row of "Sources used in the report" carrying the same
-# `data-turn-source-index` the chips carry. Then each chip becomes Gemini's own
-# number, `\[N\]`, glued to the word before it, each table mark the same, and the
-# document ends with ONE "Sources" list — Gemini's own rows, in its order, each
-# with its title, its address and the number citing it (ChatGPT's row shape,
-# `_cg_pdf_source_row`, which the write reads as an agent's own list). A report's
-# own trailing sources section with no link in it is replaced by it. The write
-# links each number to its row (`_doc_link_own_numbers`); the crash-retry
-# read-back turns them back.
-# ⛔ CHECKED BEFORE ANYTHING IS WRITTEN: every chip has a number; every row of the
-# list has a number and one address; no number is on two rows; every number cited
-# has a row and every row is cited; no number is glued to a line's bullet, list
-# number or heading mark; and every number written links at the write. ⛔ A row
-# whose address is not a public page (Gemini reads Drive and Gmail) is listed by
-# its title only, and its number stays text.
-# On ANY doubt nothing changes — the document is today's, byte for byte — and one
-# log line says why, with the counts the next run needs to settle the join: how
-# many numbers, whether they run 1…K, how many rows the list shows, and what its
-# first row's element carries.
+# ⭐⭐ WHICH ROW IS NUMBER N — PROVED BY THE OWNER'S RECORDING OF 10-02 18:45
+# (sr-gemini-sources-open.json; excerpt in tests/fixtures/gemini_1002/
+# sources_open_recording.json). With the list open, "Sources used in the report"
+# shows 66 rows, each a `<browse-web-item>` holding one `<a
+# data-test-id="browse-web-item-link" href=…>`, and no row carries a number. The
+# owner hovered the two chips of one paragraph, index 1 and index 3, and the
+# cards that opened carry row 1's and row 3's addresses. So chip N is row N of
+# that list, counted 1, 2, 3 … in page order. The number a chip SHOWS on screen
+# is not it (index 3 shows "2": it counts per paragraph); its index is.
+# ⭐ THE RULE. Each chip and each table mark becomes Gemini's own number, `\[N\]`,
+# glued to the word before it, and the document ends with ONE "Sources" list:
+# every row of Gemini's list, in its order, row N written as number N, with its
+# title and address (ChatGPT's row shape, `_cg_pdf_source_row`, which the write
+# reads as an agent's own list). "Sources read but not used in the report" is not
+# part of the document. A report's own trailing sources section with no link in
+# it is replaced by it. The write links each number to its row
+# (`_doc_link_own_numbers`); the crash-retry read-back turns them back.
+# ⛔ CHECKED BEFORE ANYTHING IS WRITTEN, because a place that is off by one links
+# every number after it to the wrong page: every chip and mark names a number,
+# and none is 0; every row of the list is Gemini's own row element holding
+# exactly one web address, and no link in the list is outside a row; the list
+# has a row for the highest number cited; no number is glued to a line's bullet,
+# list number or heading mark; and every number written links at the write.
+# ⛔ A row whose address we never put in a document (an agent's own page; the
+# owner's own Drive or Gmail, which Gemini reads) is listed by its title only, and
+# its number stays text. The 10-02 report has two: cdn.openai.com, rows 30, 58.
+# On ANY doubt nothing changes — the document is today's — and one log line says
+# why, with the counts the next run needs: how many numbers, whether they run
+# 1…K, how many rows the list shows, and what its first row's element carries.
+# ⭐ A CLOSED LIST IS OPENED FOR THE READ. Its rows are in the page only while it
+# is open (the 10-01 recording: closed, 0 rows). When the report cites and the
+# list shows no row, the read presses the list's own toggle (a button, never a
+# link, never a download), waits for its rows, reads, and presses it again, so
+# the page is left as it was found (`_gemini_used_sources`).
 
 #: A sources section's title, as Gemini's button shows it.
 _GEMINI_SECTION_TITLE_RE = re.compile(
@@ -58774,6 +58782,10 @@ _GEMINI_SECTION_TITLE_RE = re.compile(
 _GEMINI_CITE_MARK_RE = re.compile(r'\[cite:\s*(\d{1,3}(?:\s*,\s*\d{1,3})*)\s*\]')
 #: The attribute a chip names its source by.
 _GEMINI_INDEX_ATTR = "data-turn-source-index"
+#: The element each row of Gemini's sources lists is (the 10-02 recording).
+_GEMINI_ROW_TAG = "browse-web-item"
+#: How long a pressed list is given to show its rows, or to take them away.
+_GEMINI_SOURCES_WAIT_S = 3.0
 #: Where a number stood while the HTML is converted, and where the list began.
 _GEMINI_NUMBER_SLOT = "\ue300%d\ue301"
 _GEMINI_NUMBER_SLOT_RE = re.compile('[ \t]*\ue300(\\d{1,3})\ue301')
@@ -58854,10 +58866,12 @@ def _gemini_footnoted(html: str, label: str = "Gemini"):
 
     if any(n is None for n in numbers):
         return _no("a citation chip carries no number")
+    if 0 in cited:
+        return _no("a citation names number 0")
     if used is None:
         return _no("the page holds no \"Sources used in the report\" list")
-    # The list: each element carrying a number, and every link in the section.
-    rows, row_els, row_ids, links = {}, [], set(), []
+    # The list: each of Gemini's own row elements, and every link in the section.
+    row_els, row_ids, links = [], set(), []
     for node in used.next_elements:
         at = order.get(id(node))
         if at is None or at >= next_at:
@@ -58868,41 +58882,29 @@ def _gemini_footnoted(html: str, label: str = "Gemini"):
         if re.match(r"https?://", href, re.I):
             links.append(node)
         # ⛔ By identity: two rows with the same markup are equal to bs4.
-        if node.has_attr(_GEMINI_INDEX_ATTR) and not any(id(p) in row_ids for p in node.parents):
+        if node.name == _GEMINI_ROW_TAG and not any(id(p) in row_ids for p in node.parents):
             row_els.append(node)
             row_ids.add(id(node))
-    first = links[0].find_parent(lambda t: t.has_attr(_GEMINI_INDEX_ATTR)) if links else None
-    if not links:
-        return _no("its list shows no row with an address (a closed list?)", 0)
-    if not row_els:
-        return _no("its list's rows do not say which number each one is — a number is "
-                   "never joined to a row by its place", len(links), links[0].parent)
-    in_rows = set()
-    for r in row_els:
-        n = _gemini_index_of(r)
-        own = [r] if r.name == "a" else []
-        own += r.find_all("a", href=True) + [p for p in [r.find_parent("a")] if p is not None]
+    if not (links or row_els):
+        return _no("its list shows no row (a closed list?)", 0)
+    first = row_els[0] if row_els else links[0].parent
+    # Row N is the Nth row: (its address as a document may list it, its title).
+    rows, in_rows = [], set()
+    for k, r in enumerate(row_els, 1):
+        own = r.find_all("a", href=True)
         urls = {str(a.get("href") or "").strip() for a in own
                 if re.match(r"https?://", str(a.get("href") or ""), re.I)}
         in_rows |= {id(a) for a in own}
-        if n is None or len(urls) != 1:
-            return _no("a row of its list has no number or not one address", len(links), r)
-        if n in rows:
-            return _no(f"number {n} is on two rows of its list", len(links), r)
-        url = next(iter(urls))
-        text = re.sub(r"\s+", " ", (own[0] if own else r).get_text(" ")).strip()
-        # The row's host, printed after its title, is the list's own label column.
-        for host in sorted({(urlsplit(url).hostname or "").lower(), _doc_source_host(url)},
-                           key=len, reverse=True):
-            if host and text.lower().endswith(" " + host):
-                text = text[:-len(host)].rstrip()
-                break
-        rows[n] = (order[id(r)], _doc_public_source_url(url), text)
+        if len(urls) != 1:
+            return _no(f"row {k} of its list has no web address or more than one",
+                       len(row_els), r)
+        sub = r.find(attrs={"data-test-id": "sub-title"})
+        title = re.sub(r"\s+", " ", sub.get_text(" ")).strip() if sub is not None else ""
+        rows.append((_doc_public_source_url(next(iter(urls))), title))
     if any(id(a) not in in_rows for a in links):
-        return _no("a link in its list is in no numbered row", len(links), first)
-    if set(rows) != cited:
-        return _no(f"the numbers cited and its list's rows do not match one for one "
-                   f"({len(cited)} numbers, {len(rows)} rows)", len(links), first)
+        return _no("a link in its list is in no row", len(row_els), first)
+    if max(cited) > len(rows):
+        return _no(f"number {max(cited)} is past the end of its list", len(row_els), first)
     # Each number where it stood, a mark at the start of the list, then markdown.
     for c, n in zip(chips, numbers):
         c.replace_with(NavigableString(_GEMINI_NUMBER_SLOT % n))
@@ -58930,19 +58932,17 @@ def _gemini_footnoted(html: str, label: str = "Gemini"):
     if _CG_BARE_MARKER_RE.search(tmask):
         return _no("a citation comes right after a bullet, a list number or a heading mark "
                    "at the start of its line")
-    present = {int(x) for x in _CG_OWN_NUMBER_RE.findall(tmask)}
-    if not present:
+    if not _CG_OWN_NUMBER_RE.search(tmask):
         return _no("no citation is left to number")
-    listed = sorted((rows[n][0], n) for n in present)
-    out_rows = [_gemini_source_row(rows[n][1], rows[n][2], n) for _at, n in listed]
+    out_rows = [_gemini_source_row(url, title, k) for k, (url, title) in enumerate(rows, 1)]
     numbered = "%s\n\n%s\n\n%s\n" % (text.rstrip(), _doc_sources_heading(_DOC_SOURCES_TITLE),
                                      "\n".join(out_rows))
-    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n)][1])
+    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n) - 1][0])
     got = len(_DOC_MARK_NUMBER_RE.findall(_doc_link_own_numbers(numbered, who, quiet=True)))
     if got != want:
         return _no(f"{got} of {want} numbers would link at the write")
     log(f"[{who}] Gemini's own citation numbers, from its own list: {run}; "
-        f"{len(listed)} of its {len(rows)} sources listed")
+        f"its {len(rows)} sources listed in its order, row N as number N")
     return numbered
 
 
@@ -58957,6 +58957,73 @@ def _gemini_report_markdown(html: str, label: str = "Gemini") -> str:
             f"read ({type(e).__name__})")
         out = None
     return out if out is not None else html_to_markdown(html)
+
+
+#: Gemini's "Sources used in the report" toggle, read or pressed. `want` is
+#: "count" (read only), "open" or "close". ⛔ It presses only the one BUTTON with
+#: that title, and never one inside a link (a link opens a page or downloads a
+#: file): "open" only when the report cites (a `source-footnote`) and the list is
+#: closed with no row shown, "close" only while the list shows rows or says it is
+#: open. `rows` is the links between that button and the next list's ("read but
+#: not used"), where only this list's rows are.
+_GEMINI_USED_SOURCES_JS = r"""(want) => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const buttons = [...document.querySelectorAll('button')];
+  const used = buttons.filter((b) => /^sources used in the report$/i.test(norm(b.textContent)));
+  if (used.length !== 1) return {state: 'none', toggles: used.length};
+  const b = used[0];
+  const follows = (x, y) => !!(x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const next = buttons.find((x) => follows(b, x)
+      && /^sources read but not used in the report$/i.test(norm(x.textContent)));
+  const rows = [...document.querySelectorAll('a[href]')].filter((a) =>
+      follows(b, a) && (!next || follows(a, next))).length;
+  const open = b.getAttribute('aria-expanded') === 'true';
+  if (want === 'count') return {state: 'count', rows, open};
+  if (b.closest('a')) return {state: 'not a toggle', rows, open};
+  const press = want === 'open'
+      ? !rows && !open && !!document.querySelector('source-footnote')
+      : rows > 0 || open;
+  if (!press) return {state: 'left', rows, open};
+  b.click();
+  return {state: 'pressed', rows, open};
+}"""
+
+
+async def _gemini_used_sources(page, label: str, want: str) -> bool:
+    """Open Gemini's closed "Sources used in the report" for the read (`want`
+    "open"), or close it again ("close"), with a press of its own toggle — see "A
+    CLOSED LIST IS OPENED FOR THE READ". Waits up to `_GEMINI_SOURCES_WAIT_S` for
+    its rows to show (or go). True when the toggle was pressed, so a list pressed
+    open is always pressed closed again. Never raises."""
+    who = label or "Gemini"
+    try:
+        got = await page.evaluate(_GEMINI_USED_SOURCES_JS, want)
+    except Exception as e:
+        log(f"[{who}] Gemini's sources list could not be read ({type(e).__name__})", "DEBUG")
+        return False
+    if not isinstance(got, dict) or got.get("state") != "pressed":
+        return False
+    done, rows = False, 0
+    for _ in range(int(_GEMINI_SOURCES_WAIT_S / 0.2)):
+        await asyncio.sleep(0.2)
+        try:
+            now = await page.evaluate(_GEMINI_USED_SOURCES_JS, "count")
+        except Exception:
+            break
+        rows = int((now or {}).get("rows") or 0)
+        done = rows > 0 if want == "open" else not (rows or (now or {}).get("open"))
+        if done:
+            break
+    if want == "open":
+        log(f"[{who}] Gemini's \"Sources used in the report\" was closed — "
+            + (f"opened it for the read ({rows} rows)" if done else
+               f"pressed it open, but it showed no row in {_GEMINI_SOURCES_WAIT_S:g} s"),
+            "INFO" if done else "WARN")
+    else:
+        log(f"[{who}] Gemini's \"Sources used in the report\" "
+            + ("closed again, as it was found" if done else "did not close again"),
+            "INFO" if done else "WARN")
+    return True
 
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
@@ -59062,27 +59129,34 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # elements (`immersive-panel`, `deep-research-panel`), aside scopes
     # with class wildcards, and ARIA role-complementary/role-region
     # with aria-label="research". If none match, return empty (T2 follows).
-    md = await _extract_html_to_md(page, [
-        # Custom elements — only match the actual panel, not descendants
-        'immersive-panel',
-        'deep-research-panel',
-        # Aside-scoped (aside is structural for side content)
-        'aside immersive-panel',
-        'aside deep-research-panel',
-        'aside[class*="artifact" i] .markdown',
-        'aside[class*="artifact" i]',
-        'aside[class*="report" i] .markdown',
-        'aside[class*="report" i]',
-        'aside[class*="research" i] .markdown',
-        'aside[class*="research" i]',
-        # ARIA role-scoped — explicit research panel intent
-        '[role="complementary"][aria-label*="research" i] .markdown',
-        '[role="complementary"][aria-label*="research" i]',
-        '[role="region"][aria-label*="research" i] .markdown',
-        '[role="region"][aria-label*="research" i]',
-        # ⭐ Wave 14, 2026-10-02: Gemini's own citation numbers and its own list
-        # when the page joins them ("GEMINI'S FOOTNOTES, FROM ITS OWN LIST").
-    ], label, convert=lambda html: _gemini_report_markdown(html, label))
+    # ⭐ Wave 14, 2026-10-02: a closed "Sources used in the report" is opened for
+    # this read and closed again after it ("A CLOSED LIST IS OPENED FOR THE READ").
+    _sources_pressed = await _gemini_used_sources(page, label, "open")
+    try:
+        md = await _extract_html_to_md(page, [
+            # Custom elements — only match the actual panel, not descendants
+            'immersive-panel',
+            'deep-research-panel',
+            # Aside-scoped (aside is structural for side content)
+            'aside immersive-panel',
+            'aside deep-research-panel',
+            'aside[class*="artifact" i] .markdown',
+            'aside[class*="artifact" i]',
+            'aside[class*="report" i] .markdown',
+            'aside[class*="report" i]',
+            'aside[class*="research" i] .markdown',
+            'aside[class*="research" i]',
+            # ARIA role-scoped — explicit research panel intent
+            '[role="complementary"][aria-label*="research" i] .markdown',
+            '[role="complementary"][aria-label*="research" i]',
+            '[role="region"][aria-label*="research" i] .markdown',
+            '[role="region"][aria-label*="research" i]',
+            # ⭐ Wave 14, 2026-10-02: Gemini's own citation numbers and its own
+            # list ("GEMINI'S FOOTNOTES, FROM ITS OWN LIST").
+        ], label, convert=lambda html: _gemini_report_markdown(html, label))
+    finally:
+        if _sources_pressed:
+            await _gemini_used_sources(page, label, "close")
     # 2026-05-25: strip Gemini's panel chrome + post-report sources/
     # thinking-trace noise BEFORE the threshold check. The 146kb Kalki
     # gemini.md (2026-05-25 E2E) had ~70kb of clean report and ~76kb of
@@ -77749,31 +77823,34 @@ _DOC_CITED_HEADING_RE = re.compile(r'[ \t]{0,3}#{1,6}[ \t]+Sources[ \t]*\Z')
 
 
 def _doc_cited_rows(md: str, masked: str, own_at: int):
-    """`({n: address}, {every number listed})` for a trailing sources section in
-    ChatGPT's own shape — a "Sources" heading and nothing under it but rows
-    naming the numbers that cite each source — or `({}, set())` for any other
-    section. A number may be listed once; a row whose address we would never put
-    behind a number lists its numbers with no address."""
+    """`({n: address}, {every number listed}, counts up)` for a trailing sources
+    section in ChatGPT's own shape — a "Sources" heading and nothing under it but
+    rows naming the numbers that cite each source — or `({}, set(), False)` for
+    any other section. A number may be listed once; a row whose address we would
+    never put behind a number lists its numbers with no address. "Counts up":
+    each row names one number and row N names N (Gemini's own list)."""
     lines, raw = masked[own_at:].split("\n"), md[own_at:].split("\n")
     if not lines or not _DOC_CITED_HEADING_RE.match(lines[0]):
-        return {}, set()
-    rows, written = {}, set()
+        return {}, set(), False
+    rows, written, per_row = {}, set(), []
     for seen, real in zip(lines[1:], raw[1:]):
         if not seen.strip():
             continue
         m = _DOC_CITED_ROW_RE.match(real)
         if m is None or seen != real:
-            return {}, set()
+            return {}, set(), False
         numbers = [int(x) for x in re.findall(r'\d{1,3}', m.group("n"))]
         if written & set(numbers) or len(set(numbers)) != len(numbers):
-            return {}, set()
+            return {}, set(), False
         written |= set(numbers)
+        per_row.append(numbers)
         link = _DOC_CITED_ROW_LINK_RE.match(m.group("head"))
         url = link.group("u") if link else ""
         if _doc_is_linkable_url(url):
             for n in numbers:
                 rows[n] = url
-    return (rows, written) if written else ({}, set())
+    counts_up = per_row == [[k] for k in range(1, len(per_row) + 1)]
+    return (rows, written, counts_up) if written else ({}, set(), False)
 
 
 def _doc_own_list_rows(md: str, masked: str = None) -> dict:
@@ -77838,6 +77915,12 @@ def _doc_link_own_numbers(md: str, label: str = "", quiet: bool = False) -> str:
     # ⭐ 2026-10-02 — or, in ChatGPT's own list, every number its rows name.
     written = ({int(n) for n in _DOC_OWN_ROW_NUMBER_RE.findall(masked[own_at:])}
                or _doc_cited_rows(md, masked, own_at)[1])
+    if cited < written and _doc_cited_rows(md, masked, own_at)[2]:
+        # ⭐ Wave 14, 2026-10-02 — GEMINI'S OWN LIST: one number on each row,
+        # counting 1, 2, 3 … ("GEMINI'S FOOTNOTES, FROM ITS OWN LIST"). Row N IS
+        # number N, written on it, so a row the text does not cite is still that
+        # row: only a number with no row is a mismatch.
+        written = cited
     if cited != written:
         if not quiet:
             log(f"[{who}] left its own citation numbers as written — they do not match "

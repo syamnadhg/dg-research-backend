@@ -12,16 +12,22 @@ page presses Export to PDF.
       (the single bar), a `\\|` kept; an inline one written `$$ tex $$`, a space
       between it and any dollar outside it; inside code nothing is maths; an
       element with no source is converted as before.
-  G*  Gemini's citations: the panel read uses Gemini's own conversion; a number
-      is joined to a row only by the row's own number — every chip numbered, the
-      list found, its rows each one number and one address, no number on two
-      rows, no link outside a numbered row, cited = rows one for one, nothing
+  G*  Gemini's citations: the panel read uses Gemini's own conversion; chip N
+      is row N of "Sources used in the report", by its place (the owner's 18:45
+      recording) — every chip and mark numbered and none 0, the list found, its
+      rows Gemini's own row elements (one inside another is one), each with one
+      web address, no link outside a row, a row for the highest number, nothing
       glued to a bullet, every number written links; chips and table marks
-      become `\\[N\\]` glued to the word before; marks inside code stay; rows in
-      Gemini's order, only those cited in the text; a row that is not a public
-      page listed by title only; the list's host label off the title; a link-less
+      become `\\[N\\]` glued to the word before; marks inside code stay; ALL of
+      Gemini's rows listed in its order, row N as number N, each with its own
+      title; a row we never put in a document listed by title only; a link-less
       own section replaced, one with links refused; any failure is today's
-      document; "Copy contents" gets a short cap.
+      document; "Copy contents" gets a short cap. A closed list is opened by a
+      press of its own toggle and closed again — only for a report that cites,
+      only a closed list showing no row, never a toggle in a link or one of two,
+      waiting for its rows to come and go. The write links Gemini's list, whose
+      rows count 1, 2, 3 one number each, though some rows go uncited; every
+      other list still matches one for one.
   F*  pictures: an svg, a canvas and a blob image drawn by the page with the
       page's colours, on the ground they sit on, at twice their size; never an
       icon, a control's glyph, a hidden drawing or one under the rehost's size;
@@ -186,27 +192,11 @@ MUTANTS = [
     ("G5", RESEARCH, "⛔ the rows of \"read but not used\" are read as the list's",
      [("        if at is None or at >= next_at:\n", "        if at is None:\n")],
      "gemini"),
-    ("G6", RESEARCH, "a row's inner element with its number is a second row",
-     [("        if node.has_attr(_GEMINI_INDEX_ATTR) and not any(id(p) in row_ids for p in node.parents):\n",
-       "        if node.has_attr(_GEMINI_INDEX_ATTR):\n")],
-     "gemini"),
-    ("G7", RESEARCH, "a closed list is not said to be closed",
-     [("    if not links:\n        return _no(", "    if False:\n        return _no(")],
-     "gemini"),
-    ("G8", RESEARCH, "rows that do not say their number are not said to",
-     [("    if not row_els:\n        return _no(", "    if False:\n        return _no(")],
-     "gemini"),
-    ("G9", RESEARCH, "⛔ a row with two addresses is joined to one of them",
-     [("        if n is None or len(urls) != 1:\n", "        if n is None:\n")],
-     "gemini"),
-    ("G10", RESEARCH, "⛔ a number on two rows opens the last of them",
-     [("        if n in rows:\n            return _no(", "        if False:\n            return _no(")],
-     "gemini"),
-    ("G11", RESEARCH, "⛔ a link in no numbered row is ignored",
+    # (G6-G10, G12, G21-G23, G26, G27 were the dormant join's — a number only on a
+    # row that carries it, every row cited, a row's host off its title. The
+    # owner's 18:45 recording proved the join by place: G32 on are its mutants.)
+    ("G11", RESEARCH, "⛔ a link in no row is ignored",
      [("    if any(id(a) not in in_rows for a in links):\n", "    if False:\n")],
-     "gemini"),
-    ("G12", RESEARCH, "⛔⛔ numbers and rows that do not match one for one are linked",
-     [("    if set(rows) != cited:\n", "    if False:\n")],
      "gemini"),
     ("G13", RESEARCH, "a number keeps the space before it — it never links",
      [(r"""_GEMINI_NUMBER_SLOT_RE = re.compile('[ \t]*\ue300""",
@@ -238,29 +228,11 @@ MUTANTS = [
      [("    if _CG_BARE_MARKER_RE.search(tmask):\n"
        "        return _no(\"a citation comes right after a bullet, a list number or a heading mark \"\n"
        "                   \"at the start of its line\")\n"
-       "    present = {",
+       "    if not _CG_OWN_NUMBER_RE.search(tmask):",
        "    if False:\n"
        "        return _no(\"a citation comes right after a bullet, a list number or a heading mark \"\n"
        "                   \"at the start of its line\")\n"
-       "    present = {")],
-     "gemini"),
-    ("G20", RESEARCH, "a report with nothing left to number gets an empty list",
-     [("    if not present:\n        return _no(\"no citation is left to number\")\n"
-       "    listed = ",
-       "    if False:\n        return _no(\"no citation is left to number\")\n"
-       "    listed = ")],
-     "gemini"),
-    ("G21", RESEARCH, "⛔ a row cited only inside code is listed — and nothing links",
-     [("    listed = sorted((rows[n][0], n) for n in present)\n",
-       "    listed = sorted((rows[n][0], n) for n in rows)\n")],
-     "gemini"),
-    ("G22", RESEARCH, "the list is in the numbers' order, not Gemini's",
-     [("    listed = sorted((rows[n][0], n) for n in present)\n",
-       "    listed = sorted((n, n) for n in present)\n")],
-     "gemini"),
-    ("G23", RESEARCH, "⛔⛔ a row on the owner's own Drive is listed and linked with its address",
-     [("        rows[n] = (order[id(r)], _doc_public_source_url(url), text)\n",
-       "        rows[n] = (order[id(r)], url, text)\n")],
+       "    if not _CG_OWN_NUMBER_RE.search(tmask):")],
      "gemini"),
     ("G24", RESEARCH, "a row that is not a public page is written as one",
      [("    if url:\n        return _cg_pdf_source_row(url, title, [n])\n",
@@ -271,13 +243,6 @@ MUTANTS = [
        "    log(f\"[{who}] Gemini's own",
        "    if False:\n        return _no(f\"{got} of {want} numbers would link at the write\")\n"
        "    log(f\"[{who}] Gemini's own")],
-     "gemini"),
-    ("G26", RESEARCH, "a private row's number is counted as one that must link",
-     [("    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n)][1])\n",
-       "    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask))\n")],
-     "gemini"),
-    ("G27", RESEARCH, "each title keeps the host the list prints after it",
-     [('            if host and text.lower().endswith(" " + host):\n', "            if False:\n")],
      "gemini"),
     ("G28", RESEARCH, "the numbers' summary never says they skip",
      [('              else (f", {span[0]} to {span[-1]} with gaps" if span else "")))\n',
@@ -293,6 +258,139 @@ MUTANTS = [
     ("G31", RESEARCH, "a report citing nothing is not quiet",
      [("    if not (chips or marks or in_code):\n        return None\n",
        "    if not (chips or marks or in_code):\n        return _no(\"nothing\")\n")],
+     "gemini"),
+    # ── G (10-02 18:45): chip N is row N of Gemini's list, by its place ─────
+    ("G32", RESEARCH, "⛔ a citation numbered 0 is let through",
+     [("    if 0 in cited:\n", "    if False:\n")],
+     "gemini"),
+    ("G33", RESEARCH, "⛔⛔ rows are found by the old rule (a number on the row) — the recorded list joins nothing",
+     [("        if node.name == _GEMINI_ROW_TAG and not any(",
+       "        if node.has_attr(_GEMINI_INDEX_ATTR) and not any(")],
+     "gemini"),
+    ("G34", RESEARCH, "⛔ a row element inside a row is a second row — every row after it shifts",
+     [("        if node.name == _GEMINI_ROW_TAG and not any(id(p) in row_ids for p in node.parents):\n",
+       "        if node.name == _GEMINI_ROW_TAG:\n")],
+     "gemini"),
+    ("G35", RESEARCH, "a closed list is not said to be closed",
+     [("    if not (links or row_els):\n        return _no(", "    if False:\n        return _no(")],
+     "gemini"),
+    ("G36", RESEARCH, "⛔ a row with two addresses is joined to one of them",
+     [("        if len(urls) != 1:\n", "        if not urls:\n")],
+     "gemini"),
+    ("G37", RESEARCH, "⛔ a row with no web address is not said to have none",
+     [("        if len(urls) != 1:\n", "        if len(urls) > 1:\n")],
+     "gemini"),
+    ("G38", RESEARCH, "each row loses its title — the list shows hosts",
+     [('        sub = r.find(attrs={"data-test-id": "sub-title"})\n', "        sub = None\n")],
+     "gemini"),
+    ("G39", RESEARCH, "⛔⛔ a row on the owner's Drive or an agent's own host is listed with its address",
+     [("        rows.append((_doc_public_source_url(next(iter(urls))), title))\n",
+       "        rows.append((next(iter(urls)), title))\n")],
+     "gemini"),
+    ("G40", RESEARCH, "⛔ a number past the end of the list is let through",
+     [("    if max(cited) > len(rows):\n", "    if False:\n")],
+     "gemini"),
+    ("G41", RESEARCH, "a list exactly as long as the highest number is refused",
+     [("    if max(cited) > len(rows):\n", "    if max(cited) >= len(rows):\n")],
+     "gemini"),
+    ("G42", RESEARCH, "a report with nothing left to number gets the list anyway",
+     [("    if not _CG_OWN_NUMBER_RE.search(tmask):\n        return _no(",
+       "    if False:\n        return _no(")],
+     "gemini"),
+    ("G43", RESEARCH, "⛔⛔ row N is written as number N - 1",
+     [("    out_rows = [_gemini_source_row(url, title, k) for k, (url, title) in enumerate(rows, 1)]\n",
+       "    out_rows = [_gemini_source_row(url, title, k) for k, (url, title) in enumerate(rows)]\n")],
+     "gemini"),
+    ("G44", RESEARCH, "⛔ only the rows the text cites are listed — not Gemini's list",
+     [("    out_rows = [_gemini_source_row(url, title, k) for k, (url, title) in enumerate(rows, 1)]\n",
+       "    out_rows = [_gemini_source_row(url, title, k) for k, (url, title) in enumerate(rows, 1)\n"
+       "                if k in cited]\n")],
+     "gemini"),
+    ("G45", RESEARCH, "a number whose row is not listed is counted as one that must link",
+     [("    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n) - 1][0])\n",
+       "    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask))\n")],
+     "gemini"),
+    ("G46", RESEARCH, "⛔ row N + 1 decides whether number N must link",
+     [("    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n) - 1][0])\n",
+       "    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n)][0])\n")],
+     "gemini"),
+    # ── G: a closed list is opened for the read, and closed again ──────────
+    ("G47", RESEARCH, "⛔⛔ a closed list is never opened",
+     [('    _sources_pressed = await _gemini_used_sources(page, label, "open")\n',
+       "    _sources_pressed = False\n")],
+     "gemini"),
+    ("G48", RESEARCH, "⛔ a list opened for the read is left open",
+     [("        if _sources_pressed:\n", "        if False:\n")],
+     "gemini"),
+    ("G49", RESEARCH, "the read does not wait for the rows",
+     [("    for _ in range(int(_GEMINI_SOURCES_WAIT_S / 0.2)):\n", "    for _ in range(0):\n")],
+     "gemini"),
+    ("G50", RESEARCH, "a list showing no row yet is said to be open",
+     [('        done = rows > 0 if want == "open" else',
+       '        done = rows >= 0 if want == "open" else')],
+     "gemini"),
+    ("G51", RESEARCH, "a list is said closed while its toggle still says open",
+     [('        done = rows > 0 if want == "open" else not (rows or (now or {}).get("open"))\n',
+       '        done = rows > 0 if want == "open" else not rows\n')],
+     "gemini"),
+    ("G52", RESEARCH, "⛔ a toggle left alone is pressed after the read anyway — an open list is closed",
+     [('    if not isinstance(got, dict) or got.get("state") != "pressed":\n',
+       "    if not isinstance(got, dict):\n")],
+     "gemini"),
+    ("G53", RESEARCH, "⛔ a list pressed open is never pressed closed",
+     [("    return True\n\n\nasync def extract_gemini_response",
+       "    return False\n\n\nasync def extract_gemini_response")],
+     "gemini"),
+    ("G54", RESEARCH, "the toggle is pressed for a report that cites nothing",
+     [("      ? !rows && !open && !!document.querySelector('source-footnote')\n",
+       "      ? !rows && !open\n")],
+     "gemini"),
+    ("G55", RESEARCH, "a list that says it is open is pressed — and so closed",
+     [("      ? !rows && !open && !!document.querySelector('source-footnote')\n",
+       "      ? !rows && !!document.querySelector('source-footnote')\n")],
+     "gemini"),
+    ("G56", RESEARCH, "⛔ a toggle inside a link is pressed — the link opens",
+     [("  if (b.closest('a')) return {state: 'not a toggle', rows, open};\n", "")],
+     "gemini"),
+    ("G57", RESEARCH, "the first of two toggles is pressed",
+     [("  if (used.length !== 1) return", "  if (!used.length) return")],
+     "gemini"),
+    ("G58", RESEARCH, "the report's own links count as the list's rows — a closed list stays closed",
+     [("      follows(b, a) && (!next || follows(a, next))).length;\n",
+       "      (!next || follows(a, next))).length;\n")],
+     "gemini"),
+    ("G59", RESEARCH, "\"read but not used\" rows count as the list's — a closed list stays closed",
+     [("      follows(b, a) && (!next || follows(a, next))).length;\n",
+       "      follows(b, a)).length;\n")],
+     "gemini"),
+    ("G60", RESEARCH, "a list that opened with no row in it is left open",
+     [("      : rows > 0 || open;\n", "      : rows > 0;\n")],
+     "gemini"),
+    ("G61", RESEARCH, "the toggle's own open/closed is never read",
+     [("  const open = b.getAttribute('aria-expanded') === 'true';\n", "  const open = false;\n")],
+     "gemini"),
+    # ── G: the write links Gemini's list, which has rows nobody cites ──────
+    ("G62", RESEARCH, "⛔⛔ Gemini's list never links — its rows nobody cites refuse it",
+     [("    if cited < written and _doc_cited_rows(md, masked, own_at)[2]:\n", "    if False:\n")],
+     "gemini"),
+    ("G63", RESEARCH, "⛔ any list in ChatGPT's shape may have rows nobody cites",
+     [("    if cited < written and _doc_cited_rows(md, masked, own_at)[2]:\n",
+       "    if cited < written:\n")],
+     "gemini"),
+    ("G64", RESEARCH, "⛔ a number past the end of Gemini's list is linked",
+     [("    if cited < written and _doc_cited_rows(md, masked, own_at)[2]:\n",
+       "    if _doc_cited_rows(md, masked, own_at)[2]:\n")],
+     "gemini"),
+    ("G65", RESEARCH, "every list in ChatGPT's shape counts up",
+     [("    counts_up = per_row == [[k] for k in range(1, len(per_row) + 1)]\n",
+       "    counts_up = True\n")],
+     "gemini"),
+    ("G66", RESEARCH, "a list counts up from 0 — Gemini's never does",
+     [("    counts_up = per_row == [[k] for k in range(1, len(per_row) + 1)]\n",
+       "    counts_up = per_row == [[k] for k in range(0, len(per_row))]\n")],
+     "gemini"),
+    ("G67", RESEARCH, "the rows' numbers are never kept — every list counts up",
+     [("        per_row.append(numbers)\n", "")],
      "gemini"),
     # ── F: a report's pictures kept as pictures ─────────────────────────────
     ("F1", RESEARCH, "⛔⛔ the read hands back the page as it is — every picture lost",

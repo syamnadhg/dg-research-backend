@@ -1,30 +1,29 @@
 """Wave 14, 2026-10-02 — Gemini's citations open the sources of Gemini's own
 "Sources used in the report", and the document ends with that one list.
 
-THE RECORDING (fixtures/gemini_1002/report_recording.json, an excerpt of the
-owner's #Dev/wave14/recordings-1001/sr-cite-gemini-report.json). Each citation is
-`<source-footnote><sup class="superscript" data-turn-source-index="N"></sup>
-</source-footnote>`: no link, no words. In a table, where Gemini draws no chip,
-its raw mark stays: "[cite: 5, 13]". The report ends with "Sources used in the
-report" and "Sources read but not used in the report", each behind a button.
-Today the chips vanish, the marks show as raw text, Gemini's list is cut off, and
-the document ends with the sites the run saw Gemini open.
+THE RECORDINGS. Each citation is `<source-footnote><sup class="superscript"
+data-turn-source-index="N"></sup></source-footnote>`: no link, no words
+(fixtures/gemini_1002/report_recording.json, 10-01's report). With the list open
+(fixtures/gemini_1002/sources_open_recording.json, the owner's 18:45 recording of
+an OpenAI governance report), "Sources used in the report" is 66 rows, each a
+`<browse-web-item>` holding one `<a data-test-id="browse-web-item-link"
+href=…>`, and no row carries a number. The owner hovered the two chips of one
+paragraph — index 1 (it SHOWS "1") and index 3 (it SHOWS "2") — and the cards
+that opened carry the addresses of rows 1 and 3. So chip N is row N, counted in
+page order, and the number shown on screen is not N.
 
-⛔⛔ WHICH ROW IS NUMBER N — WHAT THE FILES ON DISK SAY. The recording holds no
-row of the list (`usedRows` is empty: the section was closed), the saved
-documents hold none (it was cut off), and no fixture holds one. The one chip the
-recording shows with a number on it reads "1" where its index is 7
-(`numberish`). So a number is never joined to a row by its place in the list:
-only by the row saying which number it is (the same `data-turn-source-index`),
-and with every check passing. Otherwise the document is today's, byte for byte,
-and one log line says why with the counts the next run needs.
+⭐ THE RULE these tests hold. Each chip becomes `\\[N\\]`, the write links it to
+row N's address, and the document ends with ONE "Sources" list: all of Gemini's
+rows in its order, row N written as number N. "Read but not used" is not in it.
+⛔ On any doubt — a number with no row, a number 0 or none, a row with no web
+address or two, a link in the list outside a row — no number and no list are
+written: the document is today's, and one log line says why.
+⛔ A closed list is opened for the read by a press of its own toggle, and closed
+again after it.
 
-⛔ The rows below are ASSUMED markup (`_gemini_1002_pages.sources_section`): one
-shape with the number on the row, one without. Expected links are this file's
-own: each number's row is chosen here by its number, in an order that is NOT the
-numbers' order, so a join by place would link every number wrongly. The pages run
-in real headless Chrome through Gemini's production extraction; nothing leaves
-the machine (`page.set_content`).
+Every page here is built from the recordings' own markup (`_gemini_1002_pages`),
+runs in real headless Chrome through Gemini's production extraction, and
+nothing leaves the machine (`G.offline`, `page.set_content`).
 """
 import asyncio
 import re
@@ -40,22 +39,25 @@ chrome = base.chrome
 page = base.page
 fast = base.fast
 
-#: The sources this report cites, by number, and the order Gemini's list shows
-#: them in (ASSUMED — deliberately not the numbers' order).
-SOURCES = {
-    1: ("https://docs.example.org/relay/overview", "Overview - Relay Documentation"),
-    2: ("https://github.com/example/relay", "GitHub - example/relay"),
-    3: ("https://blog.example.net/tracing-agents", "Tracing agent harness behaviour"),
-    4: ("https://docs.example.org/relay/plugins", "Plugins - Relay Documentation"),
-    5: ("https://www.example.com/news/relay-launch?utm_source=gemini", "Relay launches"),
-}
-LIST_ORDER = [3, 1, 5, 2, 4]
-UNUSED = [("https://unused.example.org/a", "Read but not used A"),
-          ("https://unused.example.org/b", "Read but not used B")]
-NUMBERED_ROW = 'data-turn-source-index="{n}"'
+REC = G.sources_recording()
+#: Gemini's "Sources used in the report", in page order: row N is USED[N - 1].
+USED = REC["used"]
+#: The chips the owner hovered, and the address on the card each one opened.
+HOVERED = {1: "https://openai.com/index/built-to-benefit-everyone/",
+           3: "https://openai.com/our-structure/"}
+#: The first words of the paragraph those two chips sit in.
+HOVERED_WORDS = ("Following nearly a year of formal dialogue with the Attorneys General "
+                 "of California and Delaware, OpenAI executed a corp.")
+#: Rows on cdn.openai.com — an agent's own host, never put in a document.
+NOT_LISTED = {30, 58}
 MARKER_RE = re.compile(r"\[\\\[(\d{1,3})\\\]\]\(([^()\s]*)\)")
 OWN_RE = re.compile(r"(?<![\[\\])\\\[(\d{1,3})\\\](?!\]\()")
 TAIL = "\n\n##### Sources\n\n"
+ROW_RE = re.compile(r"- (?:\[(?P<t>[^\]]*)\]\((?P<u>[^()\s]+)\) — .+|(?P<p>.+?)) "
+                    r"— cited as (?P<n>\d+)")
+#: A link in the report's own words (the 10-01 recording's `bodyLinks`).
+BODY_LINK = ("<p>The plugin model is documented in <a href='https://docs.example.org/"
+             "relay/plugins'>the configuration guide</a> in full.</p>")
 
 
 @pytest.fixture
@@ -70,37 +72,15 @@ def _said(lines, words):
     return [m for m in lines if words in m]
 
 
-def _report(extra=""):
-    """A report citing every source: chips in its sentences (the recorded markup,
-    glued to the word they follow — ASSUMED), a run of two chips as one
-    "[cite: 4, 5]" draws them, and a table whose cells keep Gemini's raw marks."""
-    c = G.chip
-    return ("<h1>Technical Evaluation of Relay</h1><h2>Overview</h2>"
-            f"<p>{G.prose(1)} Relay sits between an agent and its models.{c(1)}</p>"
-            f"<p>{G.prose(2)} Its source code is public{c(2)} and documented.{c(1)}</p>"
-            "<h2>Plugins</h2>"
-            f"<p>{G.prose(3)} Each plugin runs in a fixed order.{G.chips(4, 5)}</p>"
-            "<table><thead><tr><th>Claim</th><th>Evidence</th></tr></thead><tbody>"
-            "<tr><td>Traces every call</td><td><code>trace</code> [cite: 3]</td></tr>"
-            "<tr><td>Launched in 2026</td><td>Launch post [cite: 5, 2]</td></tr>"
-            "</tbody></table>"
-            f"<h2>Verdict</h2><p>{G.prose(4)}</p><p>{G.prose(5)}</p>{extra}")
-
-
-def _sections(numbered=True, order=LIST_ORDER, rows=None):
-    rows = rows if rows is not None else [
-        (SOURCES[n][0], SOURCES[n][1], NUMBERED_ROW.format(n=n) if numbered else "")
-        for n in order]
-    unused = [(u, t, "") for u, t in UNUSED]
-    return (G.sources_section("Sources used in the report", rows)
-            + G.sources_section("Sources read but not used in the report", unused)
-            + "<div class='thoughts'><button>Thoughts</button><p>Researching websites"
-              "…</p></div>")
-
-
-def _extract(chrome, page, report_html, after):
+def _load(chrome, page, report=None, after=None, outside=""):
     G.offline(chrome, page)
-    chrome.run(page.set_content(G.report_page(report_html, after=after)))
+    chrome.run(page.set_content(G.report_page(
+        G.recorded_report() if report is None else report,
+        after=G.recorded_sources() if after is None else after, outside=outside)))
+
+
+def _extract(chrome, page, report=None, after=None, outside=""):
+    _load(chrome, page, report, after, outside)
     return chrome.run(research.extract_gemini_response(page))
 
 
@@ -110,132 +90,281 @@ def _panel_html(chrome, page):
 
 
 def _today(chrome, page):
-    """What Gemini's extraction wrote before this change, from the page as loaded:
-    the panel converted as every HTML read converts it, then its noise strip."""
+    """What Gemini's extraction wrote before this change, from the page as it is
+    now: the panel converted as every HTML read converts it, then its noise strip."""
     return research._strip_gemini_panel_noise(research.html_to_markdown(_panel_html(chrome, page)))
 
 
 def _rows(doc):
-    """This file's own reading of the one Sources list: [(number, url, title)]."""
+    """This file's own reading of the one Sources list: [(number, url, title)],
+    url "" for a row listed by its title only."""
     assert doc.count(TAIL) == 1, "not exactly one Sources list"
     out = []
     for line in doc[doc.index(TAIL) + len(TAIL):].rstrip("\n").split("\n"):
-        m = re.fullmatch(r"- \[(?P<t>[^\]]*)\]\((?P<u>[^()\s]+)\) — .+ — cited as (?P<n>\d+)", line)
+        m = ROW_RE.fullmatch(line)
         assert m, line
-        out.append((int(m["n"]), m["u"], m["t"]))
+        out.append((int(m["n"]), m["u"] or "", m["t"] if m["u"] else m["p"]))
     return out
 
 
-def test_rows_that_say_their_number_give_each_citation_its_own_source(chrome, page, fast, lines):
-    """⭐⭐ The page joins each number to a row (the row carries the chip's own
-    `data-turn-source-index`): every chip and every table mark becomes Gemini's
-    own number, glued to the word before it, and the document ends with ONE
-    "Sources" list — Gemini's rows, in Gemini's order, each naming its number —
-    and nothing of "Sources read but not used" or the thoughts after it."""
-    md = _extract(chrome, page, _report(), _sections())
+def _paragraph(doc, words):
+    start = doc.index(words)
+    return doc[start: doc.index("\n", start)]
+
+
+def _state(chrome, page):
+    """The used list's toggle and rows as the page shows them right now."""
+    return chrome.run(page.evaluate("""() => {
+        const b = document.querySelector(
+            'collapsible-button[data-test-id="used-sources-button"] button');
+        return {expanded: b.getAttribute('aria-expanded'),
+                rows: document.querySelectorAll('div.used-sources browse-web-item').length,
+                presses: document.body.dataset.srPresses || null, url: location.href};
+    }"""))
+
+
+# ═══ 1. Each chip opens row N ════════════════════════════════════════════════
+
+def test_the_chips_the_owner_hovered_open_the_cards_that_opened(chrome, page, fast, lines):
+    """⭐⭐ THROUGH THE REAL EXTRACTION AND THE REAL WRITE. The paragraph the owner
+    hovered: index 1 opens row 1, index 3 opens row 3 — the numbers written are
+    the indexes, not the 1 and 2 the page shows — and every other chip opens its
+    own row, by its place in the list."""
+    # What the rule stands on, read off the recording's excerpt (never off the
+    # code under test): 66 rows; every index within them; the hovered
+    # paragraph's chips are index 1 and 3 and SHOW 1 and 2; the cards that
+    # opened carry rows 1 and 3's addresses.
+    assert len(USED) == 66 and REC["unusedCount"] == 136
+    assert max(int(c["index"]) for c in REC["chips"]) == 64 and len(REC["chips"]) == 118
+    hovered = [c for c in REC["chips"] if c["before"].startswith(HOVERED_WORDS[:60])]
+    assert [(c["index"], c["shows"]) for c in hovered] == [("1", "1"), ("3", "2")]
+    assert {c["href"] for c in REC["cards"]} == set(HOVERED.values())
+    assert {n: USED[n - 1]["href"] for n in HOVERED} == HOVERED
+    assert {n for n, r in enumerate(USED, 1) if "cdn.openai.com" in r["href"]} == NOT_LISTED
+    md = _extract(chrome, page)
     assert md, lines
-    rows = _rows(md)
-    assert [n for n, _u, _t in rows] == LIST_ORDER
-    for n, u, t in rows:
-        assert t == SOURCES[n][1]
-        assert u == research._doc_public_source_url(SOURCES[n][0])
-    assert "utm_source" not in md
-    body = md[:md.index(TAIL)]
-    assert [int(n) for n in OWN_RE.findall(body)] == [1, 2, 1, 4, 5, 3, 5, 2]
-    assert "models.\\[1\\]" in body and "public\\[2\\] and" in body
-    assert "order.\\[4\\]\\[5\\]" in body
-    assert "| `trace`\\[3\\] |" in body and "| Launch post\\[5\\]\\[2\\] |" in body
-    assert "[cite:" not in md and "\ue300" not in md
-    assert "Read but not used" not in md and "Researching websites" not in md
-    assert "Sources used in the report" not in md
-    assert _said(lines, "[Gemini] Gemini's own citation numbers, from its own list: "
-                        "5 citation chips and 2 written marks naming 5 numbers, 1 to 5, every one")
-
-
-def test_the_write_links_each_number_to_the_row_it_names(chrome, page, fast, lines):
-    """⭐⭐ At the write, each number opens the address of the row that carries its
-    number — never the row at its place — and the list stays the one list."""
-    md = _extract(chrome, page, _report(), _sections())
     out = research._number_document_sources(md, [], ["https://visited.example.org/x"],
                                             label="Gemini")
-    links = MARKER_RE.findall(out[:out.index(TAIL)])
-    assert len(links) == 8
+    assert _paragraph(out, HOVERED_WORDS) == (
+        HOVERED_WORDS + "[\\[1\\]](https://openai.com/index/built-to-benefit-everyone/)"
+        "[\\[3\\]](https://openai.com/our-structure/)")
+    body = out[:out.index(TAIL)]
+    links = MARKER_RE.findall(body)
+    assert len(links) == 116, len(links)
     for n, url in links:
-        assert url == research._doc_public_source_url(SOURCES[int(n)][0])
+        assert url == USED[int(n) - 1]["href"], (n, url)
+    want = [c["index"] for c in REC["chips"] if int(c["index"]) not in NOT_LISTED]
+    assert [n for n, _u in links] == want
+    assert [int(n) for n in OWN_RE.findall(body)] == [30, 58]
     assert out.count("##### Sources") == 1 and "visited.example.org" not in out
-    assert _said(lines, "[Gemini] linked 8 of its own citation numbers to its own sources list")
+    assert _said(lines, "[Gemini] linked 116 of its own citation numbers to its own sources "
+                        "list (64 rows) — 2 numbers whose row has no link stay as written")
     # The crash-retry read-back hands over what the extraction did.
-    assert research._document_without_sources(out) == md.rstrip("\n") or \
-        research._document_without_sources(out) == md
+    assert research._document_without_sources(out) == md
 
 
-def test_rows_that_do_not_say_their_number_keep_todays_document(chrome, page, fast, lines):
-    """⛔⛔ THE JOIN IS NEVER BY PLACE. The same report and the same rows, in the
-    numbers' own order, but with no number on any row: the document is exactly
-    what Gemini's extraction wrote before, and one line says why, with the counts
-    the next run needs to settle the join."""
-    md = _extract(chrome, page, _report(), _sections(numbered=False, order=[1, 2, 3, 4, 5]))
+def test_the_one_sources_section_is_geminis_list_in_its_order(chrome, page, fast, lines):
+    """⭐⭐ The document ends with ONE "Sources" list: all 66 of Gemini's rows, in
+    its order, row N as number N, each with its own title and address — the two
+    on an agent's own host by their title only — and nothing of "Sources read but
+    not used in the report" or the thoughts after it."""
+    md = _extract(chrome, page)
+    rows = _rows(md)
+    assert [n for n, _u, _t in rows] == list(range(1, 67))
+    for n, url, title in rows:
+        assert title == G.row_words(USED[n - 1]["text"])[1], n
+        assert url == ("" if n in NOT_LISTED else USED[n - 1]["href"]), n
+    assert "cdn.openai.com" not in md
+    for r in REC["unused"]:
+        assert r["href"] not in md
+    assert "Sources used in the report" not in md and "Researching websites" not in md
+    assert "read but not used" not in md
+    assert _said(lines, "[Gemini] Gemini's own citation numbers, from its own list: 118 "
+                        "citation chips and 0 written marks naming 30 numbers, 1 to 64 with "
+                        "gaps; its 66 sources listed in its order, row N as number N")
+
+
+def test_a_list_exactly_as_long_as_the_highest_number_is_enough(chrome, page, fast, lines):
+    """The highest number cited is 64: a list of 64 rows has a row for each."""
+    md = _extract(chrome, page, after=G.recorded_sources(USED[:64]))
+    assert [n for n, _u, _t in _rows(md)] == list(range(1, 65))
+
+
+def test_a_rows_inner_element_of_the_same_kind_is_the_same_row(chrome, page, fast, lines):
+    """A row element inside a row is that row, not the next one: every number
+    still opens its own row."""
+    rows = [G.recorded_row(r["href"], r["text"]) for r in USED]
+    rows[4] = rows[4].replace("<a ", "<browse-web-item><a ", 1).replace(
+        "</a>", "</a></browse-web-item>", 1)
+    md = _extract(chrome, page, after=G.recorded_sources(rows))
+    assert [(n, u) for n, u, _t in _rows(md)] == [
+        (n, "" if n in NOT_LISTED else r["href"]) for n, r in enumerate(USED, 1)]
+
+
+def test_a_tables_raw_marks_are_the_same_numbers(chrome, page, fast, lines):
+    """Where Gemini draws no chip (a table, in the 10-01 recording) it leaves its
+    raw mark, "[cite: 5, 13]": the same numbers, glued to the word before them,
+    each opening its own row. Inside code a mark is the code's own text."""
+    table = ("<table><thead><tr><th>Claim</th><th>Evidence</th></tr></thead><tbody>"
+             "<tr><td>Restructured in 2025</td><td>Filings [cite: 5, 13]</td></tr></tbody>"
+             "</table><pre><code>| claim | [cite: 2] |</code></pre>")
+    md = _extract(chrome, page, report=G.recorded_report(extra=table))
+    assert "| Filings\\[5\\]\\[13\\] |" in md and "| claim | [cite: 2] |" in md
+    out = research._number_document_sources(md, [], [], label="Gemini")
+    assert (f"Filings[\\[5\\]]({USED[4]['href']})[\\[13\\]]({USED[12]['href']})" in out)
+
+
+def test_a_row_on_the_owners_own_drive_is_listed_by_its_title_only(chrome, page, fast, lines):
+    """⛔ Gemini reads Drive and Gmail. A row opening the owner's own file is
+    listed by its title only — its address never reaches the document — and its
+    number stays text at the write; every other number links."""
+    private = "https://docs.google.com/document/d/abc123/edit"
+    rows = [dict(USED[0]), dict(USED[1], href=private)] + USED[2:]
+    md = _extract(chrome, page, after=G.recorded_sources(rows))
+    assert "docs.google.com" not in md and "abc123" not in md
+    assert "\n- Who owns OpenAI? Ownership structure explained (2026) — cited as 2\n" in md
+    out = research._number_document_sources(md, [], [], label="Gemini")
+    nums = {int(n) for n, _u in MARKER_RE.findall(out)}
+    assert 2 not in nums and 1 in nums and 3 in nums
+    assert "\\[2\\]" in out[:out.index(TAIL)]
+
+
+# ═══ 2. A closed list is opened for the read, and closed again ═══════════════
+
+def test_a_closed_list_is_opened_by_its_own_toggle_and_closed_again(chrome, page, fast, lines):
+    """⭐⭐ The list closed, as the 10-01 recording found it (its rows are not in
+    the page). The read presses its toggle, waits for its rows, reads exactly
+    what the open list gives — and presses it again, so the page is as it was
+    found: closed, no row, the same address, two presses."""
+    open_md = _extract(chrome, page)
+    lines.clear()
+    md = _extract(chrome, page, report=G.recorded_report(extra=BODY_LINK),
+                  after=G.recorded_sources(closed=True), outside=G.toggle_script())
+    assert _state(chrome, page) == {"expanded": "false", "rows": 0, "presses": "2",
+                                    "url": "about:blank"}
+    # The same document as the open list gives, but for the report's own link.
+    assert md.replace("\n\n" + _paragraph(md, "The plugin model"), "", 1) == open_md
+    assert _said(lines, "[Gemini] Gemini's \"Sources used in the report\" was closed — "
+                        "opened it for the read (66 rows)")
+    assert _said(lines, "[Gemini] Gemini's \"Sources used in the report\" closed again, "
+                        "as it was found")
+
+
+@pytest.mark.parametrize("name", ["open", "cites-nothing", "says-open", "in-a-link",
+                                  "two-toggles"])
+def test_the_toggle_is_left_alone(chrome, page, fast, lines, name):
+    """⛔ The toggle is pressed only to open a closed list of a report that cites:
+    never an open list, never for a report citing nothing, never a list that says
+    it is open, never a toggle inside a link, never when there are two. (First,
+    the same closed page with none of these IS pressed, twice.)"""
+    report, after = G.recorded_report(), G.recorded_sources(closed=True)
+    _extract(chrome, page, report=report, after=after, outside=G.toggle_script())
+    assert _state(chrome, page)["presses"] == "2"
+    lines.clear()
+    if name == "open":
+        after = G.recorded_sources()
+    elif name == "cites-nothing":
+        report = "<h1>Report</h1>" + "".join(f"<p>{G.prose(i)}</p>" for i in range(8))
+    elif name == "says-open":
+        after = after.replace('aria-expanded="false"', 'aria-expanded="true"', 1)
+    elif name == "in-a-link":
+        after = after.replace("<collapsible-button", "<a href='https://example.invalid/x'>"
+                              "<collapsible-button", 1).replace(
+            "</collapsible-button>", "</collapsible-button></a>", 1)
+    else:
+        after = after + after
+    md = _extract(chrome, page, report=report, after=after, outside=G.toggle_script())
+    assert _state(chrome, page)["presses"] == "0"
+    if name == "open":
+        assert len(_rows(md)) == 66
+    else:
+        assert md == _today(chrome, page)
+    assert not _said(lines, "\"Sources used in the report\" was closed")
+
+
+def test_a_list_that_does_not_open_keeps_todays_document(chrome, page, fast, lines):
+    """⛔ A press that shows no row (here nothing answers it): the read goes on,
+    the document is today's, and the line says the list showed no row."""
+    md = _extract(chrome, page, after=G.recorded_sources(closed=True))
     assert md == _today(chrome, page)
-    assert "\\[1\\]" not in md and "Sources used in the report" not in md
-    said = _said(lines, "[Gemini] Gemini's citations stay as they are: its list's rows do not "
-                        "say which number each one is")
-    assert len(said) == 1, lines
-    assert ("5 citation chips and 2 written marks naming 5 numbers, 1 to 5, every one; its "
-            "list \"Sources used in the report\" shows 5 rows") in said[0]
+    assert _said(lines, "pressed it open, but it showed no row in 3 s")
+    said = _said(lines, "[Gemini] Gemini's citations stay as they are: ")
+    assert len(said) == 1 and "its list shows no row (a closed list?)" in said[0], said
 
+
+def test_a_list_that_opens_empty_is_closed_again(chrome, page, fast, lines):
+    """A press that opens the list with no row in it: the toggle says open, so
+    it is pressed again, and the read waits until it says closed."""
+    md = _extract(chrome, page, after=G.recorded_sources(closed=True),
+                  outside=G.toggle_script(rows=[]))
+    assert _state(chrome, page) == {"expanded": "false", "rows": 0, "presses": "2",
+                                    "url": "about:blank"}
+    assert md == _today(chrome, page)
+    assert _said(lines, "closed again, as it was found")
+
+
+# ═══ 3. Any doubt keeps today's document ═════════════════════════════════════
 
 def _variant(name):
-    """A page that fails exactly one check — (report, sections, why)."""
-    rows = [(SOURCES[n][0], SOURCES[n][1], NUMBERED_ROW.format(n=n)) for n in LIST_ORDER]
+    """A page that fails exactly one check — (report, sources, why)."""
+    rows = [G.recorded_row(r["href"], r["text"]) for r in USED]
+    report, why = G.recorded_report(), None
+    if name == "list-shorter-than-a-number":
+        return report, G.recorded_sources(USED[:63]), "number 64 is past the end of its list"
+    if name in ("row-without-address", "row-not-a-web-address", "row-two-addresses"):
+        old = f'href="{USED[4]["href"]}"'
+        assert rows[4].count(old) == 1
+        rows[4] = (rows[4].replace(old, "") if name == "row-without-address" else
+                   rows[4].replace(old, 'href="/app/06be5842def539f5"')
+                   if name == "row-not-a-web-address" else
+                   rows[4].replace("</browse-web-item>",
+                                   "<a href='https://other.example.org/x'>more</a>"
+                                   "</browse-web-item>"))
+        why = "row 5 of its list has no web address or more than one"
+    elif name == "link-in-no-row":
+        rows.insert(10, "<a href='https://loose.example.org/z'>Loose</a>")
+        why = "a link in its list is in no row"
+    elif name == "rows-of-another-kind":
+        rows = [r.replace("browse-web-item", "div") for r in rows]
+        why = "a link in its list is in no row"
+    if why:
+        return report, G.recorded_sources(rows), why
+    if name == "number-0":
+        return (G.recorded_report(extra=f"<p>One more claim.{G.recorded_chip(0)}</p>"),
+                G.recorded_sources(), "a citation names number 0")
+    if name == "mark-0":
+        return (G.recorded_report(extra="<table><tbody><tr><td>Claim</td><td>Filing "
+                                        "[cite: 0]</td></tr></tbody></table>"),
+                G.recorded_sources(), "a citation names number 0")
     if name == "chip-without-number":
-        return (_report(G.chip(1).replace(' data-turn-source-index="1"', "")
-                        .join(["<p>One more sentence.", "</p>"])),
-                _sections(), "a citation chip carries no number")
+        return (G.recorded_report(extra=f"<p>One more claim.{G.recorded_chip(None)}</p>"),
+                G.recorded_sources(), "a citation chip carries no number")
     if name == "no-list":
-        return _report(), "", "the page holds no \"Sources used in the report\" list"
-    if name == "closed-list":
-        return (_report(), G.sources_section("Sources used in the report", []),
-                "its list shows no row with an address")
-    if name == "row-two-addresses":
-        bad = rows[:1] + [rows[1] + ("<a href='https://other.example.org/x'>more</a>",)] + rows[2:]
-        return _report(), _sections(rows=bad), "a row of its list has no number or not one address"
-    if name == "number-on-two-rows":
-        bad = rows + [("https://dup.example.org/y", "Dup", NUMBERED_ROW.format(n=3))]
-        return _report(), _sections(rows=bad), "number 3 is on two rows of its list"
-    if name == "link-in-no-row":
-        bad = rows + [("https://loose.example.org/z", "Loose", "")]
-        return _report(), _sections(rows=bad), "a link in its list is in no numbered row"
-    if name == "row-nobody-cites":
-        bad = rows + [("https://extra.example.org/w", "Extra", NUMBERED_ROW.format(n=6))]
-        return (_report(), _sections(rows=bad),
-                "the numbers cited and its list's rows do not match one for one "
-                "(5 numbers, 6 rows)")
-    if name == "number-without-row":
-        return (_report(f"<p>A last claim.{G.chip(6)}</p>"), _sections(),
-                "the numbers cited and its list's rows do not match one for one "
-                "(6 numbers, 5 rows)")
+        return report, "", "the page holds no \"Sources used in the report\" list"
     if name == "after-a-bullet":
-        return (_report(f"<ul><li>{G.chip(2)} opens the item</li></ul>"), _sections(),
-                "a citation comes right after a bullet")
+        return (G.recorded_report(extra=f"<ul><li>{G.recorded_chip(2)} opens the item</li></ul>"),
+                G.recorded_sources(), "a citation comes right after a bullet")
     if name == "own-list-with-links":
-        return (_report("<h2>Works cited</h2><ol><li><a href='https://own.example.org/p'>"
-                        "Own</a></li></ol>"), _sections(),
+        return (G.recorded_report(extra="<h2>Works cited</h2><ol><li><a href='https://own."
+                                        "example.org/p'>Own</a></li></ol>"),
+                G.recorded_sources(),
                 "the report ends with a sources list of its own that holds links")
     if name == "at-a-line-start":
-        return (_report(f"<p>Line one<br>{G.chip(2)}line two</p>"), _sections(),
-                "numbers would link at the write")
+        return (G.recorded_report(extra=f"<p>Line one<br>{G.recorded_chip(2)}line two</p>"),
+                G.recorded_sources(), "numbers would link at the write")
     raise AssertionError(name)
 
 
 @pytest.mark.parametrize("name", [
-    "chip-without-number", "no-list", "closed-list", "row-two-addresses",
-    "number-on-two-rows", "link-in-no-row", "row-nobody-cites", "number-without-row",
-    "after-a-bullet", "own-list-with-links", "at-a-line-start"])
+    "list-shorter-than-a-number", "row-without-address", "row-not-a-web-address",
+    "row-two-addresses", "link-in-no-row", "rows-of-another-kind", "number-0", "mark-0",
+    "chip-without-number", "no-list", "after-a-bullet", "own-list-with-links",
+    "at-a-line-start"])
 def test_any_doubt_keeps_todays_document(chrome, page, fast, lines, name):
     """⛔ Each check, failed alone: no number and no list are written — the
     document is exactly today's — and one log line says which check."""
-    report, sections, why = _variant(name)
-    md = _extract(chrome, page, report, sections)
+    report, sources, why = _variant(name)
+    md = _extract(chrome, page, report=report, after=sources)
     assert md == _today(chrome, page)
     said = _said(lines, "[Gemini] Gemini's citations stay as they are: ")
     assert len(said) == 1 and why in said[0], (said, lines[-5:])
@@ -246,43 +375,88 @@ def test_a_report_citing_nothing_says_nothing(chrome, page, fast, lines):
     """A report with no chip and no mark is today's document, and no line about
     citations is written — while the same page with one chip says why."""
     plain = "<h1>Report</h1>" + "".join(f"<p>{G.prose(i)}</p>" for i in range(8))
-    md = _extract(chrome, page, plain, _sections())
+    md = _extract(chrome, page, report=plain)
     assert md == _today(chrome, page)
     assert not _said(lines, "Gemini's citations")
-    _extract(chrome, page, plain + f"<p>Cited.{G.chip(1)}</p>", _sections(numbered=False))
+    _extract(chrome, page, report=plain + f"<p>Cited.{G.recorded_chip(70)}</p>")
     assert len(_said(lines, "Gemini's citations stay as they are")) == 1
 
 
-def test_a_row_that_is_not_a_public_page_keeps_its_number_as_text(chrome, page, fast, lines):
-    """⛔ Gemini reads Drive and Gmail. A row opening the owner's own file is listed
-    by its title only — its address never reaches the document — and its number
-    stays text at the write; every other number links."""
-    private = "https://docs.google.com/document/d/abc123/edit"
-    rows = [(SOURCES[n][0] if n != 2 else private, SOURCES[n][1], NUMBERED_ROW.format(n=n))
-            for n in LIST_ORDER]
-    md = _extract(chrome, page, _report(), _sections(rows=rows))
-    assert "docs.google.com" not in md and "abc123" not in md
-    assert "\n- GitHub - example/relay — cited as 2\n" in md
-    out = research._number_document_sources(md, [], [], label="Gemini")
-    nums = [int(n) for n, _u in MARKER_RE.findall(out)]
-    assert 2 not in nums and sorted(set(nums)) == [1, 3, 4, 5]
-    assert "public\\[2\\] and" in out
+def test_citations_only_inside_code_leave_nothing_to_number(chrome, page, fast, lines):
+    """A report whose only citations are inside code has no number to write: it
+    is today's document, and the line says so."""
+    plain = ("<h1>Report</h1>" + "".join(f"<p>{G.prose(i)}</p>" for i in range(8))
+             + "<pre><code>see [cite: 1]</code></pre>")
+    md = _extract(chrome, page, report=plain)
+    assert md == _today(chrome, page)
+    assert _said(lines, "Gemini's citations stay as they are: no citation is left to number")
 
 
 def test_a_link_less_works_cited_of_its_own_is_replaced(chrome, page, fast, lines):
     """One sources section: the report's own trailing "Works cited" with no link
     in it is replaced by Gemini's own list."""
-    own = "<h2>Works cited</h2><ol><li>Relay documentation</li><li>Relay on GitHub</li></ol>"
-    md = _extract(chrome, page, _report(own), _sections())
-    assert "Works cited" not in md and md.count("Sources") == 1
+    own = "<h2>Works cited</h2><ol><li>OpenAI's structure page</li><li>Quartz</li></ol>"
+    md = _extract(chrome, page, report=G.recorded_report(extra=own))
+    assert "Works cited" not in md and md.count("##### Sources") == 1
     assert _said(lines, "replaced by Gemini's own sources list")
 
 
+def test_a_failure_while_reading_them_keeps_todays_document(chrome, page, fast, lines,
+                                                           monkeypatch):
+    """⛔ Anything that goes wrong while the citations are read leaves the document
+    as it was, with one line."""
+    def _boom(html, label="Gemini"):
+        raise ValueError("unexpected markup")
+    monkeypatch.setattr(research, "_gemini_footnoted", _boom)
+    md = _extract(chrome, page)
+    assert md == _today(chrome, page)
+    assert _said(lines, "Gemini's citations stay as they are: they could not be read (ValueError)")
+
+
+# ═══ 4. The write ════════════════════════════════════════════════════════════
+
+def _own_list(rows, cites):
+    return ("A claim." + "".join(f"\\[{n}\\]" for n in cites) + " More words follow it.\n\n"
+            "##### Sources\n\n" + "\n".join(
+                f"- [Row {i}](https://r{i}.example.org/) — r{i}.example.org — cited as {ns}"
+                for i, ns in enumerate(rows, 1)) + "\n")
+
+
+def test_the_write_links_a_list_that_counts_up_with_rows_nobody_cites(lines):
+    """⭐ Gemini's list, one number on each row counting 1, 2, 3: a row the text
+    does not cite is still its row, and each number cited opens its own row."""
+    out = research._number_document_sources(_own_list(["1", "2", "3"], [3, 1]), [], [],
+                                            label="Gemini")
+    assert MARKER_RE.findall(out) == [("3", "https://r3.example.org/"),
+                                      ("1", "https://r1.example.org/")]
+
+
+@pytest.mark.parametrize("rows,cites,inside", [
+    (["1", "2", "3"], [2, 4], [2]),       # a number past the end of the list
+    (["1, 3", "2"], [1, 3], [1, 3]),      # rows naming several numbers (ChatGPT's shape)
+    (["1", "3"], [1], [1]),               # rows that skip a number
+], ids=["number-past-the-end", "several-on-a-row", "rows-skip"])
+def test_any_other_list_still_matches_one_for_one(lines, rows, cites, inside):
+    """⛔ Only a list counting 1, 2, 3, one number on each row, may have rows
+    nobody cites — and even there every number cited needs its row. Any other
+    list links nothing unless the numbers and its rows match one for one. (The
+    numbers within it, against a list counting 1, 2, 3, do link.)"""
+    counting = research._number_document_sources(_own_list(["1", "2", "3"], inside), [], [],
+                                                 label="Gemini")
+    assert [int(n) for n, _u in MARKER_RE.findall(counting)] == inside
+    md = _own_list(rows, cites)
+    assert research._number_document_sources(md, [], [], label="Gemini") == md
+    assert _said(lines, "left its own citation numbers as written")
+
+
+# ═══ 5. Through the real save ════════════════════════════════════════════════
+
 def test_the_saved_document_and_its_cloud_copy_carry_the_links(chrome, page, fast, lines,
                                                               monkeypatch, tmp_path):
-    """⭐⭐ THROUGH THE REAL WRITE: the per-agent save writes Gemini's numbers
-    linked to its own rows and its one list — on disk and in the copy the app
-    reads — and the sites the run tracked are NOT added after it."""
+    """⭐⭐ THROUGH THE REAL WRITE, with the list closed as the owner's runs find
+    it: the per-agent save writes Gemini's numbers linked to its own rows and its
+    one list — on disk and in the copy the app reads — and the sites the run
+    tracked are NOT added after it."""
     sink = _firestore(monkeypatch)
     runtime = research.PipelineRuntime()
     monkeypatch.setattr(research, "_runtime", runtime, raising=False)
@@ -295,8 +469,7 @@ def test_the_saved_document_and_its_cloud_copy_carry_the_links(chrome, page, fas
         return text
     monkeypatch.setattr(research, "_rehost_document_images", _same)
     monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
-    G.offline(chrome, page)
-    chrome.run(page.set_content(G.report_page(_report(), after=_sections())))
+    _load(chrome, page, after=G.recorded_sources(closed=True), outside=G.toggle_script())
 
     class _Browser:
         async def switch_to_page(self, p):
@@ -306,9 +479,12 @@ def test_the_saved_document_and_its_cloud_copy_carry_the_links(chrome, page, fas
     assert res["status"] == "done"
     assert [d["content"] for p, d in sink if p.endswith("/documents/gemini")] == [local]
     assert "visited-only" not in local and local.count("\n##### Sources\n") == 1
+    assert _paragraph(local, HOVERED_WORDS) == (
+        HOVERED_WORDS + "[\\[1\\]](https://openai.com/index/built-to-benefit-everyone/)"
+        "[\\[3\\]](https://openai.com/our-structure/)")
     links = MARKER_RE.findall(local)
-    assert len(links) == 8 and all(
-        u == research._doc_public_source_url(SOURCES[int(n)][0]) for n, u in links)
+    assert len(links) == 116 and all(u == USED[int(n) - 1]["href"] for n, u in links)
+    assert _state(chrome, page)["presses"] == "2"
 
 
 def test_copy_contents_that_hangs_is_left_after_a_short_wait(chrome, page, fast, lines,
@@ -342,57 +518,3 @@ def test_copy_contents_that_hangs_is_left_after_a_short_wait(chrome, page, fast,
     assert chrome.run(_go()) == ""
     assert held["for"] < 2.5, held
     assert _said(lines, "Falling back to select-all")
-
-
-def test_rows_with_numbers_that_skip_still_join_by_the_number(chrome, page, fast, lines):
-    """The numbers a report cites need not run 1…K: Gemini's rows carry 1, 2, 3
-    and 5 and the report cites exactly those. Each links its own row — a join by
-    place would have sent 5 to the fourth row — and the log says the numbers skip."""
-    rows = [(SOURCES[n][0], SOURCES[n][1], NUMBERED_ROW.format(n=n)) for n in (3, 5, 1, 2)]
-    report = _report().replace(G.chips(4, 5), G.chip(5))
-    md = _extract(chrome, page, report, _sections(rows=rows))
-    assert [n for n, _u, _t in _rows(md)] == [3, 5, 1, 2]
-    out = research._number_document_sources(md, [], [], label="Gemini")
-    for n, url in MARKER_RE.findall(out):
-        assert url == research._doc_public_source_url(SOURCES[int(n)][0])
-    assert _said(lines, "naming 4 numbers, 1 to 5 with gaps")
-
-
-def test_a_mark_inside_code_stays_and_a_row_cited_only_there_is_not_listed(
-        chrome, page, fast, lines):
-    """⛔ Inside code a mark is the code's own text: it stays "[cite: N]". Its
-    number still counts as cited, so the list and the citations match; a row cited
-    only inside code is not listed (no number in the text opens it). A row's inner
-    element carrying its number too is the same row."""
-    code = "<pre><code>| claim | [cite: 2] |\n| other | [cite: 6] |</code></pre>"
-    rows = [(SOURCES[n][0], SOURCES[n][1], NUMBERED_ROW.format(n=n),
-             f'<sup {NUMBERED_ROW.format(n=n)}></sup>') for n in LIST_ORDER]
-    rows.append(("https://only-in-code.example.org/c", "Only in code", NUMBERED_ROW.format(n=6)))
-    md = _extract(chrome, page, _report(code), _sections(rows=rows))
-    assert "| claim | [cite: 2] |" in md and "| other | [cite: 6] |" in md
-    assert [n for n, _u, _t in _rows(md)] == LIST_ORDER
-    assert "only-in-code" not in md
-    assert _said(lines, "5 of its 6 sources listed")
-
-
-def test_citations_only_inside_code_leave_nothing_to_number(chrome, page, fast, lines):
-    """A report whose only citations are inside code has no number to write: it
-    is today's document, and the line says so."""
-    plain = ("<h1>Report</h1>" + "".join(f"<p>{G.prose(i)}</p>" for i in range(8))
-             + "<pre><code>see [cite: 1]</code></pre>")
-    rows = [(SOURCES[1][0], SOURCES[1][1], NUMBERED_ROW.format(n=1))]
-    md = _extract(chrome, page, plain, _sections(rows=rows))
-    assert md == _today(chrome, page)
-    assert _said(lines, "Gemini's citations stay as they are: no citation is left to number")
-
-
-def test_a_failure_while_reading_them_keeps_todays_document(chrome, page, fast, lines,
-                                                           monkeypatch):
-    """⛔ Anything that goes wrong while the citations are read leaves the document
-    as it was, with one line."""
-    def _boom(html, label="Gemini"):
-        raise ValueError("unexpected markup")
-    monkeypatch.setattr(research, "_gemini_footnoted", _boom)
-    md = _extract(chrome, page, _report(), _sections())
-    assert md == _today(chrome, page)
-    assert _said(lines, "Gemini's citations stay as they are: they could not be read (ValueError)")

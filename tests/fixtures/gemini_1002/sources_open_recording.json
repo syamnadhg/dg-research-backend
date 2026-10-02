@@ -1,0 +1,1037 @@
+{
+ "what": "excerpt of sr-gemini-sources-open.json (owner's recording, 2026-10-02 18:45Z, an OpenAI governance report with both source lists opened)",
+ "source": "#Dev/wave14/recordings-1001/sr-gemini-sources-open.json",
+ "url": "https://gemini.google.com/u/3/app/06be5842def539f5?pageId=none",
+ "head": "<deep-research-source-lists _ngcontent-ng-c3053465479=\"\" _nghost-ng-c2127188725=\"\" class=\"ng-tns-c2127188725-16 ng-tns-c3053465479-14 ng-star-inserted\"><collapsible-button _ngcontent-ng-c2127188725=\"\" expandtooltip=\"\" collapsetooltip=\"\" aria-controls=\"used-sources-list\" data-test-id=\"used-sources-button\" class=\"ng-tns-c2127188725-16 ng-star-inserted\"><button mat-button=\"\" class=\"mdc-button mat-mdc-button-base mat-mdc-tooltip-trigger button mat-mdc-button mat-unthemed\" mat-ripple-loader-class-name=\"mat-mdc-button-ripple\" aria-expanded=\"true\"><span class=\"mat-mdc-button-persistent-ripple mdc-button__ripple\"></span><span class=\"mdc-button__label\"><span _ngcontent-ng-c2127188725=\"\" class=\"gds-title-m\">Sources used in the report</span></span><mat-icon role=\"img\" iconpositionend=\"\" data-test-id=\"icon\" class=\"mat-icon notranslate mat-icon-no-color google-symbols mat-ligature-font\" aria-hidden=\"true\" data-mat-icon-type=\"font\" data-mat-icon-name=\"expand_less\" fonticon=\"expand_less\"></mat-icon><!----><span class=\"mat-focus-indicator\"></span><span class=\"mat-mdc-button-touch-target\"></span><span class=\"mat-ripple mat-mdc-button-ripple\"></span></button><!----></collapsible-button><div _ngcontent-ng-c2127188725=\"\" class=\"source-list used-sources ng-tns-c2127188725-16 ng-trigger ng-trigger-expandCollapse ng-star-inserted\" aria-expanded=\"true\" style=\"opacity: 1;\">",
+ "row": "<browse-web-item _ngcontent-ng-c2127188725=\"\" _nghost-ng-c4165884442=\"\" class=\"ng-tns-c2127188725-16 ng-star-inserted\" jslog=\"281763;track:generic_click,impression;BardVeMetadataKey:W1sicl9iNTYyYTJjMjA0NjIyODhkIiwiY18wNmJlNTg0MmRlZjUzOWY1IixudWxsLCJpbV8yMjIyYTkwNWI0NmQ2MWJhIixudWxsLG51bGwsbnVsbCxudWxsLDEsbnVsbCxudWxsLDEsMV1d\" style=\"\"><a _ngcontent-ng-c4165884442=\"\" target=\"_blank\" rel=\"noopener\" externallink=\"\" data-test-id=\"browse-web-item-link\" _nghost-ng-c2661267847=\"\" tabindex=\"0\" href=\"https://openai.com/index/built-to-benefit-everyone/\" class=\"ng-star-inserted\"><!----><span _ngcontent-ng-c2661267847=\"\" data-test-id=\"content\" class=\"link-content ng-star-inserted\"><div _ngcontent-ng-c4165884442=\"\" matripple=\"\" class=\"mat-ripple browse-item gds-body-m\"><div _ngcontent-ng-c4165884442=\"\" class=\"title-container\"><img _ngcontent-ng-c4165884442=\"\" role=\"presentation\" class=\"favicon\" src=\"https://t0.gstatic.com/faviconV2?client=BARD&amp;type=FAVICON&amp;size=256&amp;fallback_opts=TYPE,SIZE,URL&amp;url=https%3A%2F%2Fopenai.com%2Findex%2Fbuilt-to-benefit-everyone%2F\"><div _ngcontent-ng-c4165884442=\"\" data-test-id=\"domain-name\" class=\"display-name\">openai.com</div><div _ngcontent-ng-c4165884442=\"\" data-test-id=\"sub-title\" class=\"sub-title ng-star-inserted\">Built to benefit everyone - OpenAI</div><!----></div></div></span><span _ngcontent-ng-c2661267847=\"\" class=\"cdk-visually-hidden ng-star-inserted\">Opens in a new window</span><!----><!----><!----><!----></a><!----><!----></browse-web-item>",
+ "between": "<!----><!----><!---->",
+ "used": [
+  {
+   "href": "https://openai.com/index/built-to-benefit-everyone/",
+   "text": "openai.com Built to benefit everyone - OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://www.revenuememo.com/p/who-owns-openai",
+   "text": "revenuememo.com Who owns OpenAI? Ownership structure explained (2026) Opens in a new window"
+  },
+  {
+   "href": "https://openai.com/our-structure/",
+   "text": "openai.com Our Structure | OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://qz.com/openai-abandons-the-pretense",
+   "text": "qz.com OpenAI drops nonprofit status for $130 billion restructure - Quartz Opens in a new window"
+  },
+  {
+   "href": "https://www.vaasblock.com/news/openai-ipo-governance-altman-conflicts-what-it-reveals/",
+   "text": "vaasblock.com OpenAI's $850B Valuation and the Altman Governance Gap Opens in a new window"
+  },
+  {
+   "href": "https://news.northeastern.edu/2025/11/07/openai-restructures-organization/",
+   "text": "news.northeastern.edu How Will OpenAI's For-Profit Restructure Change the AI Industry? Opens in a new window"
+  },
+  {
+   "href": "https://forklog.com/en/microsoft-retains-27-stake-in-openais-new-structure/",
+   "text": "forklog.com Microsoft Retains 27% Stake in OpenAI's New Structure - ForkLog Opens in a new window"
+  },
+  {
+   "href": "https://www.empower.com/the-currency/money/openai-restructuring-public-benefit-corporation-news",
+   "text": "empower.com OpenAI restructuring puts spotlight on public benefit corporations Opens in a new window"
+  },
+  {
+   "href": "https://www.constellationr.com/insights/news/microsoft-owns-27-openai-worth-135-billion",
+   "text": "constellationr.com Microsoft owns 27% of OpenAI worth $135 billion Opens in a new window"
+  },
+  {
+   "href": "https://www.alphaspread.com/market-news/mergers-acquisitions/openai-restructures-as-public-benefit-corporation-microsoft-takes-27-stake",
+   "text": "alphaspread.com OpenAI Restructures as Public Benefit Corporation, Microsoft Takes Opens in a new window"
+  },
+  {
+   "href": "https://bostonglobalforum.org/global-alliance-for-digital-governance/more-9-execs-out-at-openai-including-technology-chief-mira-murati/",
+   "text": "bostonglobalforum.org More 9 execs out at OpenAI, including technology chief Mira Murati Opens in a new window"
+  },
+  {
+   "href": "https://www.proactiveinvestors.co.uk/companies/news/1057593/openai-sees-leadership-shakeup-as-cto-and-two-top-executives-depart-1057593.html",
+   "text": "proactiveinvestors.co.uk OpenAI sees leadership shakeup as CTO and two top executives Opens in a new window"
+  },
+  {
+   "href": "https://observer.com/2024/05/inside-openais-9-person-safety-committee-led-by-all-powerful-sam-altman/",
+   "text": "observer.com Inside OpenAI's 9-Person Safety Committee Led by Sam Altman Opens in a new window"
+  },
+  {
+   "href": "https://en.wikipedia.org/wiki/Mira_Murati",
+   "text": "en.wikipedia.org Mira Murati - Wikipedia Opens in a new window"
+  },
+  {
+   "href": "https://www.facebook.com/CBSMornings/posts/openai-has-parted-ways-with-three-employees-who-the-company-says-violated-its-po/1541784367975709/",
+   "text": "facebook.com OpenAI has parted ways with three employees who the company Opens in a new window"
+  },
+  {
+   "href": "https://www.inc.com/ben-sherry/why-openais-restructuring-is-a-victory-for-sam-altman/91256928",
+   "text": "inc.com Why OpenAI's Restructuring Is a Victory for Sam Altman Opens in a new window"
+  },
+  {
+   "href": "https://gulfnews.com/technology/openai-targets-mind-boggling-12-trillion-valuation-in-shock-new-funding-talks-1.500676079",
+   "text": "gulfnews.com OpenAI targets mind-boggling $1.2 trillion valuation in shock new Opens in a new window"
+  },
+  {
+   "href": "https://www.aljazeera.com/economy/2025/10/28/openai-restructures-into-public-benefit-firm-microsoft-takes-27-stake",
+   "text": "aljazeera.com OpenAI restructures into public-benefit firm, Microsoft takes 27% stake Opens in a new window"
+  },
+  {
+   "href": "https://www.tradingview.com/news/tradingview:1ad49bf0fb7ed:0-key-facts-msft-unifies-copilot-jefferies-buy-575-retains-27-openai/",
+   "text": "tradingview.com Key facts: MSFT unifies Copilot; Jefferies Buy $575; Retains 27% OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://en.wikipedia.org/wiki/OpenAI",
+   "text": "en.wikipedia.org OpenAI - Wikipedia Opens in a new window"
+  },
+  {
+   "href": "https://blogs.microsoft.com/blog/2025/10/28/the-next-chapter-of-the-microsoft-openai-partnership/",
+   "text": "blogs.microsoft.com The next chapter of the Microsoft–OpenAI partnership Opens in a new window"
+  },
+  {
+   "href": "https://aifundingtracker.com/who-owns-openai/",
+   "text": "aifundingtracker.com Who Owns OpenAI? Complete Ownership Breakdown (2026) Opens in a new window"
+  },
+  {
+   "href": "https://ca.investing.com/analysis/microsofts-175-billion-capex-bet-raises-the-stakes-for-azure-growth-200628281",
+   "text": "ca.investing.com Microsoft's $175 Billion Capex Bet Raises the Stakes for Azure Growth Opens in a new window"
+  },
+  {
+   "href": "https://ca.investing.com/news/stock-market-news/softbank-completes-30-billion-openai-investment-from-latest-funding-round-4862713",
+   "text": "ca.investing.com SoftBank completes $30 billion OpenAI investment from latest Opens in a new window"
+  },
+  {
+   "href": "https://www.reddit.com/r/singularity/comments/1olawkp/summary_of_the_real_facts_surrounding_openais/",
+   "text": "reddit.com Summary of the real facts surrounding OpenAIs restructuring. - Reddit Opens in a new window"
+  },
+  {
+   "href": "https://openai.com/index/evolving-our-structure/",
+   "text": "openai.com Evolving OpenAI's structure Opens in a new window"
+  },
+  {
+   "href": "https://aifray.com/openai-fails-to-strike-output-pirate-library-arguments-from-copyright-infringement-class-action/",
+   "text": "aifray.com OpenAI fails to strike output, pirate library arguments from copyright Opens in a new window"
+  },
+  {
+   "href": "https://litigate.com/digital-doppelgangers-exploring-the-implications-of-a-synthetic-voice-that-might-or-might-not-be-scarlett-johansson-s/pdf",
+   "text": "litigate.com Exploring the Implications of a Synthetic Voice That Might (or Might Opens in a new window"
+  },
+  {
+   "href": "https://openai.com/index/updating-our-preparedness-framework/",
+   "text": "openai.com Our updated Preparedness Framework | OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://cdn.openai.com/pdf/18a02b5d-6b67-4cec-ab64-68cdfbddebcd/preparedness-framework-v2.pdf",
+   "text": "cdn.openai.com Preparedness Framework - OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://arxiv.org/html/2412.16720v1",
+   "text": "arxiv.org OpenAI o1 System Card - arXiv Opens in a new window"
+  },
+  {
+   "href": "https://m.economictimes.com/news/international/global-trends/openais-ai-agents-went-rogue-targeted-us-government-websites-without-labs-knowledge-report/articleshow/134495500.cms",
+   "text": "m.economictimes.com OpenAI's AI agents ‘went rogue’, targeted US government websites without lab’s knowledge: Report Opens in a new window"
+  },
+  {
+   "href": "https://timesofindia.indiatimes.com/world/us/bombs-without-brakes-why-the-us-china-ai-race-may-be-harder-to-control-than-the-nuclear-one/articleshow/134592901.cms",
+   "text": "timesofindia.indiatimes.com Bombs without brakes? Why the US-China AI race may be harder to control than the nuclear one Opens in a new window"
+  },
+  {
+   "href": "https://skpipblog.pl/en/scarlett-johansson-v-openai-does-the-actress-have-a-right-to-her-voice/",
+   "text": "skpipblog.pl Scarlett Johansson v. OpenAI - does the actress have a right to her Opens in a new window"
+  },
+  {
+   "href": "https://www.americanbar.org/advocacy/governmental_legislative_work/publications/washingtonletter/november-24-wl/openai-scarlett-johansson-1124wl/",
+   "text": "americanbar.org OpenAI's use of Scarlett Johansson-like voice in ChatGPT exposed Opens in a new window"
+  },
+  {
+   "href": "https://www.theguardian.com/technology/article/2024/may/20/chatgpt-scarlett-johansson-voice",
+   "text": "theguardian.com ChatGPT suspends Scarlett Johansson-like voice as actor speaks Opens in a new window"
+  },
+  {
+   "href": "https://www.cbc.ca/news/business/openai-chatgpt-voice-scarlett-johansson-sky-1.7209555",
+   "text": "cbc.ca Is that Her? OpenAI halting ChatGPT voice after some say it sounds Opens in a new window"
+  },
+  {
+   "href": "https://community.openai.com/t/openai-reveals-details-about-chatgpt-voices-along-with-special-reference-to-sky/767971?page=3",
+   "text": "community.openai.com OpenAI reveals details about ChatGPT voices along with special Opens in a new window"
+  },
+  {
+   "href": "https://www.georgetown.edu/news/ask-a-professor-openai-v-scarlett-johansson/",
+   "text": "georgetown.edu OpenAI v. Scarlett Johansson? Georgetown Law Professor Answers Opens in a new window"
+  },
+  {
+   "href": "https://en.wikipedia.org/wiki/Musk_v._Altman",
+   "text": "en.wikipedia.org Musk v. Altman - Wikipedia Opens in a new window"
+  },
+  {
+   "href": "https://apnews.com/article/nyt-openai-copyright-lawsuit-chatgpt-cc19ef2cf3f23343738e892b60d6d7a6",
+   "text": "apnews.com Judge allows newspaper copyright lawsuit against OpenAI to proceed Opens in a new window"
+  },
+  {
+   "href": "https://bannerwitcoff.com/ip-alert-authors-copyright-battle-against-openai-survives-motion-to-dismiss/?pdf=true",
+   "text": "bannerwitcoff.com Authors' Copyright Battle Against OpenAI Survives Motion to Dismiss Opens in a new window"
+  },
+  {
+   "href": "https://www.cbc.ca/news/world/openai-elon-musk-lawsuit-verdict-9.7203353",
+   "text": "cbc.ca California jury in Elon Musk lawsuit unanimously sides with OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://www.foxbusiness.com/technology/musk-altman-openai-lawsuit-trial-verdict",
+   "text": "foxbusiness.com Federal jury delivers verdict on Musk's lawsuit against OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://www.theguardian.com/technology/2026/may/18/sam-altman-trial-victory-elon-musk-openai",
+   "text": "theguardian.com Jury hands victory to Sam Altman and OpenAI in battle with Elon Musk Opens in a new window"
+  },
+  {
+   "href": "https://www.youtube.com/watch?v=6kdD1GKyP58",
+   "text": "youtube.com Elon Musk Loses $150B OpenAI Lawsuit as US Court Dismisses Case Opens in a new window"
+  },
+  {
+   "href": "https://www.bnnbloomberg.ca/business/company-news/2026/05/18/jury-rules-against-elon-musk-in-openai-lawsuit/",
+   "text": "bnnbloomberg.ca Jury rules against Elon Musk in OpenAI lawsuit - BNN Bloomberg Opens in a new window"
+  },
+  {
+   "href": "https://en.wikipedia.org/wiki/The_New_York_Times_v._Microsoft_and_OpenAI",
+   "text": "en.wikipedia.org The New York Times v. Microsoft and OpenAI - Wikipedia Opens in a new window"
+  },
+  {
+   "href": "https://www.bairdholm.com/blog/openai-gets-copyright-suit-dismissed-first-of-many/",
+   "text": "bairdholm.com OpenAI Gets Copyright Suit Dismissed, First of Many? Opens in a new window"
+  },
+  {
+   "href": "https://www.loeb.com/en/insights/publications/2025/06/in-re-openai-inc-copyright-infringement-litigation",
+   "text": "loeb.com In Re: OpenAI Inc., Copyright Infringement Litigation Opens in a new window"
+  },
+  {
+   "href": "https://www.courthousenews.com/federal-judge-tosses-out-chatgpt-plagiarism-case-from-independent-digital-news-outlets/",
+   "text": "courthousenews.com Federal judge tosses out ChatGPT plagiarism case from Opens in a new window"
+  },
+  {
+   "href": "https://law.justia.com/cases/federal/district-courts/new-york/nysdce/1:2024cv01514/616533/178/",
+   "text": "law.justia.com Raw Story Media, Inc. et al v. OpenAI Inc. et al, 1:2024cv01514 Opens in a new window"
+  },
+  {
+   "href": "https://www.mccarthy.ca/en/insights/blogs/spotlight-can-asia/copyright-management-information-insights-raw-story-v-openai",
+   "text": "mccarthy.ca Copyright Management Information: Insights from Raw Story v OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://caselaw.findlaw.com/court/us-dis-crt-sd-new-yor/117126751.html",
+   "text": "caselaw.findlaw.com THE NEW YORK TIMES COMPANY, Plaintiff, v. MICROSOFT Opens in a new window"
+  },
+  {
+   "href": "https://www.reddit.com/r/artificial/comments/1jsognn/judge_calls_out_openais_straw_man_argument_in_new/",
+   "text": "reddit.com Judge calls out OpenAI's “straw man” argument in New York Times Opens in a new window"
+  },
+  {
+   "href": "https://subscriber.politicopro.com/article/2024/08/openai-joins-opposition-to-california-ai-safety-bill-00175815",
+   "text": "subscriber.politicopro.com OpenAI joins opposition to California AI safety bill - POLITICO Pro Opens in a new window"
+  },
+  {
+   "href": "https://www.aigl.blog/preparedness-framework/",
+   "text": "aigl.blog Preparedness Framework - AI Governance Library Opens in a new window"
+  },
+  {
+   "href": "https://cdn.openai.com/openai-preparedness-framework-beta.pdf",
+   "text": "cdn.openai.com Preparedness Framework (Beta) | OpenAI Opens in a new window"
+  },
+  {
+   "href": "https://aisecurityandsafety.org/en/frameworks/openai-preparedness-framework/",
+   "text": "aisecurityandsafety.org OpenAI Preparedness Framework (International, 2026) Opens in a new window"
+  },
+  {
+   "href": "https://openai.com/index/openai-board-forms-safety-and-security-committee/",
+   "text": "openai.com OpenAI Board Forms Safety and Security Committee Opens in a new window"
+  },
+  {
+   "href": "https://www.darkreading.com/cybersecurity-operations/openai-forms-another-safety-committee-after-dismantling-prior-team",
+   "text": "darkreading.com OpenAI Forms Another Safety Committee After Dismantling Prior Team Opens in a new window"
+  },
+  {
+   "href": "https://time.com/7022026/sam-altman-safety-committee/",
+   "text": "time.com Why Sam Altman Is Leaving OpenAI's Safety Committee - TIME Opens in a new window"
+  },
+  {
+   "href": "https://openai.com/index/zico-kolter-joins-openais-board-of-directors/",
+   "text": "openai.com Zico Kolter Joins OpenAI's Board of Directors Opens in a new window"
+  },
+  {
+   "href": "https://genigears.com/winne/open-ai-exec-warns-californias-ai-safety-bill-could-slow-progress-joins-opposition-efforts",
+   "text": "genigears.com OpenAI Exec Warns California's AI Safety Bill Could Slow Progress Opens in a new window"
+  },
+  {
+   "href": "https://cryptonews.com/news/openai-vs-california-will-sb-1047-protect-the-public-or-undermine-ai-innovation/",
+   "text": "cryptonews.com Will California's SB 1047 Protect the Public or Stifle AI Innovation? Opens in a new window"
+  },
+  {
+   "href": "https://www.siliconrepublic.com/business/openai-ai-safety-bill-sb-1047-california-scott-wiener-criticism",
+   "text": "siliconrepublic.com OpenAI says California AI safety bill will slow innovation Opens in a new window"
+  }
+ ],
+ "unused": [
+  {
+   "href": "https://openai.com/index/statement-on-openai-nonprofit-and-pbc/",
+   "text": "openai.com Statement on OpenAI's Nonprofit and PBC Opens in a new window"
+  },
+  {
+   "href": "https://www.theguardian.com/technology/2025/oct/28/openai-for-profit-restructuring",
+   "text": "theguardian.com OpenAI completes conversion to for-profit business after lengthy Opens in a new window"
+  },
+  {
+   "href": "https://apnews.com/article/openai-chatgpt-nonprofit-microsoft-c661df3242766d6b0ddbab401ad1fd84",
+   "text": "apnews.com OpenAI reorganizes its structure to raise money and profit - AP News Opens in a new window"
+  },
+  {
+   "href": "https://observer.com/2024/09/openai-executives-resign/",
+   "text": "observer.com OpenAI's Leadership Exodus: 9 Execs Who Left the A.I. Giant This Opens in a new window"
+  },
+  {
+   "href": "https://thedispatch.com/newsletter/morning/the-cornell-case-gets-a-second-look/",
+   "text": "thedispatch.com The Cornell Case Gets a Second Look Opens in a new window"
+  },
+  {
+   "href": "https://www.facebook.com/thejordantimes/videos/a-federal-jury-ruled-monday-that-elon-musk-waited-too-long-to-sue-openai-and-its/2088155458423336/",
+   "text": "facebook.com A federal jury ruled Monday that Elon Musk waited too long to sue Opens in a new window"
+  }
+ ],
+ "unusedCount": 136,
+ "cards": [
+  {
+   "href": "https://openai.com/index/built-to-benefit-everyone/",
+   "text": "Built to benefit everyone - OpenAI"
+  },
+  {
+   "href": "https://openai.com/index/built-to-benefit-everyone/",
+   "text": "openai.com/index/built-to-benefit-everyone"
+  },
+  {
+   "href": "https://openai.com/our-structure/",
+   "text": "Our Structure | OpenAI"
+  },
+  {
+   "href": "https://openai.com/our-structure/",
+   "text": "openai.com/our-structure"
+  },
+  {
+   "href": "https://openai.com/our-structure/",
+   "text": "Our Structure | OpenAI"
+  },
+  {
+   "href": "https://openai.com/our-structure/",
+   "text": "openai.com/our-structure"
+  }
+ ],
+ "chips": [
+  {
+   "index": "1",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The institutional trajectory of OpenAI presents a compelling study in corporate governance, structural adaptation, and s"
+  },
+  {
+   "index": "1",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The institutional trajectory of OpenAI presents a compelling study in corporate governance, structural adaptation, and s"
+  },
+  {
+   "index": "1",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s corporate structure has transitioned through three major configurations: an initial 501(c)(3) public charity fo"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s corporate structure has transitioned through three major configurations: an initial 501(c)(3) public charity fo"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s corporate structure has transitioned through three major configurations: an initial 501(c)(3) public charity fo"
+  },
+  {
+   "index": "1",
+   "shows": "1",
+   "cls": "superscript visible",
+   "before": "Following nearly a year of formal dialogue with the Attorneys General of California and Delaware, OpenAI executed a corp"
+  },
+  {
+   "index": "3",
+   "shows": "2",
+   "cls": "superscript visible",
+   "before": "Following nearly a year of formal dialogue with the Attorneys General of California and Delaware, OpenAI executed a corp"
+  },
+  {
+   "index": "8",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Under Delaware General Corporation Law, a Public Benefit Corporation requires fiduciaries to balance stockholder pecunia"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Under Delaware General Corporation Law, a Public Benefit Corporation requires fiduciaries to balance stockholder pecunia"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Statutorily balances commercial viability with charter-defined societal benefits."
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Retains irrevocable authority to appoint and replace all Group PBC directors."
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Endows non-profit with permanent, liquid equity linked directly to firm capitalization."
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Grants substantial equity if market share price scales greater than tenfold over 15 years."
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Eliminates compute exclusivity while securing commercial technology access through 2032."
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Normalizes capitalization table for institutional capital and potential initial public offering."
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The OpenAI Foundation maintains structural authority over OpenAI Group PBC through exclusive voting rights that allow it"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The OpenAI Foundation maintains structural authority over OpenAI Group PBC through exclusive voting rights that allow it"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The OpenAI Foundation maintains structural authority over OpenAI Group PBC through exclusive voting rights that allow it"
+  },
+  {
+   "index": "11",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This corporate recapitalization succeeded a period of leadership turbulence. Following the brief boardroom removal and s"
+  },
+  {
+   "index": "2",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This corporate recapitalization succeeded a period of leadership turbulence. Following the brief boardroom removal and s"
+  },
+  {
+   "index": "11",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This corporate recapitalization succeeded a period of leadership turbulence. Following the brief boardroom removal and s"
+  },
+  {
+   "index": "2",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Concurrently, the recapitalization addressed persistent industry speculation regarding executive equity grants. Formal t"
+  },
+  {
+   "index": "2",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Concurrently, the recapitalization addressed persistent industry speculation regarding executive equity grants. Formal t"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The transition from purely theoretical alignment research to frontier model pre-training has required an unprecedented c"
+  },
+  {
+   "index": "2",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The transition from purely theoretical alignment research to frontier model pre-training has required an unprecedented c"
+  },
+  {
+   "index": "10",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The revised arrangement between OpenAI and Microsoft altered their strategic relationship. Microsoft exchanged its legac"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The revised arrangement between OpenAI and Microsoft altered their strategic relationship. Microsoft exchanged its legac"
+  },
+  {
+   "index": "10",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The agreement secured Microsoft’s intellectual property licensing rights to OpenAI foundation models through at least 20"
+  },
+  {
+   "index": "18",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The agreement secured Microsoft’s intellectual property licensing rights to OpenAI foundation models through at least 20"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The restructuring also loosened compute restrictions between the two companies. Microsoft waived its right of first refu"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The restructuring also loosened compute restrictions between the two companies. Microsoft waived its right of first refu"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The restructuring also loosened compute restrictions between the two companies. Microsoft waived its right of first refu"
+  },
+  {
+   "index": "18",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Microsoft’s licensing privileges were also amended to exclude proprietary consumer hardware developed by OpenAI, safegua"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Microsoft’s licensing privileges were also amended to exclude proprietary consumer hardware developed by OpenAI, safegua"
+  },
+  {
+   "index": "20",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To satisfy projected compute demands, OpenAI expanded its capital syndication through private capital markets in 2025 an"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To satisfy projected compute demands, OpenAI expanded its capital syndication through private capital markets in 2025 an"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "~$135B equity valuation (27% stake)"
+  },
+  {
+   "index": "9",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Deep integration into Microsoft 365 Copilot; incremental $250B Azure procurement agreement."
+  },
+  {
+   "index": "17",
+   "shows": "",
+   "cls": "superscript",
+   "before": "$50B equity commitment"
+  },
+  {
+   "index": "20",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Multi-year strategic cloud agreement deploying OpenAI model APIs onto AWS infrastructure."
+  },
+  {
+   "index": "17",
+   "shows": "",
+   "cls": "superscript",
+   "before": "$30B commitment ($64.6B cumulative)"
+  },
+  {
+   "index": "24",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Principal financing partner for global datacenter development, maintaining an approximate 13% firm stake."
+  },
+  {
+   "index": "17",
+   "shows": "",
+   "cls": "superscript",
+   "before": "$30B equity commitment"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "High-volume GPU allocations and architectural co-design for next-generation network clusters."
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "~$300B infrastructure agreements"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Delivery of high-performance OCI Superclusters supporting the multi-gigawatt Stargate datacenter initiative."
+  },
+  {
+   "index": "20",
+   "shows": "",
+   "cls": "superscript",
+   "before": "160M share purchase warrant (~10% option)"
+  },
+  {
+   "index": "20",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Dual-sourcing semiconductor strategy establishing hardware and software optimization benchmarks."
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "These infrastructure agreements support OpenAI’s long-term operational plans, which encompass deploying 30 gigawatts of "
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "These infrastructure agreements support OpenAI’s long-term operational plans, which encompass deploying 30 gigawatts of "
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s transition from releasing open-source code to deploying proprietary, API-gated models and autonomous agentic so"
+  },
+  {
+   "index": "27",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s transition from releasing open-source code to deploying proprietary, API-gated models and autonomous agentic so"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Following the release of ChatGPT in late 2022, the laboratory ended the standard practice of publishing model weights fo"
+  },
+  {
+   "index": "20",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Following the release of ChatGPT in late 2022, the laboratory ended the standard practice of publishing model weights fo"
+  },
+  {
+   "index": "32",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This expanding autonomy has introduced novel failure modes. Routine evaluations revealed incidents where experimental ag"
+  },
+  {
+   "index": "32",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This expanding autonomy has introduced novel failure modes. Routine evaluations revealed incidents where experimental ag"
+  },
+  {
+   "index": "28",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Concurrently, the commercialization of synthetic media surfaced unprecedented intellectual property disputes. In May 202"
+  },
+  {
+   "index": "35",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Concurrently, the commercialization of synthetic media surfaced unprecedented intellectual property disputes. In May 202"
+  },
+  {
+   "index": "34",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Concurrently, the commercialization of synthetic media surfaced unprecedented intellectual property disputes. In May 202"
+  },
+  {
+   "index": "34",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Concurrently, the commercialization of synthetic media surfaced unprecedented intellectual property disputes. In May 202"
+  },
+  {
+   "index": "28",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Johansson retained legal counsel and submitted formal inquiries demanding that OpenAI detail the development, data sourc"
+  },
+  {
+   "index": "34",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Johansson retained legal counsel and submitted formal inquiries demanding that OpenAI detail the development, data sourc"
+  },
+  {
+   "index": "34",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Legal scholars evaluated the controversy under common-law and statutory rights of publicity, drawing analogies to Midler"
+  },
+  {
+   "index": "35",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Legal scholars evaluated the controversy under common-law and statutory rights of publicity, drawing analogies to Midler"
+  },
+  {
+   "index": "40",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s operational choices have been tested through high-profile legal battles spanning contract law, fiduciary admini"
+  },
+  {
+   "index": "40",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The corporate conversion and commercial licensing arrangements faced a direct challenge in Musk v. Altman et al., filed "
+  },
+  {
+   "index": "40",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The corporate conversion and commercial licensing arrangements faced a direct challenge in Musk v. Altman et al., filed "
+  },
+  {
+   "index": "40",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The corporate conversion and commercial licensing arrangements faced a direct challenge in Musk v. Altman et al., filed "
+  },
+  {
+   "index": "40",
+   "shows": "",
+   "cls": "superscript",
+   "before": "On May 18, 2026, the federal jury delivered a unanimous verdict in favor of OpenAI and Altman, ruling that Musk’s breach"
+  },
+  {
+   "index": "17",
+   "shows": "",
+   "cls": "superscript",
+   "before": "On May 18, 2026, the federal jury delivered a unanimous verdict in favor of OpenAI and Altman, ruling that Musk’s breach"
+  },
+  {
+   "index": "41",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Parallel to corporate governance litigation, OpenAI has defended its training methodologies against class-action authors"
+  },
+  {
+   "index": "49",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In Raw Story Media, Inc. v. OpenAI Inc., U.S. District Judge Colleen McMahon granted OpenAI’s motion to dismiss claims b"
+  },
+  {
+   "index": "50",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In Raw Story Media, Inc. v. OpenAI Inc., U.S. District Judge Colleen McMahon granted OpenAI’s motion to dismiss claims b"
+  },
+  {
+   "index": "27",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In the consolidated class litigation In re OpenAI Inc. Copyright Infringement Litigation (MDL No. 3143), U.S. District J"
+  },
+  {
+   "index": "27",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In the consolidated class litigation In re OpenAI Inc. Copyright Infringement Litigation (MDL No. 3143), U.S. District J"
+  },
+  {
+   "index": "27",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In the consolidated class litigation In re OpenAI Inc. Copyright Infringement Litigation (MDL No. 3143), U.S. District J"
+  },
+  {
+   "index": "41",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In The New York Times Co. v. Microsoft and OpenAI, the district court dismissed common-law unfair competition claims due"
+  },
+  {
+   "index": "41",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In The New York Times Co. v. Microsoft and OpenAI, the district court dismissed common-law unfair competition claims due"
+  },
+  {
+   "index": "41",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In The New York Times Co. v. Microsoft and OpenAI, the district court dismissed common-law unfair competition claims due"
+  },
+  {
+   "index": "31",
+   "shows": "",
+   "cls": "superscript",
+   "before": "As its models demonstrated advanced reasoning and tool-use capabilities, OpenAI developed an empirical risk management f"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To systemize catastrophic risk evaluations, OpenAI released its initial Preparedness Framework (Beta) in late 2023, foll"
+  },
+  {
+   "index": "30",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To systemize catastrophic risk evaluations, OpenAI released its initial Preparedness Framework (Beta) in late 2023, foll"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The revised framework established two distinct evaluation tiers. Tracked Categories encompass mature vectors with establ"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The revised framework established two distinct evaluation tiers. Tracked Categories encompass mature vectors with establ"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The revised framework established two distinct evaluation tiers. Tracked Categories encompass mature vectors with establ"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Significantly, Version 2 shifted the risk evaluation of \"Persuasion\" out of the Preparedness Framework and into standard"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Actionable, expert-level protocol synthesis that lowers barriers to acquiring or synthesizing lethal pathogens."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "High: Pre-deployment gating; automated screening heuristics and biological red-team evaluations."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Critical: Full pre-training pause; air-gapped containment and verified laboratory isolation."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Autonomous discovery, exploitation, and chaining of novel zero-day flaws within critical infrastructure."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "High: Deployment blocked until runtime safeguards reduce operational risk to baseline parameters."
+  },
+  {
+   "index": "58",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Critical: Immediate freeze on model training; physical hardware air-gapping against exfiltration."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Autonomous model fine-tuning, architectural self-modification, code refinement, or bypassing human oversight."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "High: Enforced compute execution bounds, sandboxed runtime environments, and strict API constraints."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Critical: Immediate shutdown of autonomous optimization loops; mandatory board escalation."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Emerging vectors: model sandbagging, autonomous survival, replication, and safeguard undermining."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Development of scalable benchmarks; periodic Capabilities Reports submitted directly to the Safety Advisory Group."
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Under the Preparedness Framework, models evaluated as having \"High\" capabilities cannot be deployed commercially until m"
+  },
+  {
+   "index": "29",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Under the Preparedness Framework, models evaluated as having \"High\" capabilities cannot be deployed commercially until m"
+  },
+  {
+   "index": "60",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To complement internal alignment procedures, OpenAI established a Safety and Security Committee (SSC) at the board level"
+  },
+  {
+   "index": "13",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To complement internal alignment procedures, OpenAI established a Safety and Security Committee (SSC) at the board level"
+  },
+  {
+   "index": "62",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To complement internal alignment procedures, OpenAI established a Safety and Security Committee (SSC) at the board level"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "To complement internal alignment procedures, OpenAI established a Safety and Security Committee (SSC) at the board level"
+  },
+  {
+   "index": "56",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s approach to public policy was clearly demonstrated during the debate over California Senate Bill 1047 (the Safe"
+  },
+  {
+   "index": "56",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI’s approach to public policy was clearly demonstrated during the debate over California Senate Bill 1047 (the Safe"
+  },
+  {
+   "index": "56",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In an August 2024 letter authored by Chief Strategy Officer Jason Kwon, OpenAI formally opposed the legislation, arguing"
+  },
+  {
+   "index": "64",
+   "shows": "",
+   "cls": "superscript",
+   "before": "In an August 2024 letter authored by Chief Strategy Officer Jason Kwon, OpenAI formally opposed the legislation, arguing"
+  },
+  {
+   "index": "64",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Supporters of the legislation noted that the bill's requirements were modeled on the voluntary commitments already outli"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI's organizational trajectory reflects the structural challenges of developing frontier AI within modern market eco"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "OpenAI's organizational trajectory reflects the structural challenges of developing frontier AI within modern market eco"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The organization resolved this capital constraint through successive structural compromises, culminating in the Delaware"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "The organization resolved this capital constraint through successive structural compromises, culminating in the Delaware"
+  },
+  {
+   "index": "17",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This structural reorganization enabled OpenAI Group PBC to secure more than $120 billion in syndicated financing from Mi"
+  },
+  {
+   "index": "40",
+   "shows": "",
+   "cls": "superscript",
+   "before": "This structural reorganization enabled OpenAI Group PBC to secure more than $120 billion in syndicated financing from Mi"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Nevertheless, these choices have fundamentally transformed the institution's operating profile. The sunsetting of open-s"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "Nevertheless, these choices have fundamentally transformed the institution's operating profile. The sunsetting of open-s"
+  },
+  {
+   "index": "4",
+   "shows": "",
+   "cls": "superscript",
+   "before": "While the Public Benefit Corporation model establishes a legal framework requiring fiduciaries to balance societal welfa"
+  },
+  {
+   "index": "3",
+   "shows": "",
+   "cls": "superscript",
+   "before": "While the Public Benefit Corporation model establishes a legal framework requiring fiduciaries to balance societal welfa"
+  }
+ ]
+}
