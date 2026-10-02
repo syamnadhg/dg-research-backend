@@ -259,6 +259,32 @@ def test_a_chat_holding_another_brief_is_never_pressed(launch, how):
     assert out.looks == [] and out.cards == []
 
 
+def test_a_tab_back_on_our_address_is_believed_only_once_it_is_proven(launch):
+    """The tab drifts to another chat at 30 s, and at 60 s Gemini takes it back
+    to the run's own address — but what loads there now holds another brief. It
+    is on our address and still not believed: nothing on it is pressed."""
+    moves = []
+
+    def script(cid, n):
+        if cid == OTHER:
+            return page(SILENT, brief=FOREIGN)
+        return page(SILENT) if n == 1 else page(PLAN, brief=FOREIGN)
+
+    async def wander(elapsed, pg):
+        if elapsed >= 30 and not moves:
+            moves.append(elapsed)
+            await pg.goto(f"{APP}/{OTHER}")
+        elif elapsed >= 60 and len(moves) == 1:
+            moves.append(elapsed)
+            await pg.goto(f"{APP}/{OURS}")
+
+    out = launch(script, on_tick=wander)
+    assert len(moves) == 2 and out.loads == Counter({OURS: 2, OTHER: 1}), out.loads
+    assert out.clicks == [], out.clicks
+    assert not said(out, "back on the run's own chat (proven on a later look)")
+    assert out.cards == [] and out.looks == []
+
+
 def test_a_chat_that_never_proves_it_is_ours_is_read_as_before_and_never_reloaded(launch):
     """The tab has an address but its first turn cannot be read: its address is
     never taken as the run's. "Cannot tell" is read as before — not as somebody
