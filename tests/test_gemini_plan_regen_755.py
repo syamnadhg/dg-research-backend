@@ -1,43 +1,21 @@
-"""#755 — Gemini plan-fail auto-regenerate in the [2D] Start-research wait loop.
+"""#755 — the [2D] Start-research wait: Stop-aware, and it presses only Start.
 
-Observed (4 E2Es, 2026-06-02): Gemini sometimes FAILS to draft the research
-plan and shows "I'm sorry, it looks like something went wrong." with a
-Regenerate/Retry button instead of "Start research". The old [2D] loop only
-polled for a "Start research" button for the full 10 minutes — it never clicked
-Regenerate — so the user had to manually hit Retry ~3 times to get the plan and
-the "Start research" button. With no manual help the loop dwelled the full
-window and then escalated to a needless human-intervention alert.
+⛔⛔ WAVE 15 (10-02): THE PLAN RE-DRAFT THIS FILE WAS WRITTEN FOR IS GONE. #755
+(2026-06-02) taught the [2D] loop to press Gemini's Regenerate/Redo on a failed
+plan, bounded at three with a cooldown; on 09-10 that was rewired to
+`_gemini_redraft_plan`. Gemini now starts its research by itself on a timer, and
+the owner: "wait for the research without refreshing and then let the research
+finish … keep it simple without making it complicated and causing alerts". So
+the loop presses no Redo at all; the bound, the cooldown and the cap's one-time
+notice went with the re-draft, and so did their tests
+(tests/test_w15_gemini_waits_1002.py measures the wait as it is now).
 
-Fix: inside the [2D] loop, after the "Start research" check (still preferred and
-still breaks on success), call the existing _try_inpage_retry_on_research_fail
-to auto-click Gemini's Regenerate/Retry — BOUNDED (cap _GEMINI_MAX_PLAN_REGEN=3)
-and STOP-aware. The helper only clicks when the page actually shows failure text
-AND finds a retry-labeled button in the assistant area, so a healthy "still
-drafting" plan is never touched; the 30s loop sleep spaces attempts so each
-re-draft can finish. The loop also now honors Stop/Pause (a 10-min wait must).
-
-The icon-only / silent-stall case (failure with NO retry-labeled button, or a
-stall with no failure text) still NEEDS a live E2E to pin the exact Regenerate
-selector — so instead of blind-clicking an unidentified control (misclick risk)
-the loop logs a ONE-TIME read-only dump of the assistant-area buttons after 90s.
-
-⛔⛔ SUPERSEDED IN PART, 2026-09-10 — READ THIS BEFORE TRUSTING THE PARAGRAPHS
-ABOVE. The "fix" described above wired this loop to
-`_try_inpage_retry_on_research_fail`, and that call never clicked anything on
-Gemini for the fifteen months it stood: the control is `aria-label="Redo"` and
-that helper's word list is `retry|regenerate|try again|rerun|restart`. The
-"icon-only / silent-stall case" the third paragraph says "still NEEDS a live
-E2E" was in fact the ONLY case there ever was, and the owner captured it on
-09-10 — the control is not icon-only at all, it is aria-labelled and carries
-`data-test-id="regenerate-button"`. The loop now targets it structurally via
-`_gemini_redraft_plan` and gates on `_gemini_plan_verdict`; the bound, the
-cooldown and the Stop-awareness pinned below are unchanged and still this
-file's job. The behaviour lives in test_gemini_redraft_0910.py, executed
-against that capture, and the gate in test_gemini_plan_gate_0910.py.
+What stays true, and is pinned here: the wait honours Stop and Pause; the only
+thing it presses is the vetted 'Start research' finder; and after a Stop the
+verify is skipped.
 
 These are source-inspection guards (the loop lives inline in the large
-run_phase2 coroutine), matching the suite convention — and the fifteen months
-above are what that convention costs when nothing executes the thing it wires.
+run_phase2 coroutine), read with comments BLANKED where they are about code.
 
 Run:  pytest tests/test_gemini_plan_regen_755.py -v
 """
@@ -50,159 +28,48 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import research  # noqa: E402
 from conftest import code_only  # noqa: E402
 
+#: The wait's own boundaries: the start of the loop's state and the verify after it.
+_LOOP_FROM = "        start_clicked = False\n"
+_LOOP_TO = "        # Verify Gemini is actually researching."
+
 
 def _phase2_src():
     return inspect.getsource(research.run_phase2)
 
 
-def _2d_loop():
-    # Scope to the [2D] plan-wait loop: from its init to the CUA recovery.
-    # (#776/#755 renamed the boundary comment "CUA fallback" → "CUA recovery";
-    # this marker tracks the live comment.)
-    src = _phase2_src()
-    return src.split("start_clicked = False", 1)[1].split(
-        '# CUA recovery for "Start research"', 1)[0]
-
-
 def _2d_loop_code():
-    """The same slice with `#` comments blanked — for assertions about CODE.
-
-    `code_only` blanks in place, so the raw offsets stay valid, which matters
-    here because the END boundary is itself a comment."""
+    """The [2D] plan wait, from its init to the verify after it, with `#`
+    comments blanked (in place, so offsets stay valid)."""
     raw = _phase2_src()
-    blanked = code_only(raw)
-    i = raw.index("start_clicked = False") + len("start_clicked = False")
-    j = raw.index('# CUA recovery for "Start research"', i)
-    return blanked[i:j]
+    assert raw.count(_LOOP_FROM) == 1 and raw.count(_LOOP_TO) == 1, "the wait moved"
+    i = raw.index(_LOOP_FROM)
+    j = raw.index(_LOOP_TO, i)
+    return code_only(raw)[i:j]
 
 
-def test_regen_is_bounded():
-    loop = _2d_loop()
-    assert "_GEMINI_MAX_PLAN_REGEN = 3" in loop, (
-        "the Gemini plan-regen cap is gone or changed — an unbounded auto-retry "
-        "could loop on a hard Gemini failure"
-    )
-    assert "_regen_count < _GEMINI_MAX_PLAN_REGEN" in loop, (
-        "the regen is no longer gated on the cap — it can exceed the bound"
-    )
-    assert "_regen_count += 1" in loop, "the regen counter is never incremented"
-
-
-def test_regen_wires_the_redraft_path():
-    """⛔⛔ THE ANCHOR MOVED ON 2026-09-10, AND THE REASON MATTERS MORE THAN THE
-    RENAME. This used to assert the loop called
-    `_try_inpage_retry_on_research_fail`, and it passed for fifteen months
-    while that call clicked NOTHING: Gemini's control is `aria-label="Redo"`
-    and that helper's word list is `retry|regenerate|try again|rerun|restart`.
-    A wiring assertion cannot see that the thing it is wired to does not work,
-    which is why the replacement path is pinned by EXECUTION against the
-    owner's captured DOM in test_gemini_redraft_0910.py — this test only keeps
-    the wire attached.
-
-    ⛔⛔ AND THE NEGATIVE HALF OF IT IS GONE, 2026-09-18. This also asserted
-    `"_try_inpage_retry_on_research_fail(" not in loop`. The helper was retired
-    that day and its name no longer exists anywhere in the module, so no
-    realistic edit could make that line fail — an unfalsifiable assertion
-    standing in for a retirement it could not see. The live pin is
-    tests/test_gemini_dr_error_retry.py::
-    test_the_retired_helper_is_gone_and_nothing_calls_it, which parses the
-    module for a definition or a call. What is left here reads the loop with
-    comments BLANKED, because a containment pin on raw source is satisfied by a
-    comment naming the call — which is how a wire that clicked nothing stayed
-    certified for fifteen months."""
+def test_loop_is_stop_and_pause_aware():
     loop = _2d_loop_code()
-    assert "_gemini_redraft_plan(" in loop, (
-        "the [2D] loop no longer calls _gemini_redraft_plan — the plan-fail "
-        "re-draft is not wired in"
-    )
-    assert "_gemini_plan_verdict(" in loop, (
-        "the re-draft must be gated on the plan STATE, not on `not "
-        "start_clicked` plus a page-wide text probe"
-    )
-
-
-def test_loop_is_stop_aware():
-    loop = _2d_loop()
-    assert "_controls.is_stop()" in loop, (
+    assert "if _controls.is_stop():\n" in loop, (
         "the [2D] plan-wait loop no longer honors Stop — a 10-min wait must be "
-        "stop-aware so the user can cancel"
-    )
-    # And the regen itself must be gated on not-stopped.
-    assert "not _controls.is_stop()" in loop, (
-        "the regen click is no longer gated on not-stopped"
-    )
+        "stop-aware so the user can cancel")
+    assert "if _controls.is_pause():\n" in loop and "await _controls.wait_if_paused()" in loop
 
 
-def test_start_research_click_is_preferred_over_regen():
-    # A freshly-appeared "Start research" must be clicked BEFORE we consider a
-    # regenerate, so a healthy plan kicks off research immediately.
-    # (#953: the finder JS was hoisted to module scope — anchor on the click
-    # call site `_click_start_js`, not the predicate's literal text.)
-    loop = _2d_loop()
-    i_start = loop.find("evaluate(_click_start_js)")
-    i_regen = loop.find("_gemini_redraft_plan(")
-    assert i_start != -1 and i_regen != -1, "loop markers missing"
-    assert i_start < i_regen, (
-        "the regenerate path now precedes the 'Start research' click — a healthy "
-        "plan could get needlessly regenerated instead of started"
-    )
-
-
-def test_regen_has_inter_attempt_cooldown():
-    # A slow-but-healthy re-draft must not burn the 3-cap: successive regen
-    # attempts are spaced by a cooldown gate.
-    loop = _2d_loop()
-    assert "_GEMINI_REGEN_COOLDOWN_SEC" in loop, (
-        "the inter-regen cooldown constant is gone — 3 regens could fire in ~90s "
-        "and exhaust the cap before a slow re-draft finishes"
-    )
-    assert "_last_regen_at" in loop and "(time.time() - _last_regen_at)" in loop, (
-        "the regen gate no longer enforces the cooldown via _last_regen_at"
-    )
-
-
-def test_cap_exhaustion_is_surfaced_once():
-    # When auto-regenerate is exhausted with still no plan, emit ONCE so the FE
-    # shows a known repeated failure instead of a silent stall.
-    loop = _2d_loop()
-    assert "_regen_cap_emitted" in loop, (
-        "the one-time cap-exhaustion emit was removed — an eventual not-verified "
-        "Gemini reads as a silent stall in the FE"
-    )
-
-
-def test_post_loop_skips_cua_and_verify_on_stop():
-    # After the loop, a Stop must skip the CUA Start-research fallback AND the
-    # ~45s DOM-verify churn (both would just no-op/fail on a stopped run).
-    src = _phase2_src()
-    post = src.split('# CUA recovery for "Start research"', 1)[1].split(
-        "# ── Verify all launched agents", 1)[0]
-    assert "not _controls.is_stop()" in post, (
-        "the post-loop CUA Start-research fallback no longer skips on Stop"
-    )
-    assert 'if _controls.is_stop():' in post and "verified_b = False" in post, (
-        "the post-loop Gemini verify no longer short-circuits to not-verified on "
-        "Stop — a stopped run burns ~45s in DOM-verify retries"
-    )
-
-
-def test_silent_stall_diag_is_read_only_no_blind_click():
-    # The stall diagnostic must be capture-only. The ONLY click pathway in the
-    # loop is the deterministic 'Start research' finder (#953: hoisted to
-    # module scope as _GEMINI_CLICK_START_JS, aliased _click_start_js) — the
-    # diag dump and the regen path must not introduce a blind click on an
-    # unidentified control.
-    loop = _2d_loop()
-    assert "_logged_stall_diag" in loop, (
-        "the one-time silent-stall diagnostic was removed — we lose the data "
-        "needed to pin the icon-only Regenerate selector"
-    )
-    # No inline b.click() remains in the loop (the vetted click lives in the
-    # module-level finder); the loop clicks ONLY via evaluate(_click_start_js).
-    assert loop.count("b.click()") == 0, (
-        "an inline .click() appeared in the [2D] loop — the silent-stall "
-        "path must stay read-only (no blind clicks on unidentified controls)"
-    )
-    assert loop.count("evaluate(_click_start_js)") >= 1
-    # And the module-level finder still carries the single vetted b.click().
+def test_the_only_press_is_the_vetted_start_research_finder():
+    """No Redo, no Stop, no blind click: the loop presses through the module's
+    one vetted 'Start research' finder and nothing else."""
+    loop = _2d_loop_code()
+    assert loop.count("b.click()") == 0
+    assert "_gemini_redraft_plan(" not in loop, "the wait re-drafts a plan again"
+    assert "_shadow_observed_cua(" not in loop and "agent_loop(" not in loop, (
+        "computer use is pointed at Gemini's plan again")
+    assert "evaluate(_click_start_js)" in loop
     assert research._GEMINI_CLICK_START_JS.count("b.click()") == 1
+
+
+def test_post_loop_skips_verify_on_stop():
+    """After the loop, a Stop skips the ~45s DOM-verify churn."""
+    raw = _phase2_src()
+    i = raw.index(_LOOP_TO)
+    post = code_only(raw)[i:raw.index("# ── Verify all launched agents", i)]
+    assert "elif _controls.is_stop():\n" in post and "verified_b = False" in post

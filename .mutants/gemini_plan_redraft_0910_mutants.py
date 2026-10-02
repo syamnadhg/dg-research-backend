@@ -324,75 +324,12 @@ MUTANTS = [
      "the Stop check before the click goes, so a Stop arriving inside this helper's two round trips still results in a click — 'no post-Stop DOM driving' is the standing rule",
      [('        if _controls.is_stop():\n            return False, False, False, "stop requested before the re-draft click"\n',
        '')]),
-    # ⛔⛔ RE-ANCHORED 2026-09-18, AND THE REPLACEMENT HAD TO CHANGE, NOT THE
-    # ANCHOR. This mutant used to restore the delegation to
-    # `_try_inpage_retry_on_research_fail` — the fifteen-month defect in one
-    # line. That helper was RETIRED in wave 10, so the old replacement named a
-    # function that no longer exists: it still parses, so `_apply_sweep` cannot
-    # see it, and it would have gone on scoring a kill for a regression that can
-    # no longer be written. What survives of the same defect is the loop giving
-    # up the structural re-draft and reporting that it had one.
-    ('G1', RESEARCH, 'under',
-     "⛔⛔ THE LOOP STOPS DELEGATING TO THE STRUCTURAL RE-DRAFT and hands the caller a fabricated outcome. This is the shape of the whole fifteen-month defect — a branch that reports a retry it never performed — with the dead helper it used to call taken out of it",
-     [('                    (_redrafted, _acted, _in_flight,\n                     _why_rd) = await _gemini_redraft_plan(gemini_page, "2D-plan")',
-       '                    _redrafted, _acted, _in_flight, _why_rd = (\n                        False, False, False, "legacy helper")')]),
-    ('G2', RESEARCH, 'over',
-     'the running-research probe is hoisted ABOVE the fail-text gate, so every healthy tick of the plan wait pays for a body read it has no use for',
-     [('                _already_running = False\n                if _gemini_reads_as_failed(_latest):\n                    try:',
-       '                _already_running = False\n                if True:\n                    try:')]),
-    ('G3', RESEARCH, 'under',
-     '⛔⛔ THE VERDICT IS HANDED A LITERAL, so its first arm is dead at its only call site — and that arm is the one that stops a RUNNING research being re-drafted, the single destructive move on this screen',
-     [('                    research_started=_already_running,',
-       '                    research_started=False,')]),
-    ('G3b', RESEARCH, 'over',
-     "⛔⛔ A RUNNING-RESEARCH PROBE THAT RAISED READS AS 'NOT RUNNING', which is what AUTHORISES the click. The function is documented fail-closed so a miss never fakes a start — and at this call site the polarity is inverted, so the safe answer is the dangerous one",
-     [('                        # probe that could not answer must read as "assume it is\n                        # running": the cost is one re-draft skipped, against\n                        # re-drafting a live research run.\n                        _already_running = True',
-       '                        _already_running = False')]),
-    ('G4', RESEARCH, 'under',
-     'the attempt is spent on the OUTCOME instead of the click, so a control that never re-drafts is never counted and is clicked every tick',
-     [('                    if _acted:',
-       '                    if _redrafted:')]),
-    ('G5', RESEARCH, 'over',
-     "the gate widens from 'failed' to 'anything but ready', so the plain-chat stall and a visibly drafting plan both get clicked at",
-     [('                if _verdict == "failed":\n                    (_redrafted',
-       '                if _verdict != "ready":\n                    (_redrafted')]),
-    # ⛔ G6 and G8 RETIRED 2026-10-01, not re-anchored: their code is gone by
-    # design. The owner ruled nothing is raised before the plan wait is over, so
-    # the in-loop early card (G8's site) went, and the hold flag only it read
-    # (G6's declaration) went with it. The rule that replaced them is measured
-    # by .mutants/gemini_plan_wait_1001_mutants.py.
-    ('G7', RESEARCH, 'over',
-     "⛔⛔ THE BREAK-SITE CARD IS HELD AGAIN — the blocker two independent reviewers found. That site is the loop DECIDING TO STOP WAITING: the next statement is an unconditional break, so the alert is deferred to a retry the following line cancels. Nothing on screen at the moment the loop gives up, and the owner's first actionable surface arrives from the CUA ladder about twelve minutes later — the seventeen-minute ladder #921 exists to remove, deleted by a boolean instead of an edit. (Re-pointed 2026-10-01: the hold flag it used to hand over is gone, so the mutant holds the card outright.)",
-     [('                        redraft_pending=False):\n                    _raise_plan_alert("our own plan-wait budget is spent")',
-       '                        redraft_pending=True):\n                    _raise_plan_alert("our own plan-wait budget is spent")')]),
-    ('G9', RESEARCH, 'over',
-     '⛔ THE COOLDOWN CLOCK GOES BACK TO ZERO, so it is already satisfied on the first tick and a re-draft can fire about two seconds after the brief was submitted — at a turn that is still painting',
-     [("        _last_regen_at = time.time()      # re-draft can't burn the 3-cap",
-       "        _last_regen_at = 0.0              # re-draft can't burn the 3-cap")]),
-    ('G10', RESEARCH, 'over',
-     "⛔⛔ OUR OWN RE-DRAFT'S STREAMING IS READ AS PROOF THAT GEMINI AUTO-STARTED ITS RESEARCH. A Redo we clicked restarts the plan, legitimately, and the heartbeat reports `generating` — so a planless Gemini is handed to the round-robin as though its research were running: no CUA ladder, no card, and a log line that is false",
-     [('            if (_elapsed >= _stream_handoff_sec and _streaming_recent\n                    and (time.time() - _last_regen_at) >= _stream_handoff_sec):',
-       '            if _elapsed >= _stream_handoff_sec and _streaming_recent:')]),
-    ('G11', RESEARCH, 'over',
-     '⛔ THE LAST ATTEMPT LOSES ITS WINDOW. The exhausted-attempts latch fires the instant the third click lands, so that attempt is judged ~10 seconds after it while the first two each got 45 — same page, same failure, and a card on the third the first would not have raised',
-     [('                    and not _regen_cap_emitted and not _controls.is_stop()\n                    and (time.time() - _last_regen_at) > _GEMINI_REGEN_COOLDOWN_SEC):',
-       '                    and not _regen_cap_emitted and not _controls.is_stop()):')]),
-    ('G12', RESEARCH, 'under',
-     'the diagnostic stops distinguishing a READ THAT FAILED from a silent plan, so the one artefact meant to make a Gemini UI revision visible names the wrong cause for the exact failure it exists to catch',
-     [('                    if (_verdict == "silent" and not _reading.get("found")',
-       '                    if (_verdict == "silent" and False')]),
-    ('C1', RESEARCH, 'under',
-     'the hold arm goes and the alert is beside the clicks again rather than after them',
-     [('    if redraft_pending:\n        return False\n',
-       '')]),
-    ('C2', RESEARCH, 'over',
-     "⛔⛔ THE HOLD OUTRANKS THE EXHAUSTED-ATTEMPTS ARM. Three spent re-drafts is EVIDENCE, not a timer, and #921 exists so it reaches the owner early — 'the alert comes last' must not become 'the alert never comes'. This ordering is load-bearing now that the cap lives in one place instead of two",
-     [('    if regen_capped:\n        return True\n    if redraft_pending:\n        return False',
-       '    if redraft_pending:\n        return False\n    if regen_capped:\n        return True')]),
-    ('C3', RESEARCH, 'over',
-     'the new arm defaults to True, so every OTHER caller of the predicate silently inherits a hold it never asked for',
-     [('                          redraft_pending: bool = False) -> bool:',
-       '                          redraft_pending: bool = True) -> bool:')]),
+    # ⛔ G1-G12 and C1-C3 RETIRED in wave 15 (10-02), not re-anchored: they
+    # measured the [2D] plan wait's re-draft (Redo) and the hold on its card, and
+    # both are gone by the owner's decision — the plan wait presses no Redo and
+    # raises no card (tests/test_w15_gemini_waits_1002.py). G6 and G8 went the
+    # same way on 2026-10-01. The re-draft itself (`_gemini_redraft_plan`, B*
+    # above) stays: the send path's failed-turn re-draft still calls it.
     ('O1', RESEARCH, 'over',
      "⛔⛔ 'I CANNOT TELL' COMES OUT AS 'SOMEBODY ELSE'S'. A conversation still rendering answers False, and False is ACTED on — so a healthy run whose bubble painted a moment late is walked out of its own thread. The owner ruled on this exact shape on 2026-08-27",
      [('    if len(b) < _CONVO_TEXT_MIN_CHARS or not (pasted_text or "").strip():\n        return None',

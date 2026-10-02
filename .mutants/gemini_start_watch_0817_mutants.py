@@ -41,19 +41,25 @@ ALL = [T_WATCH, T_DET]
 PY = str(ROOT / ".venv" / "bin" / "python")
 _TEST_TIMEOUT_S = 180
 
+#: Re-anchored in wave 15 (10-02): the streaming hand-off is gone, and the plan
+#: wait that ended with nothing pressed arms the watch instead — on the run's own
+#: chat only.
 _ARM = ('                                "gemini_watch_start": bool(\n'
-        '                                    _streaming_handoff\n'
+        '                                    (not start_clicked and not _finished_handoff\n'
+        '                                     and not _controls.is_stop() and _chat_ok)\n'
         '                                    or (start_clicked and not verified_b))}')
 
 MUTANTS = [
     # ── the arming condition ────────────────────────────────────────────────
-    ("G1", "under", "⭐⭐ THE ORIGINAL BUG — the watch arms only for a streaming "
-     "hand-off, so an unverified Start click is never pressed again and the run "
-     "burns to the 90-minute auto-skip",
-     [(_ARM, '                                "gemini_watch_start": bool(_streaming_handoff)}')],
+    ("G1", "under", "⭐⭐ THE ORIGINAL BUG — an unverified Start click no longer "
+     "arms the watch, so it is never pressed again and the run burns to the "
+     "90-minute auto-skip",
+     [(_ARM, '                                "gemini_watch_start": bool(\n'
+             '                                    (not start_clicked and not _finished_handoff\n'
+             '                                     and not _controls.is_stop() and _chat_ok))}')],
      [T_WATCH]),
-    ("G2", "under", "the streaming case is dropped while fixing the other one — a "
-     "slow plan that finishes drafting after hand-off loses its clicker",
+    ("G2", "under", "the plan wait that ended with nothing pressed is dropped — a "
+     "plan that shows its Start after the hand-off loses its clicker",
      [(_ARM, '                                "gemini_watch_start": bool(\n'
              '                                    start_clicked and not verified_b)}')],
      [T_WATCH]),
@@ -62,10 +68,12 @@ MUTANTS = [
      "hides a genuinely dead Gemini behind it",
      [(_ARM, '                                "gemini_watch_start": bool(True)}')],
      [T_WATCH]),
-    ("G4", "over", "the arming ignores whether we ever clicked, so a Gemini that "
-     "was never started by us — a user-skip, an error card — gets clicked at",
+    ("G4", "over", "⛔ the watch is armed on a tab that is not provably the run's "
+     "chat — and the watch presses",
      [(_ARM, '                                "gemini_watch_start": bool(\n'
-             '                                    _streaming_handoff or not verified_b)}')],
+             '                                    (not start_clicked and not _finished_handoff\n'
+             '                                     and not _controls.is_stop())\n'
+             '                                    or (start_clicked and not verified_b))}')],
      [T_WATCH]),
     ("G5", "under", "the two flags disagree again: needs_start_verify acts on the "
      "unverified click and the watch does not, which is exactly the split that "
@@ -108,23 +116,8 @@ MUTANTS = [
      [('                    if not p.get("gemini_watch_start"):', '                    if True:')],
      [T_WATCH]),
 
-    # ── the card withdrawn from a dead run ─────────────────────────────────
-    ("G11", "under", "⛔ the plan-stall card is retracted on a click that merely "
-     "returned true again — the live run withdrew the user's only actionable "
-     "surface six seconds before the verify disagreed",
-     [('                        await asyncio.sleep(5)\n                        break\n                    await asyncio.sleep(5)',
-       '                        _retract_plan_alert("CUA recovery re-draft")\n'
-       '                        await asyncio.sleep(5)\n                        break\n                    await asyncio.sleep(5)')],
-     [T_WATCH]),
-    ("G12", "under", "the retraction never happens at all, so a healthy "
-     "researching Gemini keeps a stale [Retry][Skip] card sitting on it",
-     [('            _retract_plan_alert("verified running")\n', '')],
-     [T_WATCH]),
-    ("G13", "over", "the retraction stops being idempotent, so the paths that can "
-     "now both reach it emit a duplicate 'recovered' event",
-     [('            if not _plan_alert_emitted:\n                return',
-       '            if False:\n                return')],
-     [T_WATCH]),
+    # G11-G13 (where the plan-stall card was taken down) went with the card
+    # in wave 15: the plan wait raises none.
 ]
 
 

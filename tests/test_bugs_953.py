@@ -65,67 +65,27 @@ POLL_SRC = inspect.getsource(research.poll_all_agents_round_robin)
 EXTRACT_SRC = inspect.getsource(research.extract_and_record_agent)
 
 
-# ── A: streaming hand-off ─────────────────────────────────────────────────────
-
-def test_streaming_handoff_env_and_flag_exist():
-    assert "GEMINI_PLAN_STREAM_HANDOFF_SEC" in P2_SRC
-    assert "_streaming_handoff = True" in P2_SRC
-
-
-def test_streaming_handoff_breaks_before_hard_cap():
-    # The hand-off check must precede the 900s hard-cap check in the wait loop
-    # (else a streaming Gemini dwells the full cap first — the 22-min bug).
-    i_handoff = P2_SRC.index("_elapsed >= _stream_handoff_sec and _streaming_recent")
-    i_cap = P2_SRC.index("_elapsed >= _stream_max_sec")
-    assert i_handoff < i_cap
-
-
-def test_cua_ladder_gated_off_on_streaming_handoff():
-    # The ladder must not run for a streaming hand-off — pointing the CUA at a
-    # healthy streaming Gemini is what produced the click spam.
-    # ⭐ Wave 13: and not for a Gemini that already FINISHED on its own either.
-    i_gate = P2_SRC.index("not start_clicked and not _streaming_handoff\n"
-                          "                and not _finished_handoff and not _controls.is_stop()")
-    assert i_gate > 0
-
-
-def test_ladder_reprobes_streaming_before_each_attempt():
-    # Even in the dead-plan ladder, a page that resumed generating must stand
-    # the ladder down (research may auto-start late).
-    assert "streaming again mid-recovery" in P2_SRC
-    i_probe = P2_SRC.index("streaming again mid-recovery")
-    i_click = P2_SRC.index("CUA recovery: clicked 'Start research' via JS", i_probe)
-    assert i_probe < i_click, "the re-probe runs before the ladder touches the page"
-
-
-def test_fail_agent_guarded_by_final_streaming_probe():
-    # The false "couldn't start" card fired on an agent that was mid-research.
-    # A final scrape must veto the card when Gemini is actively generating.
-    i_final = P2_SRC.index("_final_streaming")
-    # #63: couldn't-start copy centralized in the _GEMINI_CANT_START constant.
-    i_card = P2_SRC.index('fail_agent("gemini", *_GEMINI_CANT_START)', i_final)
-    assert i_final < i_card
-    assert "elif not _controls.is_stop():" in P2_SRC
-
+# ── A: the hand-off after the plan wait ───────────────────────────────────────
+#
+# ⛔⛔ WAVE 15 (10-02): THE STREAMING HAND-OFF AND THE COMPUTER-USE LADDER ARE
+# GONE. "A plan never streams this long, so Gemini has almost certainly
+# auto-started" was false — on 10-01 the plan streamed for 47 minutes — and the
+# ladder, its re-probes and its "couldn't start" card went with it. Gemini starts
+# its research by itself; the plan wait hands it to the round-robin when the
+# wait is over (tests/test_w15_gemini_waits_1002.py).
 
 def test_handoff_registers_watch_flag_not_failure():
-    # The hand-off is healthy: agent registered with gemini_watch_start=True,
-    # plan alert retracted, and NO scary "may not be running" warn.
-    #
-    # 2026-08-17 RE-ANCHORED, invariant unchanged. The streaming hand-off still
-    # arms the watch; the condition simply gained a second, equally obvious
-    # trigger — we pressed Start and could not confirm it took. That state armed
-    # nothing before, and two live runs died in it: the DOM read
-    # `start_research_btn_visible (pre-research)` once a minute for ninety
-    # minutes while nobody pressed the button.
+    """The hand-off is healthy: Gemini is registered with the late-Start watch
+    armed, and no "may not be running" warning — for the wait that ended with
+    nothing pressed, and for a press that could not be confirmed (2026-08-17)."""
     assert '"gemini_watch_start": bool(' in P2_SRC
     _arm = P2_SRC[P2_SRC.index('"needs_start_verify": bool(start_clicked'):][:2600]
-    assert "_streaming_handoff" in _arm, "the streaming hand-off must still arm it"
+    assert "(not start_clicked and not _finished_handoff" in _arm, (
+        "the wait that ended with nothing pressed must arm it")
     assert "start_clicked and not verified_b" in _arm, (
-        "an unverified Start click must arm it too"
-    )
-    assert '_retract_plan_alert("streaming hand-off")' in P2_SRC
-    assert "streaming hand-off — round-robin takes it from here" in P2_SRC
+        "an unverified Start click must arm it too")
+    assert '"[2D] Gemini may not be running"' not in P2_SRC
+    assert "Gemini handed to the round-robin before its research started" in P2_SRC
 
 
 # ── B: round-robin late-Start watch leg ──────────────────────────────────────
