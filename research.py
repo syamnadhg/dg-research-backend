@@ -17184,8 +17184,9 @@ def start_firestore_start_listener(job_queue, loop):
                 # fresh and any orphan Patchright/Chromium dies with the
                 # parent process. Mark the research status="stopped" too
                 # so the FE chat + tile reflect cancelled immediately;
-                # `_flip_queued_to_ongoing` is now transactional and
-                # honors this even if the worker dequeues concurrently.
+                # `_flip_queued_to_ongoing` flips only a record that still says
+                # "queued" (a compare-and-set since wave 15) and honors this
+                # even if the worker dequeues concurrently.
                 # (Replaces the old cancelTooLate band-aid: the cancel
                 # actually cancels now, so no "couldn't cancel" message
                 # path is needed.)
@@ -21351,10 +21352,29 @@ def _answered_without_phase_5(body_text) -> bool:
     return isinstance(parsed, dict) and "p5" not in parsed
 
 
-def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0) -> str:
+def _route_answered(body_text) -> bool:
+    """Is this 2xx body the route's own answer — its JSON, after the keep-alive
+    spaces it streams first?
+
+    ⛔⛔ 10-01 (3NH9Q7CH, and twice more in CJFYMAB1's backend logs). The hand-off
+    logged "the route ran it ✓" on a 200 whose body was the keep-alive spaces and
+    then a Google front-end "Internal Server Error" page: the front door cut the
+    call at 300 s, after the status had gone out with the first spaces. The
+    cloud finished that run (20:04Z, the email sent). The web reads such an
+    answer as a transport failure (`cloudKickOutcome`: "the route's answer could
+    not be read"), and so does this now."""
+    try:
+        return isinstance(json.loads(body_text or ""), dict)
+    except Exception:
+        return False
+
+
+def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0,
+                      body=None) -> str:
     """What one attempt at the cloud kick means. One of:
 
-      "ran"     — the route ran the chain and answered (HTTP 2xx).
+      "ran"     — the route ran the chain and answered (HTTP 2xx, with its JSON
+                  when the `body` is given).
       "claimed" — HTTP 202: ANOTHER caller holds the claim. The work is
                   somebody's; it is not this call's, and it is not a failure.
       "cut"     — the connection died AFTER the cloud had the request. The route
@@ -21384,6 +21404,11 @@ def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0) -> s
     if status_code == 202:
         return "claimed"
     if isinstance(status_code, int) and 200 <= status_code < 300:
+        # ⭐ Wave 15: a 2xx whose body is not the route's answer is the front
+        # door cutting the call after the status went out — the cloud has the
+        # request and keeps working (`_route_answered`).
+        if body is not None and not _route_answered(body):
+            return "cut"
         return "ran"
     if status_code in (401, 403):
         return "retry"
@@ -21517,9 +21542,16 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
             _t0 = time.monotonic()
             try:
                 _status, _text = post(id_token, _p5_only)
-                verdict = _dispatch_verdict(status_code=_status)
-                why = f"HTTP {_status}" + (f" ({str(_text)[:160]})"
-                                           if _text and _quote_reply else "")
+                _elapsed = int(time.monotonic() - _t0)
+                verdict = _dispatch_verdict(status_code=_status, body=_text)
+                if verdict == "cut":
+                    # The front door's error page is not the route's reply: say
+                    # what happened, never quote the page.
+                    why = (f"HTTP {_status}, then the cloud's front door ended the "
+                           f"answer with an error page in place of the route's reply")
+                else:
+                    why = f"HTTP {_status}" + (f" ({str(_text)[:160]})"
+                                               if _text and _quote_reply else "")
             except Exception as _e:
                 _elapsed = int(time.monotonic() - _t0)
                 verdict = _dispatch_verdict(exc=_e, elapsed_sec=_elapsed)
@@ -38205,6 +38237,13 @@ _CHATGPT_DONE_PROBE_JS = _cg_js("""() => {
         }
     }
     const bl = (document.body?.innerText || '');
+    // ⛔ Wave 15 (10-02): a document that is not DRAWN answers innerText with its
+    // whole source — scripts included. The hidden old report frame's inline
+    // `<script type=module>` read as text_len 13391747 on 10-01, and the done
+    // check handed that to the report read. So its length counts only when the
+    // document is drawn: a body with boxes, in a frame with a size.
+    const drawn = !!(document.body && document.body.getClientRects().length
+                     && (window.innerWidth || 0) > 0 && (window.innerHeight || 0) > 0);
     // The thinking-time badge — renders only AFTER the thinking phase
     // completes. With Stop button gone + this badge present, we're as
     // confident as we can be that DR is fully settled.
@@ -38291,7 +38330,8 @@ _CHATGPT_DONE_PROBE_JS = _cg_js("""() => {
         '[data-mcp-app-frame] iframe, [data-mcp-app-side-panel-frame-container] iframe, ' +
         'iframe[src*="web-sandbox.oaiusercontent.com"]');
     return { hasStop, thoughtFor, researchDone, completedChip, docPanelAffordances,
-             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };
+             assistantLen, panelLen, bodyLen: drawn ? bl.length : 0, sources, steps, vw, vh,
+             drApp };
 }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
 
 # A non-main context must be a real surface before its download-button scan may
@@ -85654,139 +85694,85 @@ async def run_server(port=8000):
     _QUEUE_STATE["queue_ref"] = _job_queue
     _QUEUE_STATE["recompute_fn"] = None  # set below after defining helper
 
-    def _flip_txn_stage(tx, root) -> str:
-        """Which Firestore RPC was refused — the one thing 20 logged failures
-        never said.
-
-        The library masks a denial inside a transaction as "the transaction has
-        no transaction ID, so it cannot be rolled back", which describes the
-        rollback and not the fault. But that message is itself the evidence:
-        `Transaction._id` is set only AFTER BeginTransaction returns, so an
-        absent id means BeginTransaction is what was refused — before any
-        document was read or written, and therefore upstream of every rule
-        predicate about deviceId or ownership. An id that IS present narrows it
-        to the read or the commit instead.
-
-        Kept a named function, not an f-string at the call site, so the polarity
-        can be tested without provoking a real denial.
-        """
-        try:
-            began = getattr(tx, "_id", None) is not None
-        except Exception:
-            return "stage=unknown (transaction object unreadable)"
-        if not began:
-            return ("stage=BeginTransaction — no transaction id was ever issued, "
-                    "so the denial is on opening the transaction itself, not on "
-                    "the document read or the write payload")
-        _dbg = getattr(root, "debug_error_string", "") or ""
-        return ("stage=read_or_commit — the transaction opened, so the denial is "
-                "on the document"
-                + (f" | grpc={str(_dbg)[:200]}" if _dbg else ""))
-
     def _flip_queued_to_ongoing(uid_val, research_id_val):
         """Worker pickup: flip status from queued → ongoing and clear queue
-        fields. Transactional — only flips if current status is "queued",
-        so a concurrent cancel that wrote status="stopped" between dequeue
-        and this call wins the race. Without this, a cancel landing in the
-        ms between worker dequeue and worker.flip() would be silently
-        overwritten back to "ongoing" and the user would see "Cancelled" in
-        chat while the tile said running. No-op if Firestore is unavailable
-        or uid/rid missing (HTTP /api/runs path doesn't carry them)."""
+        fields — only while the record still says "queued", so a concurrent
+        cancel that wrote status="stopped" between dequeue and this call wins
+        the race. Without that, a cancel landing in the ms between worker
+        dequeue and worker.flip() would be silently overwritten back to
+        "ongoing" and the user would see "Cancelled" in chat while the tile said
+        running. No-op if Firestore is unavailable or uid/rid missing (HTTP
+        /api/runs path doesn't carry them).
+
+        ⛔⛔ WAVE 15 (10-02): NO TRANSACTION, BECAUSE THIS MACHINE MAY NOT OPEN
+        ONE. The flip used to be a Firestore transaction, and it failed on every
+        run in the corpus — twenty of twenty, and on 10-02 on a sharer's run —
+        with the stage read as "BeginTransaction": the rules deny this machine's
+        synth user a transaction on the user tree (#720, "Track D denies
+        synth-user transactional reads"), before any document is touched, which
+        is why re-minting the token never helped. The plain read the caller
+        fell back to has worked every time. So the flip IS that read now, plus
+        an update with a precondition on the record's update time — the
+        compare-and-set `_try_claim_queue_doc` already uses: a write that lands
+        between our read and ours fails the precondition, and the record is
+        read again. Same guarantee, no BeginTransaction."""
         if not (_firebase_db and uid_val and research_id_val):
             return
         try:
             from google.cloud import firestore as _firestore
+            import google.api_core.exceptions as _gax
             doc_ref = _firebase_db.collection("users").document(uid_val) \
                 .collection("researches").document(research_id_val)
 
-            @_firestore.transactional
-            def _flip_txn(tx):
-                snap = doc_ref.get(transaction=tx)
+            def _flip_once():
+                snap = doc_ref.get()
                 if not snap.exists:
                     return "missing"
                 cur = (snap.to_dict() or {}).get("status")
                 if cur != "queued":
                     return f"skipped({cur})"
-                tx.update(doc_ref, _be_payload({
-                    "status": "ongoing",
-                    "queuePosition": _firestore.DELETE_FIELD,
-                    "queuedBehindRunId": _firestore.DELETE_FIELD,
-                    "queuedBehindTitle": _firestore.DELETE_FIELD,
-                }))
+                try:
+                    doc_ref.update(_be_payload({
+                        "status": "ongoing",
+                        "queuePosition": _firestore.DELETE_FIELD,
+                        "queuedBehindRunId": _firestore.DELETE_FIELD,
+                        "queuedBehindTitle": _firestore.DELETE_FIELD,
+                    }), option=_firebase_db.write_option(
+                        last_update_time=snap.update_time))
+                except _gax.FailedPrecondition:
+                    return "raced"   # somebody wrote it after our read
                 return "flipped"
 
-            # #720: a stale gRPC idToken (missing the deviceId claim) makes the
-            # transaction's first READ fail deviceMemberOf → google-cloud-firestore
-            # masks it as "transaction has no transaction ID". Heal re-mints a
-            # claim-bearing token and re-runs with a FRESH transaction object.
-            #
-            # ⚠ 2026-08-06 — THAT DIAGNOSIS IS NOT WHAT THE LIBRARY DOES, and the
-            # heal's own output says so: "the re-minted token did NOT clear the
-            # denial — so a stale credential was not the cause", 20 occurrences
-            # across the corpus and not one success. Reading the installed
-            # google-cloud-firestore: `_Transactional._pre_commit` calls
-            # `transaction._begin(...)` EAGERLY, `_begin` issues a real
-            # BeginTransaction RPC and only sets `self._id` afterwards, and
-            # `_rollback` opens with `if not self.in_progress: raise ValueError`
-            # where `in_progress` is `self._id is not None`. A denied READ, a
-            # denied COMMIT and a denied ROLLBACK all leave `_id` set and would
-            # surface as a bare PermissionDenied — so the ValueError we see can
-            # only come from BeginTransaction ITSELF being denied, before any
-            # document is touched. That is upstream of every rule predicate the
-            # heal reasons about, which is exactly why re-minting cannot help.
-            # `_flip_tx` is captured so the except block can report whether an id
-            # was ever obtained, and turn that reading into proof next run.
-            _flip_tx = _firebase_db.transaction()
-            outcome = _grpc_write_with_heal(
-                lambda: _flip_txn(_flip_tx),
-                what=f"flip queued→ongoing {research_id_val[:8]}…", uid=uid_val,
-            )
+            outcome = "raced"
+            for _attempt in range(2):
+                outcome = _grpc_write_with_heal(
+                    _flip_once, what=f"flip queued→ongoing {research_id_val[:8]}…",
+                    uid=uid_val)
+                if outcome != "raced":
+                    break
+            if outcome == "raced":
+                # Written twice under us: let the caller's own read decide.
+                log(f"[flip] {research_id_val[:8]}… changed under the flip twice — "
+                    f"the caller reads it once more", "DEBUG")
+                return "error"
             if outcome.startswith("skipped"):
                 log(f"[flip] {research_id_val[:8]}… {outcome} — leaving status as-is (cancel race won)", "INFO")
             elif outcome == "missing":
                 log(f"[flip] {research_id_val[:8]}… research doc missing — Q3 cascade-cancel should catch this", "WARN")
             return outcome
         except Exception as e:
-            # 2026-05-28: surface the ROOT cause. A permission error inside the
-            # transaction makes google-cloud-firestore raise "transaction has no
-            # transaction ID, so it cannot be rolled back", which MASKS the real
-            # 403 (the flip's research-doc update was denied — see the
-            # deviceUpdatingFor self-heal fix). Log __cause__/__context__ so any
-            # future flip failure is diagnosable instead of misleading.
-            # ⚠ Lead with the ROOT. Appending it was not enough: the line opened
-            # with "The transaction has no transaction ID, so it cannot be rolled
-            # back", which is an artifact of the rollback and not a fault anyone
-            # can act on, and the PermissionDenied that actually happened sat at
-            # the end past a device id. Every occurrence in the live corpus reads
-            # that way.
+            # Lead with the ROOT cause, as the heal's own line does.
             _root = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
             _head = f"{type(_root).__name__}: {_root}" if _root is not None else str(e)
-            # ⛔⛔ 2026-08-20 — THIS WAS A WARN FOR A WRITE THAT IS NEVER NEEDED.
-            # The comment on the caller's fallback says it plainly: this flip has
-            # failed on EVERY run in the corpus, twenty occurrences and zero
-            # successes — and the fallback plain-read has resolved the status
-            # every single time, because the app has already set it. So the run is
-            # never affected, and the operator was handed two WARNs and a
-            # paragraph of transaction diagnostics per run for a no-op.
-            #
-            # Owner, 2026-08-20, on this exact line: take care of the false alarm.
-            # The alerting rule this file already follows is "speak when a PERSON
-            # must act"; nobody can act on this and nothing is lost.
-            #
-            # ⭐ Kept at full detail, ONCE per process, keyed on the root cause's
-            # class — via the same `logquiet` primitive wave 2 added for the
-            # telemetry flood. The root cause is still unnamed, so the day it
-            # changes class the new one still speaks. What stops is the repetition
-            # (and the level: the caller downgrades this to DEBUG the moment its
-            # read resolves the status, which is the measured 100% case).
+            # ⛔ 2026-08-20 (the owner): nobody can act on this and the caller's
+            # read decides the run — so DEBUG, once per process per root cause.
             _emit_flip, _flip_dropped = _FLIP_403_QUIET.consider(
-                "flip-txn-refused", f"{type(_root).__name__ if _root else type(e).__name__}")
+                "flip-refused", f"{type(_root).__name__ if _root else type(e).__name__}")
             if _emit_flip:
                 log(
-                    f"[flip] could not open the queued→ongoing transaction for "
-                    f"{research_id_val}: {_head}"
+                    f"[flip] could not flip {research_id_val} from queued to ongoing: "
+                    f"{_head}"
                     + (f" | surfaced as: {e}" if _root is not None else "")
-                    + f" | {_flip_txn_stage(locals().get('_flip_tx'), _root)}"
                     + " | the caller falls back to a plain read; this is not a "
                       "run-affecting failure"
                     + logquiet.suppressed_note(_flip_dropped),
