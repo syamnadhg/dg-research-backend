@@ -11,10 +11,15 @@ the podcast without a Chrome download, Gemini just waits, three lows.
       recovered-by-itself flag, the durable decision, the tile — only that
       research's, only Phase 2's, never one already answered; a fresh run takes
       down nothing.
+  E*  a report read that fails because the browser closed is a crash, not a
+      card, for EVERY agent — Claude's and Gemini's too, not only ChatGPT's.
   G*  Gemini's plan wait: ten minutes, not six; never reloaded; nothing on an
       unproven tab believed or pressed; handed on with the late-Start watch
       armed on the run's own chat only; while the watch is armed the round-robin
-      runs no stuck check and no computer-use completion look.
+      runs no stuck check and no computer-use completion look. After a person's
+      Retry the same (G7-G15): no computer use, no planning card, an unstarted
+      Gemini handed back watched — only when its brief went in — and no
+      "Gemini recovered" notice unless a card is up to take down.
   P*  the podcast: the catch is armed around the page's own Download, lets
       thumbnails through, answers 204 (never an abort's error page), closes a
       tab the press opened; the fetch's refusals, size and content checks; the
@@ -52,6 +57,7 @@ SUITES = {
     "gemini": (_T + "gemini_waits_1002" + ".py", "tests/test_gemini_plan_wait_1001" + ".py"),
     "podcast": (_T + "podcast_fetch_1002" + ".py",),
     "lows": (_T + "lows_1002" + ".py",),
+    "every": (_T + "every_agent_crash_1002" + ".py",),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
@@ -146,6 +152,45 @@ MUTANTS = [
     ("G6", RESEARCH, "gemini", "⛔⛔ computer use looks at a planning Gemini — the door to a Redo, a card and a drop",
      [("            if name == \"Gemini\" and p.get(\"gemini_watch_start\"):\n                continue\n",
        "            if False:\n                continue\n")]),
+    # ── G7-G15: after a person's Retry, Gemini just waits too ───────────────
+    ("G7", RESEARCH, "gemini", "⛔⛔ a Gemini the Retry handed back unstarted is not watched — its late Start is never pressed, and the stuck check looks at its plan",
+     [("                \"gemini_watch_start\": _agent_name == \"Gemini\" and verified_h is None,\n",
+       "                \"gemini_watch_start\": False,\n")]),
+    ("G8", RESEARCH, "gemini", "⛔⛔ a Retry whose brief did not go in is watched — the watch presses on a tab that is not provably the run's",
+     [("                \"gemini_watch_start\": _agent_name == \"Gemini\" and verified_h is None,\n",
+       "                \"gemini_watch_start\": _agent_name == \"Gemini\" and not verified_h,\n")]),
+    ("G9", RESEARCH, "gemini", "⛔⛔ the planning card is back after a person's Retry (\"Gemini couldn't start Deep Research\")",
+     [("        return (new_page, None)\n",
+       "        fail_agent(\"gemini\", *_GEMINI_CANT_START)\n        return (new_page, None)\n")]),
+    ("G10", RESEARCH, "gemini", "⛔⛔ computer use is pointed at the plan again after a person's Retry",
+     [("        return (new_page, None)\n",
+       "        await agent_loop(cua_client, browser, PROMPT_DIAGNOSE, \"Start research\",\n"
+       "                         model=CUA_MODEL, max_iterations=10, verbose=verbose)\n"
+       "        return (new_page, None)\n")]),
+    ("G11", RESEARCH, "gemini", "⛔ an unstarted Gemini is handed back as researching — no watch, the stuck check and computer use look at its plan",
+     [("        return (new_page, None)\n", "        return (new_page, True)\n")]),
+    ("G12", RESEARCH, "gemini", "⛔⛔ a Start confirmed a leg late puts up \"Gemini recovered\" with no card to take down",
+     [("                        if _AGENT_ERROR_CARD_TS.get(\"gemini\"):\n",
+       "                        if True:\n")]),
+    ("G13", RESEARCH, "gemini", "⛔ the card's stamp outlives its retraction — a later completion 'retracts' it again",
+     [("                                _clear_pending_decision(\"gemini\")\n"
+       "                                _AGENT_ERROR_CARD_TS.pop(\"gemini\", None)\n",
+       "                                _clear_pending_decision(\"gemini\")\n")]),
+    ("G14", RESEARCH, "gemini", "⛔ a Start the Retry pressed and saw take is never believed — a running research is watched for a Start",
+     [("                if await verify_gemini_generating(new_page):\n                    return (new_page, True)\n",
+       "                if await verify_gemini_generating(new_page):\n                    return (new_page, None)\n")]),
+    ("G15", RESEARCH, "gemini", "the log never says the Retry's Gemini is waiting for its own start",
+     [("            elif verified_h is None:\n", "            elif False:\n")]),
+
+    # ── E: a dead browser is a crash, not a card, for every agent ──────────
+    ("E1", RESEARCH, "every", "⛔⛔ only ChatGPT's empty read asks the browser — Claude's and Gemini's crash gets a card",
+     [("    if await _browser_context_is_dead(browser):\n"
+       "        log(f\"[{name}] the whole browser is gone, not just this tab — no card; \"",
+       "    if name == \"ChatGPT\" and await _browser_context_is_dead(browser):\n"
+       "        log(f\"[{name}] the whole browser is gone, not just this tab — no card; \"")]),
+    ("E2", RESEARCH, "every", "⛔ Claude and Gemini are shown \"failed\" and saved \"errored\" for a crash the run retries silently",
+     [("    elif n_chars <= 0 and await _browser_context_is_dead(browser):\n",
+       "    elif name == \"ChatGPT\" and n_chars <= 0 and await _browser_context_is_dead(browser):\n")]),
 
     # ── P: the podcast without a Chrome download ────────────────────────────
     ("P1", RESEARCH, "podcast", "⛔⛔ the catch is never armed — Chrome downloads the podcast again",
