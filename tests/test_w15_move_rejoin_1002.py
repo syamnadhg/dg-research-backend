@@ -153,18 +153,19 @@ def test_the_worker_it_was_moved_off_takes_its_chats_back(monkeypatch, tmp_path)
     assert not _said(m2, "goes back into them") and not _said(m2, "starts fresh")
 
 
-@pytest.mark.parametrize("from_worker", [1, None, "2", True],
+@pytest.mark.parametrize("from_worker, taker", [(1, 2), (None, 2), ("2", 2), (True, 1)],
                          ids=["another-worker", "not-recorded", "text", "bool"])
-def test_another_worker_starts_the_phase_fresh(monkeypatch, tmp_path, from_worker):
+def test_another_worker_starts_the_phase_fresh(monkeypatch, tmp_path, from_worker, taker):
     """⛔⛔ Another worker is another Chrome profile, signed in to other
     accounts: the chats are not its own. The run is still taken — only its Phase
     2 starts fresh, as before. A marker that does not say plainly which worker it
-    came from proves nothing."""
-    m, _folder = _moved_with_chats(monkeypatch, tmp_path, taker=2, from_worker=from_worker)
+    came from proves nothing (`True` is not worker 1, though Python says it
+    equals 1)."""
+    m, _folder = _moved_with_chats(monkeypatch, tmp_path, taker=taker, from_worker=from_worker)
     [job] = _rescan(monkeypatch, m)
     assert job["research_id"] == RID, "the run itself was not taken"
     assert "p2_rejoin" not in job, job
-    assert _said(m, "this is worker 2, signed in to other accounts", "starts fresh"), m.lines
+    assert _said(m, f"this is worker {taker}, signed in to other accounts", "starts fresh"), m.lines
 
 
 # ══ 3. the worker loop passes them into the run ══════════════════════════════

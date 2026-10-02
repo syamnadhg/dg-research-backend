@@ -644,9 +644,11 @@ def test_the_flip_degrade_leads_with_the_root_cause():
     # DEBUG because the transaction is a compensated no-op (see the caller's
     # fallback read), but it must still LEAD with the root cause rather than the
     # rollback artifact — that is what this test exists to hold.
-    assert 'f"[flip] could not open the queued→ongoing transaction for "' in src, (
-        "the flip degrade no longer leads with the root cause")
-    assert '{_head}' in src.split("could not open the queued→ongoing", 1)[1][:400], (
+    # Wave 15: the flip is a read plus a guarded update now, not a transaction,
+    # and the line says what it could not do — still leading with the root.
+    _line = 'f"[flip] could not flip {research_id_val} from queued to ongoing: "'
+    assert _line in src, "the flip degrade no longer leads with the root cause"
+    assert '{_head}' in src.split(_line, 1)[1][:400], (
         "the root-cause head no longer rides the line")
     assert "Failed to flip queued→ongoing" not in src, (
         "the line is calling a compensated no-op a failure again")

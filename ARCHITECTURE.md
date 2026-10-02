@@ -244,6 +244,16 @@ dies during the rejoin unwinds as a crash rather than setting agents up on it. A
 agent leaves its chat only when it is set up again (`_p2_forget_chat`: a relaunch,
 a hard retry, a chat that failed its proof). An agent in chat mode is not carried,
 since the retry's reset drops its mode, and a Stop ends the rejoin.
+⭐ **A run moved to the queue rejoins the same way** (wave 15, 10-02). The move
+keeps the run's Phase-2 chats — the same snapshot a crash takes, only in Phase 2 or
+before it (`_p2_chats_to_move`) — in its waiting marker beside `from_worker`; the
+worker that takes the run back hands them to `run_pipeline(_p2_rejoin=…)` only when
+it is that worker (`_waiting_p2_chats`). Each worker is its own Chrome profile and
+its own accounts, so on another worker the phase starts fresh, as before.
+⭐ **A crash's retry takes down the crashed attempt's cards** (wave 15): as soon as
+its record is bound, every Phase-2 agent card that attempt raised for this research
+and nobody answered is retracted by its own alert id, as a recovered-by-itself
+signal, its durable decision cleared (`_retract_crashed_attempt_cards`).
 
 **B. One agent's tab dies inside the Phase 2 round-robin** — nothing is rebuilt
 and nothing resumes. The per-tick crash sweep runs before any per-agent work,

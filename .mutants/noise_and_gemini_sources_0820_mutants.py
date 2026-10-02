@@ -124,8 +124,9 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      [T_NEW]),
     ("F2", SRC, "under", "the line goes back to calling it a failure, which is "
      "the wording that made me report it as one",
-     [('                    f"[flip] could not open the queued→ongoing transaction for "',
-       '                    f"Failed to flip queued→ongoing for "')],
+     # Wave 15: the flip is no transaction any more, and its line says so.
+     [('                    f"[flip] could not flip {research_id_val} from queued to ongoing: "',
+       '                    f"Failed to flip queued→ongoing for {research_id_val}: "')],
      [T_NEW]),
     ("F3", SRC, "over", "⛔⛔ the path where the fallback read ALSO failed is "
      "quietened too. Nobody then knows the status — the one case in this whole "
@@ -143,9 +144,9 @@ MUTANTS: list[tuple[str, str, str, str, list[tuple[str, str]], list[str]]] = [
      "class is swallowed by the first one's marker — and the root cause here is "
      "still unnamed, so that is exactly the signal we would lose",
      [('            _emit_flip, _flip_dropped = _FLIP_403_QUIET.consider(\n'
-       '                "flip-txn-refused", f"{type(_root).__name__ if _root else type(e).__name__}")',
+       '                "flip-refused", f"{type(_root).__name__ if _root else type(e).__name__}")',
        '            _emit_flip, _flip_dropped = _FLIP_403_QUIET.consider(\n'
-       '                "flip-txn-refused", "same")')],
+       '                "flip-refused", "same")')],
      [T_NEW]),
     ("F6", SRC, "over", "the suppressor widens instead of speaking once, so the "
      "line comes back every fifth and fifteenth attempt",

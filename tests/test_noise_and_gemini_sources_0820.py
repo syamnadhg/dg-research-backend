@@ -202,7 +202,7 @@ class TestTheFlip403IsNotAnAlarm:
 
     def test_it_is_debug_not_warn(self):
         src = inspect.getsource(research)
-        at = src.index("could not open the queued→ongoing transaction")
+        at = src.index("could not flip {research_id_val} from queued to ongoing")
         tail = src[at:at + 700]
         assert '"DEBUG"' in tail, tail
         assert '"WARN"' not in tail, tail
@@ -212,7 +212,7 @@ class TestTheFlip403IsNotAnAlarm:
         assert "Failed to flip queued→ongoing" not in src, (
             "the line still opens by calling a compensated no-op a failure"
         )
-        at = src.index("could not open the queued→ongoing transaction")
+        at = src.index("could not flip {research_id_val} from queued to ongoing")
         assert "not a \nrun-affecting" in src[at:at + 900].replace(
             "run-affecting", "\nrun-affecting", 1) or "run-affecting" in src[at:at + 900]
 
@@ -232,7 +232,7 @@ class TestTheFlip403IsNotAnAlarm:
         directly, which passes whether or not the call site consults it — the
         `helper-pinned-caller-not` trap, exactly. Pin the gate."""
         src = inspect.getsource(research)
-        at = src.index("could not open the queued→ongoing transaction")
+        at = src.index("could not flip {research_id_val} from queued to ongoing")
         before = src[max(0, at - 400):at]
         assert "if _emit_flip:" in before, before[-200:]
 
@@ -243,7 +243,7 @@ class TestTheFlip403IsNotAnAlarm:
         precisely the signal we would be throwing away. An EXACT line, because a
         presence check cannot see a changed argument."""
         src = inspect.getsource(research)
-        assert ('                "flip-txn-refused", '
+        assert ('                "flip-refused", '
                 'f"{type(_root).__name__ if _root else type(e).__name__}")'
                 in src), (
             "the suppressor is no longer keyed on the failure's class"

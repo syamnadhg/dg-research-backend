@@ -47,15 +47,29 @@ AUDIO_URL = ("https://lh3.googleusercontent.com/notebooklm/AKYWMX_mHaNT736Amw27y
 M4A = bytes([0, 0, 0, 32]) + b"ftypM4A " + bytes(4) + b"M4A mp42isom" + bytes(200_000)
 
 
+#: A thumbnail on the same host and path, as NotebookLM's own page draws them.
+THUMB_URL = "https://lh3.googleusercontent.com/notebooklm/AKYWMXthumbnail0001=w64-h64"
+
+
 def _download_row_asks(how: str) -> str:
-    """A script for the fixture page: pressing the menu's Download row asks for
-    the audio's address `how` — "same_tab" (a link followed) or "new_tab"."""
-    act = ("window.open(U, '_blank')" if how == "new_tab" else
-           "{ const a = document.createElement('a'); a.href = U; document.body.append(a); a.click(); }")
+    """A script for the fixture page: pressing the menu's Download row first
+    draws a thumbnail from the audio's own host (an image the catch must let
+    through), then asks for the audio's address `how` — "same_tab" (a link
+    followed), "new_tab" (a tab opened on it) or "blank_tab" (a tab opened
+    blank, then sent to it — the tab that must be closed)."""
+    act = {
+        "new_tab": "window.open(U, '_blank')",
+        # A tab opened blank first and sent to the address: the tab is there.
+        "blank_tab": "{ const w = window.open('about:blank', '_blank');"
+                     " setTimeout(() => { w.location.href = U; }, 30); }",
+        "same_tab": "{ const a = document.createElement('a'); a.href = U;"
+                    " document.body.append(a); a.click(); }",
+    }[how]
     return ("<script>document.addEventListener('click', (e) => {"
             " const row = e.target.closest('[role=\"menuitem\"]');"
             " if (!row || row.textContent.trim() !== 'Download') return;"
-            f" const U = {AUDIO_URL!r}; setTimeout(() => {act}, 0);"
+            f" const img = new Image(); img.src = {THUMB_URL!r}; document.body.append(img);"
+            f" const U = {AUDIO_URL!r}; setTimeout(() => {act}, 60);"
             "});</script>")
 
 
@@ -227,7 +241,7 @@ def _said(r, text):
     return [m for m in r.lines if text in m]
 
 
-@pytest.mark.parametrize("how", ["same_tab", "new_tab"])
+@pytest.mark.parametrize("how", ["same_tab", "new_tab", "blank_tab"])
 def test_the_podcast_is_fetched_from_its_address_with_no_chrome_download(
         chrome, monkeypatch, tmp_path, how):
     """⭐⭐ THE FEATURE. The page's own Download is pressed once; the request it
@@ -237,6 +251,8 @@ def test_the_podcast_is_fetched_from_its_address_with_no_chrome_download(
     left behind. Before: "Audio downloaded via Playwright"."""
     r = _run(chrome, monkeypatch, tmp_path, how=how)
     assert r.api.asked == [AUDIO_URL], r.api.asked
+    # The thumbnail on the same host was let through, not taken for the audio.
+    assert THUMB_URL in r.stopped, r.stopped
     assert r.downloads == [], "Chrome started a download"
     assert "download_audio_overview" not in r.cua, r.cua
     path = r.out["audio_path"]

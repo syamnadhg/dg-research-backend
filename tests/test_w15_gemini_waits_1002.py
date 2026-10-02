@@ -292,6 +292,7 @@ def test_a_gemini_whose_research_has_not_started_is_left_to_wait(round_robin):
     assert out.looks == [], out.looks
     assert out.cards == [], out.cards
     assert not [m for m in out.lines if "CUA arbiter deciding stuck-vs-slow" in m]
+    assert not [m for m in out.lines if "CUA checking completion" in m]
 
     out2 = round_robin(watch=False, minutes=40)
     assert "poll-stuck-arbiter" in out2.looks, out2.looks

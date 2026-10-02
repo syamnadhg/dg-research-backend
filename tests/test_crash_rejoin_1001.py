@@ -25,7 +25,6 @@ Only the edges are stubbed: Chrome, the pages' readers, the round-robin.
 import ast
 import asyncio
 import inspect
-import json
 import textwrap
 
 import pytest
@@ -275,7 +274,7 @@ def p2(monkeypatch, tmp_path):
 
 
 def _resume_lines(logs):
-    return [l for l in logs if l.startswith("[resume]")]
+    return [ln for ln in logs if ln.startswith("[resume]")]
 
 
 # ══ 1. the 09-30 evening, after the fix ══════════════════════════════════════
@@ -379,8 +378,8 @@ def test_a_chat_that_cannot_be_proven_falls_back_for_that_agent_only(p2, who, ur
     for n in others:
         assert agents[n]["page"] is browser.lands[{"ChatGPT": CG_URL, "Claude": CL_URL,
                                                     "Gemini": GM_URL}[n]]
-    assert any(l.startswith(f"[resume] {who}: ") and l.endswith("starting it again")
-               for l in p2.logs)
+    assert any(ln.startswith(f"[resume] {who}: ") and ln.endswith("starting it again")
+               for ln in p2.logs)
 
 
 def test_a_chat_that_will_not_open_falls_back_for_that_agent_only(p2):
@@ -1083,7 +1082,7 @@ def test_the_rejoin_lines_keep_chat_addresses_out_of_the_run_log(p2):
     with pytest.raises(_Launched):
         p2.run(CHATS, browser=browser)
     lines = _resume_lines(p2.logs)
-    assert any("would not open" in l for l in lines)
-    assert any("sidebar hunt raised" in l for l in lines)
+    assert any("would not open" in ln for ln in lines)
+    assert any("sidebar hunt raised" in ln for ln in lines)
     for chat_id in ("4d24eb39", "e91e413e201fee2a"):
-        assert not [l for l in lines if chat_id in l], chat_id
+        assert not [ln for ln in lines if chat_id in ln], chat_id

@@ -72986,15 +72986,6 @@ class _NlmAudioCatch:
                 await route.abort()
             except Exception:
                 pass
-        # A Download the page opened in a tab of its own: that tab now holds an
-        # error page and nothing else — close it.
-        try:
-            tab = req.frame.page
-            if id(tab) not in self._tabs_before:
-                await tab.close()
-        except Exception:
-            pass
-
     async def disarm(self) -> None:
         if self._ctx is None:
             return
@@ -73002,6 +72993,22 @@ class _NlmAudioCatch:
             await self._ctx.unroute(_NLM_AUDIO_URL_RE, self._on_route)
         except Exception:
             pass
+        # A Download that opened a tab of its own leaves it blank (or on the
+        # audio's address): close it. ⛔ Found from the context's tabs, not from
+        # the request — a new tab's first request has no frame to ask yet.
+        # Only a tab opened since the catch went on, and only a blank one.
+        for tab in list(getattr(self._ctx, "pages", None) or []):
+            if id(tab) in self._tabs_before:
+                continue
+            try:
+                url = str(tab.url or "")
+            except Exception:
+                url = ""
+            if url in ("", "about:blank") or _NLM_AUDIO_URL_RE.match(url):
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
         self._ctx = None
 
     async def wait(self, seconds: float = _NLM_AUDIO_CATCH_WAIT_S) -> str:
