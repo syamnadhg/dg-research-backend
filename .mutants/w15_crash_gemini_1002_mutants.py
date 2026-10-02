@@ -29,6 +29,21 @@ the podcast without a Chrome download, Gemini just waits, three lows.
       route's JSON is a cut; the flip is a read plus a guarded update, read
       again on a race.
 
+  ── review 10-02 (the repair batch) ──
+  R*  a crash or a move carries the chat ChatGPT's and Claude's brief went into,
+      never one their tab wandered to (only Gemini follows its tab, and a note
+      that is not a chat gives way to the tab's chat); a ChatGPT chat dated
+      older than the run is never carried, and the log says so; any worker of
+      this computer takes a moved run's chats (M6/M7, "only the worker it left",
+      went with that decision).
+  K12+ an automatic skip drops the card stamp (both finalizers); a crash after
+      Phase 2 forgets this research's stamps, and only this research's.
+  G16+ auto-skip off: one ask at the 90-minute ceiling for a Gemini whose
+      research has not started; a failed plan is one honest card, parked as a
+      mid-run error (a fresh chat on Retry, "couldn't start" when unanswered),
+      never read as a report or salvaged; only a settled failed turn counts.
+  P10+ the player's own stream is let through; the no-address line is said.
+
 ⛔ ANCHORS ARE SINGLE STRING LITERALS AND MUST MATCH EXACTLY ONCE, and every
 mutated file must still COMPILE. Both are harness faults, counted OUT.
 ⛔ BYTES BACK, NOT TEXT — a text restore would flip a CRLF checkout's line endings.
@@ -58,6 +73,7 @@ SUITES = {
     "podcast": (_T + "podcast_fetch_1002" + ".py",),
     "lows": (_T + "lows_1002" + ".py",),
     "every": (_T + "every_agent_crash_1002" + ".py",),
+    "rejoin": ("tests/test_crash_rejoin_1001" + ".py", _T + "move_rejoin_1002" + ".py"),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
@@ -79,13 +95,8 @@ MUTANTS = [
     ("M5", RESEARCH, "move", "⛔ a chat record that cannot be read fails the move itself",
      [("        return _p2_chats_to_rejoin()\n    except Exception:\n        return {}\n",
        "        return _p2_chats_to_rejoin()\n    except ZeroDivisionError:\n        return {}\n")]),
-    ("M6", RESEARCH, "move", "⛔⛔ any worker takes the chats — another account's Chrome opens them",
-     [("    if (isinstance(came_from, int) and not isinstance(came_from, bool)\n"
-       "            and came_from == int(worker_id)):",
-       "    if (isinstance(came_from, int) and not isinstance(came_from, bool)):")]),
-    ("M7", RESEARCH, "move", "⛔ `True` is taken for worker 1",
-     [("    if (isinstance(came_from, int) and not isinstance(came_from, bool)\n",
-       "    if (isinstance(came_from, int)\n")]),
+    # M6/M7 ("only the worker it was moved off") were removed with that rule in
+    # the review repair of 10-02 — see R6.
     ("M8", RESEARCH, "move", "⛔⛔ the claim drops the chats it was right to hand on",
      [("        _chats = _waiting_p2_chats(rec, worker_id)\n        if _chats:\n",
        "        _chats = _waiting_p2_chats(rec, worker_id)\n        if False:\n")]),
@@ -251,6 +262,101 @@ MUTANTS = [
     ("L7", RESEARCH, "lows", "⛔ two races hand back 'raced', which the caller does not know",
      [("            if outcome == \"raced\":\n                # Written twice under us",
        "            if False:\n                # Written twice under us")]),
+
+    # ══ review 10-02 ══════════════════════════════════════════════════════
+    # ── R: only this run's chats are carried ────────────────────────────────
+    ("R1", RESEARCH, "rejoin", "⛔⛔ ChatGPT and Claude follow a tab that wandered to an older chat — its report is collected as this run's",
+     [("            pick = live if (_p2_chat_id(k, live) and not _p2_chat_id(k, u)) else u\n",
+       "            pick = live if _p2_chat_id(k, live) else u\n")]),
+    ("R2", RESEARCH, "rejoin", "⛔ a note that is not a chat never gives way to the tab's own chat",
+     [("            pick = live if (_p2_chat_id(k, live) and not _p2_chat_id(k, u)) else u\n",
+       "            pick = u\n")]),
+    ("R3", RESEARCH, "rejoin", "⛔⛔ a ChatGPT chat older than the run is carried",
+     [("        if k == \"chatgpt\" and _chatgpt_tab_is_foreign(pick):\n",
+       "        if False:\n")]),
+    ("R4", RESEARCH, "rejoin", "⛔⛔ every agent follows its tab, not only Gemini",
+     [("        if k == \"gemini\":\n            pick = live",
+       "        if True:\n            pick = live")]),
+    ("R5", RESEARCH, "rejoin", "the log never says why ChatGPT starts again",
+     [("            log(\"[resume] ChatGPT: the chat it was on is older than this run — \"\n"
+       "                \"not going back into it\", \"WARN\")\n",
+       "            pass\n")]),
+    ("R6", RESEARCH, "move", "⛔⛔ only the worker it was moved off takes the chats — the worker that does take it sends every brief again",
+     [("    rid = str((rec or {}).get(\"research_id\") or \"\")\n"
+       "    log(f\"[moved-run] {rid[:8]}… comes back to worker {worker_id} (it was moved off \"",
+       "    rid = str((rec or {}).get(\"research_id\") or \"\")\n"
+       "    if came_from != worker_id:\n        return {}\n"
+       "    log(f\"[moved-run] {rid[:8]}… comes back to worker {worker_id} (it was moved off \"")]),
+
+    # ── K12+: a card that is gone is never taken down again ─────────────────
+    ("K12", RESEARCH, "cards", "⛔⛔ the unanswered-card / time-limit auto-skip keeps the stamp — a later crash says the skipped agent 'is going again'",
+     [("               auto_clear_on_resume=True)\n    _drop_agent_card_stamp(key)\n",
+       "               auto_clear_on_resume=True)\n")]),
+    ("K13", RESEARCH, "cards", "⛔ the verification-wall auto-skip keeps the stamp",
+     [("    _drop_agent_card_stamp(agent_key)\n    _clear_pending_decision()\n",
+       "    _clear_pending_decision()\n")]),
+    ("K14", RESEARCH, "cards", "⛔⛔ a crash after Phase 2 keeps its cards' stamps — the retry takes down a card that is long gone",
+     [("        elif _captured_failure_kind == \"browser_crash\":\n            # Review 10-02",
+       "        elif False:\n            # Review 10-02")]),
+    ("K15", RESEARCH, "cards", "⛔ a crash forgets ANOTHER research's cards",
+     [("        if card_rid == rid:\n            _drop_agent_card_stamp(agent_key)\n",
+       "        if True:\n            _drop_agent_card_stamp(agent_key)\n")]),
+
+    # ── G16+: what still reaches the person ─────────────────────────────────
+    ("G16", RESEARCH, "gemini", "⛔⛔ auto-skip off: a Gemini that never starts waits for ever, nothing asked",
+     [("            if (_hit_hard_cap and name == \"Gemini\" and p.get(\"gemini_watch_start\")\n"
+       "                    and not p.get(\"hard_cap_asked\")):\n",
+       "            if False:\n")]),
+    ("G17", RESEARCH, "gemini", "⛔ the ask goes up on every tick past the ceiling",
+     [("            if (_hit_hard_cap and name == \"Gemini\" and p.get(\"gemini_watch_start\")\n"
+       "                    and not p.get(\"hard_cap_asked\")):\n",
+       "            if (_hit_hard_cap and name == \"Gemini\" and p.get(\"gemini_watch_start\")):\n")]),
+    ("G18", RESEARCH, "gemini", "⛔ a Gemini whose research started is asked too — its own checks already run",
+     [("            if (_hit_hard_cap and name == \"Gemini\" and p.get(\"gemini_watch_start\")\n"
+       "                    and not p.get(\"hard_cap_asked\")):\n",
+       "            if (_hit_hard_cap and name == \"Gemini\"\n"
+       "                    and not p.get(\"hard_cap_asked\")):\n")]),
+    ("G19", RESEARCH, "gemini", "⛔⛔ a failed plan is read as a finished report — computer use and 'Couldn't read Gemini's report' every ten minutes",
+     [("                _ws_failed = await _gemini_watched_plan_failed(p[\"page\"])\n",
+       "                _ws_failed = \"\"\n")]),
+    ("G20", RESEARCH, "gemini", "⛔⛔ the failed plan is not parked — a card on every leg",
+     [("                    p[\"awaiting_decision\"] = {\"kind\": \"agent_error\", \"key\": \"gemini\",\n"
+       "                                              \"since\": time.time(), \"timeout\": _pf_window}\n"
+       "                    continue\n",
+       "                    continue\n")]),
+    ("G21", RESEARCH, "gemini", "⛔⛔ after the card the leg goes on into the done check",
+     [("                                              \"since\": time.time(), \"timeout\": _pf_window}\n"
+       "                    continue\n",
+       "                                              \"since\": time.time(), \"timeout\": _pf_window}\n")]),
+    ("G22", RESEARCH, "gemini", "⛔ an unanswered failed-plan card says Gemini 'started fine' and failed partway",
+     [("                    results[name] = {\"status\": \"plan_failed\", \"text\": \"\",",
+       "                    results[name] = {\"status\": \"agent_error\", \"text\": \"\",")]),
+    ("G23", RESEARCH, "gemini", "⛔ the failed-plan card ignores the auto-skip setting",
+     [("                    _pf_window = unacted_window_sec(_runtime.auto_skip_stuck)\n",
+       "                    _pf_window = unacted_window_sec(True)\n")]),
+    ("G24", RESEARCH, "gemini", "⛔ the time limit 'salvages' a failed plan — an extraction on a page that holds nothing",
+     [("                            and (results.get(name) or {}).get(\"status\") != \"plan_failed\"):",
+       "                            and True):")]),
+    ("G25", RESEARCH, "gemini", "⛔⛔ a turn still changing is called failed — a plan that restates a brief about a failure gets a card",
+     [("        if not second.get(\"found\") or (_gemini_norm(second.get(\"text\") or \"\")\n"
+       "                                       != _gemini_norm(latest)):\n",
+       "        if not second.get(\"found\"):\n")]),
+    ("G26", RESEARCH, "gemini", "⛔⛔ a failure line above an enabled Start, or under a running research, gets a card",
+     [("    return \" \".join(latest.split())[:200] if verdict == \"failed\" else \"\"\n",
+       "    return \" \".join(latest.split())[:200]\n")]),
+    ("G27", RESEARCH, "gemini", "⛔⛔ a half-read 'done' survives into the park — the person's Retry is swallowed as 'already completed'",
+     [("                    void_completion_signals(p)\n"
+       "                    p[\"awaiting_decision\"] = {\"kind\": \"agent_error\", \"key\": \"gemini\",\n",
+       "                    p[\"awaiting_decision\"] = {\"kind\": \"agent_error\", \"key\": \"gemini\",\n")]),
+
+    # ── P10+: the podcast's two unmeasured lines ────────────────────────────
+    ("P10", RESEARCH, "podcast", "⛔ the player's own stream is stopped and its address fetched",
+     [("        if kind in (\"image\", \"media\") or self.url:\n",
+       "        if kind in (\"image\",) or self.url:\n")]),
+    ("P11", RESEARCH, "podcast", "the log never says Chrome downloads it when the Download asked for nothing",
+     [("            log(\"[Audio] the page's Download asked for no audio address this run \"\n"
+       "                \"knows — Chrome downloads it, as before\", \"WARN\")\n",
+       "            pass\n")]),
 ]
 
 

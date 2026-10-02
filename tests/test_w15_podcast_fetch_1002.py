@@ -49,6 +49,9 @@ M4A = bytes([0, 0, 0, 32]) + b"ftypM4A " + bytes(4) + b"M4A mp42isom" + bytes(20
 
 #: A thumbnail on the same host and path, as NotebookLM's own page draws them.
 THUMB_URL = "https://lh3.googleusercontent.com/notebooklm/AKYWMXthumbnail0001=w64-h64"
+#: The player's own stream of the audio, on the same host and path.
+PLAYER_URL = ("https://lh3.googleusercontent.com/notebooklm/AKYWMXplayerstream0001"
+              "=m140?authuser=0")
 
 
 def _download_row_asks(how: str) -> str:
@@ -58,6 +61,13 @@ def _download_row_asks(how: str) -> str:
     followed), "new_tab" (a tab opened on it) or "blank_tab" (a tab opened
     blank, then sent to it — the tab that must be closed)."""
     act = {
+        # Asks for nothing on the audio's host: no address the catch can keep.
+        "nothing": "null",
+        # The player loads its own stream from the same host first (a media
+        # request the catch must let through), then the link is followed.
+        "player_first": "{ const au = new Audio(); au.src = P; au.load();"
+                        " setTimeout(() => { const a = document.createElement('a');"
+                        " a.href = U; document.body.append(a); a.click(); }, 150); }",
         "new_tab": "window.open(U, '_blank')",
         # A tab opened blank first and sent to the address: the tab is there.
         "blank_tab": "{ const w = window.open('about:blank', '_blank');"
@@ -69,7 +79,8 @@ def _download_row_asks(how: str) -> str:
             " const row = e.target.closest('[role=\"menuitem\"]');"
             " if (!row || row.textContent.trim() !== 'Download') return;"
             f" const img = new Image(); img.src = {THUMB_URL!r}; document.body.append(img);"
-            f" const U = {AUDIO_URL!r}; setTimeout(() => {act}, 60);"
+            f" const U = {AUDIO_URL!r}; const P = {PLAYER_URL!r};"
+            f" setTimeout(() => {act}, 60);"
             "});</script>")
 
 
@@ -289,3 +300,28 @@ def test_a_fetch_that_fails_falls_back_to_todays_download_and_says_so(
     assert AUDIO_URL in r.stopped
     assert not (tmp_path / "podcasts" / ".audio_fetch.part").exists()
     assert not list((tmp_path / "podcasts").glob("*.m4a"))
+
+
+def test_the_players_own_stream_is_let_through_and_the_download_is_fetched(
+        chrome, monkeypatch, tmp_path):
+    """Review 10-02. The press first loads the player's own stream from the
+    audio's host (a media request), then follows the download link. The stream
+    is let through to the page, untouched; the address fetched is the
+    download's. Taking the stream would answer the player with nothing and fetch
+    the wrong address."""
+    r = _run(chrome, monkeypatch, tmp_path, how="player_first")
+    assert PLAYER_URL in r.stopped, r.stopped
+    assert r.api.asked == [AUDIO_URL], r.api.asked
+    assert r.out["audio_path"].read_bytes() == M4A
+
+
+def test_a_download_that_asks_for_no_audio_address_says_chrome_downloads_it(
+        chrome, monkeypatch, tmp_path):
+    """Review 10-02. The page's Download is pressed and asks for nothing on the
+    audio's host: nothing is fetched, and the log says, once, that Chrome
+    downloads it as before (here, on to the step's own fallbacks)."""
+    r = _run(chrome, monkeypatch, tmp_path, how="nothing")
+    assert r.api.asked == []
+    assert len(_said(r, "the page's Download asked for no audio address this run "
+                        "knows — Chrome downloads it, as before")) == 1, r.lines[-30:]
+    assert not _said(r, "pressing Download again")

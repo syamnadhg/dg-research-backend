@@ -14,8 +14,10 @@ through the queue:
 
   1. the move keeps the run's chats in its marker, beside the worker it was
      moved off — only while the run is in Phase 2 or before it;
-  2. the worker that takes it back hands them to the run only when it IS that
-     worker (each worker is its own Chrome profile, its own accounts);
+  2. whichever worker of this computer takes it back hands them to the run
+     (review 10-02: the worker it was moved off stays off, so another one
+     usually takes it; one signed in to other accounts cannot prove the chats
+     are its own, and those agents start again — tests/test_crash_rejoin_1001.py);
   3. the worker loop passes them into the run.
 
 ⭐ EVERY STEP IS THE REAL CODE: the device-command listener's callback, the
@@ -43,15 +45,25 @@ GEMINI_NOW = "https://gemini.google.com/app/58499e483bcc082c"
 CHATS = {"chatgpt": CHATGPT, "claude": CLAUDE, "gemini": GEMINI_SENT}
 
 
-def _in_phase(monkeypatch, phase, chats=CHATS, *, gemini_tab=None):
+#: When the run began: ten minutes before ChatGPT's chat id (hex seconds) was
+#: minted. An older research chat of the same account: a day before that.
+RUN_START = int("6abf59c5", 16) - 600
+OLDER_CHATGPT = f"https://chatgpt.com/c/{int('6abf59c5', 16) - 86400:08x}-1111-82aa-b3cc-0123456789ab"
+OLDER_CLAUDE = "https://claude.ai/chat/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+
+
+def _in_phase(monkeypatch, phase, chats=CHATS, *, gemini_tab=None, tabs=None):
     """The running pipeline's own record of its Phase-2 chats, as the move finds
     it: the address each agent was sent the brief at, and the tab it is in."""
     rt = research._runtime
     monkeypatch.setattr(rt, "phase", phase)
     monkeypatch.setattr(rt, "p2_chat_urls", dict(chats))
+    monkeypatch.setattr(research, "_run_start_epoch", lambda: RUN_START)
     pages = {k: types.SimpleNamespace(url=u) for k, u in chats.items()}
     if gemini_tab is not None:
         pages["gemini"] = types.SimpleNamespace(url=gemini_tab)
+    for k, u in (tabs or {}).items():
+        pages[k] = types.SimpleNamespace(url=u)
     monkeypatch.setattr(rt, "p2_chat_pages", pages)
     monkeypatch.setattr(rt, "agent_modes", {})
 
@@ -73,6 +85,19 @@ def test_a_move_in_phase_2_keeps_each_agents_chat_beside_the_worker_it_ran_on(
     rec = _marker(folder)
     assert rec["from_worker"] == 2
     assert rec["p2_chats"] == {"chatgpt": CHATGPT, "claude": CLAUDE, "gemini": GEMINI_NOW}
+
+
+def test_a_move_keeps_the_chats_chatgpt_and_claude_were_sent_the_brief_in(
+        monkeypatch, tmp_path):
+    """⛔⛔ Review 10-02. ChatGPT's and Claude's tabs wandered to older research
+    chats of the same account before the move: the marker keeps the chats their
+    brief went into, never the older ones — the run would otherwise go back into
+    an older chat and collect its report as this run's. Before: it kept the
+    older chats."""
+    m, _job_, folder = _running(monkeypatch, tmp_path, worker=2)
+    _in_phase(monkeypatch, 2, tabs={"chatgpt": OLDER_CHATGPT, "claude": OLDER_CLAUDE})
+    _command(monkeypatch, m, _requeue(workerId=2))
+    assert _marker(folder)["p2_chats"] == CHATS
     assert m.exits == ["requeue"], "the move itself did not go through"
 
 
@@ -137,35 +162,27 @@ def _moved_with_chats(monkeypatch, tmp_path, *, taker, from_worker=2, chats=CHAT
     return m, folder
 
 
-def test_the_worker_it_was_moved_off_takes_its_chats_back(monkeypatch, tmp_path):
-    """⭐ The single-worker computer's every move, and any worker turned back on
-    before another took its run: the same Chrome profile, the same accounts."""
-    m, _folder = _moved_with_chats(monkeypatch, tmp_path, taker=2, from_worker=2)
-    [job] = _rescan(monkeypatch, m)
-    assert job["research_id"] == RID and job["p2_rejoin"] == CHATS
-    assert _said(m, "comes back to worker 2", "goes back into them"), m.lines
-
-    # Beside it: the same worker taking a run whose marker kept no chats takes
-    # it as before, saying nothing about chats.
-    m2, _folder2 = _moved_with_chats(monkeypatch, tmp_path / "none", taker=2, chats=None)
-    [job2] = _rescan(monkeypatch, m2)
-    assert job2["research_id"] == RID and "p2_rejoin" not in job2
-    assert not _said(m2, "goes back into them") and not _said(m2, "starts fresh")
-
-
-@pytest.mark.parametrize("from_worker, taker", [(1, 2), (None, 2), ("2", 2), (True, 1)],
-                         ids=["another-worker", "not-recorded", "text", "bool"])
-def test_another_worker_starts_the_phase_fresh(monkeypatch, tmp_path, from_worker, taker):
-    """⛔⛔ Another worker is another Chrome profile, signed in to other
-    accounts: the chats are not its own. The run is still taken — only its Phase
-    2 starts fresh, as before. A marker that does not say plainly which worker it
-    came from proves nothing (`True` is not worker 1, though Python says it
-    equals 1)."""
+@pytest.mark.parametrize("from_worker, taker", [(2, 2), (1, 2), (None, 2)],
+                         ids=["the-worker-it-left", "another-worker", "not-recorded"])
+def test_any_worker_of_this_computer_takes_the_chats_back(monkeypatch, tmp_path,
+                                                          from_worker, taker):
+    """⭐ Review 10-02, the owner's words: "picked up again by the SAME computer
+    re-adopts that run's chats". The worker it was moved off stays off, so
+    another worker usually takes it — and before, that worker sent every brief
+    again. Each worker tries the chats; one signed in to other accounts cannot
+    prove them, and those agents start again (the rejoin's proof)."""
     m, _folder = _moved_with_chats(monkeypatch, tmp_path, taker=taker, from_worker=from_worker)
     [job] = _rescan(monkeypatch, m)
-    assert job["research_id"] == RID, "the run itself was not taken"
-    assert "p2_rejoin" not in job, job
-    assert _said(m, f"this is worker {taker}, signed in to other accounts", "starts fresh"), m.lines
+    assert job["research_id"] == RID and job["p2_rejoin"] == CHATS, job
+    assert _said(m, f"comes back to worker {taker}", "goes back into its chats"), m.lines
+
+    # Beside it: a run whose marker kept no chats is taken as before, saying
+    # nothing about chats.
+    m2, _folder2 = _moved_with_chats(monkeypatch, tmp_path / "none", taker=taker,
+                                     from_worker=from_worker, chats=None)
+    [job2] = _rescan(monkeypatch, m2)
+    assert job2["research_id"] == RID and "p2_rejoin" not in job2
+    assert not _said(m2, "goes back into its chats")
 
 
 # ══ 3. the worker loop passes them into the run ══════════════════════════════
@@ -193,11 +210,11 @@ def test_a_job_with_no_chats_hands_the_run_none(monkeypatch, tmp_path):
     assert len(started) == 1 and started[0]["_p2_rejoin"] is None
 
 
-@pytest.mark.parametrize("taker, rejoined", [(2, True), (1, False)],
-                         ids=["same-worker", "another-worker"])
-def test_move_then_pickup_then_run_end_to_end(monkeypatch, tmp_path, taker, rejoined):
+@pytest.mark.parametrize("taker", [2, 1], ids=["same-worker", "another-worker"])
+def test_move_then_pickup_then_run_end_to_end(monkeypatch, tmp_path, taker):
     """⭐ The whole trip on one disk: worker 2 is moved off mid-Phase 2; then
-    `taker` takes the run from the queue and its worker loop starts it."""
+    `taker` takes the run from the queue and its worker loop starts it — back
+    into the run's chats, whichever worker of this computer it is."""
     m, _job_, folder = _running(monkeypatch, tmp_path, worker=2)
     _in_phase(monkeypatch, 2)
     _command(monkeypatch, m, _requeue(workerId=2))
@@ -211,4 +228,4 @@ def test_move_then_pickup_then_run_end_to_end(monkeypatch, tmp_path, taker, rejo
                               db=m.store, update_research=lambda *a, **k: True,
                               device_id=DEVICE)
     assert len(started) == 1 and started[0]["resume_dir"] == str(folder)
-    assert started[0]["_p2_rejoin"] == (CHATS if rejoined else None), started[0]
+    assert started[0]["_p2_rejoin"] == CHATS, started[0]

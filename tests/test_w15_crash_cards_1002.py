@@ -90,11 +90,11 @@ def machine(tmp_path, monkeypatch):
     # raising=False: on a tree without it, the test fails on what it measures.
     monkeypatch.setattr(research, "_AGENT_ERROR_CARD_OF", {}, raising=False)
 
-    def _attempt(*, crash_retries=0, research_id=RID, cards=(CG_CARD,)):
+    def _attempt(*, crash_retries=0, research_id=RID, cards=(CG_CARD,), crash_phase=2):
         """Attempt number `crash_retries` of the run. The first attempt (0)
         raises `cards` — (agent, title, phase) — with the real `fail_agent`,
-        then Chrome dies in Phase 2. A retry (≥ 1) is stopped as its first phase
-        starts."""
+        then Chrome dies in `crash_phase`. A retry (≥ 1) is stopped as its first
+        phase starts."""
         def _emit(name, phase=None, **kw):
             m.events.append((name, phase, dict(kw)))
             if name == "phase_start" and phase == 0:
@@ -103,8 +103,9 @@ def machine(tmp_path, monkeypatch):
                 for agent, title, card_phase in cards:
                     research._runtime.phase = card_phase
                     research.fail_agent(agent, title, "Retry to run it fresh, or Skip it.")
-                research._runtime.phase = 2
-                raise RuntimeError("research browser died during phase 2 (browser crash)")
+                research._runtime.phase = crash_phase
+                raise RuntimeError(f"research browser died during phase {crash_phase} "
+                                   "(browser crash)")
         monkeypatch.setattr(research, "emit_event", _emit)
         try:
             asyncio.run(research.run_pipeline(
@@ -197,3 +198,55 @@ def test_every_agents_card_is_taken_down(machine):
                            ("gemini", "Gemini couldn't start Deep Research", 2)))
     got = {kw["agent"]: kw["alert_id"] for kw in machine.restart()}
     assert got == {a: f"phase2_agent_{a}_error" for a in ("chatgpt", "claude", "gemini")}
+
+
+# ══ review 10-02: a card that is gone is never "taken down" again ════════════
+# The app treats a take-down with no live card behind it as a NEW amber alert
+# (dg-research src/hooks/usePipeline.ts, near line 3110): "Claude is going
+# again … the earlier alert about Claude no longer applies" about a Claude that
+# was skipped long before.
+
+def _skip_claude_automatically(how):
+    """Claude's card goes unanswered and the run skips Claude by itself, through
+    the REAL finalizer: the unanswered-card / time-limit auto-skip, or the
+    verification-wall one."""
+    if how == "unanswered":
+        asyncio.run(research._finalize_agent_autoskip(
+            None, None, "claude", "Claude", reason="auto_skip_unacted",
+            copy_key="stuck", why="stayed frozen with no response"))
+    else:
+        asyncio.run(research._hv_auto_skip_finalize(None, None, "claude", "Claude"))
+
+
+@pytest.mark.parametrize("how", ["unanswered", "verification-wall"])
+def test_an_agent_skipped_automatically_has_no_card_left_to_take_down(machine, how):
+    """⭐ ChatGPT's and Claude's cards are up; the run skips Claude by itself; then
+    Chrome dies. The retry takes down ChatGPT's card only. Before: it also told
+    the app "Claude is going again"."""
+    machine.attempt(cards=(CG_CARD, CL_CARD))
+    _skip_claude_automatically(how)
+    assert [n for n, _p, _k in machine.events].count("agent_skipped") == 1
+    assert [kw["agent"] for kw in machine.restart()] == ["chatgpt"]
+    assert ("claude", "running") not in machine.tiles
+
+
+def test_a_crash_after_phase_2_takes_down_no_phase_2_card(machine):
+    """Phase 2 is over — here a card nobody answered before the phase was
+    skipped — and Chrome dies in Phase 3: the retry takes down nothing. Beside
+    it, the same card with Chrome dying in Phase 2 is taken down."""
+    machine.attempt(cards=(CL_CARD,), crash_phase=3)
+    assert len(machine.retries) == 1, "the crash in Phase 3 was not retried"
+    assert machine.restart() == []
+    assert "claude" not in research._AGENT_ERROR_CARD_TS
+
+    machine.attempt(cards=(CL_CARD,), crash_phase=2)
+    assert [kw["agent"] for kw in machine.restart()] == ["claude"]
+
+
+def test_a_crash_after_phase_2_leaves_another_researchs_cards_alone(machine):
+    """⛔ The stamps outlive a run in a long-lived worker: a crash in this
+    research's Phase 3 forgets this research's cards only."""
+    machine.attempt(research_id=OTHER_RID, cards=(CG_CARD,))
+    machine.attempt(research_id=RID, cards=(CL_CARD,), crash_phase=3)
+    assert "chatgpt" in research._AGENT_ERROR_CARD_TS
+    assert "claude" not in research._AGENT_ERROR_CARD_TS

@@ -45,6 +45,14 @@ CHATS = {"chatgpt": CG_URL, "claude": CL_URL, "gemini": GM_URL}
 NEW_CG = "https://chatgpt.com/c/6abdb8d7-c264-83e9-994e-2a94839dc3d3"
 NEW_CL = "https://claude.ai/chat/99999999-aaaa-4bbb-8ccc-dddddddddddd"
 
+#: When the 09-30 evening run began: its folder's own stamp, 18:09:08 Pacific —
+#: 411 s before ChatGPT's chat id (hex seconds) was minted at 18:15:59. Pinned as
+#: an instant, so the dating does not move with the machine's time zone.
+RUN_START = int("6abdb44f", 16) - 411
+#: The previous evening's research chat in the same account: one day older.
+OLD_CG = f"https://chatgpt.com/c/{int('6abdb44f', 16) - 86400:08x}-1111-82aa-b3cc-0123456789ab"
+OLD_CL = "https://claude.ai/chat/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+
 BRIEF = ("# Research Brief\n\n## Objective\nSaint Bernard breed health, longevity, "
          "working history and rescue lineage across alpine hospices, kennel clubs "
          "and veterinary registries.\n\n## Scope\nCanine cardiology, hip dysplasia, "
@@ -158,6 +166,7 @@ def p2(monkeypatch, tmp_path):
     monkeypatch.setattr(research, "_write_agent_terminal_status",
                         lambda key, status, **k: ns.statuses.append((key, status)))
     monkeypatch.setattr(research, "_p2_run_dir", lambda: q)
+    monkeypatch.setattr(research, "_run_start_epoch", lambda: RUN_START)
     monkeypatch.setattr(research, "_tracks_dir", None)
     monkeypatch.setattr(research, "_fb_research_id", "rid-1")
     monkeypatch.setenv("DG_P2_STAGGER_SEC", "0")
@@ -532,6 +541,7 @@ def crash(tmp_path, monkeypatch):
     monkeypatch.setattr(research, "Browser", _FakeBrowser)
     monkeypatch.setattr(research, "_profile_dir", lambda *_a, **_k: tmp_path / "profile")
     monkeypatch.setattr(research, "_update_firestore_research", lambda *a, **k: None)
+    monkeypatch.setattr(research, "_run_start_epoch", lambda: RUN_START)
 
     async def _noop_dispatcher():
         return None
@@ -547,10 +557,12 @@ def crash(tmp_path, monkeypatch):
         return await _real_sleep(0)
     monkeypatch.setattr(research.asyncio, "sleep", _fast_sleep)
 
-    def _run(exc, *, at_phase=2, crash_retries=0, rejoin=None, chats=CHATS, modes=None):
+    def _run(exc, *, at_phase=2, crash_retries=0, rejoin=None, chats=CHATS, modes=None,
+             tabs=None):
         """`rejoin`: what this attempt was itself handed by the crash before it.
         `chats`: what Phase 2 noted before Chrome died (None: it got nowhere).
-        `modes`: the agents' recorded modes at the crash."""
+        `modes`: the agents' recorded modes at the crash.
+        `tabs`: {agent: the address its tab is on when Chrome dies}."""
         def _emit(name, phase=None, **_kw):
             # The first thing the main `try` does is announce phase 0; the run is
             # put where the 09-30 crash found it, then Chrome dies.
@@ -559,6 +571,8 @@ def crash(tmp_path, monkeypatch):
                 if chats is not None:
                     research._runtime.agent_chat_urls = dict(chats)
                     research._runtime.p2_chat_urls = dict(chats)
+                if tabs:
+                    research._runtime.p2_chat_pages = {k: _Page(u) for k, u in tabs.items()}
                 if modes:
                     research._runtime.agent_modes = dict(modes)
                 raise exc
@@ -804,7 +818,8 @@ def test_the_first_phase_2_attempt_takes_the_carried_chats_and_no_other_call_doe
                 and n.id == "_p2_rejoin_left"]) == 1
 
 
-# ══ 11. the chat the TAB is on at the crash, not the one it was sent in ══════
+# ══ 11. Gemini: the chat its TAB is on at the crash, not the one it was sent in
+# (ChatGPT and Claude keep the chat noted at the send — section 17.)
 # 09-30 evening run.log:146 — Gemini's send landed on #1cb56678, the digest of
 # /app/3a6f3707328a6fa8. At 18:21:17 the tab navigated, and from 18:21:27 its plan
 # and its research were on /app/e91e413e201fee2a. Nothing in 2D notes the move;
@@ -1086,3 +1101,82 @@ def test_the_rejoin_lines_keep_chat_addresses_out_of_the_run_log(p2):
     assert any("sidebar hunt raised" in ln for ln in lines)
     for chat_id in ("4d24eb39", "e91e413e201fee2a"):
         assert not [ln for ln in lines if chat_id in ln], chat_id
+
+
+# ══ 17. only this run's chats are carried (review, 10-02) ════════════════════
+# ⛔⛔ ChatGPT's and Claude's brief goes as a file, so the chat's first message is
+# the same fixed line on every run (`ASK_TURN`), and the retry's proof cannot
+# tell this run's chat from an older research chat of the same account. Their
+# tabs are known to wander — 2026-08-05: a press landed on a sidebar link titled
+# "Deep research request" and ChatGPT ran on the previous evening's chat. So for
+# them the crash carries the chat noted when the brief went in, never the one the
+# tab wandered to; only Gemini, which really does move its research to another
+# chat, follows its tab. A ChatGPT chat dated older than the run is never carried.
+
+GM_MOVED = "https://gemini.google.com/app/1111222233334444"
+
+
+def test_a_crash_carries_the_chats_chatgpt_and_claude_were_sent_the_brief_in(crash):
+    """⭐ Through the REAL `run_pipeline`: Chrome dies with ChatGPT's and Claude's
+    tabs on older chats and Gemini's on the chat it moved its research to. The
+    retry is handed ChatGPT's and Claude's own chats, and Gemini's new one.
+    Before: ChatGPT and Claude were carried on the older chats."""
+    retries, _cards = crash(_chrome_died(),
+                            tabs={"chatgpt": OLD_CG, "claude": OLD_CL, "gemini": GM_MOVED})
+    assert retries[0]["_p2_rejoin"] == {"chatgpt": CG_URL, "claude": CL_URL,
+                                        "gemini": GM_MOVED}
+
+
+@pytest.mark.parametrize("noted, tab, carried", [
+    ("https://chatgpt.com/", OLD_CG, None),
+    (OLD_CG, OLD_CG, None),
+    ("https://chatgpt.com/", NEW_CG, NEW_CG),
+], ids=["tab-on-older-chat", "noted-on-older-chat", "own-new-chat"])
+def test_a_chatgpt_chat_older_than_the_run_is_never_carried(crash, noted, tab, carried):
+    """The note is not a chat (the send went in on ChatGPT's home): the tab's chat
+    is taken — but never one its own id dates as older than this run. Beside it,
+    the tab on a chat of this run is carried. Before: the older chat was carried."""
+    retries, _cards = crash(_chrome_died(), chats={"chatgpt": noted, "claude": CL_URL},
+                            tabs={"chatgpt": tab})
+    want = {"claude": CL_URL}
+    if carried:
+        want["chatgpt"] = carried
+    assert retries[0]["_p2_rejoin"] == want
+
+
+def test_the_retry_never_collects_an_older_chats_finished_report(p2):
+    """⛔⛔ THE HARM, through the retry's REAL Phase 2: the older chat is finished
+    and its first message is the same line. ChatGPT goes back into its own chat,
+    still researching; the older chat is never opened."""
+    tab = _Page(CG_URL)
+    research._p2_note_chat("chatgpt", tab)
+    tab.url = OLD_CG
+    carried = research._p2_chats_to_rejoin()
+    research._runtime.reset()
+    browser = _Browser({CG_URL: _Page(CG_URL, ASK_TURN, done=False),
+                        OLD_CG: _Page(OLD_CG, ASK_TURN, done=True)})
+    p2.run(carried, browser=browser, enabled=["chatgpt"])
+    assert browser.opened == [CG_URL]
+    assert p2.launched == []
+    assert p2.polled[0]["ChatGPT"]["url"] == CG_URL
+    assert _resume_lines(p2.logs) == [
+        "[resume] ChatGPT: back on its own chat — still researching"]
+
+
+def test_a_chatgpt_left_with_only_an_older_chat_starts_again_and_says_why(p2):
+    """Its brief went in on ChatGPT's home and its tab is on an older chat: nothing
+    is carried, the log says why without the address, and ChatGPT is set up the
+    usual way."""
+    tab = _Page("https://chatgpt.com/")
+    research._p2_note_chat("chatgpt", tab)
+    tab.url = OLD_CG
+    carried = research._p2_chats_to_rejoin()
+    assert carried == {}
+    said = [ln for ln in p2.logs if "older than this run" in ln]
+    assert said == ["[resume] ChatGPT: the chat it was on is older than this run — "
+                    "not going back into it"]
+    research._runtime.reset()
+    p2.run(carried, browser=_Browser({OLD_CG: _Page(OLD_CG, ASK_TURN, done=True)}),
+           enabled=["chatgpt"])
+    assert p2.launched == ["ChatGPT"]
+    assert p2.polled[0]["ChatGPT"]["url"] == NEW_CG

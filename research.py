@@ -9997,32 +9997,30 @@ def _claim_waiting_run(worker_id) -> "dict | None":
 
 
 def _waiting_p2_chats(rec, worker_id) -> dict:
-    """{agent: chat address} a moved run may go back into on worker
-    `worker_id`, or {} when its Phase 2 starts fresh (wave 15, the owner's yes
-    on 10-02).
+    """{agent: chat address} a moved run goes back into on worker `worker_id`,
+    or {} when it kept none (wave 15, the owner's yes on 10-02: "picked up again
+    by the SAME computer re-adopts that run's chats; a different computer starts
+    the phase fresh").
 
-    ⛔⛔ ONLY ON THE WORKER IT WAS MOVED OFF. Each worker is its own Chrome
-    profile, signed in to its own ChatGPT, Claude and Google accounts (the same
-    reason `_p3_notebook_to_reopen` reopens a notebook only on the worker that
-    made it). On another worker the chats are another account's: they would not
-    open, or would open as somebody else's. So there the phase starts fresh, as
-    before. A marker that does not say which worker it came from is treated as
-    another worker's — nothing proves it was this one."""
+    ⭐ ANY WORKER OF THIS COMPUTER TRIES THEM (review 10-02). A moved run waits in
+    this computer's own queue folder, so only this computer's workers can take it,
+    and the worker it was moved off stays off (`_keep_worker_resting`): limiting
+    the chats to that worker meant another worker took the run and sent every
+    brief again — the usage the owner asked to stop wasting. Each worker is its
+    own Chrome profile and may be signed in to other accounts, and that is what
+    the retry's proof is for: a chat of another account does not open, or its
+    first message cannot be read, so that agent starts again the usual way — only
+    that one. A different computer never sees this run's chats at all."""
     chats = (rec or {}).get("p2_chats")
     if not isinstance(chats, dict) or not chats:
         return {}
     came_from = (rec or {}).get("from_worker")
     rid = str((rec or {}).get("research_id") or "")
-    if (isinstance(came_from, int) and not isinstance(came_from, bool)
-            and came_from == int(worker_id)):
-        log(f"[moved-run] {rid[:8]}… comes back to worker {worker_id}, the worker its "
-            f"chats were opened on — its Phase 2 goes back into them", "INFO")
-        return {str(k): str(v) for k, v in chats.items() if k and v}
-    log(f"[moved-run] {rid[:8]}…'s chats were opened on "
-        f"{f'worker {came_from}' if came_from is not None else 'a worker it did not record'}, "
-        f"and this is worker {worker_id}, signed in to other accounts — its Phase 2 "
-        f"starts fresh", "INFO")
-    return {}
+    log(f"[moved-run] {rid[:8]}… comes back to worker {worker_id} (it was moved off "
+        f"{f'worker {came_from}' if came_from is not None else 'a worker it did not record'})"
+        f" — its Phase 2 goes back into its chats, and any it cannot prove are its own "
+        f"start again", "INFO")
+    return {str(k): str(v) for k, v in chats.items() if k and v}
 
 
 def _drop_waiting_claim(run_dir, worker_id) -> None:
@@ -32198,6 +32196,29 @@ _AGENT_ERROR_CARD_TS: dict = {}
 _AGENT_ERROR_CARD_OF: dict = {}
 
 
+def _drop_agent_card_stamp(agent_key) -> None:
+    """`agent_key`'s card is no longer up: it was skipped automatically.
+
+    ⛔ Review 10-02. A person's Skip and Retry drop the stamp, and so does the
+    agent finishing; an automatic skip did not. A crash later in the run then
+    "took down" a card that was long gone, and the app showed that as a new
+    alert — "Claude is going again" — about an agent that had been skipped."""
+    _AGENT_ERROR_CARD_TS.pop(agent_key, None)
+    _AGENT_ERROR_CARD_OF.pop(agent_key, None)
+
+
+def _forget_research_cards(research_id) -> None:
+    """Chrome died after Phase 2: that phase is over, so none of this research's
+    cards is one the crash's retry should take down (it takes down Phase 2's
+    only). Their stamps go now (review 10-02: a card nobody answered before the
+    phase was skipped, then a crash in Phase 3, told the app the agent "is going
+    again")."""
+    rid = str(research_id or "")
+    for agent_key, (card_rid, _phase) in list(_AGENT_ERROR_CARD_OF.items()):
+        if card_rid == rid:
+            _drop_agent_card_stamp(agent_key)
+
+
 def _retract_crashed_attempt_cards(research_id) -> list:
     """A crash retry has started: take down every Phase-2 agent card the
     crashed attempt raised for this research. Returns the agents whose card was
@@ -48559,6 +48580,45 @@ async def _gemini_research_started(page) -> bool:
     return bool(_GEMINI_RESEARCH_CARD_RE.search(body) or _GEMINI_COMPLETION_RE.search(body))
 
 
+#: How far apart the two reads of a failed-looking plan are taken.
+_GEMINI_PLAN_FAIL_SETTLE_SEC = 2.0
+
+
+async def _gemini_watched_plan_failed(page) -> str:
+    """A watched Gemini — its research not started — whose plan FAILED: the
+    failure's own words, or "".
+
+    ⛔⛔ Review 10-02. Gemini's own failed plan ("Sorry, something went wrong",
+    the owner's capture) shows no Stop and does show Share & export, which the
+    round-robin's done check reads as a finished report: computer use was sent
+    to copy it, the read failed, and "Couldn't read Gemini's report" went up
+    about every ten minutes. A failed plan is not a finished report.
+
+    ⭐ The same reader and the same verdict the plan screen has always been
+    judged by (`_gemini_reads_as_failed`, `_gemini_plan_verdict`), on a SETTLED
+    turn: the same text twice, a moment apart. A plan still streaming that
+    restates a brief about a failure is never byte-identical two seconds apart;
+    a failed turn never changes again. Never raises; "" on any doubt."""
+    try:
+        first = await _gemini_regen_read(page)
+        latest = first.get("text") or ""
+        if not (first.get("found") and _gemini_reads_as_failed(latest)):
+            return ""
+        await asyncio.sleep(_GEMINI_PLAN_FAIL_SETTLE_SEC)
+        second = await _gemini_regen_read(page)
+        if not second.get("found") or (_gemini_norm(second.get("text") or "")
+                                       != _gemini_norm(latest)):
+            return ""
+        started = await _gemini_research_started(page)
+        start_present = bool(await page.evaluate(_GEMINI_START_PRESENT_JS))
+    except Exception:
+        return ""
+    verdict = _gemini_plan_verdict(research_started=started,
+                                   start_present=start_present,
+                                   streaming=False, latest_text=latest)
+    return " ".join(latest.split())[:200] if verdict == "failed" else ""
+
+
 # ── The stale deep research: a BOUNDED CADENCE, not a stall detector ─────────
 #
 # ⛔⛔ THERE IS NO STALL DETECTOR TO BUILD ON THIS SCREEN, AND A FIX THAT CLAIMS
@@ -50645,7 +50705,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "cap — auto-skipping (the card went unanswered too long)", "WARN")
                     p["awaiting_decision"] = None
                     _hc_partial = ""
-                    if _pk_key not in _controls.hv_blocked:
+                    # A failed Gemini plan holds nothing to salvage (review 10-02).
+                    if (_pk_key not in _controls.hv_blocked
+                            and (results.get(name) or {}).get("status") != "plan_failed"):
                         try:
                             await browser.switch_to_page(p["page"])
                             _hc_partial = await extract_fns[name](
@@ -50795,6 +50857,31 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #   (c) else the plan is still drafting (streaming, no enabled Start
             #       yet) → leave the watch armed and wait.
             if name == "Gemini" and p.get("gemini_watch_start"):
+                # ⭐ Review 10-02: a FAILED plan is not a finished report. One
+                # honest card and the agent parked, exactly as a research that
+                # fails mid-run (kind "agent_error": Retry starts a fresh chat,
+                # the card's window or a Skip ends it) — no done check, no
+                # extraction, no computer use on a page that holds nothing.
+                _ws_failed = await _gemini_watched_plan_failed(p["page"])
+                if _ws_failed:
+                    _pf_window = unacted_window_sec(_runtime.auto_skip_stuck)
+                    log(f"[{name}] its research plan failed (\"{_ws_failed}\") — asking "
+                        "you: Retry starts a fresh chat, or Skip it", "WARN")
+                    fail_agent("gemini", "Gemini's plan failed",
+                               f"Gemini showed: {_ws_failed} Retry starts a fresh chat, "
+                               "or Skip it.",
+                               raw_err=_ws_failed,
+                               **({"auto_skip_deadline": (time.time() + _pf_window) * 1000,
+                                   "arm_registry": False} if _pf_window else {}))
+                    # Its status says it never started: an unanswered card's
+                    # auto-skip then says "couldn't start", not "failed partway".
+                    results[name] = {"status": "plan_failed", "text": "",
+                                     "url": p.get("url", ""), "page": p["page"],
+                                     "elapsed_sec": int(elapsed)}
+                    void_completion_signals(p)
+                    p["awaiting_decision"] = {"kind": "agent_error", "key": "gemini",
+                                              "since": time.time(), "timeout": _pf_window}
+                    continue
                 try:
                     _ws_running = (p.get("done_count", 0) > 0
                                    or await _gemini_research_started(p["page"]))
@@ -52170,6 +52257,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     results=results, results_name=name)
                 del pending[name]
                 continue
+            # ⭐ Review 10-02: AUTO-SKIP OFF MEANS "ASK ME", NOT "NEVER TELL ME".
+            # A Gemini whose research has not started is left to wait (wave 15):
+            # no "seems stuck" check and no computer-use look while its watch is
+            # armed. With auto-skip off, the ceiling above was the one thing left
+            # that could end that wait, and it stood down — a Gemini stuck on its
+            # plan waited for ever with nothing on screen. So at the ceiling the
+            # person is asked, once: the card Gemini's plan wait used to raise at
+            # ten minutes. The watch stays armed, so a late Start is still pressed.
+            if (_hit_hard_cap and name == "Gemini" and p.get("gemini_watch_start")
+                    and not p.get("hard_cap_asked")):
+                p["hard_cap_asked"] = True
+                log(f"[{name}] its research has not started after "
+                    f"{PER_AGENT_HARD_CAP_SEC // 60} min and auto-skip is off — "
+                    "asking you: Retry or Skip", "WARN")
+                fail_agent(agent_key_stuck, *_GEMINI_CANT_START)
 
             # ── #921 Layer 1 — CUA-arbitrated stuck card at 10 min no-growth ──
             # When nothing has grown for STUCK_NO_GROWTH_SEC (and we're past the
@@ -66800,6 +66902,7 @@ async def _finalize_agent_autoskip(browser, page, key: str, name: str, *,
                details=_detail,
                actions=[], alert_id=f"agent_{key}_autoskip",
                auto_clear_on_resume=True)
+    _drop_agent_card_stamp(key)
     try:
         await _close_skipped_agent_tab(browser, page, key, name,
                                        final_status=final_status)
@@ -66858,6 +66961,7 @@ async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
                details=_autoskip_details("hv_wall", _name),
                actions=[], alert_id=f"agent_{agent_key}_autoskip",
                auto_clear_on_resume=True)
+    _drop_agent_card_stamp(agent_key)
     _clear_pending_decision()
     await _close_skipped_agent_tab(browser, page, agent_key, label,
                                    preserve_tab=preserve_tab)
@@ -78520,14 +78624,27 @@ def _p2_forget_chat(platform: str) -> None:
 
 def _p2_chats_to_rejoin() -> dict:
     """{platform: chat URL} for a Phase-2 crash retry, as `_runtime` holds them
-    now. Taken before the run's `finally` resets `_runtime`.
+    now. Taken before the run's `finally` resets `_runtime`. A "Move to queue"
+    keeps the same ones (`_p2_chats_to_move`).
 
-    The chat is the one the agent's TAB is on at the crash, when that is one of
-    its chats. 09-30: Gemini's brief went in on /app/3a6f…, and two minutes later
-    the same tab held its plan and its research on /app/e91e…; nothing in 2D
-    notes the move. Playwright keeps a page's last address after Chrome dies.
-    The address noted at the send is the fallback: a tab that cannot be read, or
-    one off its chats (a home page, mid-reset).
+    GEMINI: the chat its TAB is on at the crash, when that is one of its chats.
+    09-30: Gemini's brief went in on /app/3a6f…, and two minutes later the same
+    tab held its plan and its research on /app/e91e…; nothing in 2D notes the
+    move. Playwright keeps a page's last address after Chrome dies. The address
+    noted at the send is the fallback: a tab that cannot be read, or one off its
+    chats (a home page, mid-reset).
+
+    ⛔⛔ CHATGPT AND CLAUDE: THE CHAT NOTED WHEN THE BRIEF WENT IN, and the tab's
+    address only when that note is not a chat. Neither moves its research to
+    another chat, and their tabs are known to wander: on 2026-08-05 a press
+    landed on a sidebar link titled "Deep research request" and ChatGPT's tab ran
+    on the previous evening's chat. Their brief goes as a file, so the chat's
+    first message is the same fixed line on every run, and the retry's proof
+    cannot tell this run's chat from an older one — following a wandered tab
+    would have the retry collect the older chat's report as this run's.
+    ⛔ And a ChatGPT chat whose own id dates it as older than the run is never
+    carried, whichever address it came from (`_chatgpt_tab_is_foreign`): that
+    agent starts again the usual way.
 
     ⛔ An agent in chat mode is left out. The retry resets its mode and its
     keep/skip hold, and a rejoin puts neither back, so its plain chat answer would
@@ -78543,7 +78660,15 @@ def _p2_chats_to_rejoin() -> dict:
             live = _runtime.p2_chat_pages[k].url or ""
         except Exception:
             live = ""
-        out[k] = live if _p2_chat_id(k, live) else u
+        if k == "gemini":
+            pick = live if _p2_chat_id(k, live) else u
+        else:
+            pick = live if (_p2_chat_id(k, live) and not _p2_chat_id(k, u)) else u
+        if k == "chatgpt" and _chatgpt_tab_is_foreign(pick):
+            log("[resume] ChatGPT: the chat it was on is older than this run — "
+                "not going back into it", "WARN")
+            continue
+        out[k] = pick
     return out
 
 
@@ -79410,8 +79535,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     _p2_rejoin (10-01): {agent key: chat URL} — the chats a Phase-2 browser crash
     left, handed over by that crash's own retry so the first Phase-2 attempt goes
     back into them instead of sending the brief again. The one other caller is
-    the worker taking back a run that was moved to the queue (wave 15), and only
-    when it is the worker the run was moved off (`_waiting_p2_chats`).
+    a worker of this computer taking back a run that was moved to the queue
+    (wave 15, `_waiting_p2_chats`).
 
     brief_text (2026-04): inline brief content passed from the frontend when
     the user toggled Phase 1 off. Written to the new run's
@@ -83540,6 +83665,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # first attempt); after it, there is nothing to go back into.
         if _captured_failure_kind == "browser_crash" and last_phase <= 2:
             _p2_rejoin_next = _p2_chats_to_rejoin()
+        elif _captured_failure_kind == "browser_crash":
+            # Review 10-02: and its retry takes down none of Phase 2's cards.
+            _forget_research_cards(research_id or run_id)
         # Will the post-finally block silently re-run this from checkpoint? If
         # so, SUPPRESS the user-facing card — the silent-self-heal rule says we
         # only show Retry/Skip AFTER auto-retries are exhausted. Same predicate
@@ -86640,8 +86768,8 @@ async def run_server(port=8000):
                                      brief_text=job.get("brief_text", ""),
                                      user_sources=job.get("user_sources") or [],
                                      user_links=job.get("user_links") or [],
-                                     # Wave 15: a moved run's chats, only when
-                                     # this is the worker it was moved off.
+                                     # Wave 15: a moved run's chats
+                                     # (`_waiting_p2_chats`).
                                      _p2_rejoin=job.get("p2_rejoin") or None))
                     _wd_active_sec = 0.0
                     _wd_tick = 10.0

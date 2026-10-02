@@ -235,9 +235,14 @@ round-robin's start watch. An agent already recorded as finished is kept and nev
 opened; one with no chat, or whose chat cannot be opened or proven, is set up and
 sent the brief as before — only that agent. A person's Retry, Skip or new input
 re-runs the whole phase, so only the first attempt rejoins.
-The address carried is the one the agent's tab is on at the crash when that is one
-of its chats (Gemini moves a run to a new chat after the brief goes in; the tab is
-kept beside the address in `p2_chat_pages`), else the one noted at the send. The
+For Gemini the address carried is the one its tab is on at the crash when that is
+one of its chats (Gemini moves a run to a new chat after the brief goes in; the tab
+is kept beside the address in `p2_chat_pages`), else the one noted at the send. For
+ChatGPT and Claude it is the one noted at the send, and the tab's only when that
+note is not a chat: their brief goes as a file, so the first message is the same
+line on every run and the proof cannot tell an older research chat a tab wandered
+to from this run's. A ChatGPT chat whose id dates it as older than the run is never
+carried (`_chatgpt_tab_is_foreign`); that agent is set up again. The
 retry puts the chats it was handed back into `p2_chat_urls` at its start, so a
 second crash before or during the rejoin hands them on again, and a Chrome that
 dies during the rejoin unwinds as a crash rather than setting agents up on it. An
@@ -246,14 +251,19 @@ a hard retry, a chat that failed its proof). An agent in chat mode is not carrie
 since the retry's reset drops its mode, and a Stop ends the rejoin.
 ⭐ **A run moved to the queue rejoins the same way** (wave 15, 10-02). The move
 keeps the run's Phase-2 chats — the same snapshot a crash takes, only in Phase 2 or
-before it (`_p2_chats_to_move`) — in its waiting marker beside `from_worker`; the
-worker that takes the run back hands them to `run_pipeline(_p2_rejoin=…)` only when
-it is that worker (`_waiting_p2_chats`). Each worker is its own Chrome profile and
-its own accounts, so on another worker the phase starts fresh, as before.
+before it (`_p2_chats_to_move`) — in its waiting marker beside `from_worker`; any
+worker of this computer that takes the run back hands them to
+`run_pipeline(_p2_rejoin=…)` (`_waiting_p2_chats`). The worker it was moved off
+stays off, so another worker usually takes it; a worker signed in to other accounts
+cannot prove those chats are its own, and those agents start again. A different
+computer never sees the run's chats.
 ⭐ **A crash's retry takes down the crashed attempt's cards** (wave 15): as soon as
 its record is bound, every Phase-2 agent card that attempt raised for this research
 and nobody answered is retracted by its own alert id, as a recovered-by-itself
-signal, its durable decision cleared (`_retract_crashed_attempt_cards`).
+signal, its durable decision cleared (`_retract_crashed_attempt_cards`). A card an
+automatic skip ended is not up any more and is not retracted
+(`_drop_agent_card_stamp`), and a crash after Phase 2 retracts none of Phase 2's
+cards (`_forget_research_cards`).
 
 **B. One agent's tab dies inside the Phase 2 round-robin** — nothing is rebuilt
 and nothing resumes. The per-tick crash sweep runs before any per-agent work,

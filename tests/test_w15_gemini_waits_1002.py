@@ -407,3 +407,128 @@ def test_a_start_confirmed_a_leg_late_raises_no_recovered_notice(round_robin):
     assert len(took) == 1, took
     assert took[0]["alert_id"] == "phase2_agent_gemini_error" and took[0]["actions"] == []
     assert "gemini" not in research._AGENT_ERROR_CARD_TS
+
+
+# ══ review 10-02: what still reaches the person ══════════════════════════════
+
+def _skipped(out):
+    return [k for n, k in out.emits if n == "agent_skipped"]
+
+
+def test_with_auto_skip_off_a_gemini_that_never_starts_is_asked_about_once(
+        round_robin, monkeypatch):
+    """⭐ Settings → Pipeline → Auto-skip stuck OFF means "ask me", not "never
+    tell me". Gemini sits on "Generating research plan", watched: nothing is
+    raised before the 90-minute ceiling, and at it the person is asked once —
+    Retry or Skip — with no computer use. Before: four hours, nothing at all.
+    Beside it, auto-skip ON skips Gemini at the ceiling, as before, and asks
+    nothing."""
+    monkeypatch.setattr(research._runtime, "auto_skip_stuck", False)
+    out = round_robin(watch=True, minutes=89)
+    assert out.cards == [], out.cards
+
+    out = round_robin(watch=True, minutes=240)
+    assert out.cards == [("gemini", *research._GEMINI_CANT_START)], out.cards
+    assert out.cua == [] and out.looks == [], (out.cua, out.looks)
+    assert _said_rr(out, "has not started after 90 min and auto-skip is off")
+    assert _skipped(out) == []
+
+    # A Gemini whose research has started is judged by the round-robin's own
+    # checks, which still run for it — this ask is not one of them.
+    started = round_robin(watch=False, minutes=240)
+    assert ("gemini", *research._GEMINI_CANT_START) not in started.cards, started.cards
+
+    monkeypatch.setattr(research._runtime, "auto_skip_stuck", True)
+    on = round_robin(watch=True, minutes=120)
+    assert on.cards == [], on.cards
+    assert [k["reason"] for k in _skipped(on)] == ["auto_skip_hard_cap"]
+
+
+#: Gemini's own failed plan (the owner's 09-10 capture) on the run's chat.
+FAILED_PLAN_PAGE = ("<html><body><main><user-query><div class='query-text'>" + "brief " * 40
+                    + "</div></user-query>" + CAPTURED_FAIL_TURN + "</main></body></html>")
+
+
+@pytest.mark.parametrize("auto_skip", [True, False], ids=["auto-skip-on", "auto-skip-off"])
+def test_a_failed_plan_is_one_honest_card_and_never_read_as_a_report(
+        round_robin, monkeypatch, auto_skip):
+    """⭐⭐ The failed plan shows no Stop and does show Share & export, which the
+    done check read as a finished report: computer use copied it, the read failed,
+    and "Couldn't read Gemini's report" went up eight times in four hours. Now:
+    one card that says what Gemini showed, no computer use, nothing extracted. An
+    unanswered card is skipped as an agent that "couldn't start" — at its
+    window with auto-skip on, at the agent's 90-minute limit with it off."""
+    monkeypatch.setattr(research._runtime, "auto_skip_stuck", auto_skip)
+    out = round_robin(watch=True, minutes=240, html=FAILED_PLAN_PAGE)
+    assert out.cards == [("gemini", "Gemini's plan failed",
+                          "Gemini showed: Sorry, something went wrong. Please try your "
+                          "request again. Retry starts a fresh chat, or Skip it.")], out.cards
+    assert out.cua == [] and out.looks == [], (out.cua, out.looks)
+    assert not _said_rr(out, "CONFIRMED DONE")
+    assert _said_rr(out, "its research plan failed")
+    [skip] = _skipped(out)
+    assert skip["reason"] == ("auto_skip_setup_failed" if auto_skip else "auto_skip_hard_cap")
+    assert skip["partial_chars"] == 0
+
+
+def test_retry_on_the_failed_plan_card_starts_a_fresh_chat(round_robin, monkeypatch):
+    """The card says "Retry starts a fresh chat", and it must: the person presses
+    Retry once the card is up, and Gemini is set up again. ⛔ Even when an earlier
+    leg had half-read the failed page as done — a reading the Retry would take for
+    a finished agent, and swallow."""
+    raised = []
+
+    def _card_then_retry(*a, **k):
+        raised.append(a)
+        if a[1] == "Gemini's plan failed":
+            research._controls.request_retry_agent_hard("gemini")
+    monkeypatch.setattr(research, "fail_agent", _card_then_retry)
+    out = round_robin(watch=True, minutes=10, html=FAILED_PLAN_PAGE,
+                      entry={"done_count": 1})
+    assert [c[1] for c in raised][:1] == ["Gemini's plan failed"], raised
+    assert _said_rr(out, "Hard retry #1"), out.lines[-20:]
+    assert not _said_rr(out, "already completed"), out.lines[-20:]
+
+
+def test_a_failure_line_above_an_enabled_start_is_pressed_not_carded(round_robin):
+    """What is actionable outranks a diagnosis: a 'Start research' showing under a
+    turn that reads as failed is pressed, and the failed-plan card is not raised.
+    (What this toy page shows after the press — the same failed turn — is not
+    what a started research shows, so only the press and the card are read.)"""
+    ready = FAILED_PLAN_PAGE.replace("</message-content>",
+                                     "</message-content>" + LATE_START, 1)
+    out = round_robin(watch=True, minutes=5, html=ready)
+    assert out.pressed == 1, out.pressed
+    assert not [c for c in out.cards if c[1] == "Gemini's plan failed"], out.cards
+    assert not _said_rr(out, "its research plan failed")
+
+
+class _Turns:
+    """A page whose latest turn reads `texts`, one per read."""
+
+    def __init__(self, *texts, start=False, body=""):
+        self.texts, self.start, self.body = list(texts), start, body
+
+    async def evaluate(self, script, *a):
+        if script == research._GEMINI_LATEST_TURN_JS:
+            text = self.texts.pop(0) if len(self.texts) > 1 else self.texts[0]
+            return '{"found": true, "text": %s}' % __import__("json").dumps(text)
+        if script == research._GEMINI_START_PRESENT_JS:
+            return self.start
+        return self.body
+
+
+FAIL_LINE = "Sorry, something went wrong. Please try your request again."
+
+
+@pytest.mark.parametrize("page, said", [
+    (_Turns(FAIL_LINE), FAIL_LINE),
+    (_Turns("Sorry, something went wrong", FAIL_LINE), ""),
+    (_Turns(FAIL_LINE, start=True), ""),
+    (_Turns(FAIL_LINE, body="Researching 12 websites"), ""),
+    (_Turns("Here is my plan for the research."), ""),
+], ids=["settled-failure", "still-changing", "start-showing", "research-running",
+        "a-plan"])
+def test_only_a_settled_failed_plan_reads_as_failed(monkeypatch, page, said):
+    monkeypatch.setattr(research, "_GEMINI_PLAN_FAIL_SETTLE_SEC", 0)
+    assert asyncio.run(research._gemini_watched_plan_failed(page)) == said

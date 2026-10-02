@@ -268,13 +268,14 @@ MUTANTS = [
     ('N8', RESEARCH, '⛔ the typed line loses the space after its first sentence',
      [('        _P2_ATTACHED_BRIEF_ASK + " "\n',
        '        _P2_ATTACHED_BRIEF_ASK + ""\n')]),
+    # Re-anchored 10-02 (review): only Gemini follows its tab now.
     ('N9', RESEARCH, "⛔⛔ the chat noted at the send is carried after Gemini's tab moved on "
                      "to the chat holding its plan",
-     [('        out[k] = live if _p2_chat_id(k, live) else u\n',
-       '        out[k] = u\n')]),
+     [('            pick = live if _p2_chat_id(k, live) else u\n',
+       '            pick = u\n')]),
     ('N10', RESEARCH, '⛔ a tab off its chats (a home page) is carried instead of the chat',
-     [('        out[k] = live if _p2_chat_id(k, live) else u\n',
-       '        out[k] = live or u\n')]),
+     [('            pick = live if _p2_chat_id(k, live) else u\n',
+       '            pick = live or u\n')]),
     ('N11', RESEARCH, '⛔ the tab is not kept beside the chat noted at the send',
      [('        _runtime.p2_chat_pages[platform] = page\n',
        '        pass\n')]),
