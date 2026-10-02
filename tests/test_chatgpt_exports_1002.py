@@ -1209,6 +1209,70 @@ def test_a_pdf_caught_after_the_page_navigated_is_taken(chrome, page, fast, line
     assert not _said(lines, "no pdf file caught")
 
 
+def test_a_page_that_navigated_before_its_own_pdf_press_gets_the_catcher_back(
+        chrome, page, fast, lines, monkeypatch):
+    """⛔ Wave 14, 2026-10-02. The Markdown is caught; then the page navigates
+    before the PAGE ITSELF presses "Export to PDF" (computer use's own watch
+    already put the catcher back). The catcher is put back before that press: the
+    PDF is caught, Chrome downloads nothing, and the source links are written."""
+    real = research._chatgpt_export_caught
+
+    async def _navigates_first(pg, browser, cua_client, kind, label="ChatGPT", verbose=False):
+        if kind == "pdf":
+            await pg.goto(HOST)
+            for _ in range(200):
+                fr = next((f for f in pg.frames if (f.url or "").startswith(APP)), None)
+                try:
+                    if fr is not None and await fr.evaluate("() => document.readyState") == "complete":
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.02)
+        return await real(pg, browser, cua_client, kind, label, verbose)
+    monkeypatch.setattr(research, "_chatgpt_export_caught", _navigates_first)
+    _serve(chrome, page, _host_html(MD, PDF), _app_html(report=FRAME_REPORT))
+    downloads = _downloads(page)
+    md = _extract(chrome, page, cua_client=None)
+    assert downloads == [], "Chrome downloaded the PDF the page pressed after navigating"
+    assert _made(chrome, page) == ["pdf"]
+    assert research._doc_link_own_numbers(md, "ChatGPT") == GOLDEN
+    assert len(_said(lines, "put back before the pdf export is pressed")) == 1
+
+
+def test_a_page_whose_catcher_cannot_be_put_back_is_not_pressed(chrome, page, fast, lines,
+                                                               monkeypatch):
+    """⛔ Nothing is pressed without the catcher: when it is gone and cannot be put
+    back, the page does not press the PDF export (and Chrome downloads nothing)."""
+    real_arm = research._export_catch_arm
+    state = {"md": False}
+
+    async def _arm(pg, label, *, quiet=False):
+        return False if state["md"] else await real_arm(pg, label, quiet=quiet)
+    real = research._chatgpt_export_caught
+
+    async def _navigates_first(pg, browser, cua_client, kind, label="ChatGPT", verbose=False):
+        if kind == "pdf":
+            state["md"] = True
+            await pg.goto(HOST)
+            for _ in range(200):
+                fr = next((f for f in pg.frames if (f.url or "").startswith(APP)), None)
+                try:
+                    if fr is not None and await fr.evaluate("() => document.readyState") == "complete":
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.02)
+        return await real(pg, browser, cua_client, kind, label, verbose)
+    monkeypatch.setattr(research, "_export_catch_arm", _arm)
+    monkeypatch.setattr(research, "_chatgpt_export_caught", _navigates_first)
+    _serve(chrome, page, _host_html(MD, PDF), _app_html(report=FRAME_REPORT))
+    downloads = _downloads(page)
+    _extract(chrome, page, cua_client=None)
+    assert downloads == []
+    assert _made(chrome, page) == []
+    assert _said(lines, "could not be put back — the pdf export is not pressed")
+
+
 def test_a_file_caught_before_the_press_is_not_this_export(chrome, page, fast, lines):
     """A Markdown file the page made earlier (the catcher already on) is not the
     one this press made: each press takes only a file caught after it began."""

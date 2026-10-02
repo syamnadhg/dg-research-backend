@@ -64,9 +64,14 @@ WEB_LIB = Path("src") / "lib"
 WEB_HEADING_LINE_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$", re.M)
 
 #: The web's DOCUMENT VIEWER and public share, ported from
-#: `HEADING_RE` and `SOURCES_HEADING_RE` in `markdown-components.tsx`. The last
+#: `atxHeadingText` and `SOURCES_HEADING_RE` in `markdown-components.tsx`. The last
 #: heading a document has is folded
 #: into a `Sources · n` disclosure when both of these accept it.
+#: (⛔ Web 0a2b4385, 10-02: `HEADING_RE` was cubic on a crafted line, and became
+#: `atxHeadingText`, which reads each line twice. Its comment names the
+#: expression it answers exactly as, and the web's own suite holds it to that
+#: expression — `samePageAsBefore.test.tsx`, `OLD_HEADING_RE` — on every line of
+#: the real documents, so that expression is the one read here.)
 WEB_VIEWER_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 WEB_VIEWER_SOURCES_RE = re.compile(r"^sources\b", re.I)
 
@@ -77,7 +82,8 @@ WEB_LITERALS = {
         (r"const HEADING_LINE_RE = /(?P<body>.+?)/[gimsuy]*;", r"^(#{1,4})\s+(.+?)\s*$"),
     ],
     "markdown-components.tsx": [
-        (r"const HEADING_RE = /(?P<body>.+?)/[gimsuy]*;", r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$"),
+        (r"exactly what\s*\*\s*`/(?P<body>.+?)/` captured as its text\.",
+         r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$"),
         (r"const SOURCES_HEADING_RE = /(?P<body>.+?)/[gimsuy]*;", r"^sources\b"),
     ],
 }

@@ -54407,6 +54407,106 @@ def _doc_img_note_decorative() -> None:
     _doc_img_decorative_pending += 1
 
 
+# ── EQUATIONS KEEP THEIR SOURCE (Wave 14, 2026-10-02) ───────────────────────
+# The owner's recording of a finished Gemini report (#Dev/wave14/recordings-1001/
+# sr-cite-gemini-report.json, snapshot "report", `.math`): Gemini keeps each
+# equation's TeX in a `data-math` attribute — on `div.math-block` for one shown on
+# its own line, on `span.math-inline` for one inside a sentence, 14 on that
+# report — and draws it with KaTeX inside that element. The converter wrote the
+# DRAWING: one glyph per KaTeX box and a zero-width space after every subscript
+# ("zk=dhstate⊤Wchoptk" with those spaces in it — 65 of them in the 10-01 Gemini
+# document).
+# ⭐ Now an equation is written from its source and its drawing is never read:
+# inside a sentence as `$$ tex $$`, on its own line as a `$$` block, the delimiters
+# on lines of their own — the one shape the web's renderer reads (remark-math,
+# single-dollar maths off). A KaTeX root that carries its source —
+# `annotation[encoding="application/x-tex"]`, as KaTeX renders on ChatGPT's and
+# Claude's pages — is read the same way; `.katex-display` (or `<math
+# display="block">`) makes it a block.
+# ⛔ The TeX is written exactly as the page holds it: the converter's `\_` and
+#    `\*` are for prose, and in an equation they draw a literal underscore.
+# ⛔ A block holds no blank line: the web ends an unclosed `$$` at a blank line,
+#    and TeX has no use for one inside maths.
+# ⛔ Inside a table cell or a heading — one line each — a block is written inline,
+#    and so it is inside bold, italics, a link or a quote (`_DOC_MATH_WRAPPED`):
+#    their marks hold one line, so a block's own lines left its TeX as raw text.
+# ⛔ In a table cell a bare `|` would end the cell, so it is written `\vert ` —
+#    the same single bar to KaTeX. NOT `\|`: the web hands an equation's TeX to
+#    KaTeX as written, and `\|` is the DOUBLE bar ("p(j | x)" drew "p(j‖x)", and a
+#    real `\|` could no longer be told from it). A `\|` the TeX holds stays: the
+#    cell reads it as a pipe, and KaTeX draws the double bar it was.
+# ⛔ An inline equation is written `$$ tex $$`, one space inside each side: the
+#    web takes those spaces off, and a TeX ending in a dollar (`C = 100\$`) no
+#    longer runs into the closing `$$` ("$$$" closes nothing). Where it would
+#    touch a dollar outside it — the equation beside it, a price — a space goes
+#    between (`_doc_math_join`): "$$a$$$$b$$" was read as one broken equation.
+# ⛔ Nothing here writes `\[` or `\(`: a citation `\[7\]`, or our `[\[7\]](url)`,
+#    is never made into an equation or out of one.
+#: The encoding KaTeX gives the TeX it keeps beside its drawing.
+_DOC_MATH_TEX_ENCODING = "application/x-tex"
+#: The tags whose markdown holds its words on one line between marks — `**`,
+#: `*`, `~~`, a link's brackets, a quote's quotes. A block inside one is inline.
+_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "del", "s", "q"})
+#: Either side of an inline equation while the converter runs, so the finished
+#: markdown can tell where one touches a dollar (`_doc_math_join`). Never left in.
+#: (Named by number, never written as the characters: they are invisible.)
+_DOC_MATH_OPEN, _DOC_MATH_CLOSE = chr(0xE3A0), chr(0xE3A1)
+
+
+def _doc_math_classes(el) -> set:
+    c = el.get("class") or []
+    return set(c.split() if isinstance(c, str) else c)
+
+
+def _doc_math_source(el):
+    """`(tex, block)` for an element that is an equation keeping its own source —
+    Gemini's `[data-math]`, or a KaTeX root (`.katex`, `.katex-display`, `<math>`)
+    holding its TeX annotation — else None."""
+    name = getattr(el, "name", None)
+    if not name or not hasattr(el, "get"):
+        return None
+    cls = _doc_math_classes(el)
+    tex = el.get("data-math")
+    if isinstance(tex, str) and tex.strip():
+        return tex, "math-block" in cls or (name == "div" and "math-inline" not in cls)
+    if not ({"katex", "katex-display"} & cls or name == "math"):
+        return None
+    ann = el.find("annotation", attrs={"encoding": _DOC_MATH_TEX_ENCODING})
+    tex = ann.get_text() if ann is not None else ""
+    if not tex.strip():
+        return None
+    return tex, "katex-display" in cls or (name == "math" and el.get("display") == "block")
+
+
+def _doc_math_markdown(tex: str, block: bool, parent_tags) -> str:
+    """One equation as the web's renderer reads it — see the block above."""
+    tags = set(parent_tags)
+    if block and not ({"_inline"} | _DOC_MATH_WRAPPED) & tags:
+        lines = [ln.rstrip() for ln in tex.strip().splitlines() if ln.strip()]
+        return "\n\n$$\n%s\n$$\n\n" % "\n".join(lines)
+    one = " ".join(tex.split())
+    if {"td", "th"} & tags:
+        # A command or an escaped character (`\\`, `\|`) is read whole and kept.
+        one = " ".join(re.sub(r"\\.|\|", lambda m: r"\vert " if m.group(0) == "|"
+                              else m.group(0), one).split())
+    one = "%s$$ %s $$%s" % (_DOC_MATH_OPEN, one, _DOC_MATH_CLOSE)
+    # A block element's neighbours lose the space beside it, so a block written
+    # inline brings its own.
+    return " %s " % one if block else one
+
+
+def _doc_math_join(text: str) -> str:
+    """The converter's markdown with the marks around each inline equation taken
+    out, and a space put where an equation touches a dollar outside it: the
+    equation beside it, or a price."""
+    if _DOC_MATH_OPEN not in text and _DOC_MATH_CLOSE not in text:
+        return text
+    text = text.replace(_DOC_MATH_CLOSE + _DOC_MATH_OPEN, _DOC_MATH_CLOSE + " " + _DOC_MATH_OPEN)
+    text = text.replace("$" + _DOC_MATH_OPEN, "$ " + _DOC_MATH_OPEN)
+    text = text.replace(_DOC_MATH_CLOSE + "$", _DOC_MATH_CLOSE + " $")
+    return text.replace(_DOC_MATH_OPEN, "").replace(_DOC_MATH_CLOSE, "")
+
+
 _doc_img_converter_classes: dict = {}
 
 
@@ -54418,10 +54518,20 @@ def _doc_img_converter_cls(base):
     ⛔ Not `keep_inline_images_in`: markdownify's own `convert_img` returns the bare
     alt for an image inside a heading or table cell unless its DIRECT parent is
     listed, so `<td><a><img></a></td>` still lost the image. GFM renders an image
-    inside a cell, a heading or a link, so this one always emits it."""
+    inside a cell, a heading or a link, so this one always emits it.
+
+    ⭐ Wave 14, 2026-10-02: an equation that keeps its own source is written from
+    it (`_doc_math_source`, "EQUATIONS KEEP THEIR SOURCE"), and its drawing — the
+    element's children — is never converted."""
     cls = _doc_img_converter_classes.get(base)
     if cls is None:
         class _DocImageConverter(base):
+            def process_tag(self, node, parent_tags=None):
+                found = _doc_math_source(node)
+                if found is not None and "_noformat" not in (parent_tags or ()):
+                    return _doc_math_markdown(found[0], found[1], parent_tags or set())
+                return super().process_tag(node, parent_tags)
+
             def convert_img(self, el, text, parent_tags):
                 # ⭐ Wave 13: the site icon inside a ChatGPT source chip
                 # (a[data-testid="chatgpt-citation"], the owner's capture of a
@@ -55932,8 +56042,8 @@ def html_to_markdown(html, keep_images=True):
         from markdownify import markdownify as md
         if keep_images:
             from markdownify import MarkdownConverter
-            text = _doc_img_converter_cls(MarkdownConverter)(
-                heading_style="ATX", bullets="-", strip=['script', 'style']).convert(html)
+            text = _doc_math_join(_doc_img_converter_cls(MarkdownConverter)(
+                heading_style="ATX", bullets="-", strip=['script', 'style']).convert(html))
         else:
             text = md(html, heading_style="ATX", bullets="-", strip=['img', 'script', 'style'])
         # Clean up excessive whitespace
@@ -56003,7 +56113,199 @@ def _strip_chatgpt_citation_tokens(md: str) -> str:
     return _CHATGPT_CITE_TOKEN_RE.sub('', md)
 
 
-async def _extract_html_to_md(page, selectors, label):
+# ── A REPORT'S PICTURES ARE KEPT AS PICTURES (Wave 14, 2026-10-02) ──────────
+# Owner, 10-01: "if there are any images, make sure to grab those images as well
+# into this. Diagrams, images, graphs and stuff."
+# What every page read did with a picture in the report, before this:
+#   · an `<img>` with a web address, or a `data:` one, came through as
+#     `![alt](<src>)` and was stored by the document-image rehost — kept;
+#   · an `<img>` whose address is the page's own `blob:` one: no one but that page
+#     can read it, so the rehost could not fetch it — LOST;
+#   · a chart or diagram drawn as `<svg>`: the converter has no picture for it and
+#     wrote the words inside it (axis labels, a flowchart's node names) as loose
+#     prose in the report; ChatGPT's frame read removed it ("1 diagram left out")
+#     — LOST, and on Gemini's and Claude's pages worse than lost;
+#   · a chart drawn on a `<canvas>`: nothing at all — LOST.
+# ⭐ Now the page itself draws each of those into a PNG before the report is read
+# (`_DOC_FIGURES_JS`): an `<svg>` with the page's computed colours and fonts on
+# it, a `<canvas>` as it stands, a `blob:` image as it shows, each on the
+# background it sits on, at up to twice its size. The copy of the report the
+# markdown is made from then holds an `<img>` with that PNG as a `data:` address
+# where the picture stood, and the rehost stores it like any other image
+# (`_doc_img_decode_data_uri`: a `data:` address is never left in a document).
+# ⛔ NOT a picture: anything smaller than `_DOC_IMG_MIN_PX` on either side, not
+#    drawn, or inside a button, a link, an equation or another `<svg>` — an icon,
+#    a control's glyph, KaTeX's own strokes.
+# ⛔ A picture the page cannot draw (a canvas holding another site's image, a
+#    drawing that takes longer than `_DOC_FIGURES_WAIT_MS`) is left as before; at
+#    most `_DOC_FIGURES_MAX` are drawn per read, within `_DOC_FIGURES_BUDGET_MS`,
+#    and each one past either is left as before too — and the log counts every
+#    one left (it said only "20 drawn" for a report holding 25 charts).
+# ⛔ The limits are read when the page read is built (`_doc_figures_js`), not
+#    when research.py loads, so a test can hold each one to account.
+# ⛔ A diagram the agent wrote as mermaid CODE is not a picture on the page: it
+#    stays code, and the web draws it.
+#: How many pictures one read draws, how long each may take, the whole read's
+#: budget, and the longest side of a drawn picture, in pixels.
+_DOC_FIGURES_MAX = 20
+_DOC_FIGURES_WAIT_MS = 3000
+_DOC_FIGURES_BUDGET_MS = 15000
+_DOC_FIGURES_MAX_PX = 2400
+#: The longest `data:` address a drawn picture may have (the rehost stores at
+#: most `_DOC_IMG_MAX_BYTES`; base64 is 4/3 of the bytes).
+_DOC_FIGURES_MAX_CHARS = 4 * 1024 * 1024
+#: `figures(live, copy)` — draws each picture of `live` (the page's element) and
+#: puts it in `copy` (its clone, not yet changed: the two are paired element by
+#: element), returning {made, failed}.
+_DOC_FIGURES_JS = r"""async (live, copy) => {
+    const MIN = __MIN__, MAX = __MAX__, WAIT = __WAIT__, BUDGET = __BUDGET__,
+          MAXPX = __MAXPX__, CHARS = __CHARS__;
+    const L = [live, ...live.querySelectorAll('*')], C = [copy, ...copy.querySelectorAll('*')];
+    const got = { made: 0, failed: 0 };
+    if (L.length !== C.length) return got;
+    const KEEP = ['fill', 'fill-opacity', 'stroke', 'stroke-width', 'stroke-opacity',
+                  'stroke-dasharray', 'stroke-linecap', 'opacity', 'color', 'font-family',
+                  'font-size', 'font-weight', 'font-style', 'text-anchor', 'dominant-baseline',
+                  'visibility', 'display', 'line-height', 'white-space', 'text-align',
+                  'background-color'];
+    const started = Date.now();
+    const timed = (p) => Promise.race([p, new Promise((_, no) => setTimeout(
+        () => no(new Error('slow')), WAIT))]);
+    const ground = (el) => {
+        for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+            const c = getComputedStyle(n).backgroundColor;
+            if (c && !/^(transparent|rgba\([^)]*,\s*0\))$/i.test(c)) return c;
+        }
+        return '#ffffff';
+    };
+    // One picture, on its background, at up to twice its size.
+    const paint = (src, w, h, bg) => {
+        const k = Math.max(0.1, Math.min(2, MAXPX / Math.max(w, h)));
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(w * k));
+        c.height = Math.max(1, Math.round(h * k));
+        const g = c.getContext('2d');
+        g.fillStyle = bg;
+        g.fillRect(0, 0, c.width, c.height);
+        g.drawImage(src, 0, 0, c.width, c.height);
+        return c.toDataURL('image/png');
+    };
+    const svgPicture = (el, w, h) => timed(new Promise((ok, no) => {
+        const twin = el.cloneNode(true);
+        const a = [el, ...el.querySelectorAll('*')], b = [twin, ...twin.querySelectorAll('*')];
+        for (let i = 0; i < a.length && i < b.length && i < 4000; i++) {
+            const cs = getComputedStyle(a[i]);
+            let s = '';
+            for (const k of KEEP) {
+                const v = cs.getPropertyValue(k);
+                if (v) s += k + ':' + v + ';';
+            }
+            b[i].setAttribute('style', s);
+        }
+        twin.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+        twin.setAttribute('width', String(w));
+        twin.setAttribute('height', String(h));
+        const img = new Image();
+        img.onload = () => { try { ok(paint(img, w, h, ground(el))); } catch (e) { no(e); } };
+        img.onerror = () => no(new Error('not drawn'));
+        img.src = 'data:image/svg+xml;charset=utf-8,'
+            + encodeURIComponent(new XMLSerializer().serializeToString(twin));
+    }));
+    const name = (el) => {
+        for (const k of ['aria-label', 'alt', 'title']) {
+            const v = (el.getAttribute(k) || '').trim();
+            if (v) return v;
+        }
+        return el.tagName.toLowerCase() === 'svg' ? 'Diagram' : 'Chart';
+    };
+    // Inside a control, an equation or another drawing — looked for only up to
+    // the read's own root: ChatGPT's whole report sits in a card that is a button.
+    const held = (el) => {
+        for (let n = el.parentElement; n && n !== live; n = n.parentElement) {
+            if (n.matches('button, [role="button"], a, .katex, [data-math], math, svg')) return true;
+        }
+        return false;
+    };
+    const swaps = [];
+    for (let i = 0; i < L.length; i++) {
+        const el = L[i], tag = el.tagName.toLowerCase();
+        if (tag !== 'svg' && tag !== 'canvas' && tag !== 'img') continue;
+        if (tag === 'img' && !/^blob:/i.test(el.currentSrc || el.getAttribute('src') || '')) continue;
+        if (held(el) || getComputedStyle(el).visibility === 'hidden') continue;
+        // (One that is not drawn at all measures 0 × 0.)
+        const r = el.getBoundingClientRect(), w = Math.round(r.width), h = Math.round(r.height);
+        if (w < MIN || h < MIN) continue;
+        // Past the read's count or its time: left as the page shows it, and counted.
+        if (swaps.length >= MAX) { got.failed += 1; continue; }
+        if (Date.now() - started >= BUDGET) { got.failed += 1; continue; }
+        let url = '';
+        try {
+            if (tag === 'svg') url = await svgPicture(el, w, h);
+            else if (tag === 'canvas') url = paint(el, w, h, ground(el));
+            else if (el.complete && el.naturalWidth) url = paint(el, w, h, ground(el));
+        } catch (e) { url = ''; }
+        if (!/^data:image\/png;base64,/.test(url) || url.length > CHARS) { got.failed += 1; continue; }
+        swaps.push([C[i], url, w, h, name(el)]);
+    }
+    for (const [node, url, w, h, alt] of swaps) {
+        const img = node.ownerDocument.createElement('img');
+        img.setAttribute('src', url);
+        img.setAttribute('alt', alt);
+        img.setAttribute('width', String(w));
+        img.setAttribute('height', String(h));
+        node.replaceWith(img);
+        got.made += 1;
+    }
+    return got;
+}"""
+
+
+def _doc_figures_js() -> str:
+    """`_DOC_FIGURES_JS` with the limits above as they stand at this read."""
+    return (_DOC_FIGURES_JS.replace("__MIN__", str(_DOC_IMG_MIN_PX))
+            .replace("__MAX__", str(_DOC_FIGURES_MAX)).replace("__WAIT__", str(_DOC_FIGURES_WAIT_MS))
+            .replace("__BUDGET__", str(_DOC_FIGURES_BUDGET_MS))
+            .replace("__MAXPX__", str(_DOC_FIGURES_MAX_PX))
+            .replace("__CHARS__", str(_DOC_FIGURES_MAX_CHARS)))
+
+
+#: The page read every HTML tier uses: the last element `__SEL__` matches, with
+#: its pictures drawn (`_DOC_FIGURES_JS`) in the copy it hands back. When any was
+#: drawn or failed, a comment first says how many (`_DOC_FIGURES_NOTE_RE`).
+_DOC_HTML_READ_JS = r"""async () => {
+    const els = document.querySelectorAll(__SEL__);
+    if (els.length === 0) return '';
+    const root = els[els.length - 1];
+    try {
+        const copy = root.cloneNode(true);
+        const got = await (__FIGURES__)(root, copy);
+        if (got.made || got.failed) {
+            return '<!--sr-figures ' + got.made + ' ' + got.failed + '-->' + copy.innerHTML;
+        }
+    } catch (e) {}
+    return root.innerHTML;
+}"""
+_DOC_FIGURES_NOTE_RE = re.compile(r"\A<!--sr-figures (\d+) (\d+)-->")
+
+
+def _doc_html_read_js(sel: str) -> str:
+    """`_DOC_HTML_READ_JS` for the selector `sel`, its pictures drawn as this read's
+    limits say."""
+    return _DOC_HTML_READ_JS.replace("__FIGURES__", _doc_figures_js()).replace(
+        "__SEL__", json.dumps(sel))
+
+
+def _doc_figures_note(html: str, label: str) -> None:
+    """One log line for the pictures a page read drew (see the block above)."""
+    m = _DOC_FIGURES_NOTE_RE.match(html or "")
+    if m:
+        made, failed = int(m.group(1)), int(m.group(2))
+        log(f"[{label}] pictures in the report: {made} drawn as images"
+            + (f", {failed} could not be drawn and stay as the page shows them"
+               if failed else ""))
+
+
+async def _extract_html_to_md(page, selectors, label, convert=None):
     """Extract response HTML from page, convert to clean markdown.
 
     Returns a tuple-like sequence via the existing string return, but emits
@@ -56011,25 +56313,28 @@ async def _extract_html_to_md(page, selectors, label):
     selector-level hit counts. Previously every miss was silent — when T2
     fell through on P2 ChatGPT we had no way to tell whether (a) no
     selectors matched, (b) selectors matched but innerHTML was too short,
-    or (c) html_to_markdown returned an empty string."""
+    or (c) html_to_markdown returned an empty string.
+
+    `convert` turns the HTML into markdown (`html_to_markdown` when None):
+    Gemini's report passes its own, which reads its citations
+    (`_gemini_report_markdown`)."""
     biggest_html_len = 0
     biggest_sel = ""
     matched_sels = 0
     for sel in selectors:
         try:
-            html = await page.evaluate(f"""() => {{
-                const els = document.querySelectorAll('{sel}');
-                if (els.length > 0) return els[els.length - 1].innerHTML;
-                return '';
-            }}""")
+            # ⭐ Wave 14: the report's pictures drawn as images in the copy read
+            # ("A REPORT'S PICTURES ARE KEPT AS PICTURES").
+            html = await page.evaluate(_doc_html_read_js(sel))
             if html:
                 matched_sels += 1
                 if len(html) > biggest_html_len:
                     biggest_html_len = len(html)
                     biggest_sel = sel
             if html and len(html) > 200:
-                md_text = html_to_markdown(html)
+                md_text = convert(html) if convert else html_to_markdown(html)
                 if md_text and _doc_img_prose_len(md_text) > 100:
+                    _doc_figures_note(html, label)
                     log(f"[{label}] Extracted via HTML→MD: {len(md_text)} chars")
                     return md_text
         except Exception:
@@ -57337,7 +57642,20 @@ async def _chatgpt_export_caught(page, browser, cua_client, kind, label="ChatGPT
                                  verbose=False):
     """One of the finished report's exports, caught in the page: pressed by the
     page, else by computer use (which waits out a slow file from the page's
-    press too: both wait for a file caught after the same moment)."""
+    press too: both wait for a file caught after the same moment).
+
+    ⛔ Wave 14, 2026-10-02: a page that navigated after the last export was
+    caught (before the page presses "Export to PDF") has lost its catcher, and
+    the page's press would have gone to Chrome as a download. It is put back
+    first, as computer use's watch already does; when it cannot be, nothing is
+    pressed."""
+    if await _export_catch_list(page) is None:
+        if not await _export_catch_arm(page, label, quiet=True):
+            log(f"[{label}] the page lost its export catcher and it could not be put back "
+                f"— the {kind} export is not pressed", "WARN")
+            return None
+        log(f"[{label}] the page lost its export catcher (it navigated) — put back before "
+            f"the {kind} export is pressed")
     since = await _export_catch_last_id(page)
     got = await _chatgpt_dr_press_export(page, kind, label, since=since)
     if got is None and browser and cua_client:
@@ -57720,7 +58038,7 @@ def _chatgpt_pdf_numbered(md: str, pdf, label: str = "ChatGPT"):
 # nothing matches them; one that holds a link keeps it (the converter writes it
 # as a markdown link, and the document's numbered sources are built from those
 # links). The log line counts both, so the next run says what the frame gave.
-_CHATGPT_DR_REPORT_JS = r"""(P) => {
+_CHATGPT_DR_REPORT_JS = r"""async (P) => {
     const body = document.body;
     if (!body) return null;
     // ⛔ Drawn elements only: an element that is not drawn answers innerText
@@ -57748,6 +58066,10 @@ _CHATGPT_DR_REPORT_JS = r"""(P) => {
     for (let i = 0; i < live.length; i++) {
         if (getComputedStyle(live[i]).display === 'none') unseen.push(copy[i]);
     }
+    // ⭐ Wave 14: its pictures drawn as images while the copy still matches the
+    // page ("A REPORT'S PICTURES ARE KEPT AS PICTURES") — a diagram among them.
+    let pictures = { made: 0, failed: 0 };
+    try { pictures = await (__FIGURES__)(root, out); } catch (e) {}
     for (const el of unseen) el.remove();
     let cites = 0;
     for (const el of [...out.querySelectorAll('[data-citation-index]')]) {
@@ -57773,7 +58095,7 @@ _CHATGPT_DR_REPORT_JS = r"""(P) => {
     for (const el of [...out.querySelectorAll('svg')]) el.remove();
     return { total, text: len(root), headings: root.querySelectorAll(HEAD).length,
              links: out.querySelectorAll('a[href^="http"]').length, cites, diagrams,
-             html: out.innerHTML };
+             pictures: pictures.made, html: out.innerHTML };
 }"""
 
 #: Going down from the frame's body, the share of its text a child must hold to
@@ -57813,7 +58135,8 @@ async def _chatgpt_dr_frame_report(page, label="ChatGPT", *, done_text_len=0) ->
             "label": _CHATGPT_DR_REPORT_LABEL}
     for f in _chatgpt_dr_app_frames(page):
         try:
-            r = await f.evaluate(_CHATGPT_DR_REPORT_JS, args)
+            r = await f.evaluate(_CHATGPT_DR_REPORT_JS.replace("__FIGURES__", _doc_figures_js()),
+                                 args)
         except Exception:
             continue
         if isinstance(r, dict) and int(r.get("text") or 0) > int((best or {}).get("text") or 0):
@@ -57844,7 +58167,8 @@ async def _chatgpt_dr_frame_report(page, label="ChatGPT", *, done_text_len=0) ->
         f"{len(md)} chars, {_cg_count(int(best.get('headings') or 0), 'heading')}, "
         f"{_cg_count(int(best.get('links') or 0), 'link')}, "
         f"{_cg_count(int(best.get('cites') or 0), 'citation')} had no link in the frame "
-        f"(left out), {_cg_count(int(best.get('diagrams') or 0), 'diagram')} left out")
+        f"(left out), {_cg_count(int(best.get('pictures') or 0), 'picture')} kept as "
+        f"images, {_cg_count(int(best.get('diagrams') or 0), 'diagram')} left out")
     return md
 
 
@@ -58398,6 +58722,310 @@ async def _chatgpt_copy_reply(page, *, browser, cua_client, ours, verbose,
     return text
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# GEMINI'S FOOTNOTES, FROM ITS OWN LIST (Wave 14, 2026-10-02)
+# ─────────────────────────────────────────────────────────────────────────────
+# The owner's recording of a finished Gemini report (#Dev/wave14/recordings-1001/
+# sr-cite-gemini-report.json; excerpt in tests/fixtures/gemini_1002/
+# report_recording.json): each citation is `<source-footnote><sup
+# class="superscript" data-turn-source-index="N"></sup></source-footnote>` with no
+# link and no words in it (1,090 of these elements and their sups on one report),
+# and in a table, where Gemini draws no chip, its raw mark stays as text:
+# "[cite: 5, 13]" — read here as the same numbers (a mark is what is left where
+# no chip was drawn). The report ends with Gemini's own "Sources used in the
+# report" and "Sources read but not used in the report", each opened by a button
+# with that title.
+# Before this, the chips vanished (an element with no words), the table marks
+# showed as raw text, Gemini's list was cut off with everything after it, and the
+# document ended with the sites the run saw Gemini open — no number opened
+# anything.
+#
+# ⭐⭐ WHICH ROW IS NUMBER N — PROVED BY THE OWNER'S RECORDING OF 10-02 18:45
+# (sr-gemini-sources-open.json; excerpt in tests/fixtures/gemini_1002/
+# sources_open_recording.json). With the list open, "Sources used in the report"
+# shows 66 rows, each a `<browse-web-item>` holding one `<a
+# data-test-id="browse-web-item-link" href=…>`, and no row carries a number. The
+# owner hovered the two chips of one paragraph, index 1 and index 3, and the
+# cards that opened carry row 1's and row 3's addresses. So chip N is row N of
+# that list, counted 1, 2, 3 … in page order. The number a chip SHOWS on screen
+# is not it (index 3 shows "2": it counts per paragraph); its index is.
+# ⭐ THE RULE. Each chip and each table mark becomes Gemini's own number, `\[N\]`,
+# glued to the word before it, and the document ends with ONE "Sources" list:
+# every row of Gemini's list, in its order, row N written as number N, with its
+# title and address (ChatGPT's row shape, `_cg_pdf_source_row`, which the write
+# reads as an agent's own list). "Sources read but not used in the report" is not
+# part of the document. A report's own trailing sources section with no link in
+# it is replaced by it. The write links each number to its row
+# (`_doc_link_own_numbers`); the crash-retry read-back turns them back.
+# ⛔ CHECKED BEFORE ANYTHING IS WRITTEN, because a place that is off by one links
+# every number after it to the wrong page: every chip and mark names a number,
+# and none is 0; every row of the list is Gemini's own row element holding
+# exactly one web address, and no link in the list is outside a row; the list
+# has a row for the highest number cited; no number is glued to a line's bullet,
+# list number or heading mark; and every number written links at the write.
+# ⛔ A row whose address we never put in a document (an agent's own page; the
+# owner's own Drive or Gmail, which Gemini reads) is listed by its title only, and
+# its number stays text. The 10-02 report has two: cdn.openai.com, rows 30, 58.
+# On ANY doubt nothing changes — the document is today's — and one log line says
+# why, with the counts the next run needs: how many numbers, whether they run
+# 1…K, how many rows the list shows, and what its first row's element carries.
+# ⭐ A CLOSED LIST IS OPENED FOR THE READ. Its rows are in the page only while it
+# is open (the 10-01 recording: closed, 0 rows). When the report cites and the
+# list shows no row, the read presses the list's own toggle (a button, never a
+# link, never a download), waits for its rows, reads, and presses it again, so
+# the page is left as it was found (`_gemini_used_sources`).
+
+#: A sources section's title, as Gemini's button shows it.
+_GEMINI_SECTION_TITLE_RE = re.compile(
+    r'\A\s*sources\s+(used|read\s+but\s+not\s+used)\s+in\s+the\s+report\s*\Z', re.I)
+#: The raw mark Gemini leaves where it drew no chip: "[cite: 5, 13]".
+_GEMINI_CITE_MARK_RE = re.compile(r'\[cite:\s*(\d{1,3}(?:\s*,\s*\d{1,3})*)\s*\]')
+#: The attribute a chip names its source by.
+_GEMINI_INDEX_ATTR = "data-turn-source-index"
+#: The element each row of Gemini's sources lists is (the 10-02 recording).
+_GEMINI_ROW_TAG = "browse-web-item"
+#: How long a pressed list is given to show its rows, or to take them away.
+_GEMINI_SOURCES_WAIT_S = 3.0
+#: Where a number stood while the HTML is converted, and where the list began.
+_GEMINI_NUMBER_SLOT = "\ue300%d\ue301"
+_GEMINI_NUMBER_SLOT_RE = re.compile('[ \t]*\ue300(\\d{1,3})\ue301')
+_GEMINI_CUT_SLOT = "\ue302"
+#: ⛔ Gemini's "Share & Export → Copy contents" hung for the owner (10-02), so the
+#: extraction never depends on it: it is Tier 2, after the panel read, and computer
+#: use gets this long to press it (the clipboard hook 5 s more), then the ladder
+#: moves on. It was 90 s, and 120 s for the hook.
+_GEMINI_COPY_CONTENTS_S = 45.0
+
+
+def _gemini_index_of(el):
+    """The source number an element carries (itself, else its first descendant
+    carrying one), or None."""
+    hit = el if el.has_attr(_GEMINI_INDEX_ATTR) else el.find(attrs={_GEMINI_INDEX_ATTR: True})
+    raw = str(hit.get(_GEMINI_INDEX_ATTR) or "").strip() if hit is not None else ""
+    return int(raw) if re.fullmatch(r"\d{1,3}", raw) else None
+
+
+def _gemini_shape(el) -> str:
+    """An element's tag and attribute names, for the log: no words, no address."""
+    if el is None:
+        return "none"
+    names = [k for k in (el.attrs or {}) if not k.startswith("_ng")][:8]
+    return f"<{el.name}{''.join(' ' + k for k in names)}>"
+
+
+def _gemini_source_row(url: str, title: str, n: int) -> str:
+    """One row of the list. A public page: ChatGPT's row shape, linked. Anything
+    else: the title alone, so the address never reaches the document."""
+    if url:
+        return _cg_pdf_source_row(url, title, [n])
+    name = re.sub(r"\s+", " ", (title or "").replace("`", "'")).strip()[:200]
+    return "- %s — cited as %d" % (_doc_escape_link_text(name or "A source that is not a public page"), n)
+
+
+def _gemini_footnoted(html: str, label: str = "Gemini"):
+    """Gemini's report with its own numbers and its own list — see the block
+    above — or None (and, when the report cites anything, one log line saying
+    why) on any doubt."""
+    from bs4 import BeautifulSoup, Comment, NavigableString
+    who = label or "Gemini"
+    soup = BeautifulSoup(html or "", "html.parser")
+    order = {id(node): i for i, node in enumerate(soup.descendants)}
+    titles = [s for s in soup.find_all(string=_GEMINI_SECTION_TITLE_RE)
+              if not isinstance(s, Comment)]
+    used = next((s for s in titles
+                 if _GEMINI_SECTION_TITLE_RE.match(s).group(1).lower() == "used"), None)
+    used_at = order[id(used)] if used is not None else len(order)
+    after = [order[id(s)] for s in titles if order[id(s)] > used_at]
+    next_at = min(after) if after else len(order)
+    chips = [c for c in soup.find_all("source-footnote") if order[id(c)] < used_at]
+    numbers = [_gemini_index_of(c) for c in chips]
+    marks, in_code = [], []
+    for s in soup.find_all(string=_GEMINI_CITE_MARK_RE):
+        if isinstance(s, Comment) or order[id(s)] >= used_at:
+            continue
+        ns = [int(x) for m in _GEMINI_CITE_MARK_RE.finditer(str(s))
+              for x in re.findall(r"\d{1,3}", m.group(1))]
+        (in_code if s.find_parent(["pre", "code"]) is not None else marks).append((s, ns))
+    cited = {n for n in numbers if n is not None}
+    cited |= {n for _s, ns in marks + in_code for n in ns}
+    if not (chips or marks or in_code):
+        return None
+    span = sorted(cited)
+    run = (f"{len(chips)} citation chip{'' if len(chips) == 1 else 's'} and "
+           f"{len(marks) + len(in_code)} written mark{'' if len(marks) + len(in_code) == 1 else 's'}"
+           f" naming {len(span)} number{'' if len(span) == 1 else 's'}"
+           + (f", 1 to {span[-1]}, every one" if span and span == list(range(1, span[-1] + 1))
+              else (f", {span[0]} to {span[-1]} with gaps" if span else "")))
+
+    def _no(why, rows_seen=None, first=None):
+        log(f"[{who}] Gemini's citations stay as they are: {why} ({run}"
+            + (f"; its list \"Sources used in the report\" shows {rows_seen} row"
+               f"{'' if rows_seen == 1 else 's'}, the first {_gemini_shape(first)}"
+               if rows_seen is not None else "") + ")")
+        return None
+
+    if any(n is None for n in numbers):
+        return _no("a citation chip carries no number")
+    if 0 in cited:
+        return _no("a citation names number 0")
+    if used is None:
+        return _no("the page holds no \"Sources used in the report\" list")
+    # The list: each of Gemini's own row elements, and every link in the section.
+    row_els, row_ids, links = [], set(), []
+    for node in used.next_elements:
+        at = order.get(id(node))
+        if at is None or at >= next_at:
+            break
+        if getattr(node, "name", None) is None:
+            continue
+        href = str(node.get("href") or "") if node.name == "a" else ""
+        if re.match(r"https?://", href, re.I):
+            links.append(node)
+        # ⛔ By identity: two rows with the same markup are equal to bs4.
+        if node.name == _GEMINI_ROW_TAG and not any(id(p) in row_ids for p in node.parents):
+            row_els.append(node)
+            row_ids.add(id(node))
+    if not (links or row_els):
+        return _no("its list shows no row (a closed list?)", 0)
+    first = row_els[0] if row_els else links[0].parent
+    # Row N is the Nth row: (its address as a document may list it, its title).
+    rows, in_rows = [], set()
+    for k, r in enumerate(row_els, 1):
+        own = r.find_all("a", href=True)
+        urls = {str(a.get("href") or "").strip() for a in own
+                if re.match(r"https?://", str(a.get("href") or ""), re.I)}
+        in_rows |= {id(a) for a in own}
+        if len(urls) != 1:
+            return _no(f"row {k} of its list has no web address or more than one",
+                       len(row_els), r)
+        sub = r.find(attrs={"data-test-id": "sub-title"})
+        title = re.sub(r"\s+", " ", sub.get_text(" ")).strip() if sub is not None else ""
+        rows.append((_doc_public_source_url(next(iter(urls))), title))
+    if any(id(a) not in in_rows for a in links):
+        return _no("a link in its list is in no row", len(row_els), first)
+    if max(cited) > len(rows):
+        return _no(f"number {max(cited)} is past the end of its list", len(row_els), first)
+    # Each number where it stood, a mark at the start of the list, then markdown.
+    for c, n in zip(chips, numbers):
+        c.replace_with(NavigableString(_GEMINI_NUMBER_SLOT % n))
+    for s, _ns in marks:
+        s.replace_with(NavigableString(_GEMINI_CITE_MARK_RE.sub(
+            lambda m: "".join(_GEMINI_NUMBER_SLOT % int(x)
+                              for x in re.findall(r"\d{1,3}", m.group(1))), str(s))))
+    used.insert_before(NavigableString(_GEMINI_CUT_SLOT))
+    md = html_to_markdown(str(soup))
+    cut = md.find(_GEMINI_CUT_SLOT)
+    if cut < 0:
+        return _no("the report's end could not be found after it was converted")
+    text = _GEMINI_NUMBER_SLOT_RE.sub(lambda m: "\\[%s\\]" % m.group(1), md[:cut]).rstrip()
+    if "\ue300" in text or "\ue301" in text:
+        return _no("a number's place was lost in the conversion")
+    tmask = _mask_code_spans(text)[0]
+    own_at = _doc_own_sources_start(tmask)
+    if own_at is not None:
+        if _doc_cited_public_keys(tmask[own_at:]):
+            return _no("the report ends with a sources list of its own that holds links")
+        text = text[:own_at].rstrip()
+        tmask = _mask_code_spans(text)[0]
+        log(f"[{who}] the report's own sources section holds no link — replaced by "
+            "Gemini's own sources list, so the document ends with one")
+    if _CG_BARE_MARKER_RE.search(tmask):
+        return _no("a citation comes right after a bullet, a list number or a heading mark "
+                   "at the start of its line")
+    if not _CG_OWN_NUMBER_RE.search(tmask):
+        return _no("no citation is left to number")
+    out_rows = [_gemini_source_row(url, title, k) for k, (url, title) in enumerate(rows, 1)]
+    numbered = "%s\n\n%s\n\n%s\n" % (text.rstrip(), _doc_sources_heading(_DOC_SOURCES_TITLE),
+                                     "\n".join(out_rows))
+    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask) if rows[int(n) - 1][0])
+    got = len(_DOC_MARK_NUMBER_RE.findall(_doc_link_own_numbers(numbered, who, quiet=True)))
+    if got != want:
+        return _no(f"{got} of {want} numbers would link at the write")
+    log(f"[{who}] Gemini's own citation numbers, from its own list: {run}; "
+        f"its {len(rows)} sources listed in its order, row N as number N")
+    return numbered
+
+
+def _gemini_report_markdown(html: str, label: str = "Gemini") -> str:
+    """Gemini's report panel as markdown: with its own numbers and its own list
+    when the page joins them (`_gemini_footnoted`), else exactly as
+    `html_to_markdown` writes it."""
+    try:
+        out = _gemini_footnoted(html, label)
+    except Exception as e:
+        log(f"[{label or 'Gemini'}] Gemini's citations stay as they are: they could not be "
+            f"read ({type(e).__name__})")
+        out = None
+    return out if out is not None else html_to_markdown(html)
+
+
+#: Gemini's "Sources used in the report" toggle, read or pressed. `want` is
+#: "count" (read only), "open" or "close". ⛔ It presses only the one BUTTON with
+#: that title, and never one inside a link (a link opens a page or downloads a
+#: file): "open" only when the report cites (a `source-footnote`) and the list is
+#: closed with no row shown, "close" only while the list shows rows or says it is
+#: open. `rows` is the links between that button and the next list's ("read but
+#: not used"), where only this list's rows are.
+_GEMINI_USED_SOURCES_JS = r"""(want) => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const buttons = [...document.querySelectorAll('button')];
+  const used = buttons.filter((b) => /^sources used in the report$/i.test(norm(b.textContent)));
+  if (used.length !== 1) return {state: 'none', toggles: used.length};
+  const b = used[0];
+  const follows = (x, y) => !!(x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const next = buttons.find((x) => follows(b, x)
+      && /^sources read but not used in the report$/i.test(norm(x.textContent)));
+  const rows = [...document.querySelectorAll('a[href]')].filter((a) =>
+      follows(b, a) && (!next || follows(a, next))).length;
+  const open = b.getAttribute('aria-expanded') === 'true';
+  if (want === 'count') return {state: 'count', rows, open};
+  if (b.closest('a')) return {state: 'not a toggle', rows, open};
+  const press = want === 'open'
+      ? !rows && !open && !!document.querySelector('source-footnote')
+      : rows > 0 || open;
+  if (!press) return {state: 'left', rows, open};
+  b.click();
+  return {state: 'pressed', rows, open};
+}"""
+
+
+async def _gemini_used_sources(page, label: str, want: str) -> bool:
+    """Open Gemini's closed "Sources used in the report" for the read (`want`
+    "open"), or close it again ("close"), with a press of its own toggle — see "A
+    CLOSED LIST IS OPENED FOR THE READ". Waits up to `_GEMINI_SOURCES_WAIT_S` for
+    its rows to show (or go). True when the toggle was pressed, so a list pressed
+    open is always pressed closed again. Never raises."""
+    who = label or "Gemini"
+    try:
+        got = await page.evaluate(_GEMINI_USED_SOURCES_JS, want)
+    except Exception as e:
+        log(f"[{who}] Gemini's sources list could not be read ({type(e).__name__})", "DEBUG")
+        return False
+    if not isinstance(got, dict) or got.get("state") != "pressed":
+        return False
+    done, rows = False, 0
+    for _ in range(int(_GEMINI_SOURCES_WAIT_S / 0.2)):
+        await asyncio.sleep(0.2)
+        try:
+            now = await page.evaluate(_GEMINI_USED_SOURCES_JS, "count")
+        except Exception:
+            break
+        rows = int((now or {}).get("rows") or 0)
+        done = rows > 0 if want == "open" else not (rows or (now or {}).get("open"))
+        if done:
+            break
+    if want == "open":
+        log(f"[{who}] Gemini's \"Sources used in the report\" was closed — "
+            + (f"opened it for the read ({rows} rows)" if done else
+               f"pressed it open, but it showed no row in {_GEMINI_SOURCES_WAIT_S:g} s"),
+            "INFO" if done else "WARN")
+    else:
+        log(f"[{who}] Gemini's \"Sources used in the report\" "
+            + ("closed again, as it was found" if done else "did not close again"),
+            "INFO" if done else "WARN")
+    return True
+
+
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
     """Dedicated Gemini extractor — 3 panel-aware tiers:
       Tier 1: HTML→MD from Gemini's strict side-panel containers (DOM-scrape
@@ -58501,25 +59129,34 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # elements (`immersive-panel`, `deep-research-panel`), aside scopes
     # with class wildcards, and ARIA role-complementary/role-region
     # with aria-label="research". If none match, return empty (T2 follows).
-    md = await _extract_html_to_md(page, [
-        # Custom elements — only match the actual panel, not descendants
-        'immersive-panel',
-        'deep-research-panel',
-        # Aside-scoped (aside is structural for side content)
-        'aside immersive-panel',
-        'aside deep-research-panel',
-        'aside[class*="artifact" i] .markdown',
-        'aside[class*="artifact" i]',
-        'aside[class*="report" i] .markdown',
-        'aside[class*="report" i]',
-        'aside[class*="research" i] .markdown',
-        'aside[class*="research" i]',
-        # ARIA role-scoped — explicit research panel intent
-        '[role="complementary"][aria-label*="research" i] .markdown',
-        '[role="complementary"][aria-label*="research" i]',
-        '[role="region"][aria-label*="research" i] .markdown',
-        '[role="region"][aria-label*="research" i]',
-    ], label)
+    # ⭐ Wave 14, 2026-10-02: a closed "Sources used in the report" is opened for
+    # this read and closed again after it ("A CLOSED LIST IS OPENED FOR THE READ").
+    _sources_pressed = await _gemini_used_sources(page, label, "open")
+    try:
+        md = await _extract_html_to_md(page, [
+            # Custom elements — only match the actual panel, not descendants
+            'immersive-panel',
+            'deep-research-panel',
+            # Aside-scoped (aside is structural for side content)
+            'aside immersive-panel',
+            'aside deep-research-panel',
+            'aside[class*="artifact" i] .markdown',
+            'aside[class*="artifact" i]',
+            'aside[class*="report" i] .markdown',
+            'aside[class*="report" i]',
+            'aside[class*="research" i] .markdown',
+            'aside[class*="research" i]',
+            # ARIA role-scoped — explicit research panel intent
+            '[role="complementary"][aria-label*="research" i] .markdown',
+            '[role="complementary"][aria-label*="research" i]',
+            '[role="region"][aria-label*="research" i] .markdown',
+            '[role="region"][aria-label*="research" i]',
+            # ⭐ Wave 14, 2026-10-02: Gemini's own citation numbers and its own
+            # list ("GEMINI'S FOOTNOTES, FROM ITS OWN LIST").
+        ], label, convert=lambda html: _gemini_report_markdown(html, label))
+    finally:
+        if _sources_pressed:
+            await _gemini_used_sources(page, label, "close")
     # 2026-05-25: strip Gemini's panel chrome + post-report sources/
     # thinking-trace noise BEFORE the threshold check. The 146kb Kalki
     # gemini.md (2026-05-25 E2E) had ~70kb of clean report and ~76kb of
@@ -58580,13 +59217,15 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
                     "then click Copy contents in the dropdown menu.",
                     model=CUA_MODEL, max_iterations=8,
                     verbose=verbose, target_page=page),
-                timeout=90.0)
+                timeout=_GEMINI_COPY_CONTENTS_S)
 
         log(f"[{label}] T2: CUA Share & Export → Copy contents")
         try:
+            # ⛔ Wave 14, 2026-10-02: "Copy contents" hung for the owner — the
+            # press gets `_GEMINI_COPY_CONTENTS_S`, the hook a little more.
             md = await _run_with_clipboard_hijack(
                 page, label, _gemini_t2_trigger,
-                timeout_ms=120000, min_chars=2000,
+                timeout_ms=int(_GEMINI_COPY_CONTENTS_S * 1000) + 5000, min_chars=2000,
             )
         except Exception as _e:
             log(f"[{label}] T2 clipboard hijack raised: {_e}", "WARN")
@@ -77184,31 +77823,34 @@ _DOC_CITED_HEADING_RE = re.compile(r'[ \t]{0,3}#{1,6}[ \t]+Sources[ \t]*\Z')
 
 
 def _doc_cited_rows(md: str, masked: str, own_at: int):
-    """`({n: address}, {every number listed})` for a trailing sources section in
-    ChatGPT's own shape — a "Sources" heading and nothing under it but rows
-    naming the numbers that cite each source — or `({}, set())` for any other
-    section. A number may be listed once; a row whose address we would never put
-    behind a number lists its numbers with no address."""
+    """`({n: address}, {every number listed}, counts up)` for a trailing sources
+    section in ChatGPT's own shape — a "Sources" heading and nothing under it but
+    rows naming the numbers that cite each source — or `({}, set(), False)` for
+    any other section. A number may be listed once; a row whose address we would
+    never put behind a number lists its numbers with no address. "Counts up":
+    each row names one number and row N names N (Gemini's own list)."""
     lines, raw = masked[own_at:].split("\n"), md[own_at:].split("\n")
     if not lines or not _DOC_CITED_HEADING_RE.match(lines[0]):
-        return {}, set()
-    rows, written = {}, set()
+        return {}, set(), False
+    rows, written, per_row = {}, set(), []
     for seen, real in zip(lines[1:], raw[1:]):
         if not seen.strip():
             continue
         m = _DOC_CITED_ROW_RE.match(real)
         if m is None or seen != real:
-            return {}, set()
+            return {}, set(), False
         numbers = [int(x) for x in re.findall(r'\d{1,3}', m.group("n"))]
         if written & set(numbers) or len(set(numbers)) != len(numbers):
-            return {}, set()
+            return {}, set(), False
         written |= set(numbers)
+        per_row.append(numbers)
         link = _DOC_CITED_ROW_LINK_RE.match(m.group("head"))
         url = link.group("u") if link else ""
         if _doc_is_linkable_url(url):
             for n in numbers:
                 rows[n] = url
-    return (rows, written) if written else ({}, set())
+    counts_up = per_row == [[k] for k in range(1, len(per_row) + 1)]
+    return (rows, written, counts_up) if written else ({}, set(), False)
 
 
 def _doc_own_list_rows(md: str, masked: str = None) -> dict:
@@ -77273,6 +77915,12 @@ def _doc_link_own_numbers(md: str, label: str = "", quiet: bool = False) -> str:
     # ⭐ 2026-10-02 — or, in ChatGPT's own list, every number its rows name.
     written = ({int(n) for n in _DOC_OWN_ROW_NUMBER_RE.findall(masked[own_at:])}
                or _doc_cited_rows(md, masked, own_at)[1])
+    if cited < written and _doc_cited_rows(md, masked, own_at)[2]:
+        # ⭐ Wave 14, 2026-10-02 — GEMINI'S OWN LIST: one number on each row,
+        # counting 1, 2, 3 … ("GEMINI'S FOOTNOTES, FROM ITS OWN LIST"). Row N IS
+        # number N, written on it, so a row the text does not cite is still that
+        # row: only a number with no row is a mismatch.
+        written = cited
     if cited != written:
         if not quiet:
             log(f"[{who}] left its own citation numbers as written — they do not match "

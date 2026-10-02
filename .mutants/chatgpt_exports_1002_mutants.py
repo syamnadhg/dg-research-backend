@@ -270,7 +270,15 @@ MUTANTS = [
        "    if collections.Counter(n for n, _u in body) != collections.Counter(seq):\n")],
      "pair"),
     ("J22", RESEARCH, "⛔ a number glued to its line's bullet is written — the list item is lost",
-     [("    if _CG_BARE_MARKER_RE.search(tmask):\n", "    if False:\n")],
+     # (anchored with the next line: Gemini's own list, 10-02, has the same check)
+     [("    if _CG_BARE_MARKER_RE.search(tmask):\n"
+       "        return _no(\"a citation comes right after a bullet, a list number or a heading mark \"\n"
+       "                   \"at the start of its line\")\n"
+       "    present = sorted(",
+       "    if False:\n"
+       "        return _no(\"a citation comes right after a bullet, a list number or a heading mark \"\n"
+       "                   \"at the start of its line\")\n"
+       "    present = sorted(")],
      "pair"),
     ("J23", RESEARCH, "a number glued to a bullet is let through",
      [(r"""    r'(?:[-*+]|\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n",
@@ -326,7 +334,10 @@ MUTANTS = [
        "        if False:\n")],
      "pair"),
     ("J7", RESEARCH, "⛔ a number that cannot link at the write is written anyway",
-     [("    if got != want:\n        return _no(", "    if False:\n        return _no(")],
+     [("    if got != want:\n        return _no(f\"{got} of {want} numbers would link at the write\")\n"
+       "    every = ",
+       "    if False:\n        return _no(f\"{got} of {want} numbers would link at the write\")\n"
+       "    every = ")],
      "pair"),
     ("J8", RESEARCH, "⛔ an export writing bracketed numbers of its own is numbered over",
      [("    if _CG_OWN_NUMBER_RE.search(masked):\n", "    if False:\n")],
@@ -343,10 +354,16 @@ MUTANTS = [
      [("            if any(s <= m.start() < e for s, e in code):\n", "            if False:\n")],
      "pair"),
     ("J12", RESEARCH, "⛔ the report's own link-less sources section stays — two sections",
-     [("        text = text[:own_at].rstrip()\n", "        text = text\n")],
+     [("        text = text[:own_at].rstrip()\n        tmask = _mask_code_spans(text)[0]\n"
+       "        log(f\"[{who}] the report's own sources section holds no link — replaced by \"\n"
+       "            \"ChatGPT's own",
+       "        text = text\n        tmask = _mask_code_spans(text)[0]\n"
+       "        log(f\"[{who}] the report's own sources section holds no link — replaced by \"\n"
+       "            \"ChatGPT's own")],
      "pair"),
     ("J13", RESEARCH, "⛔ a sources section of its own WITH links gets a second list",
-     [("        if _doc_cited_public_keys(tmask[own_at:]):\n", "        if False:\n")],
+     [("        if _doc_cited_public_keys(tmask[own_at:]):\n            return _no(\"the export ends",
+       "        if False:\n            return _no(\"the export ends")],
      "pair"),
     ("J14", RESEARCH, "the Sources rows lose the numbers that cite them",
      [("    return \"- %s — %s — cited as %s\" % (head, label, \", \".join(str(n) for n in numbers))\n",

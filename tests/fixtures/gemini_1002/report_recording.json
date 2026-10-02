@@ -1,0 +1,467 @@
+{
+ "what": "excerpt of sr-cite-gemini-report.json (owner's recording, 2026-10-02 08:23Z)",
+ "source": "#Dev/wave14/recordings-1001/sr-cite-gemini-report.json, snaps[0]",
+ "url": "https://gemini.google.com/u/3/app/1da48afc71d159d1?pageId=none",
+ "panel": {
+  "tag": "immersive-panel",
+  "text": "Create NVIDIA NeMo Relay: Technical Due Diligence and Archit",
+  "attrs": [
+   "_ngcontent-ng-c541303833=",
+   "_nghost-ng-c2725312684=",
+   "class=ng-tns-c541303833-1 ng-trigger ng-trigger-immersivePanelTransitions lm-canvas-theme ng-star-inserted",
+   "jslog=270401;track:impression,attention",
+   "data-hveid=59",
+   "style="
+  ]
+ },
+ "math": {
+  "count": 30,
+  "dataMath": 14,
+  "katex": 14,
+  "texAnnotations": 0,
+  "sample": [
+   {
+    "tag": "div",
+    "attrs": [
+     "class=math-block",
+     "data-math=\\text{CacheKey} = \\text{SHA256}\\Big(\\text{TenantID} \\mathbin{\\Vert} \\text{Model} \\mathbin{\\Vert} \\text{CanonicalizedPromptIR} \\mathbin{\\Vert} \\text{Temperature} \\mathbin{\\Vert} \\text{ToolDefinitions}\\Big)"
+    ],
+    "parent": {
+     "tag": "div",
+     "text": "CacheKey=SHA256(TenantID∥Model∥CanonicalizedPromptIR∥Tempera",
+     "attrs": [
+      "data-path-to-node=104"
+     ]
+    },
+    "html": "<div class=\"math-block\" data-math=\"\\text{CacheKey} = \\text{SHA256}\\Big(\\text{TenantID} \\mathbin{\\Vert} \\text{Model} \\mathbin{\\Vert} \\text{CanonicalizedPromptIR} \\mathbin{\\Vert} \\text{Temperature} \\mathbin{\\Vert} \\text{ToolDefinitions}\\Big)\"><span class=\"katex-display\"><span class=\"katex\"><span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\"><span class=\"strut\" style=\"height: 0.8889em; vertical-align: -0.1944em;\"></span><span class=\"mord text\"><span class=\"mord\">CacheKey</span></span><span class=\"mspace\" style=\"margin-right: 0.2778em;\"></span><span class=\"mrel\">=</span><span class=\"mspace\" style=\"margin-right: 0.2778em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 1.8em; vertical-align: -0.65em;\"></span><span class=\"mord text\"><span class=\"mord\">SHA256</span></span><span class=\"mord\"><span class=\"delimsizing size2\">(</span></span><span class=\"mord text\"><span class=\"mord\">TenantID</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span><span class=\"mbin\"><span class=\"mord\">∥</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 1em; vertical-align: -0.25em;\"></span><span class=\"mord text\"><span class=\"mord\">Model</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span><span class=\"mbin\"><span class=\"mord\">∥</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 1em; vertical-align: -0.25em;\"></span><span class=\"mord text\"><span class=\"mord\">CanonicalizedPromptIR</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span><span class=\"mbin\"><span class=\"mord\">∥</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 1em; vertical-align: -0.25em;\"></span><span class=\"mord text\"><span class=\"mord\">Temperature</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span><span class=\"mbin\"><span class=\"mord\">∥</span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 1.8em; vertical-align: -0.65em;\"></span><span class=\"mord text\"><span class=\"mord\">ToolDefinitions</span></span><span class=\"mord\"><span class=\"delimsizing size2\">)</span></span></span></span></span></span></div>"
+   },
+   {
+    "tag": "div",
+    "attrs": [
+     "class=math-block",
+     "data-math=\\text{Net Value} = \\big(S_{\\text{tokens}} + S_{\\text{debugging}} + S_{\\text{risk}}\\big) - \\big(C_{\\text{engineering}} + C_{\\text{compute}} + C_{\\text{storage}} + C_{\\text{maintenance}}\\big)"
+    ],
+    "parent": {
+     "tag": "div",
+     "text": "Net Value=(S tokens ​ +S debugging ​ +S risk ​ )−(C engineer",
+     "attrs": [
+      "data-path-to-node=160"
+     ]
+    },
+    "html": "<div class=\"math-block\" data-math=\"\\text{Net Value} = \\big(S_{\\text{tokens}} + S_{\\text{debugging}} + S_{\\text{risk}}\\big) - \\big(C_{\\text{engineering}} + C_{\\text{compute}} + C_{\\text{storage}} + C_{\\text{maintenance}}\\big)\"><span class=\"katex-display\"><span class=\"katex\"><span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\"><span class=\"strut\" style=\"height: 0.6944em;\"></span><span class=\"mord text\"><span class=\"mord\">Net&nbsp;Value</span></span><span class=\"mspace\" style=\"margin-right: 0.2778em;\"></span><span class=\"mrel\">=</span><span class=\"mspace\" style=\"margin-right: 0.2778em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 1.2em; vertical-align: -0.35em;\"></span><span class=\"mord\"><span class=\"delimsizing size1\">(</span></span><span class=\"mord\"><span class=\"mord mathnormal\" style=\"margin-right: 0.0576em;\">S</span><span class=\"msupsub\"><span class=\"vlist-t vlist-t2\"><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.3361em;\"><span class=\"\" style=\"top: -2.55em; margin-left: -0.0576em; margin-right: 0.05em;\"><span class=\"pstrut\" style=\"height: 2.7em;\"></span><span class=\"sizing reset-size6 size3 mtight\"><span class=\"mord mtight\"><span class=\"mord text mtight\"><span class=\"mord mtight\">tokens</span></span></span></span></span></span><span class=\"vlist-s\">​</span></span><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.15em;\"><span class=\"\"></span></span></span></span></span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span><span class=\"mbin\">+</span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span></span><span class=\"base\"><span class=\"strut\" style=\"height: 0.9694em; vertical-align: -0.2861em;\"></span><span class=\"mord\"><span class=\"mord mathnormal\" style=\"margin-right: 0.0576em;\">S</span><span class=\"msupsub\"><span class=\"vlist-t vlist-t2\"><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.3361em;\"><span class=\"\" style=\"top: -2.55em; margin-left: -0.0576em; margin-right: 0.05em;\"><span class=\"pstrut\" style=\"height: 2.7em;\"></span><span class=\"sizing reset-size6 size3 mtight\"><span class=\"mord mtight\"><span class=\"mord text mtight\"><span class=\"mord mtight\">debugging</span></span></span></span></span></span><span class=\"vlist-s\">​</span></span><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.2861em;\"><span class=\"\"></span></span></span></span></span></span><span class=\"mspace\" style=\"margin-right: 0.2222em;\"></span><span class=\"mbin\">+</span><span class=\"mspac"
+   },
+   {
+    "tag": "span",
+    "attrs": [
+     "class=math-inline",
+     "data-math=S_{\\text{tokens}}",
+     "data-index-in-node=0"
+    ],
+    "parent": {
+     "tag": "span",
+     "text": "S tokens ​ represents measured net reductions in model API b",
+     "attrs": [
+      "data-path-to-node=162,0,0,0"
+     ]
+    },
+    "html": "<span class=\"math-inline\" data-math=\"S_{\\text{tokens}}\" data-index-in-node=\"0\"><span class=\"katex\"><span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\"><span class=\"strut\" style=\"height: 0.8333em; vertical-align: -0.15em;\"></span><span class=\"mord\"><span class=\"mord mathnormal\" style=\"margin-right: 0.0576em;\">S</span><span class=\"msupsub\"><span class=\"vlist-t vlist-t2\"><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.3361em;\"><span class=\"\" style=\"top: -2.55em; margin-left: -0.0576em; margin-right: 0.05em;\"><span class=\"pstrut\" style=\"height: 2.7em;\"></span><span class=\"sizing reset-size6 size3 mtight\"><span class=\"mord mtight\"><span class=\"mord text mtight\"><span class=\"mord mtight\">tokens</span></span></span></span></span></span><span class=\"vlist-s\">​</span></span><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.15em;\"><span class=\"\"></span></span></span></span></span></span></span></span></span></span>"
+   },
+   {
+    "tag": "span",
+    "attrs": [
+     "class=math-inline",
+     "data-math=S_{\\text{debugging}}",
+     "data-index-in-node=0"
+    ],
+    "parent": {
+     "tag": "span",
+     "text": "S debugging ​ represents defensible reductions in engineerin",
+     "attrs": [
+      "data-path-to-node=162,1,0,0"
+     ]
+    },
+    "html": "<span class=\"math-inline\" data-math=\"S_{\\text{debugging}}\" data-index-in-node=\"0\"><span class=\"katex\"><span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\"><span class=\"strut\" style=\"height: 0.9694em; vertical-align: -0.2861em;\"></span><span class=\"mord\"><span class=\"mord mathnormal\" style=\"margin-right: 0.0576em;\">S</span><span class=\"msupsub\"><span class=\"vlist-t vlist-t2\"><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.3361em;\"><span class=\"\" style=\"top: -2.55em; margin-left: -0.0576em; margin-right: 0.05em;\"><span class=\"pstrut\" style=\"height: 2.7em;\"></span><span class=\"sizing reset-size6 size3 mtight\"><span class=\"mord mtight\"><span class=\"mord text mtight\"><span class=\"mord mtight\">debugging</span></span></span></span></span></span><span class=\"vlist-s\">​</span></span><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.2861em;\"><span class=\"\"></span></span></span></span></span></span></span></span></span></span>"
+   },
+   {
+    "tag": "span",
+    "attrs": [
+     "class=math-inline",
+     "data-math=S_{\\text{risk}}",
+     "data-index-in-node=0"
+    ],
+    "parent": {
+     "tag": "span",
+     "text": "S risk ​ represents quantified reduction in operational and ",
+     "attrs": [
+      "data-path-to-node=162,2,0,0"
+     ]
+    },
+    "html": "<span class=\"math-inline\" data-math=\"S_{\\text{risk}}\" data-index-in-node=\"0\"><span class=\"katex\"><span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\"><span class=\"strut\" style=\"height: 0.8333em; vertical-align: -0.15em;\"></span><span class=\"mord\"><span class=\"mord mathnormal\" style=\"margin-right: 0.0576em;\">S</span><span class=\"msupsub\"><span class=\"vlist-t vlist-t2\"><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.3361em;\"><span class=\"\" style=\"top: -2.55em; margin-left: -0.0576em; margin-right: 0.05em;\"><span class=\"pstrut\" style=\"height: 2.7em;\"></span><span class=\"sizing reset-size6 size3 mtight\"><span class=\"mord mtight\"><span class=\"mord text mtight\"><span class=\"mord mtight\">risk</span></span></span></span></span></span><span class=\"vlist-s\">​</span></span><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.15em;\"><span class=\"\"></span></span></span></span></span></span></span></span></span></span>"
+   },
+   {
+    "tag": "span",
+    "attrs": [
+     "class=math-inline",
+     "data-math=C_{\\text{engineering}}",
+     "data-index-in-node=0"
+    ],
+    "parent": {
+     "tag": "span",
+     "text": "C engineering ​ represents upfront engineering cost to instr",
+     "attrs": [
+      "data-path-to-node=162,3,0,0"
+     ]
+    },
+    "html": "<span class=\"math-inline\" data-math=\"C_{\\text{engineering}}\" data-index-in-node=\"0\"><span class=\"katex\"><span class=\"katex-html\" aria-hidden=\"true\"><span class=\"base\"><span class=\"strut\" style=\"height: 0.9694em; vertical-align: -0.2861em;\"></span><span class=\"mord\"><span class=\"mord mathnormal\" style=\"margin-right: 0.0715em;\">C</span><span class=\"msupsub\"><span class=\"vlist-t vlist-t2\"><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.3175em;\"><span class=\"\" style=\"top: -2.55em; margin-left: -0.0715em; margin-right: 0.05em;\"><span class=\"pstrut\" style=\"height: 2.7em;\"></span><span class=\"sizing reset-size6 size3 mtight\"><span class=\"mord mtight\"><span class=\"mord text mtight\"><span class=\"mord mtight\">engineering</span></span></span></span></span></span><span class=\"vlist-s\">​</span></span><span class=\"vlist-r\"><span class=\"vlist\" style=\"height: 0.2861em;\"><span class=\"\"></span></span></span></span></span></span></span></span></span></span>"
+   }
+  ]
+ },
+ "citeLike": {
+  "count": 1090,
+  "sample": [
+   {
+    "tag": "source-footnote",
+    "text": "",
+    "attrs": [
+     "_nghost-ng-c3888946993=",
+     "class=ng-star-inserted"
+    ],
+    "parent": {
+     "tag": "response-element",
+     "text": "",
+     "attrs": [
+      "class=no-md",
+      "ng-version=0.0.0-PLACEHOLDER"
+     ]
+    },
+    "html": "<source-footnote _nghost-ng-c3888946993=\"\" class=\"ng-star-inserted\"><sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"1\"><!----></sup></source-footnote>",
+    "href": ""
+   },
+   {
+    "tag": "sup",
+    "text": "",
+    "attrs": [
+     "_ngcontent-ng-c3888946993=",
+     "class=superscript",
+     "data-turn-source-index=1"
+    ],
+    "parent": {
+     "tag": "source-footnote",
+     "text": "",
+     "attrs": [
+      "_nghost-ng-c3888946993=",
+      "class=ng-star-inserted"
+     ]
+    },
+    "html": "<sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"1\"><!----></sup>",
+    "href": ""
+   },
+   {
+    "tag": "source-footnote",
+    "text": "",
+    "attrs": [
+     "_nghost-ng-c3888946993=",
+     "class=ng-star-inserted"
+    ],
+    "parent": {
+     "tag": "response-element",
+     "text": "",
+     "attrs": [
+      "class=no-md",
+      "ng-version=0.0.0-PLACEHOLDER"
+     ]
+    },
+    "html": "<source-footnote _nghost-ng-c3888946993=\"\" class=\"ng-star-inserted\"><sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"1\"><!----></sup></source-footnote>",
+    "href": ""
+   },
+   {
+    "tag": "sup",
+    "text": "",
+    "attrs": [
+     "_ngcontent-ng-c3888946993=",
+     "class=superscript",
+     "data-turn-source-index=1"
+    ],
+    "parent": {
+     "tag": "source-footnote",
+     "text": "",
+     "attrs": [
+      "_nghost-ng-c3888946993=",
+      "class=ng-star-inserted"
+     ]
+    },
+    "html": "<sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"1\"><!----></sup>",
+    "href": ""
+   },
+   {
+    "tag": "source-footnote",
+    "text": "",
+    "attrs": [
+     "_nghost-ng-c3888946993=",
+     "class=ng-star-inserted"
+    ],
+    "parent": {
+     "tag": "response-element",
+     "text": "",
+     "attrs": [
+      "class=no-md",
+      "ng-version=0.0.0-PLACEHOLDER"
+     ]
+    },
+    "html": "<source-footnote _nghost-ng-c3888946993=\"\" class=\"ng-star-inserted\"><sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"1\"><!----></sup></source-footnote>",
+    "href": ""
+   },
+   {
+    "tag": "sup",
+    "text": "",
+    "attrs": [
+     "_ngcontent-ng-c3888946993=",
+     "class=superscript",
+     "data-turn-source-index=1"
+    ],
+    "parent": {
+     "tag": "source-footnote",
+     "text": "",
+     "attrs": [
+      "_nghost-ng-c3888946993=",
+      "class=ng-star-inserted"
+     ]
+    },
+    "html": "<sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"1\"><!----></sup>",
+    "href": ""
+   },
+   {
+    "tag": "source-footnote",
+    "text": "",
+    "attrs": [
+     "_nghost-ng-c3888946993=",
+     "class=ng-star-inserted"
+    ],
+    "parent": {
+     "tag": "response-element",
+     "text": "",
+     "attrs": [
+      "class=no-md",
+      "ng-version=0.0.0-PLACEHOLDER"
+     ]
+    },
+    "html": "<source-footnote _nghost-ng-c3888946993=\"\" class=\"ng-star-inserted\"><sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"2\"><!----></sup></source-footnote>",
+    "href": ""
+   },
+   {
+    "tag": "sup",
+    "text": "",
+    "attrs": [
+     "_ngcontent-ng-c3888946993=",
+     "class=superscript",
+     "data-turn-source-index=2"
+    ],
+    "parent": {
+     "tag": "source-footnote",
+     "text": "",
+     "attrs": [
+      "_nghost-ng-c3888946993=",
+      "class=ng-star-inserted"
+     ]
+    },
+    "html": "<sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"2\"><!----></sup>",
+    "href": ""
+   },
+   {
+    "tag": "source-footnote",
+    "text": "",
+    "attrs": [
+     "_nghost-ng-c3888946993=",
+     "class=ng-star-inserted"
+    ],
+    "parent": {
+     "tag": "response-element",
+     "text": "",
+     "attrs": [
+      "class=no-md",
+      "ng-version=0.0.0-PLACEHOLDER"
+     ]
+    },
+    "html": "<source-footnote _nghost-ng-c3888946993=\"\" class=\"ng-star-inserted\"><sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"2\"><!----></sup></source-footnote>",
+    "href": ""
+   },
+   {
+    "tag": "sup",
+    "text": "",
+    "attrs": [
+     "_ngcontent-ng-c3888946993=",
+     "class=superscript",
+     "data-turn-source-index=2"
+    ],
+    "parent": {
+     "tag": "source-footnote",
+     "text": "",
+     "attrs": [
+      "_nghost-ng-c3888946993=",
+      "class=ng-star-inserted"
+     ]
+    },
+    "html": "<sup _ngcontent-ng-c3888946993=\"\" class=\"superscript\" data-turn-source-index=\"2\"><!----></sup>",
+    "href": ""
+   }
+  ]
+ },
+ "numberish": {
+  "count": 4,
+  "sample": [
+   {
+    "tag": "sup",
+    "text": "1",
+    "attrs": [
+     "_ngcontent-ng-c3888946993=",
+     "class=superscript visible",
+     "data-turn-source-index=7"
+    ],
+    "parent": {
+     "tag": "source-footnote",
+     "text": "1",
+     "attrs": [
+      "_nghost-ng-c3888946993=",
+      "class=ng-star-inserted"
+     ]
+    },
+    "html": "<sup _ngcontent-ng-c3888946993=\"\" class=\"superscript visible\" data-turn-source-index=\"7\"> 1 <!----></sup>",
+    "href": ""
+   },
+   {
+    "tag": "span",
+    "text": "3",
+    "attrs": [
+     "class=hljs-number"
+    ],
+    "parent": {
+     "tag": "code",
+     "text": "version = 3 [plugins.policy_enforcement] kind = \"intercept_p",
+     "attrs": [
+      "_ngcontent-ng-c914423180=",
+      "role=text",
+      "data-test-id=code-content",
+      "class=code-container formatted ng-tns-c914423180-159"
+     ]
+    },
+    "html": "<span class=\"hljs-number\">3</span>",
+    "href": ""
+   },
+   {
+    "tag": "span",
+    "text": "10",
+    "attrs": [
+     "class=hljs-number"
+    ],
+    "parent": {
+     "tag": "code",
+     "text": "version = 3 [plugins.policy_enforcement] kind = \"intercept_p",
+     "attrs": [
+      "_ngcontent-ng-c914423180=",
+      "role=text",
+      "data-test-id=code-content",
+      "class=code-container formatted ng-tns-c914423180-159"
+     ]
+    },
+    "html": "<span class=\"hljs-number\">10</span>",
+    "href": ""
+   },
+   {
+    "tag": "span",
+    "text": "100",
+    "attrs": [
+     "class=hljs-number"
+    ],
+    "parent": {
+     "tag": "code",
+     "text": "version = 3 [plugins.policy_enforcement] kind = \"intercept_p",
+     "attrs": [
+      "_ngcontent-ng-c914423180=",
+      "role=text",
+      "data-test-id=code-content",
+      "class=code-container formatted ng-tns-c914423180-159"
+     ]
+    },
+    "html": "<span class=\"hljs-number\">100</span>",
+    "href": ""
+   }
+  ]
+ },
+ "sups": {
+  "count": 0,
+  "indexes": [],
+  "sample": []
+ },
+ "sourceHeadings": [
+  "Sources used in the report",
+  "Sources used in the report",
+  "Sources used in the report",
+  "Sources read but not used in the report",
+  "Sources read but not used in the report",
+  "Sources read but not used in the report"
+ ],
+ "usedRows": [],
+ "bodyLinks": {
+  "count": 4,
+  "rows": [
+   {
+    "href": "https://docs.nvidia.com/nemo/relay/v0.8.4/configure-plugins/about",
+    "text": "Configure Plugins - NeMo Relay - NVIDIA Documentation",
+    "label": "",
+    "title": ""
+   },
+   {
+    "href": "https://docs.nvidia.com/nemo/relay/v0.8.4/configure-plugins/about",
+    "text": "docs.nvidia.com/nemo/relay/v0.8.4/configure-plugins/about",
+    "label": "",
+    "title": ""
+   },
+   {
+    "href": "https://docs.nvidia.com/nemo/relay/about-nemo-relay/concepts/plugins",
+    "text": "Plugins - NeMo Relay - NVIDIA Documentation",
+    "label": "",
+    "title": ""
+   },
+   {
+    "href": "https://docs.nvidia.com/nemo/relay/about-nemo-relay/concepts/plugins",
+    "text": "docs.nvidia.com/nemo/relay/about-nemo-relay/concepts/plugins",
+    "label": "",
+    "title": ""
+   }
+  ]
+ },
+ "rawCiteMarks": 5,
+ "rawCiteSample": [
+  "[cite: 5, 13]",
+  "[cite: 5, 13]",
+  "[cite: 5, 13]",
+  "[cite: 5, 13]",
+  "[cite: 4, 5, 13]"
+ ],
+ "openCards": [
+  {
+   "role": null,
+   "tag": "button",
+   "text": "Create",
+   "links": []
+  },
+  {
+   "role": null,
+   "tag": "button",
+   "text": "Sources used in the report",
+   "links": []
+  },
+  {
+   "role": null,
+   "tag": "button",
+   "text": "Sources read but not used in the report",
+   "links": []
+  },
+  {
+   "role": null,
+   "tag": "button",
+   "text": "Thoughts",
+   "links": []
+  }
+ ]
+}

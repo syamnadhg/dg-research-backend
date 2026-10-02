@@ -62,6 +62,7 @@ reserved `.invalid` hosts; the run's census goes to a temporary folder.
 import asyncio
 import ast
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -358,13 +359,31 @@ def test_the_report_is_read_off_the_frame_when_no_export_is_the_report(
     assert "| Dimension | Profile |" in md
     assert "| Origin | Great St Bernard Pass, Western Alps |" in md
     assert "Saint Bernard breed standard." in md and "standard.7" not in md
+    # ⭐ Wave 14, 2026-10-02: the diagram is a picture now, not left out — its
+    # labels are in the picture, never loose words (its base64 is not words).
+    words = re.sub(r"\(<data:image/png;base64,[^<>]*>\)", "()", md)
+    assert words.count("![Diagram]()") == 1
     for chrome_word in ("Copy table", "Export", "Expand", "30 Sep", "339", "Worked for",
                         "Puppy screening", "xxxxxxxx"):
-        assert chrome_word not in md, chrome_word
+        assert chrome_word not in words, chrome_word
     assert _said(logs, "Extracted via the Deep research app's frame (no download)")
     said = _said(logs, "Report read from the Deep research app's frame")
     assert len(said) == 1 and "7 citations had no link in the frame" in said[0], said
-    assert "1 diagram left out" in said[0], said
+    assert "1 picture kept as images, 0 diagrams left out" in said[0], said
+
+
+def test_a_diagram_the_frame_cannot_draw_is_left_out_never_its_words(
+        chrome, page, fast, logs, monkeypatch):
+    """⛔ Wave 14, 2026-10-02: a diagram is drawn as a picture where the frame can
+    draw it. One it cannot (here: not shown) is still left out — its labels never
+    land in the report as loose words — and the log counts it as left out."""
+    hidden = DIAGRAM.replace("<svg ", '<svg style="visibility:hidden" ', 1)
+    _serve(chrome, page, _report_frame(_report().replace(DIAGRAM, hidden)))
+    md = _extract(chrome, page, monkeypatch, app._NoCua(app._export()))
+    assert md and "Puppy screening" not in md and "Adult health checks" not in md
+    assert "data:image" not in md
+    said = _said(logs, "Report read from the Deep research app's frame")
+    assert len(said) == 1 and "0 pictures kept as images, 1 diagram left out" in said[0], said
 
 
 def _done_len(chrome, page):
@@ -501,7 +520,9 @@ def test_a_citation_that_carries_its_source_keeps_it_and_the_document_numbers_it
     cua = app._NoCua(app._export())
     md = _extract(chrome, page, monkeypatch, cua)
     assert cua.calls == 0
-    assert f"[American Kennel Club]({AKC})" in md and "+1" not in md, md[:900]
+    # (The words only: the diagram is now a picture, and its base64 can hold "+1".)
+    words = re.sub(r"\(<data:image/png;base64,[^<>]*>\)", "()", md)
+    assert f"[American Kennel Club]({AKC})" in md and "+1" not in words, md[:900]
     assert f"[The Royal Kennel Club]({RKC})" in md
     said = _said(logs, "Report read from the Deep research app's frame")
     assert said and "2 links" in said[0] and "5 citations had no link" in said[0], said
