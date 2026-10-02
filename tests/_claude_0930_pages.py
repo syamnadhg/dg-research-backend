@@ -414,10 +414,24 @@ _JS = r"""
 """
 
 
+#: How "Download as Markdown" saves its file: as the 10-02 catcher's first
+#: stand-in did ("click": a link in the page, `click()`), or as the FileSaver.js
+#: library does ("file-saver": a link never put in the page, sent a plain,
+#: uncancellable `dispatchEvent(new MouseEvent('click'))` a moment later).
+#: ⚠ ASSUMED either way: nobody has recorded how claude.ai makes its file.
+_SAVE_JS = {
+    "click": "document.body.appendChild(a); a.click(); a.remove();",
+    "file-saver": "setTimeout(() => a.dispatchEvent(new MouseEvent('click')), 0);",
+}
+
+
 def page(*, tier: str = "Medium", finished: bool = False, running: bool = False,
          research_on: bool = False, panel: str = "", research_testid: bool = True,
-         research_sticks: bool = True) -> str:
-    """The whole page. `panel` is "", "research" or "report" (open at load)."""
+         research_sticks: bool = True, save: str = "click") -> str:
+    """The whole page. `panel` is "", "research" or "report" (open at load);
+    `save` is how its export saves the file (`_SAVE_JS`)."""
+    assert _JS.count(_SAVE_JS["click"]) == 1
+    js = _JS.replace(_SAVE_JS["click"], _SAVE_JS[save])
     pill = ('<button type="button" id="sr-research-pill" aria-label="Research" '
             'aria-pressed="true"' + ("" if research_on else " hidden") + '>\ue0d0</button>')
     composer = (
@@ -444,5 +458,5 @@ def page(*, tier: str = "Medium", finished: bool = False, running: bool = False,
             f'{turn(finished) if (finished or running) else ""}</div>{composer}</div>'
             f'<div id="sr-panel-slot">{slot}</div>{menus}')
     return ('<!doctype html><html><head><meta charset="utf-8">'
-            f'<style>{_CSS}</style></head><body>{body}{data}<script>{_JS}</script>'
+            f'<style>{_CSS}</style></head><body>{body}{data}<script>{js}</script>'
             '</body></html>')

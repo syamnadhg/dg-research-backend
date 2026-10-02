@@ -366,16 +366,20 @@ def _downloads(page):
     return got
 
 
+@pytest.mark.parametrize("save", ["click", "file-saver"])
 def test_the_report_is_opened_and_exported_by_the_page_and_chrome_downloads_nothing(
-        chrome, open_page, lines, monkeypatch):
+        chrome, open_page, lines, monkeypatch, save):
     """Capture 2, frames 86-91: the report card (`artifact-card-open`), its
     panel (`[role=region][aria-label^="Artifact panel"]`), "Copy options", then
     "Download as Markdown" (`export-download`). Computer use is THERE and must
     not be called: on 09-30 it opened the report (3 steps) and downloaded it
     (2), and the mount probe never once saw Claude's panel in the corpus.
-    ⛔⛔ 2026-10-02 — and Chrome downloads NOTHING: the page makes the file as
-    claude.ai does (a Blob's address on an `<a download>`, then `click()`), and
-    the export catcher takes it instead of Chrome."""
+    ⛔⛔ 2026-10-02 — and Chrome downloads NOTHING: the page makes the file (a
+    Blob's address on an `<a download>` that claude.ai's row is not) and the
+    export catcher takes it instead of Chrome — whether the page clicks it with
+    `click()` or as the FileSaver.js library does, with an uncancellable click
+    on a link it never puts in the page. ⚠ How claude.ai clicks it has never
+    been recorded, so both."""
     cua = []
 
     async def _cua(*a, **k):
@@ -397,7 +401,7 @@ def test_the_report_is_opened_and_exported_by_the_page_and_chrome_downloads_noth
     monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
     monkeypatch.setattr(research, "_cua_export_caught", _cua_export)
     monkeypatch.setattr(research, "agent_loop", _agent_loop)
-    page = open_page(finished=True)
+    page = open_page(finished=True, save=save)
     downloads = _downloads(page)
     text = chrome.run(research.extract_claude_response(page, browser=_Browser(),
                                                        cua_client=object()))

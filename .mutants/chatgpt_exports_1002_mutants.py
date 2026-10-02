@@ -7,6 +7,11 @@ downloads nothing), and ChatGPT's own citation numbers linked from its PDF.
       `click()` or by an event — is cancelled and its file kept; nothing else
       is touched; a file let go of is not kept; it goes on once; it holds the
       last sixteen; a file is read back byte for byte, a piece at a time.
+      (review 10-02) the element's own click (HTMLElement's) and a click the
+      page sends itself — FileSaver's uncancellable click on a link never put
+      in the page — are stopped and never sent on, only clicks; a real press
+      is found along the click's whole path (a shadow root, the link's words);
+      a catcher put back after a navigation numbers past the one before.
   P*  Python's side: what a caught file is; a file larger than the cap or read
       back short is not taken; the pieces are the file; only a file caught
       after the press began; a download Chrome still starts is logged;
@@ -15,12 +20,14 @@ downloads nothing), and ChatGPT's own citation numbers linked from its PDF.
       the catcher; the export comes before the frame read, with or without the
       app's frame; a Markdown file too short or a sources list is no report;
       the PDF is pressed after the Markdown.
-  C*  Claude: the page's Download as Markdown and computer use's, both caught;
-      nothing pressed without the catcher.
+  C*  Claude: the page's Download as Markdown and computer use's, both caught
+      (also when the page saves it as FileSaver.js does); nothing pressed
+      without the catcher.
   J*  ChatGPT's PDF: the chips and the sources pages read; every check before
-      anything is written (count, per number, one address per number, the
-      sources pages = the body, one address per reference id, every number
-      written links, no number of its own already); each run in place, glued to
+      anything is written (count, the numbers in order, one address per number,
+      the sources pages = the body, one address per reference id, no number
+      glued to its line's bullet, list number, heading mark or task box, every
+      number written links, no number of its own already); each run in place, glued to
       the word before it; the brief's runs and runs in code removed; a link-less
       sources section of its own replaced, one with links kept (no numbers);
       ChatGPT's own list in its page-42 shape.
@@ -59,7 +66,7 @@ SUITES = {
     "chrome": [_EXPORTS, "-k", "both_exports or saved_document or no_pdf_caught or "
                "does_not_match or without_the_catcher or no_export_control or "
                "computer_use_presses or caught_before or catcher_misses or sources_list or "
-               "no_app_frame"],
+               "no_app_frame or own_press or navigated"],
     "frame": ["tests/test_chatgpt_dr_read_1001.py"],
     "claude": ["tests/test_claude_0930_r2.py", "-k",
                "exported_by_the_page or without_the_catcher or presses_the_export"],
@@ -67,7 +74,7 @@ SUITES = {
              "caught_file or both_exports or saved_document or no_pdf_caught or "
              "does_not_match or without_the_catcher or no_export_control or "
              "computer_use_presses or caught_before or catcher_misses or sources_list or "
-             "no_app_frame)"],
+             "no_app_frame or own_press or navigated)"],
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"}
 
@@ -110,6 +117,40 @@ MUTANTS = [
      [("        s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));\n",
        "        s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x4000));\n")],
      "catch"),
+    # (review, 10-02: every common way a page clicks the link, and numbers that
+    # never go backwards — measured on the real ChatGPT path in Chrome where a
+    # browser can show it, else on node's stand-in)
+    ("K11", RESEARCH, "⛔ only the link's own click() is stopped — the element's own click downloads",
+     [("    const click = HTMLElement.prototype.click;\n    HTMLElement.prototype.click = function () {\n",
+       "    const click = HTMLAnchorElement.prototype.click;\n"
+       "    HTMLAnchorElement.prototype.click = function () {\n")],
+     "chrome"),
+    ("K12", RESEARCH, "⛔⛔ a click the page sends itself is never stopped — FileSaver's save downloads",
+     [("        if (ev && ev.type === 'click' && kept(this)) {\n", "        if (false) {\n")],
+     "chrome"),
+    ("K13", RESEARCH, "⛔ the page's own click is taken AND sent on — Chrome downloads it too",
+     [("            take(this, 'anchor.dispatchEvent(click)');\n            return false;\n",
+       "            take(this, 'anchor.dispatchEvent(click)');\n")],
+     "chrome"),
+    ("K14", RESEARCH, "the page is told its stopped click went through",
+     [("            return false;\n        }\n        return send.apply(this, arguments);\n",
+       "            return true;\n        }\n        return send.apply(this, arguments);\n")],
+     "catch"),
+    ("K15", RESEARCH, "every event sent to the export's link is swallowed, not only a click",
+     [("        if (ev && ev.type === 'click' && kept(this)) {\n", "        if (ev && kept(this)) {\n")],
+     "catch"),
+    ("K16", RESEARCH, "⛔ a real press on a link inside a shadow root is not seen — Chrome downloads it",
+     [("        try { a = e.composedPath().find((n) => n instanceof HTMLAnchorElement) || null; } catch (x) {}\n",
+       "        try { a = e.target.closest('a[download]'); } catch (x) {}\n")],
+     "chrome"),
+    ("K17", RESEARCH, "a real press on the words inside the link is not seen",
+     [("        try { a = e.composedPath().find((n) => n instanceof HTMLAnchorElement) || null; } catch (x) {}\n",
+       "        try { a = e.composedPath()[0]; } catch (x) {}\n")],
+     "catch"),
+    ("K18", RESEARCH, "⛔⛔ a catcher put back after a navigation counts from 1 again — the PDF is ignored",
+     [("    const st = { v: 1, seq: Date.now(), blobs: new Map(), caught: [] };\n",
+       "    const st = { v: 1, seq: 0, blobs: new Map(), caught: [] };\n")],
+     "chrome"),
 
     # ── P: Python's side of the catch ───────────────────────────────────────
     ("P1", RESEARCH, "a PDF with a generic type is not a PDF",
@@ -213,14 +254,63 @@ MUTANTS = [
      [("                if browser and cua_client:\n                    got = await _cua_export_caught(\n",
        "                if False:\n                    got = await _cua_export_caught(\n")],
      "claude"),
+    ("C5", RESEARCH, "⛔⛔ Claude's page saving its file as FileSaver does is not stopped — a download",
+     [("        if (ev && ev.type === 'click' && kept(this)) {\n", "        if (false) {\n")],
+     "claude"),
 
     # ── J: ChatGPT's PDF ────────────────────────────────────────────────────
     ("J1", RESEARCH, "the count check is gone (a later check says something else)",
      [("    if len(body) != len(seq):\n", "    if False:\n")],
      "pair"),
-    ("J2", RESEARCH, "the per-number check is gone",
-     [("    if collections.Counter(n for n, _u in body) != collections.Counter(seq):\n",
-       "    if False:\n")],
+    ("J2", RESEARCH, "⛔⛔ the per-number check is gone",
+     [("    if [n for n, _u in body] != seq:\n", "    if False:\n")],
+     "pair"),
+    ("J21", RESEARCH, "⛔⛔ only the counts are checked, not the order — two numbers trade sources unseen",
+     [("    if [n for n, _u in body] != seq:\n",
+       "    if collections.Counter(n for n, _u in body) != collections.Counter(seq):\n")],
+     "pair"),
+    ("J22", RESEARCH, "⛔ a number glued to its line's bullet is written — the list item is lost",
+     [("    if _CG_BARE_MARKER_RE.search(tmask):\n", "    if False:\n")],
+     "pair"),
+    ("J23", RESEARCH, "a number glued to a bullet is let through",
+     [(r"""    r'(?:[-*+]|\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n",
+       r"""    r'(?:\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n")],
+     "pair"),
+    ("J24", RESEARCH, "a number glued to a list number is let through",
+     [(r"""    r'(?:[-*+]|\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n",
+       r"""    r'(?:[-*+]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n")],
+     "pair"),
+    ("J25", RESEARCH, "a number glued to a heading mark is let through",
+     [(r"""    r'(?:[-*+]|\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n",
+       r"""    r'(?:[-*+]|\d{1,9}[.)]|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n")],
+     "pair"),
+    ("J26", RESEARCH, "a number glued to a task box is let through",
+     [(r"""    r'(?:[-*+]|\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')""" "\n",
+       r"""    r'(?:[-*+]|\d{1,9}[.)]|#{1,6})\\\[\d{1,3}\\\]')""" "\n")],
+     "pair"),
+    ("J27", RESEARCH, "a bullet inside a quote is not seen",
+     [(r"""    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n",
+       r"""    r'(?m)^[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n")],
+     "pair"),
+    ("J28", RESEARCH, "a task box after its list marker is not seen",
+     [(r"""    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n",
+       r"""    r'(?m)^[ \t>]*'""" "\n")],
+     "pair"),
+    ("J29", RESEARCH, "a task box after a bullet is not seen",
+     [(r"""    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n",
+       r"""    r'(?m)^[ \t>]*(?:(?:\d{1,9}[.)])[ \t]+)?'""" "\n")],
+     "pair"),
+    ("J30", RESEARCH, "a task box after a list number is not seen",
+     [(r"""    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n",
+       r"""    r'(?m)^[ \t>]*(?:(?:[-*+])[ \t]+)?'""" "\n")],
+     "pair"),
+    ("J31", RESEARCH, "⛔ a number glued to a bold run's end mid-line is taken for a bullet — no links",
+     [(r"""    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n",
+       r"""    r'(?m)[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n")],
+     "pair"),
+    ("J32", RESEARCH, "only the document's first line is looked at",
+     [(r"""    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n",
+       r"""    r'^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'""" "\n")],
      "pair"),
     ("J3", RESEARCH, "⛔ a number opening two addresses is accepted",
      [("        if number_url.setdefault(n, u) != u:\n", "        if False:\n")],

@@ -56481,6 +56481,19 @@ async def _copy_via_hijack(
 # one of them is CANCELLED: the Blob's bytes are handed to Python instead, read
 # back as base64 a megabyte at a time. The export is pressed as before, by the
 # page or by computer use; only the file never reaches Chrome.
+# ⛔ EVERY COMMON WAY A PAGE CLICKS THAT LINK (review, 10-02). Claude's export
+# has never been recorded, so the catcher stops each: the element's own
+# `click()` (HTMLElement's, so `HTMLElement.prototype.click.call(a)` too); a
+# click the page sends itself with `dispatchEvent` — FileSaver.js sends a plain
+# `new MouseEvent('click')`, which cannot be cancelled, to a link it never puts
+# in the page, which no window listener ever hears — never sent on; and a real
+# press (computer use's), cancelled by the window's listener, which finds the
+# link along the click's whole path, into an open shadow root (and so from the
+# words inside the link too).
+# ⛔ ITS NUMBERS NEVER GO BACKWARDS. A navigation takes the catcher off and
+# computer use's watch puts it back; the one put back starts from the clock
+# (milliseconds), past every number the one before it gave, so a file it
+# catches is after the press began (`since`) — the PDF after the Markdown.
 # ⛔ THE PAGE'S OWN WORLD (`_page_world_evaluate`). The page calls the page
 # world's `URL.createObjectURL`; a wrapper in patchright's isolated world would
 # catch nothing, as the clipboard hooks once caught nothing.
@@ -56493,7 +56506,7 @@ _EXPORT_CATCH_JS = r"""() => {
     const had = window.__srExportCatch;
     if (had && had.v === 1) return { armed: true, again: true };
     const KEEP = 16;
-    const st = { v: 1, seq: 0, blobs: new Map(), caught: [] };
+    const st = { v: 1, seq: Date.now(), blobs: new Map(), caught: [] };
     const make = URL.createObjectURL, drop = URL.revokeObjectURL;
     URL.createObjectURL = function (obj) {
         const url = make.apply(this, arguments);
@@ -56522,14 +56535,22 @@ _EXPORT_CATCH_JS = r"""() => {
                          type: String(blob.type || ''), size: blob.size, via: via, blob: blob });
         while (st.caught.length > KEEP) st.caught.shift();
     };
-    const click = HTMLAnchorElement.prototype.click;
-    HTMLAnchorElement.prototype.click = function () {
+    const click = HTMLElement.prototype.click;
+    HTMLElement.prototype.click = function () {
         if (kept(this)) { take(this, 'anchor.click()'); return; }
         return click.apply(this, arguments);
     };
+    const send = EventTarget.prototype.dispatchEvent;
+    EventTarget.prototype.dispatchEvent = function (ev) {
+        if (ev && ev.type === 'click' && kept(this)) {
+            take(this, 'anchor.dispatchEvent(click)');
+            return false;
+        }
+        return send.apply(this, arguments);
+    };
     window.addEventListener('click', (e) => {
-        const t = e.target;
-        const a = t && t.closest ? t.closest('a[download]') : null;
+        let a = null;
+        try { a = e.composedPath().find((n) => n instanceof HTMLAnchorElement) || null; } catch (x) {}
         if (!kept(a)) return;
         e.preventDefault();
         take(a, 'click event');
@@ -57382,8 +57403,9 @@ async def _chatgpt_dr_export_report(page, browser, cua_client, label="ChatGPT",
 # exactly the body's numbers; all 31 reference ids resolve (a run with one
 # reference, or the first reference of a group, which is what a chip opens).
 # ⭐ THE RULE. Run N of the Markdown (numbered by first use) is chip N of the PDF
-# — joined by NUMBER, never by position, so a table's reading order cannot shift
-# it. Each run becomes ChatGPT's own number, `\[N\]`, where the run stood, and
+# — joined by NUMBER; and the numbers must also come in the same order in both,
+# so a reading order that differs (as a table's might) falls back rather than
+# shifts a link. Each run becomes ChatGPT's own number, `\[N\]`, where the run stood, and
 # the document ends with ONE "Sources" list in the shape of ChatGPT's own sources
 # page: each source's title and address, then the numbers that cite it. At the
 # write, the own-numbers step (`_doc_link_own_numbers`) links each number to its
@@ -57393,11 +57415,15 @@ async def _chatgpt_dr_export_report(page, browser, cua_client, label="ChatGPT",
 # A report's own trailing sources section with no link in it ("**Prioritized
 # sources.**", 10-01) is replaced by this list: the document has one.
 # ⛔⛔ CHECKED BEFORE ANYTHING IS WRITTEN: the body's chips = the Markdown's runs
-# (in number and per number), one number → one address, the sources pages = the
-# body, one reference id → one address, and every number written links. On ANY
-# mismatch no number and no list are written: the runs come out as before and
-# the write ends the document with the sites ChatGPT visited — one log line says
-# why. A shifted link is worse than no footnote.
+# (in number, and the chips' numbers in the PDF's order = the runs' numbers in
+# the Markdown's — two numbers cited equally often could otherwise trade labels
+# unseen, review 10-02), one number → one address, the sources pages = the body,
+# one reference id → one address, no number glued to a line's bullet, list
+# number or heading mark (it would unmake that list item or heading), and every
+# number written links. On ANY mismatch no number and no list are written: the
+# runs come out as before and the write ends the document with the sites
+# ChatGPT visited — one log line says why. A shifted link is worse than no
+# footnote.
 
 #: A chip: a link 12 pt wide and 11.25 pt tall with only a number in it.
 _CG_PDF_CHIP_W = 12.0
@@ -57412,6 +57438,13 @@ _CG_PDF_TITLE_MIN = 8.0
 _CG_OWN_NUMBER_RE = re.compile(r'(?<!\\)\\\[(\d{1,3})\\\]')
 #: The spaces at the end of a piece of text, never its line break.
 _CG_LINE_SPACE_END_RE = re.compile(r'[^\S\n]+\Z')
+#: A number glued to the block marker its line starts with — a bullet, a list
+#: number, a heading's hashes, or a task box (after its bullet or number), past
+#: any indent or quote marks: the marker lost the space it needs, and the line
+#: is no longer that list item or heading ("-\[1\] text", "1.\[1\]", "##\[1\]").
+_CG_BARE_MARKER_RE = re.compile(
+    r'(?m)^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?'
+    r'(?:[-*+]|\d{1,9}[.)]|#{1,6}|\[[ xX]\])\\\[\d{1,3}\\\]')
 
 
 def _cg_pdf_matrix(m, n):
@@ -57583,8 +57616,11 @@ def _chatgpt_pdf_numbered(md: str, pdf, label: str = "ChatGPT"):
     body = table["body"]
     if len(body) != len(seq):
         return _no(f"{len(body)} numbered citations in the PDF, {len(seq)} in the Markdown")
-    if collections.Counter(n for n, _u in body) != collections.Counter(seq):
-        return _no("the PDF's numbers are not the Markdown's citations numbered by first use")
+    # ⛔ In order, not only in number: two numbers cited equally often could
+    # trade labels and every other check would still agree.
+    if [n for n, _u in body] != seq:
+        return _no("the PDF's numbers, in order, are not the Markdown's citations numbered "
+                   "by first use")
     number_url = {}
     for n, u in body:
         if number_url.setdefault(n, u) != u:
@@ -57634,6 +57670,9 @@ def _chatgpt_pdf_numbered(md: str, pdf, label: str = "ChatGPT"):
         tmask = _mask_code_spans(text)[0]
         log(f"[{who}] the report's own sources section holds no link — replaced by "
             "ChatGPT's own sources list, so the document ends with one")
+    if _CG_BARE_MARKER_RE.search(tmask):
+        return _no("a citation comes right after a bullet, a list number or a heading mark "
+                   "at the start of its line")
     present = sorted({int(x) for x in _CG_OWN_NUMBER_RE.findall(tmask)})
     if not present:
         return _no("no citation is left to number")
