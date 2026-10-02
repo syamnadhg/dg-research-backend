@@ -9775,12 +9775,18 @@ def _waiting_run_stop_patch() -> dict:
     }
 
 
-def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None":
+def _park_waiting_run(job, *, from_worker, behind: bool = False,
+                      p2_chats: "dict | None" = None) -> "Path | None":
     """Put `job`'s run at the front of this computer's queue: write its marker,
     naming the whole job, so whichever worker takes it can resume it without
     asking anyone. The run folder, or None when the job names no person, or
     the write failed — which is also the answer for a run with no folder yet:
     it has nothing to keep, and a folder is never made up for it here.
+
+    ⭐ `p2_chats` (wave 15, 10-02) — {agent: chat address}, the Phase-2 chats
+    the run was in when it was moved. Kept in the marker beside `from_worker`,
+    so the worker that takes the run back can go into them again instead of
+    sending the brief to new chats (`_waiting_p2_chats` decides whether it may).
 
     ⭐ `behind` — a job a RESTING worker had only QUEUED in its own line when a
     restart came (wave 13 repair). It goes to the BACK of the waiting runs, in
@@ -9820,6 +9826,8 @@ def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None
     }
     if behind:
         rec["queued_job"] = dict(job)
+    if p2_chats:
+        rec["p2_chats"] = {str(k): str(v) for k, v in p2_chats.items() if k and v}
     tmp = run_dir / f"{WAITING_MARKER}.tmp"
     try:
         for stale in run_dir.glob(f"{WAITING_MARKER}.w*"):
@@ -9968,7 +9976,7 @@ def _claim_waiting_run(worker_id) -> "dict | None":
                         kept_work=_waiting_kept_work(rec))
         log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the front of "
             f"the queue — it goes on from the start of the step it was on", "INFO")
-        return {
+        job = {
             "topic": str(rec.get("topic") or ""),
             "email": str(rec.get("email") or ""),
             "config": dict(rec.get("config") or {}),
@@ -9980,9 +9988,42 @@ def _claim_waiting_run(worker_id) -> "dict | None":
             # It was running: until it starts here its pill says so (`moved`).
             "kept_work": True,
         }
+        _chats = _waiting_p2_chats(rec, worker_id)
+        if _chats:
+            job["p2_rejoin"] = _chats
+        return job
     if dropped:
         _kick_queue_publish()
     return None
+
+
+def _waiting_p2_chats(rec, worker_id) -> dict:
+    """{agent: chat address} a moved run may go back into on worker
+    `worker_id`, or {} when its Phase 2 starts fresh (wave 15, the owner's yes
+    on 10-02).
+
+    ⛔⛔ ONLY ON THE WORKER IT WAS MOVED OFF. Each worker is its own Chrome
+    profile, signed in to its own ChatGPT, Claude and Google accounts (the same
+    reason `_p3_notebook_to_reopen` reopens a notebook only on the worker that
+    made it). On another worker the chats are another account's: they would not
+    open, or would open as somebody else's. So there the phase starts fresh, as
+    before. A marker that does not say which worker it came from is treated as
+    another worker's — nothing proves it was this one."""
+    chats = (rec or {}).get("p2_chats")
+    if not isinstance(chats, dict) or not chats:
+        return {}
+    came_from = (rec or {}).get("from_worker")
+    rid = str((rec or {}).get("research_id") or "")
+    if (isinstance(came_from, int) and not isinstance(came_from, bool)
+            and came_from == int(worker_id)):
+        log(f"[moved-run] {rid[:8]}… comes back to worker {worker_id}, the worker its "
+            f"chats were opened on — its Phase 2 goes back into them", "INFO")
+        return {str(k): str(v) for k, v in chats.items() if k and v}
+    log(f"[moved-run] {rid[:8]}…'s chats were opened on "
+        f"{f'worker {came_from}' if came_from is not None else 'a worker it did not record'}, "
+        f"and this is worker {worker_id}, signed in to other accounts — its Phase 2 "
+        f"starts fresh", "INFO")
+    return {}
 
 
 def _drop_waiting_claim(run_dir, worker_id) -> None:
@@ -10238,7 +10279,8 @@ def _move_run_to_queue(data) -> str:
             f"startup, so worker {WORKER_ID} cannot restart to let the run go; "
             f"it keeps running", "WARN")
         return "not-supervised"
-    if _park_waiting_run(current, from_worker=WORKER_ID) is None:
+    if _park_waiting_run(current, from_worker=WORKER_ID,
+                         p2_chats=_p2_chats_to_move()) is None:
         log(f"[device-cmds] REQUEUE: ignored — {rid[:8]}… has nothing saved on this "
             f"computer yet to go on from; it keeps running", "WARN")
         return "not-saved"
@@ -79035,6 +79077,22 @@ def _p2_chats_to_rejoin() -> dict:
     return out
 
 
+def _p2_chats_to_move() -> dict:
+    """{platform: chat URL} a "Move to queue" keeps with the run (wave 15): the
+    same chats a Phase-2 crash would hand its retry, taken the same way, and
+    only while the run is in Phase 2 or before it — after it there is nothing
+    to go back into. Read from the device-command thread while the pipeline
+    still holds them: plain reads of the run's own maps and its tabs' last
+    addresses. Never raises — a move must not fail over its chats."""
+    try:
+        phase = getattr(_runtime, "phase", None)
+        if isinstance(phase, int) and phase > 2:
+            return {}
+        return _p2_chats_to_rejoin()
+    except Exception:
+        return {}
+
+
 def _p2_take_rejoin(left: dict, *, new_input: bool) -> dict:
     """The carried chats for ONE Phase-2 attempt, and none for any after it: a
     person's Retry, Skip or new input re-runs the whole phase. None at all when
@@ -79881,7 +79939,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     _p2_rejoin (10-01): {agent key: chat URL} — the chats a Phase-2 browser crash
     left, handed over by that crash's own retry so the first Phase-2 attempt goes
-    back into them instead of sending the brief again. Nothing else passes it.
+    back into them instead of sending the brief again. The one other caller is
+    the worker taking back a run that was moved to the queue (wave 15), and only
+    when it is the worker the run was moved off (`_waiting_p2_chats`).
 
     brief_text (2026-04): inline brief content passed from the frontend when
     the user toggled Phase 1 off. Written to the new run's
@@ -87158,7 +87218,10 @@ async def run_server(port=8000):
                                      _submitted_by=job.get("submitted_by"),
                                      brief_text=job.get("brief_text", ""),
                                      user_sources=job.get("user_sources") or [],
-                                     user_links=job.get("user_links") or []))
+                                     user_links=job.get("user_links") or [],
+                                     # Wave 15: a moved run's chats, only when
+                                     # this is the worker it was moved off.
+                                     _p2_rejoin=job.get("p2_rejoin") or None))
                     _wd_active_sec = 0.0
                     _wd_tick = 10.0
                     while not _pipe_task.done():
