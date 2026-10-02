@@ -473,9 +473,11 @@ def test_a_failed_plan_is_one_honest_card_and_never_read_as_a_report(
 
 def test_retry_on_the_failed_plan_card_starts_a_fresh_chat(round_robin, monkeypatch):
     """The card says "Retry starts a fresh chat", and it must: the person presses
-    Retry once the card is up, and Gemini is set up again. ⛔ Even when an earlier
-    leg had half-read the failed page as done — a reading the Retry would take for
-    a finished agent, and swallow."""
+    Retry once the card is up, and Gemini is set up again. ⛔ Even when the first
+    leg missed the failure — the turn was still changing — and that leg's done
+    check half-read the failed page as done (no Stop, Share & export showing, the
+    text still moving): a reading the Retry would take for a finished agent, and
+    swallow as "already completed"."""
     raised = []
 
     def _card_then_retry(*a, **k):
@@ -483,8 +485,18 @@ def test_retry_on_the_failed_plan_card_starts_a_fresh_chat(round_robin, monkeypa
         if a[1] == "Gemini's plan failed":
             research._controls.request_retry_agent_hard("gemini")
     monkeypatch.setattr(research, "fail_agent", _card_then_retry)
-    out = round_robin(watch=True, minutes=10, html=FAILED_PLAN_PAGE,
-                      entry={"done_count": 1})
+    real_read = research._gemini_watched_plan_failed
+    reads = []
+
+    async def _first_read_misses(page):
+        reads.append(1)
+        return "" if len(reads) == 1 else await real_read(page)
+    monkeypatch.setattr(research, "_gemini_watched_plan_failed", _first_read_misses)
+    # Twelve seconds in — inside the done check's 30-second second look — the
+    # failed turn gains a line, so the done check sees the text still moving.
+    monkeypatch.setitem(globals(), "LATE_START", "<span> Please try again later.</span>")
+    out = round_robin(watch=True, minutes=10, html=FAILED_PLAN_PAGE, start_at=0.2)
+    assert _said_rr(out, "Done-marker present but signals still moving"), out.lines[:30]
     assert [c[1] for c in raised][:1] == ["Gemini's plan failed"], raised
     assert _said_rr(out, "Hard retry #1"), out.lines[-20:]
     assert not _said_rr(out, "already completed"), out.lines[-20:]

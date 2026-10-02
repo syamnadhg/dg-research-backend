@@ -32197,7 +32197,8 @@ _AGENT_ERROR_CARD_OF: dict = {}
 
 
 def _drop_agent_card_stamp(agent_key) -> None:
-    """`agent_key`'s card is no longer up: it was skipped automatically.
+    """`agent_key`'s card is no longer up — it was skipped automatically, or its
+    phase is over — so nothing may "take it down" again.
 
     ⛔ Review 10-02. A person's Skip and Retry drop the stamp, and so does the
     agent finishing; an automatic skip did not. A crash later in the run then
