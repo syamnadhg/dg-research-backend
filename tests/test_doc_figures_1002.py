@@ -21,9 +21,11 @@ and Claude's artifact panel as its page read selects it. Nothing leaves the
 machine: pages come from `page.set_content`, and an address on another site is
 answered by a local route.
 """
+import asyncio
 import base64
 import re
 import struct
+import time
 
 import research
 import test_chatgpt_new_page_0928 as base
@@ -127,7 +129,7 @@ def test_every_picture_in_a_gemini_report_reaches_the_saved_document(
     assert "data:" not in local and "blob:" not in local
     assert "Q1 revenue" not in local and "Q2 revenue" not in local
     assert local.index("![Revenue by quarter]") < local.index("Paragraph 2 of the report")
-    assert "$$\\sqrt{x^2 + y^2}$$" in local
+    assert "$$ \\sqrt{x^2 + y^2} $$" in local
     assert "```\nflowchart TD\n    A[Collateral] --> B[Position]\n```" in local
     said = [m for _lvl, m in world.logs if "pictures in the report" in m]
     assert said == ["[Gemini] pictures in the report: 3 drawn as images"], said
@@ -141,8 +143,7 @@ def test_a_drawn_chart_keeps_the_colours_and_the_ground_the_page_gave_it(
     ground of its own, is on white."""
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
     _load(chrome, page, _report())
-    html = chrome.run(page.evaluate(research._DOC_HTML_READ_JS.replace(
-        "__SEL__", '"immersive-panel"')))
+    html = chrome.run(page.evaluate(research._doc_html_read_js("immersive-panel")))
     pics = dict((alt, src) for src, alt in re.findall(
         r'<img src="(data:image/png;base64,[^"]+)" alt="([^"]+)"', html))
     assert set(pics) == {"Revenue by quarter", "Chart", "Margin trend"}, html[:300]
@@ -217,8 +218,110 @@ def test_icons_controls_and_web_images_are_not_drawn(chrome, page, fast, monkeyp
     md = chrome.run(research._extract_html_to_md(page, ["immersive-panel"], "Gemini"))
     assert re.findall(r"!\[([^\]]*)\]\(<(data|https)", md) == [
         ("Revenue by quarter", "data"), ("Photo", "https")]
-    assert "$$\\sqrt{x^2 + y^2}$$" in md
+    assert "$$ \\sqrt{x^2 + y^2} $$" in md
     # Exactly this line: a web image the page tried to redraw would be counted
     # as one it could not draw.
     assert [m for m in logs if "pictures in the report" in m] == [
         "[Gemini] pictures in the report: 1 drawn as images"], logs
+
+
+# ── The read's own limits (review 10-02: none of them was pinned) ───────────
+
+def _said(logs):
+    return [m for m in logs if "pictures in the report" in m]
+
+
+def _charts(n):
+    """`n` svg charts, each with its own axis label."""
+    return "".join(SVG_CHART.replace("Q1 revenue", f"Axis label {i}").replace(
+        "Revenue by quarter", f"Chart number {i}") for i in range(1, n + 1))
+
+
+def test_a_read_draws_twenty_pictures_and_counts_every_one_past_them(chrome, page, fast,
+                                                                     monkeypatch):
+    """⛔ Review 10-02: a report with 21 charts — the first 20 are drawn and the
+    21st stays as the page shows it; the log counts it ("20 drawn" alone hid
+    it), so a run log shows a report held more pictures than one read draws."""
+    logs = []
+    monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    G.offline(chrome, page)
+    chrome.run(page.set_content(G.report_page(
+        f"<h1>R</h1><p>{G.prose(1)}</p>{_charts(21)}<p>{G.prose(2)}</p>")))
+    md = chrome.run(research._extract_html_to_md(page, ["immersive-panel"], "Gemini"))
+    assert re.findall(r"!\[([^\]]*)\]\(<data:image/png;base64,", md) == [
+        f"Chart number {i}" for i in range(1, 21)]
+    assert re.findall(r"Axis label \d+", md) == ["Axis label 21"]
+    assert _said(logs) == ["[Gemini] pictures in the report: 20 drawn as images, 1 could "
+                           "not be drawn and stay as the page shows them"], logs
+
+
+def test_a_read_past_its_time_draws_nothing_more_and_counts_it(chrome, page, fast,
+                                                                monkeypatch):
+    """With the read's time spent (its budget set to none), not one picture is
+    drawn: each stays as the page shows it, and the log counts all three."""
+    logs = []
+    monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(research, "_DOC_FIGURES_BUDGET_MS", 0)
+    _load(chrome, page, _report())
+    md = chrome.run(research._extract_html_to_md(page, ["immersive-panel"], "Gemini"))
+    assert "data:image" not in md and "Q1 revenue" in md
+    assert _said(logs) == ["[Gemini] pictures in the report: 0 drawn as images, 3 could "
+                           "not be drawn and stay as the page shows them"], logs
+
+
+def test_a_picture_too_big_to_store_is_not_put_in(chrome, page, fast, monkeypatch):
+    """A drawn picture larger than the image store keeps (its size cap set below
+    any picture here) is not put in the copy: each stays as the page shows it,
+    and the log counts it."""
+    logs = []
+    monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(research, "_DOC_FIGURES_MAX_CHARS", 100)
+    _load(chrome, page, _report())
+    md = chrome.run(research._extract_html_to_md(page, ["immersive-panel"], "Gemini"))
+    assert "data:image" not in md and "Q1 revenue" in md
+    assert _said(logs) == ["[Gemini] pictures in the report: 0 drawn as images, 3 could "
+                           "not be drawn and stay as the page shows them"], logs
+
+
+def test_an_svg_that_never_finishes_drawing_does_not_hold_the_read(chrome, page, fast,
+                                                                   monkeypatch):
+    """⛔ `page.evaluate` has no time limit of its own: an svg whose drawing never
+    loads would hold the whole page read forever. Here `Image` never loads
+    anything; the read gives that drawing its wait (set short here), counts it,
+    and comes back with the report.
+    (Set through `page.evaluate`, not the page's own script: patchright runs the
+    read in a world of its own, where the page's globals are not seen.)"""
+    logs = []
+    monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(research, "_DOC_FIGURES_WAIT_MS", 300)
+    G.offline(chrome, page)
+    chrome.run(page.set_content(G.report_page(
+        f"<h1>R</h1><p>{G.prose(1)}</p>{SVG_CHART}<p>{G.prose(2)}</p>")))
+    assert chrome.run(page.evaluate(
+        "() => { window.Image = function () { return {}; }; return !(new Image()).decode; }"))
+    started = time.monotonic()
+    md = chrome.run(asyncio.wait_for(
+        research._extract_html_to_md(page, ["immersive-panel"], "Gemini"), 8))
+    # Inside the wait it was given, not the 3 s it is when nothing sets it.
+    assert time.monotonic() - started < 2.5
+    assert "Paragraph 2 of the report" in md and "data:image" not in md
+    assert _said(logs) == ["[Gemini] pictures in the report: 0 drawn as images, 1 could "
+                           "not be drawn and stay as the page shows them"], logs
+
+
+def test_a_copy_that_does_not_match_the_page_gets_no_picture(chrome, page, fast):
+    """⛔ The pictures go into the copy element by element, matched by position.
+    Both reads today clone the copy in the same step, so they always match; a
+    read that took something out of its copy first (as the frame read does right
+    after) would put each picture in the wrong place. So a copy that does not
+    match gets none, and nothing in it changes."""
+    _load(chrome, page, _report())
+    got = chrome.run(page.evaluate("""async () => {
+        const root = document.querySelector('immersive-panel');
+        const copy = root.cloneNode(true);
+        copy.querySelector('h1').remove();
+        const before = copy.innerHTML;
+        const got = await (""" + research._doc_figures_js() + """)(root, copy);
+        return [got.made, got.failed, copy.innerHTML === before];
+    }"""))
+    assert got == [0, 0, True]

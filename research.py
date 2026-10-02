@@ -54417,7 +54417,7 @@ def _doc_img_note_decorative() -> None:
 # ("zk=dhstate⊤Wchoptk" with those spaces in it — 65 of them in the 10-01 Gemini
 # document).
 # ⭐ Now an equation is written from its source and its drawing is never read:
-# inside a sentence as `$$tex$$`, on its own line as a `$$` block, the delimiters
+# inside a sentence as `$$ tex $$`, on its own line as a `$$` block, the delimiters
 # on lines of their own — the one shape the web's renderer reads (remark-math,
 # single-dollar maths off). A KaTeX root that carries its source —
 # `annotation[encoding="application/x-tex"]`, as KaTeX renders on ChatGPT's and
@@ -54428,11 +54428,29 @@ def _doc_img_note_decorative() -> None:
 # ⛔ A block holds no blank line: the web ends an unclosed `$$` at a blank line,
 #    and TeX has no use for one inside maths.
 # ⛔ Inside a table cell or a heading — one line each — a block is written inline,
-#    and in a cell a bare `|` is written `\|`, or it would end the cell.
+#    and so it is inside bold, italics, a link or a quote (`_DOC_MATH_WRAPPED`):
+#    their marks hold one line, so a block's own lines left its TeX as raw text.
+# ⛔ In a table cell a bare `|` would end the cell, so it is written `\vert ` —
+#    the same single bar to KaTeX. NOT `\|`: the web hands an equation's TeX to
+#    KaTeX as written, and `\|` is the DOUBLE bar ("p(j | x)" drew "p(j‖x)", and a
+#    real `\|` could no longer be told from it). A `\|` the TeX holds stays: the
+#    cell reads it as a pipe, and KaTeX draws the double bar it was.
+# ⛔ An inline equation is written `$$ tex $$`, one space inside each side: the
+#    web takes those spaces off, and a TeX ending in a dollar (`C = 100\$`) no
+#    longer runs into the closing `$$` ("$$$" closes nothing). Where it would
+#    touch a dollar outside it — the equation beside it, a price — a space goes
+#    between (`_doc_math_join`): "$$a$$$$b$$" was read as one broken equation.
 # ⛔ Nothing here writes `\[` or `\(`: a citation `\[7\]`, or our `[\[7\]](url)`,
 #    is never made into an equation or out of one.
 #: The encoding KaTeX gives the TeX it keeps beside its drawing.
 _DOC_MATH_TEX_ENCODING = "application/x-tex"
+#: The tags whose markdown holds its words on one line between marks — `**`,
+#: `*`, `~~`, a link's brackets, a quote's quotes. A block inside one is inline.
+_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "del", "s", "q"})
+#: Either side of an inline equation while the converter runs, so the finished
+#: markdown can tell where one touches a dollar (`_doc_math_join`). Never left in.
+#: (Named by number, never written as the characters: they are invisible.)
+_DOC_MATH_OPEN, _DOC_MATH_CLOSE = chr(0xE3A0), chr(0xE3A1)
 
 
 def _doc_math_classes(el) -> set:
@@ -54462,15 +54480,31 @@ def _doc_math_source(el):
 
 def _doc_math_markdown(tex: str, block: bool, parent_tags) -> str:
     """One equation as the web's renderer reads it — see the block above."""
-    if block and "_inline" not in parent_tags:
+    tags = set(parent_tags)
+    if block and not ({"_inline"} | _DOC_MATH_WRAPPED) & tags:
         lines = [ln.rstrip() for ln in tex.strip().splitlines() if ln.strip()]
         return "\n\n$$\n%s\n$$\n\n" % "\n".join(lines)
     one = " ".join(tex.split())
-    if {"td", "th"} & set(parent_tags):
-        one = re.sub(r"(?<!\\)\|", r"\\|", one)
+    if {"td", "th"} & tags:
+        # A command or an escaped character (`\\`, `\|`) is read whole and kept.
+        one = " ".join(re.sub(r"\\.|\|", lambda m: r"\vert " if m.group(0) == "|"
+                              else m.group(0), one).split())
+    one = "%s$$ %s $$%s" % (_DOC_MATH_OPEN, one, _DOC_MATH_CLOSE)
     # A block element's neighbours lose the space beside it, so a block written
     # inline brings its own.
-    return (" $$%s$$ " if block else "$$%s$$") % one
+    return " %s " % one if block else one
+
+
+def _doc_math_join(text: str) -> str:
+    """The converter's markdown with the marks around each inline equation taken
+    out, and a space put where an equation touches a dollar outside it: the
+    equation beside it, or a price."""
+    if _DOC_MATH_OPEN not in text and _DOC_MATH_CLOSE not in text:
+        return text
+    text = text.replace(_DOC_MATH_CLOSE + _DOC_MATH_OPEN, _DOC_MATH_CLOSE + " " + _DOC_MATH_OPEN)
+    text = text.replace("$" + _DOC_MATH_OPEN, "$ " + _DOC_MATH_OPEN)
+    text = text.replace(_DOC_MATH_CLOSE + "$", _DOC_MATH_CLOSE + " $")
+    return text.replace(_DOC_MATH_OPEN, "").replace(_DOC_MATH_CLOSE, "")
 
 
 _doc_img_converter_classes: dict = {}
@@ -56008,8 +56042,8 @@ def html_to_markdown(html, keep_images=True):
         from markdownify import markdownify as md
         if keep_images:
             from markdownify import MarkdownConverter
-            text = _doc_img_converter_cls(MarkdownConverter)(
-                heading_style="ATX", bullets="-", strip=['script', 'style']).convert(html)
+            text = _doc_math_join(_doc_img_converter_cls(MarkdownConverter)(
+                heading_style="ATX", bullets="-", strip=['script', 'style']).convert(html))
         else:
             text = md(html, heading_style="ATX", bullets="-", strip=['img', 'script', 'style'])
         # Clean up excessive whitespace
@@ -56104,7 +56138,11 @@ def _strip_chatgpt_citation_tokens(md: str) -> str:
 #    a control's glyph, KaTeX's own strokes.
 # ⛔ A picture the page cannot draw (a canvas holding another site's image, a
 #    drawing that takes longer than `_DOC_FIGURES_WAIT_MS`) is left as before; at
-#    most `_DOC_FIGURES_MAX` are drawn per read, within `_DOC_FIGURES_BUDGET_MS`.
+#    most `_DOC_FIGURES_MAX` are drawn per read, within `_DOC_FIGURES_BUDGET_MS`,
+#    and each one past either is left as before too — and the log counts every
+#    one left (it said only "20 drawn" for a report holding 25 charts).
+# ⛔ The limits are read when the page read is built (`_doc_figures_js`), not
+#    when research.py loads, so a test can hold each one to account.
 # ⛔ A diagram the agent wrote as mermaid CODE is not a picture on the page: it
 #    stays code, and the web draws it.
 #: How many pictures one read draws, how long each may take, the whole read's
@@ -56189,7 +56227,7 @@ _DOC_FIGURES_JS = r"""async (live, copy) => {
         return false;
     };
     const swaps = [];
-    for (let i = 0; i < L.length && swaps.length < MAX; i++) {
+    for (let i = 0; i < L.length; i++) {
         const el = L[i], tag = el.tagName.toLowerCase();
         if (tag !== 'svg' && tag !== 'canvas' && tag !== 'img') continue;
         if (tag === 'img' && !/^blob:/i.test(el.currentSrc || el.getAttribute('src') || '')) continue;
@@ -56197,7 +56235,9 @@ _DOC_FIGURES_JS = r"""async (live, copy) => {
         // (One that is not drawn at all measures 0 × 0.)
         const r = el.getBoundingClientRect(), w = Math.round(r.width), h = Math.round(r.height);
         if (w < MIN || h < MIN) continue;
-        if (Date.now() - started > BUDGET) { got.failed += 1; continue; }
+        // Past the read's count or its time: left as the page shows it, and counted.
+        if (swaps.length >= MAX) { got.failed += 1; continue; }
+        if (Date.now() - started >= BUDGET) { got.failed += 1; continue; }
         let url = '';
         try {
             if (tag === 'svg') url = await svgPicture(el, w, h);
@@ -56217,9 +56257,17 @@ _DOC_FIGURES_JS = r"""async (live, copy) => {
         got.made += 1;
     }
     return got;
-}""".replace("__MIN__", str(_DOC_IMG_MIN_PX)).replace("__MAX__", str(_DOC_FIGURES_MAX)) \
-    .replace("__WAIT__", str(_DOC_FIGURES_WAIT_MS)).replace("__BUDGET__", str(_DOC_FIGURES_BUDGET_MS)) \
-    .replace("__MAXPX__", str(_DOC_FIGURES_MAX_PX)).replace("__CHARS__", str(_DOC_FIGURES_MAX_CHARS))
+}"""
+
+
+def _doc_figures_js() -> str:
+    """`_DOC_FIGURES_JS` with the limits above as they stand at this read."""
+    return (_DOC_FIGURES_JS.replace("__MIN__", str(_DOC_IMG_MIN_PX))
+            .replace("__MAX__", str(_DOC_FIGURES_MAX)).replace("__WAIT__", str(_DOC_FIGURES_WAIT_MS))
+            .replace("__BUDGET__", str(_DOC_FIGURES_BUDGET_MS))
+            .replace("__MAXPX__", str(_DOC_FIGURES_MAX_PX))
+            .replace("__CHARS__", str(_DOC_FIGURES_MAX_CHARS)))
+
 
 #: The page read every HTML tier uses: the last element `__SEL__` matches, with
 #: its pictures drawn (`_DOC_FIGURES_JS`) in the copy it hands back. When any was
@@ -56230,7 +56278,7 @@ _DOC_HTML_READ_JS = r"""async () => {
     const root = els[els.length - 1];
     try {
         const copy = root.cloneNode(true);
-        const got = await (""" + _DOC_FIGURES_JS + r""")(root, copy);
+        const got = await (__FIGURES__)(root, copy);
         if (got.made || got.failed) {
             return '<!--sr-figures ' + got.made + ' ' + got.failed + '-->' + copy.innerHTML;
         }
@@ -56238,6 +56286,13 @@ _DOC_HTML_READ_JS = r"""async () => {
     return root.innerHTML;
 }"""
 _DOC_FIGURES_NOTE_RE = re.compile(r"\A<!--sr-figures (\d+) (\d+)-->")
+
+
+def _doc_html_read_js(sel: str) -> str:
+    """`_DOC_HTML_READ_JS` for the selector `sel`, its pictures drawn as this read's
+    limits say."""
+    return _DOC_HTML_READ_JS.replace("__FIGURES__", _doc_figures_js()).replace(
+        "__SEL__", json.dumps(sel))
 
 
 def _doc_figures_note(html: str, label: str) -> None:
@@ -56270,7 +56325,7 @@ async def _extract_html_to_md(page, selectors, label, convert=None):
         try:
             # ⭐ Wave 14: the report's pictures drawn as images in the copy read
             # ("A REPORT'S PICTURES ARE KEPT AS PICTURES").
-            html = await page.evaluate(_DOC_HTML_READ_JS.replace("__SEL__", json.dumps(sel)))
+            html = await page.evaluate(_doc_html_read_js(sel))
             if html:
                 matched_sels += 1
                 if len(html) > biggest_html_len:
@@ -58041,7 +58096,7 @@ _CHATGPT_DR_REPORT_JS = r"""async (P) => {
     return { total, text: len(root), headings: root.querySelectorAll(HEAD).length,
              links: out.querySelectorAll('a[href^="http"]').length, cites, diagrams,
              pictures: pictures.made, html: out.innerHTML };
-}""".replace("__FIGURES__", _DOC_FIGURES_JS)
+}"""
 
 #: Going down from the frame's body, the share of its text a child must hold to
 #: be gone into (the counts line and header are a few dozen characters).
@@ -58080,7 +58135,8 @@ async def _chatgpt_dr_frame_report(page, label="ChatGPT", *, done_text_len=0) ->
             "label": _CHATGPT_DR_REPORT_LABEL}
     for f in _chatgpt_dr_app_frames(page):
         try:
-            r = await f.evaluate(_CHATGPT_DR_REPORT_JS, args)
+            r = await f.evaluate(_CHATGPT_DR_REPORT_JS.replace("__FIGURES__", _doc_figures_js()),
+                                 args)
         except Exception:
             continue
         if isinstance(r, dict) and int(r.get("text") or 0) > int((best or {}).get("text") or 0):

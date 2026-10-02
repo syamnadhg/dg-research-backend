@@ -7,9 +7,11 @@ page presses Export to PDF.
   M*  equations: an element keeping its TeX (Gemini's `data-math`, a KaTeX root
       with its TeX annotation, MathML) is written from it, never its drawing;
       a block on its own lines, with no blank line; inline in a sentence, one
-      line; inside a table cell or a heading always inline (with its own spaces),
-      a bare `|` escaped in a cell; inside code nothing is maths; an element with
-      no source is converted as before.
+      line; inside a table cell, a heading, bold, italics, a link or a quote
+      always inline (with its own spaces); in a cell a bare `|` written `\\vert `
+      (the single bar), a `\\|` kept; an inline one written `$$ tex $$`, a space
+      between it and any dollar outside it; inside code nothing is maths; an
+      element with no source is converted as before.
   G*  Gemini's citations: the panel read uses Gemini's own conversion; a number
       is joined to a row only by the row's own number — every chip numbered, the
       list found, its rows each one number and one address, no number on two
@@ -24,7 +26,9 @@ page presses Export to PDF.
       page's colours, on the ground they sit on, at twice their size; never an
       icon, a control's glyph, a hidden drawing or one under the rehost's size;
       a web image left to the rehost; the read's copy carries them and the log
-      counts them; ChatGPT's frame read draws its diagram.
+      counts them; ChatGPT's frame read draws its diagram; the read's limits —
+      20 pictures, its time, one picture's size, one svg's wait, a copy that
+      matches the page — each hold, and each picture left by one is counted.
   C*  the export catcher: put back before the page's own PDF press after a
       navigation, and nothing pressed when it cannot be.
 
@@ -89,16 +93,18 @@ MUTANTS = [
        "        lines = [ln.rstrip() for ln in tex.strip().splitlines()]\n")],
      "math"),
     ("M7", RESEARCH, "a block in a table cell or heading breaks the line",
-     [('    if block and "_inline" not in parent_tags:\n', "    if block:\n")],
+     [('    if block and not ({"_inline"} | _DOC_MATH_WRAPPED) & tags:\n', "    if block:\n")],
      "math"),
     ("M8", RESEARCH, "a `|` in an equation in a table cell ends the cell",
-     [('        one = re.sub(r"(?<!\\\\)\\|", r"\\\\|", one)\n', "        one = one\n")],
+     [(r'        one = " ".join(re.sub(r"\\.|\|", lambda m: r"\vert " if m.group(0) == "|"' + "\n"
+       r'                              else m.group(0), one).split())' + "\n",
+       "        one = one\n")],
      "math"),
     ("M9", RESEARCH, "an inline equation keeps its line breaks",
      [('    one = " ".join(tex.split())\n', "    one = tex\n")],
      "math"),
     ("M10", RESEARCH, "a block written inline is glued to the words beside it",
-     [('    return (" $$%s$$ " if block else "$$%s$$") % one\n', '    return "$$%s$$" % one\n')],
+     [('    return " %s " % one if block else one\n', "    return one\n")],
      "math"),
     ("M11", RESEARCH, "⛔ a KaTeX root with its TeX is written from its drawing",
      [('    if not ({"katex", "katex-display"} & cls or name == "math"):\n',
@@ -106,6 +112,65 @@ MUTANTS = [
      "math"),
     ("M12", RESEARCH, "an empty `data-math` is written as an empty equation",
      [("    if isinstance(tex, str) and tex.strip():\n", "    if isinstance(tex, str):\n")],
+     "math"),
+    # (Review 10-02: the cell's bar, a dollar beside an equation, a block in a mark.)
+    ("M13", RESEARCH, "⛔ a block inside bold, italics, a link or a quote breaks the line — raw TeX",
+     [('    if block and not ({"_inline"} | _DOC_MATH_WRAPPED) & tags:\n',
+       '    if block and "_inline" not in tags:\n')],
+     "math"),
+    ("M14", RESEARCH, "a block inside a link breaks the line",
+     [('_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "del", "s", "q"})\n',
+       '_DOC_MATH_WRAPPED = frozenset({"b", "strong", "i", "em", "del", "s", "q"})\n')],
+     "math"),
+    ("M15", RESEARCH, "a block inside a quote breaks the line",
+     [('_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "del", "s", "q"})\n',
+       '_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "del", "s"})\n')],
+     "math"),
+    ("M16", RESEARCH, "a block inside strike-through breaks the line",
+     [('_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "del", "s", "q"})\n',
+       '_DOC_MATH_WRAPPED = frozenset({"a", "b", "strong", "i", "em", "s", "q"})\n')],
+     "math"),
+    ("M17", RESEARCH, "⛔⛔ a `|` in a cell is the DOUBLE bar again — \"p(j | x)\" draws \"p(j‖x)\"",
+     [(r'lambda m: r"\vert " if', r'lambda m: r"\|" if')],
+     "math"),
+    ("M18", RESEARCH, "a `\\|` the TeX holds in a cell is split — its bar made a second one",
+     [(r're.sub(r"\\.|\|", lambda m', r're.sub(r"\|", lambda m')],
+     "math"),
+    ("M19", RESEARCH, "the cell's `\\vert` runs into the letter after it — a KaTeX error",
+     [(r'r"\vert " if m.group(0)', r'r"\vert" if m.group(0)')],
+     "math"),
+    ("M20", RESEARCH, "the cell's bar leaves two spaces where there was one",
+     [(r'else m.group(0), one).split())' + "\n", r'else m.group(0), one).split(" "))' + "\n")],
+     "math"),
+    ("M21", RESEARCH, "⛔ an inline equation has no space inside — `100\\$` runs into its close",
+     [('    one = "%s$$ %s $$%s" % (_DOC_MATH_OPEN, one, _DOC_MATH_CLOSE)\n',
+       '    one = "%s$$%s$$%s" % (_DOC_MATH_OPEN, one, _DOC_MATH_CLOSE)\n')],
+     "math"),
+    ("M22", RESEARCH, "⛔ an inline equation is not marked — two touching ones become one",
+     [('    one = "%s$$ %s $$%s" % (_DOC_MATH_OPEN, one, _DOC_MATH_CLOSE)\n',
+       '    one = "$$ %s $$" % one\n')],
+     "math"),
+    ("M23", RESEARCH, "⛔ two equations side by side are written as one broken equation",
+     [('    text = text.replace(_DOC_MATH_CLOSE + _DOC_MATH_OPEN, _DOC_MATH_CLOSE + " " + _DOC_MATH_OPEN)\n',
+       "")],
+     "math"),
+    ("M24", RESEARCH, "a dollar right before an equation runs into its opening",
+     [('    text = text.replace("$" + _DOC_MATH_OPEN, "$ " + _DOC_MATH_OPEN)\n', "")],
+     "math"),
+    ("M25", RESEARCH, "a dollar right after an equation runs into its close",
+     [('    text = text.replace(_DOC_MATH_CLOSE + "$", _DOC_MATH_CLOSE + " $")\n', "")],
+     "math"),
+    ("M26", RESEARCH, "⛔⛔ the invisible marks stay in the saved document",
+     [('    return text.replace(_DOC_MATH_OPEN, "").replace(_DOC_MATH_CLOSE, "")\n',
+       "    return text\n")],
+     "math"),
+    ("M27", RESEARCH, "⛔⛔ the converter's markdown is never joined — the marks stay in",
+     [("            text = _doc_math_join(_doc_img_converter_cls(MarkdownConverter)(\n",
+       "            text = (_doc_img_converter_cls(MarkdownConverter)(\n")],
+     "math"),
+    ("M28", RESEARCH, "the join stops before it starts — the marks stay in",
+     [("    if _DOC_MATH_OPEN not in text and _DOC_MATH_CLOSE not in text:\n        return text\n",
+       "    if True:\n        return text\n")],
      "math"),
     # ── G: Gemini's own numbers and its own list ────────────────────────────
     ("G1", RESEARCH, "⛔⛔ Gemini's panel is converted as before — no numbers, no list",
@@ -279,6 +344,40 @@ MUTANTS = [
     ("F14", RESEARCH, "a picture the page cannot draw is not counted",
      [("        if (!/^data:image\\/png;base64,/.test(url) || url.length > CHARS) { got.failed += 1; continue; }\n",
        "        if (!/^data:image\\/png;base64,/.test(url) || url.length > CHARS) { continue; }\n")],
+     "figures"),
+    # (Review 10-02: none of the read's own limits was pinned.)
+    ("F15", RESEARCH, "⛔ a read draws every picture — no cap of 20",
+     [("        if (swaps.length >= MAX) { got.failed += 1; continue; }\n", "")],
+     "figures"),
+    ("F16", RESEARCH, "a picture past the 20 is not counted — the log says only \"20 drawn\"",
+     [("        if (swaps.length >= MAX) { got.failed += 1; continue; }\n",
+       "        if (swaps.length >= MAX) { continue; }\n")],
+     "figures"),
+    ("F17", RESEARCH, "⛔ a read draws past its time",
+     [("        if (Date.now() - started >= BUDGET) { got.failed += 1; continue; }\n", "")],
+     "figures"),
+    ("F18", RESEARCH, "a picture past the read's time is not counted",
+     [("        if (Date.now() - started >= BUDGET) { got.failed += 1; continue; }\n",
+       "        if (Date.now() - started >= BUDGET) { continue; }\n")],
+     "figures"),
+    ("F19", RESEARCH, "⛔ a picture too big for the image store is put in anyway",
+     [("        if (!/^data:image\\/png;base64,/.test(url) || url.length > CHARS) { got.failed += 1; continue; }\n",
+       "        if (!/^data:image\\/png;base64,/.test(url)) { got.failed += 1; continue; }\n")],
+     "figures"),
+    ("F20", RESEARCH, "⛔⛔ an svg that never finishes drawing holds the page read forever",
+     [("    const svgPicture = (el, w, h) => timed(new Promise((ok, no) => {\n",
+       "    const svgPicture = (el, w, h) => (new Promise((ok, no) => {\n")],
+     "figures"),
+    ("F21", RESEARCH, "⛔ a copy that does not match the page gets its pictures in the wrong places",
+     [("    if (L.length !== C.length) return got;\n", "")],
+     "figures"),
+    ("F22", RESEARCH, "ChatGPT's frame read is sent without its picture drawing",
+     [('            r = await f.evaluate(_CHATGPT_DR_REPORT_JS.replace("__FIGURES__", _doc_figures_js()),\n',
+       "            r = await f.evaluate(_CHATGPT_DR_REPORT_JS,\n")],
+     "frame"),
+    ("F23", RESEARCH, "⛔ the page read is sent without its picture drawing — every picture lost",
+     [('    return _DOC_HTML_READ_JS.replace("__FIGURES__", _doc_figures_js()).replace(\n',
+       "    return _DOC_HTML_READ_JS.replace(\n")],
      "figures"),
     # ── C: the export catcher, put back before the page's own PDF press ─────
     ("C1", RESEARCH, "⛔⛔ the page presses Export to PDF with no catcher — Chrome downloads it",
