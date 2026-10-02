@@ -202,9 +202,9 @@ def test_every_agents_card_is_taken_down(machine):
 
 # ══ review 10-02: a card that is gone is never "taken down" again ════════════
 # The app treats a take-down with no live card behind it as a NEW amber alert
-# (dg-research src/hooks/usePipeline.ts, near line 3110): "Claude is going
-# again … the earlier alert about Claude no longer applies" about a Claude that
-# was skipped long before.
+# (dg-research src/hooks/usePipeline.ts, its `pipeline_warning` handler's
+# `isBlocking` check): "Claude is going again … the earlier alert about Claude no
+# longer applies" about a Claude that was skipped long before.
 
 def _skip_claude_automatically(how):
     """Claude's card goes unanswered and the run skips Claude by itself, through
