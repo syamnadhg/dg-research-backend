@@ -65,6 +65,8 @@ ICON = ('<button aria-label="Copy"><svg width="64" height="64" viewBox="0 0 24 2
         '<svg width="16" height="16"><circle cx="8" cy="8" r="6"></circle></svg>')
 MERMAID = ("<pre><code class='language-mermaid'>flowchart TD\n    A[Collateral] --&gt; "
            "B[Position]</code></pre>")
+#: A picture with a web address (answered locally).
+PHOTO = "https://img.sr-fixture.invalid/photo.png"
 
 
 def _report(extra=""):
@@ -82,7 +84,8 @@ def _page(report):
         "</body>", SCRIPT + "</body>")
 
 
-def _load(chrome, page, report):
+def _load(chrome, page, report, pictures=()):
+    G.offline(chrome, page, pictures)
     chrome.run(page.set_content(_page(report)))
     chrome.run(page.wait_for_function("() => document.body.dataset.ready === '1'"))
 
@@ -111,6 +114,7 @@ def test_every_picture_in_a_gemini_report_reaches_the_saved_document(
     monkeypatch.setattr(research, "_runtime", runtime, raising=False)
     monkeypatch.setattr(research, "reject_off_topic_text", lambda text, *a, **k: text)
     monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
     _load(chrome, page, _report())
     res = chrome.run(research.extract_and_record_agent("Gemini", page, _Browser(), None, tmp_path))
     assert res["status"] == "done", world.logs[-8:]
@@ -160,6 +164,7 @@ def test_claudes_page_read_keeps_its_pictures_too(chrome, page, fast, monkeypatc
     logs = []
     monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
     body = _report().replace('id="cv"', 'id="cv"')
+    G.offline(chrome, page)
     chrome.run(page.set_content(
         "<!doctype html><html><head><meta charset='utf-8'>" + STYLE + "</head><body>"
         "<aside><div class='prose'>" + body + "</div></aside>" + SCRIPT + "</body></html>"))
@@ -177,21 +182,15 @@ def test_a_picture_the_page_cannot_draw_is_left_as_it_was(chrome, page, fast, mo
     could not be drawn, while the others are drawn."""
     logs = []
     monkeypatch.setattr(research, "log", lambda msg, *a, **k: logs.append(str(msg)))
-    png = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
-
-    async def _route(route):
-        await route.fulfill(status=200, content_type="image/png", body=png)
-    chrome.run(page.route("http://pictures.sr-fixture.invalid/**", _route))
+    other = "http://pictures.sr-fixture.invalid/a.png"
     tainted = ('<canvas id="tc" width="200" height="100" style="width:200px;height:100px">'
                '</canvas><script>const t = new Image(); t.onload = () => {'
                "document.getElementById('tc').getContext('2d').drawImage(t, 0, 0, 200, 100);"
                "document.body.dataset.tainted = '1'; };"
-               "t.src = 'http://pictures.sr-fixture.invalid/a.png';</script>")
-    _load(chrome, page, _report(tainted))
+               f"t.src = '{other}';</script>")
+    _load(chrome, page, _report(tainted), pictures=[other])
     chrome.run(page.wait_for_function("() => document.body.dataset.tainted === '1'"))
     md = chrome.run(research._extract_html_to_md(page, ["immersive-panel"], "Gemini"))
-    chrome.run(page.unroute("http://pictures.sr-fixture.invalid/**"))
     assert len(re.findall(r"!\[[^\]]*\]\(<data:image/png;base64,", md)) == 3
     assert ("[Gemini] pictures in the report: 3 drawn as images, 1 could not be drawn and "
             "stay as the page shows them") in logs
@@ -209,7 +208,9 @@ def test_icons_controls_and_web_images_are_not_drawn(chrome, page, fast, monkeyp
              '<canvas width="40" height="40"></canvas><canvas width="300" height="20"></canvas>'
              '<div style="display:none"><svg width="100" height="100"></svg></div>'
              '<svg width="100" height="100" style="visibility:hidden"></svg>'
-             '<img src="https://img.example.org/photo.png" alt="Photo" width="300" height="200">')
+             f'<img src="{PHOTO}" alt="Photo" width="300" height="200">')
+    # The photo loads (from a local answer), from another site than the page.
+    G.offline(chrome, page, [PHOTO])
     chrome.run(page.set_content(G.report_page(f"<h1>R</h1><p>{G.prose(1)}</p>{SVG_CHART}"
                                               f"{ICON}{extra}<p>{G.prose(2)}</p>"
                                               f"<p>{G.katex_samples()[2]['html']}</p>")))
@@ -217,4 +218,7 @@ def test_icons_controls_and_web_images_are_not_drawn(chrome, page, fast, monkeyp
     assert re.findall(r"!\[([^\]]*)\]\(<(data|https)", md) == [
         ("Revenue by quarter", "data"), ("Photo", "https")]
     assert "$$\\sqrt{x^2 + y^2}$$" in md
-    assert "[Gemini] pictures in the report: 1 drawn as images" in logs, logs
+    # Exactly this line: a web image the page tried to redraw would be counted
+    # as one it could not draw.
+    assert [m for m in logs if "pictures in the report" in m] == [
+        "[Gemini] pictures in the report: 1 drawn as images"], logs

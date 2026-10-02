@@ -29,6 +29,7 @@ the recording holds none (`usedRows` is empty: the section was closed).
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 from functools import lru_cache
@@ -98,6 +99,25 @@ def prose(i: int, words: int = 70) -> str:
     return " ".join(text[:words])
 
 
+#: A 1×1 PNG, for any picture a page asks the network for.
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+
+def offline(chrome, page, pictures=()):
+    """Every request the page makes is answered here, never by the network: an
+    address in `pictures` gets a PNG, anything else is refused."""
+    wanted = set(pictures)
+
+    async def _answer(route):
+        if route.request.url in wanted:
+            await route.fulfill(status=200, content_type="image/png", body=PNG_1PX)
+        else:
+            await route.abort()
+    chrome.run(page.unroute("**/*"))
+    chrome.run(page.route("**/*", _answer))
+
+
 def sources_section(title: str, rows: list) -> str:
     """A sources section as ASSUMED markup: the recorded button with its title,
     then one row per source — `rows` are (url, title, attrs[, inner]) where
@@ -105,7 +125,7 @@ def sources_section(title: str, rows: list) -> str:
     `inner` more markup inside the row after its link."""
     body = "".join(
         f'<div class="source-row" {r[2]}><a href="{html.escape(r[0], quote=True)}" '
-        f'target="_blank"><img src="https://www.google.com/s2/favicons?domain=x.example" '
+        f'target="_blank"><img src="https://icons.sr-fixture.invalid/favicon.png" '
         f'width="16" height="16" alt=""><span class="title">{html.escape(r[1])}</span>'
         f'<span class="host">{html.escape(r[0].split("/")[2])}</span></a>'
         f'{r[3] if len(r) > 3 else ""}</div>'

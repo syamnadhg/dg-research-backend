@@ -99,6 +99,7 @@ def _sections(numbered=True, order=LIST_ORDER, rows=None):
 
 
 def _extract(chrome, page, report_html, after):
+    G.offline(chrome, page)
     chrome.run(page.set_content(G.report_page(report_html, after=after)))
     return chrome.run(research.extract_gemini_response(page))
 
@@ -294,6 +295,7 @@ def test_the_saved_document_and_its_cloud_copy_carry_the_links(chrome, page, fas
         return text
     monkeypatch.setattr(research, "_rehost_document_images", _same)
     monkeypatch.setattr(research, "_write_agent_terminal_status", lambda *a, **k: None)
+    G.offline(chrome, page)
     chrome.run(page.set_content(G.report_page(_report(), after=_sections())))
 
     class _Browser:
@@ -327,6 +329,7 @@ def test_copy_contents_that_hangs_is_left_after_a_short_wait(chrome, page, fast,
         finally:
             held["for"] = loop.time() - held["start"]
     monkeypatch.setattr(research, "agent_loop", _hangs)
+    G.offline(chrome, page)
     chrome.run(page.set_content("<!doctype html><html><body><p>nothing here</p></body></html>"))
 
     class _Browser:

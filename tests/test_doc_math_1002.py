@@ -58,6 +58,7 @@ def _report():
 
 
 def _gemini(chrome, page, report_html, **kw):
+    G.offline(chrome, page)
     chrome.run(page.set_content(G.report_page(report_html, **kw)))
     return chrome.run(research.extract_gemini_response(page))
 
@@ -165,6 +166,7 @@ def test_a_katex_root_with_its_tex_is_written_from_it_on_claudes_page(chrome, pa
     keeps the TeX in an annotation; each equation is written from it — a display
     one as a block, an inline one in its sentence."""
     samples = G.katex_samples()
+    G.offline(chrome, page)
     chrome.run(page.set_content(_katex_page(samples)))
     md = chrome.run(research._extract_html_to_md(page, ["aside .prose"], "Claude"))
     assert md, lines
