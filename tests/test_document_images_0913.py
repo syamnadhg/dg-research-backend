@@ -3686,7 +3686,7 @@ def _tier_logs(monkeypatch, md):
     async def no_sleep(*a, **k):
         return None
 
-    async def scrape(page, selectors, label):
+    async def scrape(page, selectors, label, convert=None):
         return md
     monkeypatch.setattr(R.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(R, "_extract_html_to_md", scrape)
