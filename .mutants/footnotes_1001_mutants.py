@@ -38,8 +38,8 @@ MUTANTS = [
      [("        linked = _doc_link_own_numbers(md, label)\n",
        "        linked = md\n")]),
     ("C3", "a list whose written numbers skip or repeat is linked anyway",
-     [("    if not items or [int(m.group(1)) for m in items] != list(range(1, len(items) + 1)):",
-       "    if not items:")]),
+     [("    if [int(m.group(1)) for m in items] != list(range(1, len(items) + 1)):",
+       "    if False:")]),
     ("C4", "a document already ending with OUR list is linked to our rows",
      [("    if md and not (_DOC_SOURCE_MARK_RE.search(md) or _DOC_VISITED_BLOCK_RE.search(md)):\n"
        "        linked = _doc_link_own_numbers(md, label)",

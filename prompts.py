@@ -585,6 +585,53 @@ HARD CONSTRAINTS:
 When you've clicked "Export to Markdown", output: "downloaded"."""
 
 
+# 2026-10-02 — the same report's PDF export. Its file never reaches the browser's
+# downloads: the page's own catcher takes it (research.py, "A REPORT'S EXPORT IS
+# CAUGHT IN THE PAGE"). It is read for one thing, the sources' addresses.
+PROMPT_CHATGPT_EXPORT_PDF = SYSTEM_BASE + """
+
+You are looking at a ChatGPT Deep Research conversation. The final report
+is rendered as an artifact card in the conversation (title like "Venom OS
+Architecture Research Report", "Research complete" badge above it).
+
+GOAL: Export the artifact as a PDF via these steps.
+
+WORKFLOW:
+1. **Close any open side panel** — if there's a sources / activity panel
+   visible on the right side of the screen (separate from the main
+   conversation column), click its X / Close button or press Escape to
+   dismiss it. The artifact card needs to be unobstructed.
+
+2. **Click the enlarge button on the artifact card** — at the top-right
+   of the artifact card there's a SMALL ICON button (about 20×20 px,
+   "diagonal arrows" or "expand" style icon). Click it once. The canvas
+   opens full-page covering the conversation.
+
+3. **Locate the download icon** — once the canvas is full-page, in the
+   top-right area there are TWO small icons side by side. The LEFT one
+   is a download arrow icon (down-arrow into a box). The right one is
+   a Share icon (chain links / connected dots).
+   Click the DOWNLOAD icon (down-arrow), NOT the Share icon.
+
+4. **A dropdown menu appears** with these options:
+       Copy contents
+       Export to Markdown
+       Export to Word
+       Export to PDF
+   Click "Export to PDF" (its accessible name is "Export to PDF").
+
+HARD CONSTRAINTS:
+- DO NOT click "Share" — it's a different button next to the download icon.
+- DO NOT click "Copy contents", "Export to Markdown", or "Export to Word".
+- DO NOT click anywhere in the canvas content text.
+- DO NOT type anything; this is click-only.
+- ONE click per step. If a step fails, try once more, then stop.
+- If the canvas is already open full-page, skip to step 3.
+- Stop after 12 iterations.
+
+When you've clicked "Export to PDF", output: "exported"."""
+
+
 PROMPT_CLAUDE_DOWNLOAD_MD = SYSTEM_BASE + """
 
 You are looking at a Claude conversation with an artifact panel open on

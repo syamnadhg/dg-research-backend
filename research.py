@@ -118,6 +118,7 @@ from prompts import (
     PROMPT_CHATGPT_DEEP_RESEARCH,
     PROMPT_CHATGPT_DISABLE_DR,
     PROMPT_CHATGPT_DOWNLOAD_MD,
+    PROMPT_CHATGPT_EXPORT_PDF,
     PROMPT_CLAUDE_DOWNLOAD_MD,
     PROMPT_CLICK_SEND,
     PROMPT_COPY_ARTIFACT_CHATGPT,
@@ -42434,10 +42435,10 @@ async def agent_loop(client, browser, system_prompt, user_message,
     abort_event (optional): asyncio.Event the caller sets to make the loop
     stop deterministically (#732). Checked at the top of every iteration AND
     before each tool_use is dispatched, so once it fires the loop issues NO
-    further clicks — even mid-turn. Used by _extract_via_cua_download to halt
-    CUA the moment the first download lands (a plain task .cancel() is
-    unreliable here because the synchronous Anthropic call freezes the event
-    loop, delaying both the download event and the cancel). Returns
+    further clicks — even mid-turn. Used by _cua_export_caught to halt CUA
+    the moment the page's catcher holds the export's file (a plain task
+    .cancel() is unreliable here because the synchronous Anthropic call
+    freezes the event loop, delaying both the catch and the cancel). Returns
     status="aborted" when it trips.
     """
     async def _anchored_screenshot():
@@ -56458,191 +56459,309 @@ async def _copy_via_hijack(
         return ""
 
 
-async def _extract_via_cua_download(
-    page,
-    browser,
-    cua_client,
-    label,
-    cua_prompt,
-    cua_user_msg,
-    *,
-    max_iterations=12,
-    cua_timeout_s=180.0,
-    # Must be >= cua_timeout_s * 1000 + a small grace, because
-    # page.expect_download() starts its clock when the async-with enters
-    # (BEFORE the CUA loop runs). With the prior 30s default, a future
-    # caller using defaults would race the listener vs the CUA loop's
-    # cua_timeout_s=180s wall-clock cap. cua_timeout_s + 15s grace.
-    download_timeout_ms=195000,
-    min_chars=500,
-    verbose=False,
-):
-    """Tier 1 primitive for CUA-driven download flows (ChatGPT + Claude).
+# ═════════════════════════════════════════════════════════════════════════════
+# A REPORT'S EXPORT IS CAUGHT IN THE PAGE: NO CHROME DOWNLOAD (2026-10-02)
+# ─────────────────────────────────────────────────────────────────────────────
+# Chrome 154 crashes in its own downloads button on some downloads: 4 of the 49
+# ChatGPT report exports in every log read were followed by a browser crash, each
+# in Chrome's download toolbar code while a download updated
+# (#Dev/wave15/crash/crash-analysis-1001.json). So a run starts NO Chrome
+# download for a ChatGPT or Claude report any more.
+# ⭐ HOW THE EXPORTS MAKE THEIR FILES — the owner's recording
+# (#Dev/wave14/recordings-1001/sr-cite-chatgpt-dr-top-full.json): on the TOP
+# chatgpt.com page, not inside the Deep research frame that only holds the
+# button, `URL.createObjectURL(Blob)` (text/markdown;charset=utf-8, 101,627
+# bytes; then application/pdf, 526,821 bytes), then
+# `HTMLAnchorElement.prototype.click()` on an `<a download="deep-research-
+# report.md">` (or "<title>.pdf") whose href is that blob address. Claude's
+# export is the same shape on claude.ai (blob:https://claude.ai/… in the agent
+# profile's download history).
+# So a catcher goes on the top page before Export is pressed. It keeps each Blob
+# the page turns into an address, and a click on an `<a download>` whose href is
+# one of them is CANCELLED: the Blob's bytes are handed to Python instead, read
+# back as base64 a megabyte at a time. The export is pressed as before, by the
+# page or by computer use; only the file never reaches Chrome.
+# ⛔ THE PAGE'S OWN WORLD (`_page_world_evaluate`). The page calls the page
+# world's `URL.createObjectURL`; a wrapper in patchright's isolated world would
+# catch nothing, as the clipboard hooks once caught nothing.
+# ⛔ NOTHING IS PRESSED WITHOUT IT. When the catcher cannot be put on the page,
+# the export is not pressed at all and the next tier reads the report instead.
+# ⚠ It stays on the page after the export (a reload takes it off): a later click
+# on such a link in that tab is swallowed too, which is what a run wants. It
+# holds at most the last 16 Blobs the page made and the last 16 it caught.
+_EXPORT_CATCH_JS = r"""() => {
+    const had = window.__srExportCatch;
+    if (had && had.v === 1) return { armed: true, again: true };
+    const KEEP = 16;
+    const st = { v: 1, seq: 0, blobs: new Map(), caught: [] };
+    const make = URL.createObjectURL, drop = URL.revokeObjectURL;
+    URL.createObjectURL = function (obj) {
+        const url = make.apply(this, arguments);
+        try {
+            if (obj instanceof Blob) {
+                st.blobs.set(String(url), obj);
+                while (st.blobs.size > KEEP) st.blobs.delete(st.blobs.keys().next().value);
+            }
+        } catch (e) {}
+        return url;
+    };
+    URL.revokeObjectURL = function (url) {
+        try { st.blobs.delete(String(url)); } catch (e) {}
+        return drop.apply(this, arguments);
+    };
+    const kept = (a) => {
+        try {
+            return !!(a && a.hasAttribute && a.hasAttribute('download')
+                      && st.blobs.has(String(a.href)));
+        } catch (e) { return false; }
+    };
+    const take = (a, via) => {
+        const blob = st.blobs.get(String(a.href));
+        st.seq += 1;
+        st.caught.push({ id: st.seq, name: String(a.getAttribute('download') || ''),
+                         type: String(blob.type || ''), size: blob.size, via: via, blob: blob });
+        while (st.caught.length > KEEP) st.caught.shift();
+    };
+    const click = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function () {
+        if (kept(this)) { take(this, 'anchor.click()'); return; }
+        return click.apply(this, arguments);
+    };
+    window.addEventListener('click', (e) => {
+        const t = e.target;
+        const a = t && t.closest ? t.closest('a[download]') : null;
+        if (!kept(a)) return;
+        e.preventDefault();
+        take(a, 'click event');
+    }, true);
+    window.__srExportCatch = st;
+    return { armed: true, again: false };
+}"""
 
-    CUA navigates the UI per the prompt (close panel, open canvas, click
-    download icon, click Export/Download as Markdown menu item). Playwright's
-    `expect_download()` captures the resulting file. Read as UTF-8 markdown.
+#: What the catcher holds, without the bytes; null when it is not on the page.
+_EXPORT_CATCH_LIST_JS = r"""() => {
+    const st = window.__srExportCatch;
+    if (!st || st.v !== 1) return null;
+    return st.caught.map((c) => ({ id: c.id, name: c.name, type: c.type, size: c.size, via: c.via }));
+}"""
 
-    Wayland-safe: no OS clipboard. Selector-free: CUA does all clicking.
+#: One piece of a caught file, as base64; null when it is no longer held.
+_EXPORT_CATCH_READ_JS = r"""async (P) => {
+    const st = window.__srExportCatch;
+    const c = st && st.v === 1 ? st.caught.find((x) => x.id === P.id) : null;
+    if (!c) return null;
+    const bytes = new Uint8Array(await c.blob.slice(P.start, P.end).arrayBuffer());
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
+}"""
 
-    Why this is Tier 1: it sidesteps DOM selector drift entirely. ChatGPT
-    canvas / Claude artifact download buttons are visually consistent
-    across versions; CUA finds them by sight. The download event hook is
-    selector-independent — Playwright intercepts whichever file the menu
-    item triggers.
+#: How many bytes one read hands back (as base64): a report is about 100 KB and
+#: its PDF about 500 KB, so most files come back in one piece.
+_EXPORT_CHUNK = 1 << 20
+#: A caught file larger than this is not read back.
+_EXPORT_MAX_BYTES = 32 << 20
 
-    Returns "" on any failure (CUA exhausts iterations → expect_download
-    never fires; or CUA cap hit → asyncio.TimeoutError; or content <
-    min_chars). The empty return is the contract for the caller's Tier-2
-    fallback.
-    """
+
+def _export_kind(entry) -> str:
+    """What a caught file is: "markdown", "pdf" or "other" — by its type, else
+    its name."""
+    t = str((entry or {}).get("type") or "").lower()
+    n = str((entry or {}).get("name") or "").lower()
+    if t.startswith("application/pdf") or (not t.startswith("text/") and n.endswith(".pdf")):
+        return "pdf"
+    if t.startswith(("text/markdown", "text/x-markdown")) or n.endswith((".md", ".markdown")):
+        return "markdown"
+    return "other"
+
+
+async def _export_catch_arm(page, label, *, quiet=False) -> bool:
+    """Put the catcher on `page`'s top page (once; again is a no-op). True when
+    it is there."""
+    try:
+        r = await _page_world_evaluate(page, _EXPORT_CATCH_JS)
+    except Exception as e:
+        if not quiet:
+            log(f"[{label}] the export catcher could not be put on the page "
+                f"({str(e)[:120]}) — the export is not pressed", "WARN")
+        return False
+    armed = isinstance(r, dict) and bool(r.get("armed"))
+    if armed and not r.get("again") and not quiet:
+        log(f"[{label}] export catcher on the page: an export's file is caught here, "
+            "never downloaded by Chrome")
+    return armed
+
+
+async def _export_catch_list(page):
+    """What the catcher holds (no bytes), or None when it is not on the page."""
+    try:
+        got = await _page_world_evaluate(page, _EXPORT_CATCH_LIST_JS)
+    except Exception:
+        return None
+    return got if isinstance(got, list) else None
+
+
+async def _export_catch_last_id(page) -> int:
+    """The last file caught so far — a press waits for one after it."""
+    return max((int(c.get("id") or 0) for c in (await _export_catch_list(page) or [])),
+               default=0)
+
+
+async def _export_catch_find(page, kind, since):
+    """The first `kind` file caught after `since`, or None."""
+    for c in await _export_catch_list(page) or []:
+        if int(c.get("id") or 0) > since and _export_kind(c) == kind:
+            return c
+    return None
+
+
+async def _export_catch_read(page, entry, label):
+    """A caught file's bytes, read back in pieces, or None. Logs the catch."""
+    size = int((entry or {}).get("size") or 0)
+    name = str(entry.get("name") or "")
+    if size <= 0 or size > _EXPORT_MAX_BYTES:
+        log(f"[{label}] caught export \"{name}\" not read: {size} bytes", "WARN")
+        return None
+    parts = []
+    try:
+        for start in range(0, size, _EXPORT_CHUNK):
+            b64 = await _page_world_evaluate(page, _EXPORT_CATCH_READ_JS, {
+                "id": entry["id"], "start": start, "end": min(size, start + _EXPORT_CHUNK)})
+            if not isinstance(b64, str):
+                raise ValueError("the page no longer holds it")
+            parts.append(base64.b64decode(b64))
+    except Exception as e:
+        log(f"[{label}] caught export \"{name}\" could not be read back ({str(e)[:120]})", "WARN")
+        return None
+    data = b"".join(parts)
+    if len(data) != size:
+        log(f"[{label}] caught export \"{name}\" came back as {len(data)} of {size} bytes", "WARN")
+        return None
+    log(f"[{label}] export caught in the page, no download: {_export_kind(entry)} "
+        f"\"{name}\", {size} bytes ({entry.get('via') or '?'})")
+    return data
+
+
+async def _export_catch_wait(page, kind, since, wait_s, label):
+    """The first `kind` file caught after `since` within `wait_s`, with its
+    bytes (`{…, "bytes": b"…"}`), or None."""
+    for _ in range(max(1, int(wait_s / 0.25))):
+        hit = await _export_catch_find(page, kind, since)
+        if hit is not None:
+            data = await _export_catch_read(page, hit, label)
+            return None if data is None else {**hit, "bytes": data}
+        await asyncio.sleep(0.25)
+    return None
+
+
+class _ChromeDownloadWatch:
+    """While attached, every download Chrome starts on `page` is logged: with
+    the catcher on, a report's export starts none, and the log says so."""
+
+    def __init__(self, page, label):
+        self.page, self.label, self.seen = page, label, []
+
+    def _on_download(self, dl):
+        try:
+            name = str(dl.suggested_filename)
+        except Exception:
+            name = "?"
+        self.seen.append(name)
+        log(f"[{self.label}] ⚠ Chrome started a download during the export (\"{name}\") "
+            "— the page's catcher did not stop it", "WARN")
+
+    def __enter__(self):
+        try:
+            self.page.on("download", self._on_download)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.page.remove_listener("download", self._on_download)
+        except Exception:
+            pass
+        log(f"[{self.label}] Chrome downloads seen during the export: {len(self.seen)}")
+        return False
+
+
+async def _cua_export_caught(page, browser, cua_client, label, cua_prompt, cua_user_msg, *,
+                             kind="markdown", since=0, max_iterations=12,
+                             cua_timeout_s=180.0, grace_s=15.0, verbose=False):
+    """Computer use presses a report's export (the prompt says where) while the
+    page's catcher waits for its file. The first `kind` file caught after
+    `since` stops the loop before its next click (#732: the vision agent
+    re-clicks a menu row that does not visibly close) and comes back with its
+    bytes; None when nothing was caught.
+
+    ⛔ The catcher is put back whenever the page lost it (a navigation)."""
     if browser is None or cua_client is None:
-        return ""
+        return None
     try:
         await browser.switch_to_page(page)
     except Exception as e:
-        log(f"[{label}] CUA download: switch_to_page failed: {e}", "WARN")
-        return ""
+        log(f"[{label}] computer use export: switch_to_page failed: {e}", "WARN")
+        return None
+    caught = asyncio.Event()
+    hit = {}
 
-    download = None
-    cua_completed = False
-    # Idempotency (#732): CUA is a vision agent, and Claude's artifact
-    # "Download as Markdown" menu item does NOT visibly close after a click,
-    # so the agent concludes the click "didn't register" and re-clicks —
-    # observed up to 6× in prod (backend.log 14:36), each click a real .md
-    # download. (Stuck-detection didn't help: it keys on action+coordinate
-    # and CUA's repeat clicks drift by a pixel or two.) The old
-    # expect_download captured only the FIRST file but let agent_loop keep
-    # running — and clicking. Fix: capture via an explicit listener that sets
-    # _dl_event on the first file, and pass _dl_event into agent_loop as its
-    # abort signal — the loop checks it every iteration AND before each tool
-    # dispatch, so it issues NO further clicks once a file lands (deterministic
-    # even though the sync Anthropic call freezes the loop between turns). A
-    # task .cancel() is kept as a backstop; any straggler is deleted in finally.
-    _extra_downloads = []
-    _dl_event = asyncio.Event()
+    async def _watch():
+        while not caught.is_set():
+            got = await _export_catch_list(page)
+            if got is None:
+                await _export_catch_arm(page, label, quiet=True)
+            else:
+                c = next((x for x in got if int(x.get("id") or 0) > since
+                          and _export_kind(x) == kind), None)
+                if c is not None:
+                    hit.update(c)
+                    caught.set()
+                    return
+            await asyncio.sleep(0.5)
 
-    def _capture_download(dl):
-        nonlocal download
-        if download is None:
-            download = dl
-            _dl_event.set()
-        else:
-            _extra_downloads.append(dl)
-
-    page.on("download", _capture_download)
-    loop_task = None
-    dl_task = None
+    loop_task = watch_task = None
+    done = False
     try:
-        # Run the CUA loop and the first-download wait concurrently. The loop
-        # self-bounds at cua_timeout_s (asyncio.wait_for); download_timeout_ms
-        # is only a backstop on the race coordinator.
-        loop_task = asyncio.ensure_future(
-            asyncio.wait_for(
-                agent_loop(
-                    cua_client, browser,
-                    cua_prompt, cua_user_msg,
-                    model=CUA_MODEL,
-                    max_iterations=max_iterations,
-                    verbose=verbose,
-                    target_page=page,
-                    abort_event=_dl_event,
-                ),
-                timeout=cua_timeout_s,
-            )
-        )
-        dl_task = asyncio.ensure_future(_dl_event.wait())
+        loop_task = asyncio.ensure_future(asyncio.wait_for(
+            agent_loop(cua_client, browser, cua_prompt, cua_user_msg, model=CUA_MODEL,
+                       max_iterations=max_iterations, verbose=verbose, target_page=page,
+                       abort_event=caught),
+            timeout=cua_timeout_s))
+        watch_task = asyncio.ensure_future(_watch())
         try:
-            await asyncio.wait(
-                {loop_task, dl_task},
-                timeout=download_timeout_ms / 1000.0,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            await asyncio.wait({loop_task, watch_task}, timeout=cua_timeout_s + grace_s,
+                               return_when=asyncio.FIRST_COMPLETED)
         except Exception:
             pass
-
-        # Download landed first → stop CUA before it can re-click the menu
-        # item and trigger duplicate downloads.
-        if _dl_event.is_set() and not loop_task.done():
+        if caught.is_set() and not loop_task.done():
             loop_task.cancel()
-
-        # Settle the loop task (consume its result/exception so it isn't
-        # reported as never-retrieved). A cancel here is the SUCCESS path —
-        # we already captured the file.
         try:
             await loop_task
-            cua_completed = True
+            done = True
         except asyncio.CancelledError:
             pass
         except asyncio.TimeoutError:
-            log(f"[{label}] CUA download: CUA timed out after {cua_timeout_s}s", "WARN")
+            log(f"[{label}] computer use export: timed out after {cua_timeout_s}s", "WARN")
         except Exception as e:
-            log(f"[{label}] CUA download: CUA raised: {e}", "WARN")
-
-        # CUA finished/timed out without a download yet — give a short grace
-        # window for an in-flight file (mirrors the old expect_download
-        # post-body grace).
-        if download is None:
+            log(f"[{label}] computer use export raised: {e}", "WARN")
+        if not caught.is_set():
             try:
-                await asyncio.wait_for(_dl_event.wait(), timeout=15.0)
+                await asyncio.wait_for(caught.wait(), timeout=grace_s)
             except asyncio.TimeoutError:
                 pass
-
-        if download is None:
-            log(f"[{label}] CUA download: no download event within "
-                f"{download_timeout_ms}ms (cua_completed={cua_completed})", "WARN")
-            return ""
-
-        # Read the captured file off-thread — a research report can be 100KB+
-        # and a sync read would block the event loop (codebase to_thread norm).
-        try:
-            path = await download.path()
-            if not path:
-                log(f"[{label}] CUA download: download.path() returned None", "WARN")
-                return ""
-
-            def _read_md(p):
-                with open(p, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
-
-            content = await asyncio.to_thread(_read_md, path)
-        except Exception as e:
-            log(f"[{label}] CUA download: file read failed: {e}", "WARN")
-            return ""
-
-        if not content or len(content) < min_chars:
-            log(f"[{label}] CUA download: captured {len(content or '')} "
-                f"chars < min {min_chars} (cua_completed={cua_completed})", "WARN")
-            return ""
-        log(f"[{label}] CUA download captured {len(content)} chars "
-            f"(cua_completed={cua_completed})")
-        return content
+        if not caught.is_set():
+            log(f"[{label}] computer use export: no {kind} file caught "
+                f"(computer use finished={done})", "WARN")
+            return None
+        data = await _export_catch_read(page, hit, label)
+        return None if data is None else {**hit, "bytes": data}
     finally:
-        # Detach the listener so it can't fire on a later phase's download
-        # (e.g. the NotebookLM audio handler) or leak across runs.
-        try:
-            page.remove_listener("download", _capture_download)
-        except Exception:
-            pass
-        # Cancel the download waiter if it never fired (avoid a dangling task).
-        if dl_task is not None and not dl_task.done():
-            dl_task.cancel()
-        # Stop the CUA loop on EVERY exit path (incl. an outer cancel of this
-        # coroutine), so a still-running agent_loop can't keep clicking.
-        if loop_task is not None and not loop_task.done():
-            loop_task.cancel()
-        # Best-effort cleanup of Playwright temp files — the captured file
-        # plus any duplicate downloads CUA triggered before we stopped it.
-        for _extra in _extra_downloads:
-            try:
-                await _extra.delete()
-            except Exception:
-                pass
-        if download is not None:
-            try:
-                await download.delete()
-            except Exception:
-                pass
+        for t in (watch_task, loop_task):
+            if t is not None and not t.done():
+                t.cancel()
 
 
 async def _run_with_clipboard_hijack(
@@ -56883,12 +57002,16 @@ async def _run_with_clipboard_hijack(
 #   1. a CENSUS of the app's frames — tags, roles, labels, short texts, in the
 #      recorder's own node shape — written at launch, mid-run and done, and on
 #      every DOM miss, so the next run IS the capture;
-#   2. the report DOWNLOADED inside the frame when it shows a download/export
+#   2. the report EXPORTED from inside the frame when it shows a download/export
 #      control and then a Markdown row (the 09-30 computer use pressed exactly
 #      that: "the download icon" at the frame's top right, then "Export to
-#      Markdown"); nothing found → computer use, as before;
-#   3. the report's CITATIONS linked to the sources the rendered report shows
-#      (see `_chatgpt_link_citations`).
+#      Markdown"), then its PDF row; nothing found → computer use, as before.
+#      ⭐ 2026-10-02: the files are caught on the top page, never downloaded
+#      (see "A REPORT'S EXPORT IS CAUGHT IN THE PAGE");
+#   3. the report's CITATIONS numbered and linked from the PDF export (see
+#      "CHATGPT'S FOOTNOTES, FROM ITS OWN PDF EXPORT"). The 09-30 matcher that
+#      looked for the same words before a link in the rendered report is gone:
+#      the 10-01 census found not one link in the frame, and it linked 0 of 172.
 
 #: What a frame of the app is: its sandbox origin. A frame nested inside one of
 #: these (the about:blank the report may render in) belongs to it too.
@@ -57111,8 +57234,8 @@ _CHATGPT_DR_MARK_JS = r"""(P) => {
 
 #: The header control: a download or an export button.
 _CHATGPT_DR_DOWNLOAD_RE = r"\b(download|export)\b"
-#: The menu row: Markdown.
-_CHATGPT_DR_MARKDOWN_RE = r"markdown|\.md\b"
+#: The menu rows: Markdown, and PDF (read only for its sources' addresses).
+_CHATGPT_DR_ROW_RE = {"markdown": r"markdown|\.md\b", "pdf": r"\bpdf\b"}
 #: How long a press may take to be clickable, and how long the file may take.
 _CHATGPT_DR_PRESS_MS = 5000
 _CHATGPT_DR_FILE_S = 20.0
@@ -57136,261 +57259,402 @@ async def _chatgpt_dr_press(frame, value, pattern, *, top=0):
     return hit
 
 
-async def _chatgpt_dr_dom_download(page, label="ChatGPT"):
-    """The finished report, downloaded inside the Deep research app's frame: its
-    download/export control, then the Markdown row. Returns the file's text, or
-    "" when no frame shows such a control (the caller then asks computer use, as
-    before) — a miss writes a census, so the next run shows what was there."""
+async def _chatgpt_dr_press_export(page, kind, label="ChatGPT", *, since=0):
+    """The finished report's `kind` export ("markdown" or "pdf") pressed by the
+    page inside the Deep research app's frame — its Export control, then the
+    "Export to Markdown" / "Export to PDF" row — and its file caught on the top
+    page (`_export_catch_wait`), never downloaded. Returns the caught file, or
+    None when no frame shows the control or nothing was caught (the caller then
+    asks computer use) — a miss writes a census, so the next run shows what was
+    there."""
     frames = _chatgpt_dr_app_frames(page)
     if not frames:
-        return ""
-    got = []
-    done = asyncio.Event()
-
-    def _on_download(dl):
-        got.append(dl)
-        done.set()
-
-    page.on("download", _on_download)
+        return None
     pressed = []
-    try:
-        for f in frames:
-            first = await _chatgpt_dr_press(f, "dr-download", _CHATGPT_DR_DOWNLOAD_RE, top=160)
-            if not first:
-                continue
-            pressed.append(first.get("text") or first.get("tag") or "?")
-            try:
-                await asyncio.wait_for(done.wait(), timeout=1.5)
-            except asyncio.TimeoutError:
-                pass
-            if not got:
-                second = None
-                for g in [f] + [x for x in frames if x is not f]:
-                    second = await _chatgpt_dr_press(g, "dr-markdown", _CHATGPT_DR_MARKDOWN_RE)
-                    if second:
-                        break
+    got = None
+    for f in frames:
+        first = await _chatgpt_dr_press(f, "dr-export", _CHATGPT_DR_DOWNLOAD_RE, top=160)
+        if not first:
+            continue
+        pressed.append(first.get("text") or first.get("tag") or "?")
+        # A control that makes the file by itself.
+        got = await _export_catch_wait(page, kind, since, 1.5, label)
+        if got is None:
+            second = None
+            for g in [f] + [x for x in frames if x is not f]:
+                second = await _chatgpt_dr_press(g, f"dr-{kind}", _CHATGPT_DR_ROW_RE[kind])
                 if second:
-                    pressed.append(second.get("text") or second.get("tag") or "?")
-                    try:
-                        await asyncio.wait_for(done.wait(), timeout=_CHATGPT_DR_FILE_S)
-                    except asyncio.TimeoutError:
-                        pass
-            break
-        if not got:
-            log(f"[{label}] Deep research download by the page: "
-                + (f"pressed {json.dumps(pressed, ensure_ascii=False)} but no file came"
-                   if pressed else "no download or export control in the app's frames")
-                + " — computer use downloads it instead")
-            await _chatgpt_dr_census(page, "miss-download", label=label)
+                    break
+            if second:
+                pressed.append(second.get("text") or second.get("tag") or "?")
+                got = await _export_catch_wait(page, kind, since, _CHATGPT_DR_FILE_S, label)
+        break
+    if got is None:
+        log(f"[{label}] Deep research {kind} export by the page: "
+            + (f"pressed {json.dumps(pressed, ensure_ascii=False)} but no file was caught"
+               if pressed else "no export control in the app's frames")
+            + " — computer use presses it instead")
+        await _chatgpt_dr_census(page, f"miss-export-{kind}", label=label)
+        return None
+    log(f"[{label}] Deep research {kind} export by the page: pressed "
+        f"{json.dumps(pressed, ensure_ascii=False)}, {len(got['bytes'])} bytes caught")
+    return got
+
+
+#: What computer use is asked for each export.
+_CHATGPT_DR_CUA_EXPORT = {
+    "markdown": (PROMPT_CHATGPT_DOWNLOAD_MD,
+                 "Close any open side panel, open the canvas, then click the "
+                 "download icon and choose Export to Markdown."),
+    "pdf": (PROMPT_CHATGPT_EXPORT_PDF,
+            "Close any open side panel, open the canvas, then click the "
+            "download icon and choose Export to PDF."),
+}
+
+
+async def _chatgpt_export_caught(page, browser, cua_client, kind, label="ChatGPT",
+                                 verbose=False):
+    """One of the finished report's exports, caught in the page: pressed by the
+    page, else by computer use (which waits out a slow file from the page's
+    press too: both wait for a file caught after the same moment)."""
+    since = await _export_catch_last_id(page)
+    got = await _chatgpt_dr_press_export(page, kind, label, since=since)
+    if got is None and browser and cua_client:
+        prompt, msg = _CHATGPT_DR_CUA_EXPORT[kind]
+        got = await _cua_export_caught(page, browser, cua_client, label, prompt, msg,
+                                       kind=kind, since=since, max_iterations=12,
+                                       cua_timeout_s=180.0, verbose=verbose)
+    return got
+
+
+async def _chatgpt_dr_export_report(page, browser, cua_client, label="ChatGPT",
+                                    verbose=False) -> str:
+    """The finished report from ChatGPT's own exports, caught in the page with no
+    Chrome download: the Markdown export is the document, and the PDF export —
+    pressed after it — gives its citations their sources
+    (`_chatgpt_document_from_exports`). "" when the Markdown export was not
+    caught or is not the report; the caller then reads the report off the app's
+    frame."""
+    if not await _export_catch_arm(page, label):
+        return ""
+    with _ChromeDownloadWatch(page, label):
+        md_file = await _chatgpt_export_caught(page, browser, cua_client, "markdown",
+                                               label, verbose)
+        md = md_file["bytes"].decode("utf-8", errors="replace") if md_file else ""
+        if len(md) < 500:
+            if md_file:
+                log(f"[{label}] the Markdown export holds only {len(md)} chars — not the report",
+                    "WARN")
             return ""
-        try:
-            path = await got[0].path()
-
-            def _read(p):
-                with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                    return fh.read()
-
-            text = await asyncio.to_thread(_read, path) if path else ""
-        except Exception as _re:
-            log(f"[{label}] Deep research download by the page: the file could not be "
-                f"read ({_re})", "WARN")
-            text = ""
-        log(f"[{label}] Deep research download by the page: pressed "
-            f"{json.dumps(pressed, ensure_ascii=False)}, file {len(text)} chars")
-        return text
-    finally:
-        try:
-            page.remove_listener("download", _on_download)
-        except Exception:
-            pass
-        for dl in got:
+        if _is_sources_not_document(md, platform="chatgpt"):
+            log(f"[{label}] the Markdown export is a sources list ({len(md)} chars), "
+                "not the report", "WARN")
             try:
-                await dl.delete()
+                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                           op="finalize_copy", length=len(md), tier="export_markdown")
             except Exception:
                 pass
+            return ""
+        pdf_file = await _chatgpt_export_caught(page, browser, cua_client, "pdf",
+                                                label, verbose)
+    doc = await asyncio.to_thread(_chatgpt_document_from_exports, md,
+                                  pdf_file["bytes"] if pdf_file else None, label)
+    log(f"[{label}] Extracted via ChatGPT's Markdown export, caught in the page "
+        f"(no download): {len(doc)} chars")
+    return doc
 
 
-# ⛔⛔ 2026-09-30 (round 2) — WHY CHATGPT'S DOCUMENT HAD NO SOURCES. The owner's
-# 09-30 document (100,945 chars) ends with a reference list and carries not one
-# URL, and no footnote. Three answers, measured:
-#   * the EXPORT (computer use, "Export to Markdown", 107,195 chars) writes each
-#     citation as a token run naming ChatGPT's own source list —
-#     "\ue200cite\ue202turn18view0\ue202turn18view1\ue201" — never a URL
-#     (6,250 chars of them that day; the reference list's lines end in one);
-#   * OUR `_strip_chatgpt_citation_tokens` then deleted every run, so even the
-#     place of each citation was gone;
-#   * and the sources that WOULD have been merged in were never collected: 0
-#     from the side panel all run (the press that opened it no longer does).
-# The 09-19 export happened to carry 12 URLs of its own, so that document had
-# its numbered sources; the 09-20 and 09-30 ones had none.
-# ⭐ What is ours to fix: the rendered report in the app's frame shows each
-# citation as a link to its source, right where the export has its token run.
-# So each run is matched to the link that follows the SAME words in the
-# rendered report (the last 24 letters and digits before it), and becomes that
-# link. The document then carries its sources' URLs, and the existing numbering
-# (`_extract_findings`, `_number_document_sources`) gives it its numbered
-# markers and its Sources list, as it does for Claude's reports. A run with no
-# match is removed, as before.
-# ⚠ ASSUMED (no recording reaches inside the frame): that the rendered report's
-# citations are links (<a href="https://…">), as they are in Phase 1's reply
-# (4-chatgpt-p1-thinking.json: a[data-testid="chatgpt-citation"], its
-# aria-label "Site: Title, https://…").
-_CHATGPT_REPORT_LINKS_JS = r"""() => {
-    const out = [];
-    const BLOCK = 'p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, dd, dt, figcaption';
-    for (const a of document.querySelectorAll('a[href^="http"]')) {
-        if (out.length >= 600) break;
-        const b = a.closest(BLOCK) || a.parentElement;
-        let before = '';
-        if (b) {
-            const w = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
-            let n;
-            while ((n = w.nextNode())) {
-                if (a.contains(n)) break;
-                if (a.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING) break;
-                // Another citation's own words are not the report's.
-                if (n.parentElement && n.parentElement.closest('a[href]')) continue;
-                before += n.nodeValue || '';
-            }
-        }
-        out.push({ url: a.href, label: (a.getAttribute('aria-label') || '').slice(0, 240),
-                   text: (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120),
-                   before: before.slice(-300) });
-    }
-    return out;
-}"""
+# ═════════════════════════════════════════════════════════════════════════════
+# CHATGPT'S FOOTNOTES, FROM ITS OWN PDF EXPORT (Wave 14 part 2, 2026-10-02)
+# ─────────────────────────────────────────────────────────────────────────────
+# Decided with the owner on 10-01 (#Dev/wave14/md-vs-pdf-1001.json): ChatGPT's
+# Markdown export stays the document, and its PDF export is read for ONE thing,
+# the sources' addresses. The Markdown writes each citation as a token run that
+# names ChatGPT's own source list — "\ue200cite\ue202turn16view1\ue201" — and never
+# an address. The PDF (WeasyPrint, author "ChatGPT Deep Research") draws each run
+# as a 12-pt chip with one 6-pt number in it, linking ONE address, and ends with
+# its sources pages: each source's title and address over the numbers citing it.
+# MEASURED on the owner's pair (tests/fixtures/documents_1001/
+# chatgpt_dr_papertrade.md and .pdf): 141 runs in the Markdown, 141 chips in the
+# body; numbering each distinct run (its reference ids, in order) by first use
+# gives the chips' own numbers, 141 of 141 in order, 59 numbers; the same number
+# always opens the same address; the sources pages list 27 titled addresses with
+# exactly the body's numbers; all 31 reference ids resolve (a run with one
+# reference, or the first reference of a group, which is what a chip opens).
+# ⭐ THE RULE. Run N of the Markdown (numbered by first use) is chip N of the PDF
+# — joined by NUMBER, never by position, so a table's reading order cannot shift
+# it. Each run becomes ChatGPT's own number, `\[N\]`, where the run stood, and
+# the document ends with ONE "Sources" list in the shape of ChatGPT's own sources
+# page: each source's title and address, then the numbers that cite it. At the
+# write, the own-numbers step (`_doc_link_own_numbers`) links each number to its
+# source exactly as it links Claude's, and the crash-retry read-back turns them
+# back into `\[N\]`, the text this hands over.
+# A "filecite" run (the attached brief) has no address in either export: it goes.
+# A report's own trailing sources section with no link in it ("**Prioritized
+# sources.**", 10-01) is replaced by this list: the document has one.
+# ⛔⛔ CHECKED BEFORE ANYTHING IS WRITTEN: the body's chips = the Markdown's runs
+# (in number and per number), one number → one address, the sources pages = the
+# body, one reference id → one address, and every number written links. On ANY
+# mismatch no number and no list are written: the runs come out as before and
+# the write ends the document with the sites ChatGPT visited — one log line says
+# why. A shifted link is worse than no footnote.
 
-#: A markdown link or image, for reading a report's words without its markup.
-_CG_MD_LINK_TEXT_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
-#: The letters and digits a citation is matched on, and how many of them.
-_CG_CITE_KEY_LEN = 24
+#: A chip: a link 12 pt wide and 11.25 pt tall with only a number in it.
+_CG_PDF_CHIP_W = 12.0
+_CG_PDF_CHIP_H = 11.25
+#: How far a chip may be from that size, in points.
+_CG_PDF_CHIP_SLACK = 1.5
+#: The chip's number is set at 6 pt; anything up to this size inside it is read.
+_CG_PDF_CHIP_TEXT_MAX = 7.5
+#: A source's title on the sources pages is set at 9 pt; its address at 7.5.
+_CG_PDF_TITLE_MIN = 8.0
+#: An escaped number, `\[12\]`, as the own-numbers step reads one.
+_CG_OWN_NUMBER_RE = re.compile(r'(?<!\\)\\\[(\d{1,3})\\\]')
+#: The spaces at the end of a piece of text, never its line break.
+_CG_LINE_SPACE_END_RE = re.compile(r'[^\S\n]+\Z')
 
 
-def _cg_cite_key(text: str) -> str:
-    """The last letters and digits before a citation: what the export and the
-    rendered report both have in front of it, whatever their markup."""
-    t = _CG_MD_LINK_TEXT_RE.sub(r"\1", text or "")
-    t = re.sub(r"[^0-9a-z]+", "", t.lower())
-    return t[-_CG_CITE_KEY_LEN:]
+def _cg_pdf_matrix(m, n):
+    """The product of two PDF text matrices `[a b c d e f]`."""
+    return [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3],
+            m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3],
+            m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]]
 
 
-def _cg_cite_title(link: dict) -> str:
-    """A source's name for its link: the name the page shows on the citation
-    (its text without a "+2"), else the site in its label ("Site: Title,
-    https://…" → "Site"), else its host. Short, as the page shows it — the
-    Sources list gives the host beside it."""
-    t = re.sub(r"\s*\+\d+\s*$", "", str(link.get("text") or "")).strip()
-    if not t:
-        lab = str(link.get("label") or "")
-        m = re.match(r"^(.*?),\s*https?://", lab)
-        t = (m.group(1) if m else lab).split(":")[0].strip()
-    if not t:
-        t = re.sub(r"^https?://(www\.)?", "", str(link.get("url") or "")).split("/")[0]
-    t = re.sub(r"[\[\]\n\r]+", " ", t)
-    return re.sub(r"\s+", " ", t).strip()[:80] or "source"
+def _chatgpt_pdf_table(pdf: bytes):
+    """What ChatGPT's PDF export says about its citations, or None when it holds
+    none of its chips:
 
+      {"body": [(number, address), …] — each chip before the sources pages, in
+                the PDF's order,
+       "sources": [{"numbers": […], "urls": [address of each chip, …],
+                    "url": address, "title": str}, …] — each entry of the
+                sources pages, in order}
 
-def _chatgpt_cite_runs_to_links(md: str, links: list):
-    """Each citation token run in `md` → the link the rendered report shows after
-    the same words. Runs side by side are one citation of several sources; their
-    links go together before the cited sentence's full stop, so the sentence is
-    the one numbered. Returns (markdown, runs linked, runs seen). A run with no
-    match is removed, as `_strip_chatgpt_citation_tokens` always did."""
-    if not md or "\ue200" not in md:
-        return md, 0, 0
-    # Each link with its key; a link is used once, in page order.
-    pool = []
-    for ln in links or []:
-        u = str((ln or {}).get("url") or "")
-        if not u.lower().startswith(("http://", "https://")) or _find_is_platform_host(u):
+    A source's title is its 9-pt lines between its chips and its address, on the
+    same page ("" when the entry runs over a page break). Raises on a PDF that
+    cannot be read."""
+    import io as _io
+    from pypdf import PdfReader
+    reader = PdfReader(_io.BytesIO(pdf))
+    items, texts = [], {}
+    for pi, pg in enumerate(reader.pages):
+        frags = []
+
+        def _seen(text, cm, tm, _font, size, _frags=frags):
+            if not text or not text.strip():
+                return
+            m = _cg_pdf_matrix(tm, cm)
+            scale = abs(m[0]) or abs(m[3]) or 1.0
+            _frags.append((text, m[4], m[5], abs(size) * scale))
+
+        pg.extract_text(visitor_text=_seen)
+        texts[pi] = frags
+        for ref in pg.get("/Annots") or []:
+            a = ref.get_object()
+            if a.get("/Subtype") != "/Link":
+                continue
+            act = a.get("/A")
+            act = act.get_object() if act is not None else {}
+            uri = act.get("/URI") if hasattr(act, "get") else None
+            if not uri:
+                continue
+            x0, y0, x1, y1 = (float(v) for v in a["/Rect"])
+            x0, x1, y0, y1 = min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)
+            box = (x0, y0, x1, y1)
+            if (abs(x1 - x0 - _CG_PDF_CHIP_W) <= _CG_PDF_CHIP_SLACK
+                    and abs(y1 - y0 - _CG_PDF_CHIP_H) <= _CG_PDF_CHIP_SLACK):
+                inside = sorted((f for f in frags if f[3] <= _CG_PDF_CHIP_TEXT_MAX
+                                 and x0 - 0.5 <= f[1] <= x1 + 0.5
+                                 and y0 - 0.5 <= f[2] <= y1 + 0.5), key=lambda f: f[1])
+                number = "".join(f[0] for f in inside).strip()
+                if re.fullmatch(r"\d{1,3}", number):
+                    items.append(("chip", pi, box, int(number), str(uri)))
+                    continue
+            items.append(("link", pi, box, None, str(uri)))
+    if not any(it[0] == "chip" for it in items):
+        return None
+    # The sources pages start at the first entry: a run of chips on one row
+    # followed by a text link to the same address.
+    start = len(items)
+    for k, it in enumerate(items):
+        if it[0] != "link" or not k or items[k - 1][0] != "chip" or items[k - 1][4] != it[4]:
             continue
-        k = _cg_cite_key(str(ln.get("before") or ""))
-        if len(k) >= 12:
-            pool.append([k, ln])
-    runs = list(_CHATGPT_CITE_TOKEN_RE.finditer(md))
+        start = k - 1
+        row = items[k - 1][2][1]
+        while (start > 0 and items[start - 1][0] == "chip" and items[start - 1][4] == it[4]
+               and items[start - 1][1] == it[1] and abs(items[start - 1][2][1] - row) < 1.0):
+            start -= 1
+        break
+    body = [(it[3], it[4]) for it in items[:start] if it[0] == "chip"]
+    sources, cur = [], None
+    for it in items[start:]:
+        if it[0] == "chip":
+            if cur is None or cur["links"]:
+                cur = {"chips": [], "links": []}
+                sources.append(cur)
+            cur["chips"].append(it)
+        elif cur is not None:
+            cur["links"].append(it)
     out = []
-    last = 0
-    linked = 0
-    i = 0
-    while i < len(runs):
-        seg = md[last:runs[i].start()]
-        # The group: this run and every run after it with only spaces between.
-        j = i + 1
-        while j < len(runs) and not md[runs[j - 1].end():runs[j].start()].strip():
-            j += 1
-        k = _cg_cite_key(_CHATGPT_CITE_TOKEN_RE.sub("", md[max(0, runs[i].start() - 900):runs[i].start()]))
-        found = []
-        for _ in range(i, j):
-            # The same words in front: equal keys first; else one key the end of
-            # the other (a link near the start of its paragraph has fewer letters
-            # in front of it than the export's run), never fewer than 12.
-            hit = None
-            if len(k) >= 12:
-                hit = next((e for e in pool if e[0] == k), None) or next(
-                    (e for e in pool if k.endswith(e[0]) or e[0].endswith(k)), None)
-            if hit is None:
-                continue
-            pool.remove(hit)
-            ln = hit[1]
-            lk = f"[{_cg_cite_title(ln)}]({ln['url']})"
-            if lk not in found:
-                found.append(lk)
-            linked += 1
-        last = runs[j - 1].end()
-        if not found:
-            out.append(seg)
-        else:
-            links_md = " ".join(found)
-            # "…the brief. RUN The next…" → "…the brief [Source](url). The next…"
-            pm = re.search(r"([.!?])(\s*)$", seg)
-            if pm:
-                out.append(seg[:pm.start()] + " " + links_md + pm.group(1) + pm.group(2))
-            else:
-                out.append(seg + ("" if not seg or seg[-1].isspace() else " ") + links_md)
-        i = j
-    out.append(md[last:])
-    return "".join(out), linked, len(runs)
+    for e in sources:
+        chips = e["chips"]
+        url = chips[0][4]
+        title = ""
+        link = next((ln for ln in e["links"] if ln[4] == url), None)
+        if link is not None and link[1] == chips[0][1]:
+            top = max(c[2][3] for c in chips)
+            lines = sorted((f for f in texts[link[1]] if f[3] >= _CG_PDF_TITLE_MIN
+                            and link[2][3] < f[2] <= top + 1.0),
+                           key=lambda f: (-round(f[2], 1), f[1]))
+            title = re.sub(r"\s+", " ", " ".join(f[0] for f in lines)).strip()
+        out.append({"numbers": [c[3] for c in chips], "urls": [c[4] for c in chips],
+                    "url": url, "title": title})
+    return {"body": body, "sources": out}
 
 
-async def _chatgpt_report_links(page) -> list:
-    """The citation links the rendered report shows, from every frame of the
-    Deep research surface (never the host page: the thread holds the brief)."""
-    links = []
-    seen = set()
-    for target in _chatgpt_surface_frame_targets(page)[1:]:
-        try:
-            got = await target.evaluate(_CHATGPT_REPORT_LINKS_JS)
-        except Exception:
-            continue
-        for ln in got or []:
-            key = (ln.get("url"), ln.get("before"))
-            if key in seen:
-                continue
-            seen.add(key)
-            links.append(ln)
-    return links
+def _cg_pdf_source_row(url: str, title: str, numbers: list) -> str:
+    """One row of the Sources list, in the shape of ChatGPT's own sources page:
+    the source's title (its link), its address as a reader would type it, and the
+    numbers that cite it. A source we would never put behind a number (one of the
+    agents' own pages) keeps its title and address as plain words."""
+    label = _doc_visited_label(url)
+    # ⛔ No backtick: a code span in a row is a row this list's reader refuses.
+    name = (re.sub(r"\s+", " ", (title or "").replace("`", "'")).strip()[:200]
+            or _doc_source_host(url) or label)
+    head = ("[%s](%s)" % (_doc_escape_link_text(name), _doc_markdown_url(url))
+            if _doc_is_linkable_url(url) else _doc_escape_link_text(name))
+    return "- %s — %s — cited as %s" % (head, label, ", ".join(str(n) for n in numbers))
 
 
-async def _chatgpt_link_citations(page, md: str, label="ChatGPT") -> str:
-    """The Deep research export with its citations linked to their sources (see
-    above), and every leftover token run removed."""
+def _chatgpt_document_from_exports(md: str, pdf, label: str = "ChatGPT") -> str:
+    """The ChatGPT document from its two exports: the Markdown with each citation
+    numbered and ONE Sources list from the PDF (`_chatgpt_pdf_numbered`), or —
+    with no PDF, or any mismatch — the Markdown with its citation runs removed,
+    as before."""
+    if pdf:
+        numbered = _chatgpt_pdf_numbered(md, pdf, label)
+        if numbered is not None:
+            return numbered
+    else:
+        log(f"[{label}] no PDF export was caught — the document's citations stay "
+            "unlinked and it ends with the sites ChatGPT visited")
+    return _strip_chatgpt_citation_tokens(md)
+
+
+def _chatgpt_pdf_footnotes(md: str, pdf, label: str = "ChatGPT") -> str:
+    """ChatGPT's Markdown export with its own numbers as links to their sources
+    and one Sources list, from its PDF export — what the write produces from
+    `_chatgpt_document_from_exports`. On any mismatch: the Markdown with its
+    citation runs removed and no link."""
+    return _doc_link_own_numbers(_chatgpt_document_from_exports(md, pdf, label), label)
+
+
+def _chatgpt_pdf_numbered(md: str, pdf, label: str = "ChatGPT"):
+    """See the block above. Returns the Markdown with ChatGPT's own numbers and
+    one Sources list, or None — and one log line saying why — on any mismatch."""
+    who = label or "ChatGPT"
+
+    def _no(why):
+        log(f"[{who}] no source links from ChatGPT's PDF export: {why} — the document "
+            "keeps its citations unlinked and ends with the sites ChatGPT visited")
+        return None
+
     if not md or "\ue200" not in md:
-        return _strip_chatgpt_citation_tokens(md)
+        return _no("the Markdown export holds no citation")
+    masked, code = _mask_code_spans(md)
+    if _CG_OWN_NUMBER_RE.search(masked):
+        return _no("the Markdown export already writes bracketed numbers of its own")
     try:
-        links = await _chatgpt_report_links(page)
-    except Exception:
-        links = []
-    try:
-        out, linked, seen = _chatgpt_cite_runs_to_links(md, links)
-    except Exception as _le:
-        log(f"[{label}] citations could not be linked ({_le})", "WARN")
-        out, linked, seen = md, 0, 0
-    log(f"[{label}] Citations: {linked} of {seen} in the report linked to a source "
-        f"the report shows on the page ({len(links)} source links read there)"
-        + ("" if linked else " — the document will carry no sources"))
-    if seen and not linked:
-        await _chatgpt_dr_census(page, "miss-sources", label=label)
-    return _strip_chatgpt_citation_tokens(out)
+        table = _chatgpt_pdf_table(pdf)
+    except Exception as e:
+        return _no(f"the PDF could not be read ({type(e).__name__})")
+    if table is None:
+        return _no("the PDF holds no numbered citation")
+    runs = list(_CHATGPT_CITE_TOKEN_RE.finditer(md))
+    groups, seq = {}, []
+    kinds = []
+    for m in runs:
+        parts = [p.strip() for p in m.group(0)[1:-1].split("\ue202")]
+        kinds.append(parts[0])
+        if parts[0] == "cite":
+            refs = tuple(p for p in parts[1:] if p)
+            seq.append(groups.setdefault(refs, len(groups) + 1))
+    body = table["body"]
+    if len(body) != len(seq):
+        return _no(f"{len(body)} numbered citations in the PDF, {len(seq)} in the Markdown")
+    if collections.Counter(n for n, _u in body) != collections.Counter(seq):
+        return _no("the PDF's numbers are not the Markdown's citations numbered by first use")
+    number_url = {}
+    for n, u in body:
+        if number_url.setdefault(n, u) != u:
+            return _no(f"number {n} opens two different addresses in the PDF")
+    listed = {}
+    for e in table["sources"]:
+        for n, u in zip(e["numbers"], e["urls"]):
+            if n in listed:
+                return _no(f"number {n} is listed twice on the PDF's sources pages")
+            listed[n] = u
+    if listed != number_url:
+        return _no("the PDF's sources pages do not list the numbers and addresses its "
+                   "text links")
+    ref_url = {}
+    for refs, n in groups.items():
+        if refs and ref_url.setdefault(refs[0], number_url[n]) != number_url[n]:
+            return _no(f"reference {refs[0]} opens two different addresses")
+    titles = {}
+    for e in table["sources"]:
+        titles.setdefault(e["url"], e["title"])
+    # Each run, in place: a citation becomes its number, glued to the word before
+    # it (a number after a space is a label to the own-numbers step); a citation
+    # inside code, a filecite and any other run go, as they always did.
+    out, last, k = [], 0, 0
+    for m, kind in zip(runs, kinds):
+        seg = md[last:m.start()]
+        if kind == "cite":
+            n = seq[k]
+            k += 1
+            if any(s <= m.start() < e for s, e in code):
+                out.append(seg)
+            else:
+                out.append(_CG_LINE_SPACE_END_RE.sub("", seg) + "\\[%d\\]" % n)
+        elif kind == "filecite":
+            out.append(_CG_LINE_SPACE_END_RE.sub("", seg))
+        else:
+            out.append(seg)
+        last = m.end()
+    out.append(md[last:])
+    text = "".join(out)
+    tmask = _mask_code_spans(text)[0]
+    own_at = _doc_own_sources_start(tmask)
+    if own_at is not None:
+        if _doc_cited_public_keys(tmask[own_at:]):
+            return _no("the export ends with a sources list of its own that holds links")
+        text = text[:own_at].rstrip()
+        tmask = _mask_code_spans(text)[0]
+        log(f"[{who}] the report's own sources section holds no link — replaced by "
+            "ChatGPT's own sources list, so the document ends with one")
+    present = sorted({int(x) for x in _CG_OWN_NUMBER_RE.findall(tmask)})
+    if not present:
+        return _no("no citation is left to number")
+    by_url = {}
+    for n in present:
+        by_url.setdefault(number_url[n], []).append(n)
+    rows = [_cg_pdf_source_row(u, titles.get(u, ""), nums) for u, nums in by_url.items()]
+    numbered = "%s\n\n%s\n\n%s\n" % (text.rstrip(), _doc_sources_heading(_DOC_SOURCES_TITLE),
+                                     "\n".join(rows))
+    # ⛔ Every number written must link at the write; a number the own-numbers
+    # step would leave as text (one after a line break) means none is written.
+    want = sum(1 for n in _CG_OWN_NUMBER_RE.findall(tmask)
+               if _doc_is_linkable_url(number_url[int(n)]))
+    got = len(_DOC_MARK_NUMBER_RE.findall(_doc_link_own_numbers(numbered, who, quiet=True)))
+    if got != want:
+        return _no(f"{got} of {want} numbers would link at the write")
+    every = {r for refs in groups for r in refs}
+    log(f"[{who}] ChatGPT's own citation numbers, from its PDF export: {len(seq)} citations, "
+        f"{len(groups)} numbers, {len(by_url)} sources; "
+        f"{sum(1 for r in every if r in ref_url)} of {len(every)} reference ids have an address")
+    return numbered
 
 
 # ⭐⭐ 2026-10-01 — THE FINISHED REPORT IS READ OFF THE APP'S FRAME: NOTHING
@@ -57569,11 +57833,17 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         hijack fallback) — fires when Research wasn't enabled and the
         operator continued in chat.
 
-    ChatGPT-specific tier ordering:
-      Tier 1: CUA-driven download flow (close source panel, open canvas
-              full-page, click download icon, click "Export to Markdown",
-              expect_download captures the .md). Selector-free; CUA does
-              all clicking. Wayland-safe.
+    ChatGPT-specific tier ordering (2026-10-02):
+      Tier 1: ChatGPT's own exports, caught in the page — never downloaded by
+              Chrome (`_chatgpt_dr_export_report`): its "Export to Markdown",
+              pressed by the page inside the Deep research app's frame, else by
+              computer use; then its "Export to PDF" the same way, read only for
+              the sources' addresses. The Markdown is the document, its
+              citations numbered and linked from the PDF.
+      Tier 1b: the finished report read off the app's frame
+              (`_chatgpt_dr_frame_report`), nothing pressed; `done_text_len` is
+              the text the done check read there, so a frame that lost text
+              after the done check is not taken for the report.
       Tier 2: HTML→MD on whatever canvas state Tier 1 left mounted (canvas
               should be open full-page from CUA's enlarge click).
       Tier 3: CUA Copy + JS clipboard hijack (Ctrl+A/C with getSelection
@@ -57587,88 +57857,35 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     `chatgpt_brief_via_copy`, called by run_phase1, never from here.
 
     ChatGPT Deep Research (P2) outputs a document/artifact card, not regular
-    chat text — which is why P2 passes browser+cua to enable Tier 1/3.
-
-    Since 2026-10-01 the finished report is first read off the Deep research
-    app's frame (`_chatgpt_dr_frame_report`), nothing pressed and nothing
-    downloaded; `done_text_len` is the text the done check read there, so a
-    frame that lost text after the done check is not taken for the report."""
+    chat text — which is why P2 passes browser+cua to enable Tier 1/3."""
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # ── Tier 0 (2026-09-30, round 2): the download inside the app's frame ──
-    # Deep research runs as an app in a frame, and the finished report opens in
-    # it with a download control at its top right (the 09-30 computer use
-    # pressed it, then "Export to Markdown"). The page presses the same two
-    # controls when the frame shows them; computer use (Tier 1) only when not.
-    # A census of the app's frames is written here too — the finished state.
-    # ⛔⛔ OFF BY DEFAULT SINCE 2026-10-01: Chrome 154 CRASHED (SIGSEGV in its
-    # browser main thread, crash report 18:34:03) at 18:33:45.28 — the instant
-    # this tier's press on "Export to Markdown" started the file. The browser
-    # died, the run read it as a crash and redid all of Phase 2. Computer use
-    # pressing the same two controls on 09-30 got the file (107,195 chars), so
-    # Tier 1 downloads when the report cannot be read off the frame (below).
-    # SR_CHATGPT_DR_PAGE_DOWNLOAD=1 turns the press back on for a test.
-    _page_download = os.environ.get("SR_CHATGPT_DR_PAGE_DOWNLOAD", "") == "1"
+    # ── Tier 1 (2026-10-02): ChatGPT's own exports, caught in the page ──
+    # ⛔⛔ NO CHROME DOWNLOAD. Chrome 154 crashed in its own downloads button the
+    # instant the page pressed "Export to Markdown" on 09-30 (18:33:45, SIGSEGV),
+    # and twice more on the research computer on 10-01 under computer use — 4 of
+    # 49 ChatGPT exports in every log read. The file is now caught on the top
+    # page and Chrome never downloads it, so the export is the document again,
+    # as the owner decided on 10-01: it carries every equation as written and
+    # every citation, which the PDF export then gives its address. A census of
+    # the app's frames is written here — the finished state.
     if _chatgpt_dr_app_frames(page):
         await _chatgpt_dr_census(page, "done", label=label)
-        # 2026-10-01: the report read off the app's frame — before any press.
+    if _chatgpt_dr_app_frames(page) or (browser and cua_client):
+        md = await _chatgpt_dr_export_report(page, browser, cua_client, label, verbose)
+        if md:
+            return md
+
+    # ── Tier 1b (2026-10-01): the report read off the app's frame ──
+    # Nothing pressed: what the frame already holds, when no export was caught.
+    if _chatgpt_dr_app_frames(page):
         md = await _chatgpt_dr_frame_report(page, label, done_text_len=done_text_len)
         if md:
             log(f"[{label}] Extracted via the Deep research app's frame (no download): "
                 f"{len(md)} chars")
             return md
-    if _page_download and _chatgpt_dr_app_frames(page):
-        md = await _chatgpt_dr_dom_download(page, label)
-        if md and len(md) >= 500:
-            if _is_sources_not_document(md, platform="chatgpt"):
-                log(f"[{label}] T0 page download wrong-artifact ({len(md)} chars) — "
-                    f"falling to Tier 1", "WARN")
-            else:
-                md = await _chatgpt_link_citations(page, md, label)
-                log(f"[{label}] Extracted via T0 page download (Export to Markdown): "
-                    f"{len(md)} chars")
-                return md
-
-    # ── Tier 1: CUA-driven download flow ──
-    # CUA handles: close any open side panel, click the artifact-card
-    # enlarge button (opens canvas full-page), click the canvas's
-    # download icon (top-right, distinct from Share icon), click
-    # "Export to Markdown" in the dropdown. Playwright `expect_download()`
-    # captures the resulting .md file. Selector-free end-to-end; CUA's
-    # vision finds buttons regardless of DOM drift.
-    if browser and cua_client:
-        md = await _extract_via_cua_download(
-            page, browser, cua_client, label,
-            PROMPT_CHATGPT_DOWNLOAD_MD,
-            "Close any open side panel, open the canvas, then click the "
-            "download icon and choose Export to Markdown.",
-            max_iterations=12, cua_timeout_s=180.0,
-            # download_timeout_ms must exceed cua_timeout_s, since
-            # page.expect_download() starts its clock when the `async with`
-            # enters — which is BEFORE the CUA loop runs. With the prior
-            # 30s value, ChatGPT's CUA loop (which takes ~30-45s to reach
-            # the final 'Export to Markdown' click) would race the
-            # listener: the listener expired ~2s before the click fired,
-            # so the actual download wasn't captured and T1 silently
-            # fell back to T3 clipboard hijack (which loses markdown
-            # structure). cua_timeout_s + 15s grace covers the final
-            # click + download-event RTT.
-            download_timeout_ms=195000, min_chars=500, verbose=verbose,
-        )
-        if md and len(md) >= 500:
-            if _is_sources_not_document(md, platform="chatgpt"):
-                log(f"[{label}] T1 download wrong-artifact ({len(md)} chars) — falling to Tier 2", "WARN")
-                try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                               op="finalize_copy", length=len(md), tier="cua_download_md")
-                except Exception:
-                    pass
-            else:
-                md = await _chatgpt_link_citations(page, md, label)
-                log(f"[{label}] Extracted via T1 CUA download (Export to Markdown): {len(md)} chars")
-                return md
 
     # ── Tier 2: HTML→MD scrape (canvas should be open from T1) ──
     # If T1 succeeded in enlarging the canvas but the download itself
@@ -57775,7 +57992,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                 except Exception:
                     pass
             else:
-                md = await _chatgpt_link_citations(page, md, label)
+                md = _strip_chatgpt_citation_tokens(md)
                 log(f"[{label}] Extracted via T3 CUA + clipboard hijack: {len(md)} chars")
                 return md
 
@@ -58555,22 +58772,23 @@ async def _claude_open_report_panel(page, *, wait_s: float = 8.0) -> dict:
     return {"found": True, "open": False, "pressed": bool(how), "how": how}
 
 
-async def _claude_download_report_by_page(page, label="Claude", *,
-                                          timeout_s: float = 30.0,
-                                          min_chars: int = 500) -> str:
+async def _claude_export_report_by_page(page, label="Claude", *,
+                                        timeout_s: float = 30.0,
+                                        min_chars: int = 500) -> str:
     """Tier 1 by the page: the arrow next to "Copy" in the report header, then
-    "Download as Markdown", captured with `page.expect_download()`. Returns the
-    markdown, or "" so the computer-use download stays the fallback."""
+    "Download as Markdown", its file caught on the page by the export catcher
+    (`_export_catch_wait`) — Chrome downloads nothing. Returns the markdown, or
+    "" so computer use presses it instead."""
     try:
         st = await page.evaluate(_CLAUDE_COPY_OPTIONS_MARK_JS,
                                  {"attr": _SR_CLICK_MARK, "value": "claude-copy-options",
                                   "panelSel": _CLAUDE_REPORT_PANEL_SEL}) or {}
     except Exception as e:
-        log(f"[{label}] page download: the report header read failed ({e})", "INFO")
+        log(f"[{label}] page export: the report header read failed ({e})", "INFO")
         return ""
     if not st.get("found"):
-        log(f"[{label}] page download: {st.get('why') or 'no Copy options button'} — "
-            f"computer use downloads it", "INFO")
+        log(f"[{label}] page export: {st.get('why') or 'no Copy options button'} — "
+            f"computer use presses it", "INFO")
         return ""
     if not await _sr_real_click(page, "claude-copy-options", tag=f"[{label}]"):
         return ""
@@ -58586,45 +58804,30 @@ async def _claude_download_report_by_page(page, label="Claude", *,
         if row.get("found"):
             break
     if not row.get("found"):
-        log(f"[{label}] page download: no 'Download as Markdown' row in the menu "
+        log(f"[{label}] page export: no 'Download as Markdown' row in the menu "
             f"(rows={json.dumps(row.get('rows') or [], ensure_ascii=False)})", "INFO")
         try:
             await page.keyboard.press("Escape")
         except Exception:
             pass
         return ""
-    dl = None
-    try:
-        async with page.expect_download(timeout=timeout_s * 1000) as dl_info:
-            how = await _sr_real_click(page, "claude-md-row", tag=f"[{label}]")
-            if not how:
-                raise RuntimeError("the Download as Markdown row could not be pressed")
-        dl = await dl_info.value
-        path = await dl.path()
-        if not path:
-            return ""
-
-        def _read_md(p):
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-
-        content = await asyncio.to_thread(_read_md, path)
-    except Exception as e:
-        log(f"[{label}] page download: no file ({type(e).__name__}: {str(e)[:120]})",
+    since = await _export_catch_last_id(page)
+    if not await _sr_real_click(page, "claude-md-row", tag=f"[{label}]"):
+        log(f"[{label}] page export: the Download as Markdown row could not be pressed",
+            "INFO")
+        return ""
+    got = await _export_catch_wait(page, "markdown", since, timeout_s, label)
+    if got is None:
+        log(f"[{label}] page export: no Markdown file was caught within {int(timeout_s)} s",
             "INFO")
         try:
             await page.keyboard.press("Escape")
         except Exception:
             pass
         return ""
-    finally:
-        if dl is not None:
-            try:
-                await dl.delete()
-            except Exception:
-                pass
-    if not content or len(content) < min_chars:
-        log(f"[{label}] page download: {len(content or '')} chars < {min_chars}", "INFO")
+    content = got["bytes"].decode("utf-8", errors="replace")
+    if len(content) < min_chars:
+        log(f"[{label}] page export: {len(content)} chars < {min_chars}", "INFO")
         return ""
     return content
 
@@ -58930,58 +59133,57 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # 2026-05-14: tiers de-indented out of the prior `if clicked:`
         # gate so a missed pre-click doesn't silently skip everything.
 
-        # ── Tier 1 by the page: Copy options → Download as Markdown ──
-        # ⭐ 2026-09-30 round 2. ⛔ OFF BY DEFAULT SINCE 2026-10-01: the same
-        # kind of page-pressed download on ChatGPT's app crashed Chrome 154 the
-        # instant its file started, and every good run (09-20, 09-30) got this
-        # report by computer use's download below. SR_CLAUDE_PAGE_DOWNLOAD=1
-        # turns the page press back on for a test.
+        # ── Tier 1: Claude's own "Download as Markdown", caught in the page ──
+        # ⭐ 2026-09-30 round 2 (the page names every control) and ⛔⛔
+        # 2026-10-02: the file is CAUGHT on the page and Chrome downloads
+        # nothing — Chrome 154 crashed in its own downloads button on ChatGPT's
+        # report downloads (see "A REPORT'S EXPORT IS CAUGHT IN THE PAGE"), and
+        # Claude's export makes its file the same way (blob:https://claude.ai/…).
+        # The page presses Copy options → Download as Markdown; computer use
+        # presses them when the page cannot. Nothing is pressed without the
+        # catcher on the page.
         md_page = ""
-        if os.environ.get("SR_CLAUDE_PAGE_DOWNLOAD", "") == "1":
-            md_page = await _claude_download_report_by_page(page, label)
-        if md_page:
-            if _is_sources_not_document(md_page, platform="claude"):
-                log(f"[{label}] page download is the sources list, not the report "
-                    f"({len(md_page)} chars) — computer use tries", "WARN")
-            else:
-                log(f"[{label}] Extracted via the page's Download as Markdown: "
-                    f"{len(md_page)} chars")
-                return md_page
-
-        # ── Tier 1 (CUA-driven download): Download as Markdown ──
-        # CUA finds the small down-arrow button next to the Copy button
-        # in the artifact-panel header (Copy/▼/Published trio per user
-        # screenshot), clicks it, then clicks "Download as Markdown".
-        # Playwright expect_download() captures the .md file. Selector-
-        # free; CUA's vision handles DOM drift. Wayland-safe.
-        if browser and cua_client:
-            md_dl = await _extract_via_cua_download(
-                page, browser, cua_client, label,
-                PROMPT_CLAUDE_DOWNLOAD_MD,
-                "The artifact panel should be open on the right showing the "
-                "final research report. If it isn't open yet, click the LAST "
-                "artifact card in the chat to open it first. Then click the "
-                "small down-arrow button next to the Copy button, and click "
-                "Download as Markdown.",
-                max_iterations=12, cua_timeout_s=150.0,
-                # See ChatGPT T1 note above: download_timeout_ms must
-                # exceed cua_timeout_s so the listener stays alive past
-                # the final click. cua_timeout_s + 15s grace.
-                download_timeout_ms=165000, min_chars=500, verbose=verbose,
-            )
-            if md_dl and len(md_dl) >= 500:
-                if _is_sources_not_document(md_dl, platform="claude"):
-                    log(f"[{label}] T1 CUA download wrong-artifact "
-                        f"({len(md_dl)} chars) — falling to Tier 2", "WARN")
-                    try:
-                        emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                                   op="finalize_copy", length=len(md_dl),
-                                   tier="cua_download_md")
-                    except Exception:
-                        pass
-                else:
-                    log(f"[{label}] Extracted via T1 CUA download (.md): {len(md_dl)} chars")
-                    return md_dl
+        if await _export_catch_arm(page, label):
+            with _ChromeDownloadWatch(page, label):
+                md_page = await _claude_export_report_by_page(page, label)
+                if md_page and _is_sources_not_document(md_page, platform="claude"):
+                    log(f"[{label}] page export is the sources list, not the report "
+                        f"({len(md_page)} chars) — computer use tries", "WARN")
+                    md_page = ""
+                if md_page:
+                    log(f"[{label}] Extracted via the page's Download as Markdown, caught "
+                        f"in the page (no download): {len(md_page)} chars")
+                    return md_page
+                # Computer use finds the small down-arrow next to the Copy
+                # button in the artifact-panel header (Copy/▼/Published trio
+                # per user screenshot), clicks it, then "Download as Markdown".
+                # Selector-free; CUA's vision handles DOM drift. Wayland-safe.
+                if browser and cua_client:
+                    got = await _cua_export_caught(
+                        page, browser, cua_client, label,
+                        PROMPT_CLAUDE_DOWNLOAD_MD,
+                        "The artifact panel should be open on the right showing the "
+                        "final research report. If it isn't open yet, click the LAST "
+                        "artifact card in the chat to open it first. Then click the "
+                        "small down-arrow button next to the Copy button, and click "
+                        "Download as Markdown.",
+                        kind="markdown", since=await _export_catch_last_id(page),
+                        max_iterations=12, cua_timeout_s=150.0, verbose=verbose)
+                    md_dl = got["bytes"].decode("utf-8", errors="replace") if got else ""
+                    if md_dl and len(md_dl) >= 500:
+                        if _is_sources_not_document(md_dl, platform="claude"):
+                            log(f"[{label}] T1 computer use export wrong-artifact "
+                                f"({len(md_dl)} chars) — falling to Tier 2", "WARN")
+                            try:
+                                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                                           op="finalize_copy", length=len(md_dl),
+                                           tier="cua_export_md")
+                            except Exception:
+                                pass
+                        else:
+                            log(f"[{label}] Extracted via T1 computer use export (.md), "
+                                f"caught in the page: {len(md_dl)} chars")
+                            return md_dl
 
         # ── Tier 2: HTML→MD of the OPEN artifact panel ──
         # #777 (2026-06-03, user-directed): Claude's T2 used to PUBLISH the
@@ -76904,6 +77106,13 @@ def _doc_marker_position(md: str, masked: str, spans: list,
 #
 # ⛔ A WRONG LINK IS WORSE THAN NO FOOTNOTE. A number only ever links to an
 # address in that document's own list.
+#
+# ⭐ 2026-10-02 — CHATGPT'S OWN LIST TOO. ChatGPT numbers per CITATION, not per
+# source (59 numbers, 27 sources in the owner's 10-01 pair), so its list — built
+# from its PDF export ("CHATGPT'S FOOTNOTES, FROM ITS OWN PDF EXPORT") — has one
+# row per source naming every number that cites it, as its own sources page
+# does. Read by `_doc_cited_rows`, and only in exactly that shape: row n is not
+# number n there, so "one for one" is every number cited = every number listed.
 
 #: An agent's own citation number, escaped the way Claude's export writes it.
 #: ⛔ Never one inside a link's words, nor one with a space right before it —
@@ -76921,12 +77130,57 @@ _DOC_OWN_ROW_LINK_RE = re.compile(
 #: re-entry read-back turns it back into the agent's `\[n\]`.
 _DOC_OWN_MARK_RE = re.compile(r'\[\\\[(\d{1,3})\\\]\]\([^()\s]*\)')
 
+#: ⭐ 2026-10-02 — ChatGPT's own list (`_cg_pdf_source_row`): one row per
+#: SOURCE, "- [title](address) — host/path — cited as 1, 12, 24", because
+#: ChatGPT numbers its citations per citation, not per source (59 numbers, 27
+#: sources on 10-01). `head` is the row's title part, `n` its numbers.
+_DOC_CITED_ROW_RE = re.compile(
+    r'[ \t]{0,3}[-*+][ \t]+(?P<head>\S.*?)[ \t]+—[ \t]+cited as[ \t]+'
+    r'(?P<n>\d{1,3}(?:,[ \t]*\d{1,3})*)[ \t]*\Z')
+#: …and the link a row opens with.
+_DOC_CITED_ROW_LINK_RE = re.compile(
+    r'\[(?:\\.|[^\]\\\n])*\]\((?P<u>(?:[^\s()]|\([^\s()]*\))+)\)')
+#: The heading that list is written under — ours, "Sources", at any level.
+_DOC_CITED_HEADING_RE = re.compile(r'[ \t]{0,3}#{1,6}[ \t]+Sources[ \t]*\Z')
+
+
+def _doc_cited_rows(md: str, masked: str, own_at: int):
+    """`({n: address}, {every number listed})` for a trailing sources section in
+    ChatGPT's own shape — a "Sources" heading and nothing under it but rows
+    naming the numbers that cite each source — or `({}, set())` for any other
+    section. A number may be listed once; a row whose address we would never put
+    behind a number lists its numbers with no address."""
+    lines, raw = masked[own_at:].split("\n"), md[own_at:].split("\n")
+    if not lines or not _DOC_CITED_HEADING_RE.match(lines[0]):
+        return {}, set()
+    rows, written = {}, set()
+    for seen, real in zip(lines[1:], raw[1:]):
+        if not seen.strip():
+            continue
+        m = _DOC_CITED_ROW_RE.match(real)
+        if m is None or seen != real:
+            return {}, set()
+        numbers = [int(x) for x in re.findall(r'\d{1,3}', m.group("n"))]
+        if written & set(numbers) or len(set(numbers)) != len(numbers):
+            return {}, set()
+        written |= set(numbers)
+        link = _DOC_CITED_ROW_LINK_RE.match(m.group("head"))
+        url = link.group("u") if link else ""
+        if _doc_is_linkable_url(url):
+            for n in numbers:
+                rows[n] = url
+    return (rows, written) if written else ({}, set())
+
 
 def _doc_own_list_rows(md: str, masked: str = None) -> dict:
     """`{n: address}` for the rows of the document's own trailing sources section
     (`_doc_own_sources_start`) that open with a link we would put behind a
     number — or {} when there is no such section, or its numbered rows do not
-    count 1, 2, 3 … (see the block above)."""
+    count 1, 2, 3 … (see the block above).
+
+    ⭐ 2026-10-02 — a section with no numbered row at all may be ChatGPT's own
+    list, one row per source naming the numbers that cite it
+    (`_doc_cited_rows`)."""
     if masked is None:
         masked = _mask_code_spans(md or "")[0]
     own_at = _doc_own_sources_start(masked)
@@ -76934,7 +77188,9 @@ def _doc_own_list_rows(md: str, masked: str = None) -> dict:
         return {}
     section = masked[own_at:]
     items = list(_DOC_OWN_ROW_NUMBER_RE.finditer(section))
-    if not items or [int(m.group(1)) for m in items] != list(range(1, len(items) + 1)):
+    if not items:
+        return _doc_cited_rows(md, masked, own_at)[0]
+    if [int(m.group(1)) for m in items] != list(range(1, len(items) + 1)):
         return {}
     rows = {}
     for m in items:
@@ -76947,10 +77203,11 @@ def _doc_own_list_rows(md: str, masked: str = None) -> dict:
     return rows
 
 
-def _doc_link_own_numbers(md: str, label: str = "") -> str:
+def _doc_link_own_numbers(md: str, label: str = "", quiet: bool = False) -> str:
     """Each escaped `\\[n\\]` outside code, before the document's own sources
     section, linked to row n of that section — see the block above. Returns `md`
-    itself when nothing is linked."""
+    itself when nothing is linked. `quiet`: no log line (a check made before the
+    write, which logs its own)."""
     if not md or "\\[" not in md:
         return md
     masked = _mask_code_spans(md)[0]
@@ -76974,11 +77231,14 @@ def _doc_link_own_numbers(md: str, label: str = "") -> str:
     if not cited:
         return md
     who = label or "the agent"
-    written = {int(n) for n in _DOC_OWN_ROW_NUMBER_RE.findall(masked[own_at:])}
+    # ⭐ 2026-10-02 — or, in ChatGPT's own list, every number its rows name.
+    written = ({int(n) for n in _DOC_OWN_ROW_NUMBER_RE.findall(masked[own_at:])}
+               or _doc_cited_rows(md, masked, own_at)[1])
     if cited != written:
-        log(f"[{who}] left its own citation numbers as written — they do not match "
-            f"its own sources list one for one ({len(cited)} numbers cited, "
-            f"{len(written)} rows)")
+        if not quiet:
+            log(f"[{who}] left its own citation numbers as written — they do not match "
+                f"its own sources list one for one ({len(cited)} numbers cited, "
+                f"{len(written)} rows)")
         return md
     out, last, linked, missing = [], 0, 0, set()
     for m in numbers:
@@ -76994,10 +77254,11 @@ def _doc_link_own_numbers(md: str, label: str = "") -> str:
     if not linked:
         return md
     out.append(md[last:])
-    log(f"[{who}] linked {linked} of its own citation numbers to its own sources "
-        f"list ({len(rows)} rows)"
-        + (f" — {len(missing)} number{'' if len(missing) == 1 else 's'} whose row "
-           f"has no link stay as written" if missing else ""))
+    if not quiet:
+        log(f"[{who}] linked {linked} of its own citation numbers to its own sources "
+            f"list ({len(rows)} rows)"
+            + (f" — {len(missing)} number{'' if len(missing) == 1 else 's'} whose row "
+               f"has no link stay as written" if missing else ""))
     return "".join(out)
 
 

@@ -9,13 +9,17 @@ is a local stand-in, ⚠ ASSUMED wherever it matters (said at each one).
 
   3. Done is the Stop button gone — "Worked for …" shows from launch; a census
      of the app's frames is written at launch, mid-run, done and on a miss; the
-     report is downloaded inside the frame when it shows a download control,
-     and by computer use when not.
+     report's export is pressed inside the frame when it shows a download
+     control, and by computer use when not.
+     ⭐ 2026-10-02: the export's file is CAUGHT on the top page, never
+     downloaded by Chrome (tests/test_chatgpt_exports_1002.py). The top page
+     makes it, as the owner's 10-01 recording shows; the frame only asks.
   4. The document's sources: the export writes each citation as a token run
-     naming ChatGPT's own source list, never a URL, and we deleted the runs —
-     the owner's 09-30 document had no sources and no footnotes. Each run is now
-     linked to the source the rendered report shows after the same words, and
-     the document ends with its numbered sources.
+     naming ChatGPT's own source list, never a URL. ⭐ 2026-10-02: the 09-30
+     matcher that linked each run to the link the rendered report shows after
+     the same words is gone (the 10-01 frame held not one link, and it linked 0
+     of 172); the runs are numbered from ChatGPT's PDF export instead
+     (tests/test_chatgpt_exports_1002.py).
 
 Nothing leaves the machine: the page and the app's frame are served from
 reserved `.invalid` hosts through a route that answers every request locally.
@@ -74,7 +78,8 @@ def _dr_host_html(index, *, stop=None, strip_app=False, worked=None):
     stop_html = "".join(
         '<div style="display:none">' + cp.node_html(s) + "</div>" if s.get("box") == [0, 0, 0, 0]
         else cp.node_html(s) for s in stops)
-    body = "<main>" + turn + "</main>" + side + "<form>" + stop_html + "</form>"
+    body = ("<main>" + turn + "</main>" + side + "<form>" + stop_html + "</form>"
+            + TOP_SAVER)
     if strip_app:
         body = body.replace(iframe, "")
         for attr in ("data-mcp-app-frame", "data-mcp-app-side-panel-frame-container",
@@ -83,6 +88,22 @@ def _dr_host_html(index, *, stop=None, strip_app=False, worked=None):
         body = body.replace(f'<iframe class="h-full min-h-0 min-w-0 w-full" src="{APP_URL}" '
                             'title="Deep research"></iframe>', "")
     return cp.page_html(body)
+
+
+#: The top page's half of an export, as the owner's 10-01 recording shows it
+#: (#Dev/wave14/recordings-1001/sr-cite-chatgpt-dr-top-full.json): the TOP page
+#: makes the file — `URL.createObjectURL(Blob)`, then `click()` on an
+#: `<a download>` — when the app's frame asks. ⚠ ASSUMED: that the frame asks
+#: by a message (no recording reaches inside the frame).
+TOP_SAVER = """<script>
+window.addEventListener('message', (e) => {
+  if (!e.data || !e.data.srExport) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([e.data.text], {type: 'text/markdown;charset=utf-8'}));
+  a.download = 'deep-research-report.md';
+  document.body.appendChild(a); a.click(); a.remove();
+});
+</script>"""
 
 
 def _serve(chrome, page, host_html, app_html, host_url=HOST_URL):
@@ -132,11 +153,9 @@ def _app_html(state="finished", *, download=True, report="", export=""):
         document.getElementById('menu').hidden = false; });
       for (const r of document.querySelectorAll('[role=menuitem]')) r.addEventListener('click', () => {
         press('row:' + r.textContent);
+        document.getElementById('menu').hidden = true;
         if (r.dataset.kind !== 'md') return;
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([EXPORT], {type: 'text/markdown'}));
-        a.download = 'deep-research-report.md';
-        document.body.appendChild(a); a.click(); });
+        window.top.postMessage({srExport: 'md', text: EXPORT}, '*'); });
       document.addEventListener('click', (e) => { const x = e.target.closest('a[href^="http"]');
         if (x) { e.preventDefault(); press('link'); } }, true);
     </script>""".replace("EXPORT", json.dumps(export))
@@ -258,20 +277,27 @@ def test_the_census_keeps_no_long_text(chrome, page, logs, run_dir):
 
 
 class _NoCua:
-    """Tier 1's computer use, stood in: what it was asked, and the export it
-    downloads (the 09-30 path)."""
+    """Tier 1's computer use, stood in: how often it was asked for the
+    Markdown export, and the file the catcher takes from its press (the 09-30
+    path). It is never asked for a PDF here: none of these exports has one."""
 
     def __init__(self, export=""):
         self.calls = 0
         self.export = export
 
-    async def download(self, *a, **k):
+    async def caught(self, *a, kind="markdown", **k):
+        if kind != "markdown":
+            return None
         self.calls += 1
-        return self.export
+        if not self.export:
+            return None
+        data = self.export.encode("utf-8")
+        return {"id": 99, "name": "deep-research-report.md", "type": "text/markdown",
+                "size": len(data), "via": "anchor.click()", "bytes": data}
 
 
 def _extract(chrome, page, monkeypatch, cua):
-    monkeypatch.setattr(research, "_extract_via_cua_download", cua.download)
+    monkeypatch.setattr(research, "_cua_export_caught", cua.caught)
     browser = SimpleNamespace(page=page)
     return chrome.run(research.extract_chatgpt_response(page, browser=browser,
                                                         cua_client=object()))
@@ -382,119 +408,73 @@ def test_the_export_is_shaped_like_the_0930_one():
     assert "Study, cohort findings. \n" in stripped
 
 
-def test_the_document_ends_with_its_numbered_sources(chrome, page, logs, run_dir, monkeypatch):
-    """⭐⭐ THE OWNER'S 09-30 DOCUMENT: no sources, no footnotes. The export came
-    through computer use (Tier 1) as on 09-30, its citations only token runs;
-    the report the app shows links each citation. Now every run becomes the
-    link shown after the same words, and the document — numbered by the same
-    code as every other agent's — ends with its numbered sources, each marker
-    in the text linking to its source."""
-    _serve(chrome, page, _dr_host_html(35),
-           _app_html("finished", download=False, report=_rendered()))
-    cua = _NoCua(_export())
-    md = _extract(chrome, page, monkeypatch, cua)
-    assert cua.calls == 1, "Tier 1 was not the path, as it was on 09-30"
-    assert RUN_START not in md and RUN_END not in md
-    doc = research._document_with_sources("# ChatGPT Deep Research\n\n" + md)
-    urls = [u for u, _s, _t in SOURCES]
-    assert "\n##### Sources" in doc, "the document ends with no sources (09-30)"
-    tail = doc[doc.rindex("Sources"):]
-    for n, u in enumerate(urls, 1):
-        assert f"{n}. [" in tail and u in tail, (n, u, tail)
-    body = doc[:doc.rindex("Sources")]
-    for n, u in enumerate(urls, 1):
-        assert research._doc_source_marker(n, u) in body, (n, u)
-    # Each marker sits at the end of the sentence the report cited, its sources
-    # linked by the name the page shows on the citation.
-    akc, rkc = SOURCES[0][0], SOURCES[1][0]
-    assert ("an excellent companion for an active household "
-            f"[American Kennel Club]({akc}) " + research._doc_source_marker(1, akc) + ".") in body
-    # Two citations side by side: both sources, one sentence.
-    assert (f"males larger than females [American Kennel Club]({akc}) "
-            f"[The Royal Kennel Club]({rkc}) " + research._doc_source_marker(2, rkc) + ".") in body
-    assert any("Citations: 10 of 11 in the report linked" in m for _lv, m in logs), \
-        [m for _lv, m in logs if "Citations" in m]
+# ⛔ 2026-10-02 — THREE TESTS LEFT HERE WITH THE MATCHER THEY PINNED:
+# `test_the_document_ends_with_its_numbered_sources`,
+# `test_a_citation_the_page_does_not_show_is_removed_as_before` and
+# `test_the_link_goes_before_the_full_stop_of_the_cited_sentence` measured
+# `_chatgpt_cite_runs_to_links`, which linked each run to the link the rendered
+# report shows after the same words. The 10-01 frame held not one link (it
+# linked 0 of 172 that day) and the matcher is gone; ChatGPT's own numbers come
+# from its PDF export now, measured on the owner's pair in
+# tests/test_chatgpt_exports_1002.py. A run with nothing to link is still
+# removed exactly as before (`test_the_export_is_shaped_like_the_0930_one`).
 
 
-def test_a_citation_the_page_does_not_show_is_removed_as_before(chrome):
-    md, linked, seen = research._chatgpt_cite_runs_to_links(_export(), [])
-    assert (linked, seen) == (0, 11)
-    assert research._strip_chatgpt_citation_tokens(md) == research._strip_chatgpt_citation_tokens(
-        _export())
+def _downloads(page):
+    got = []
+    page.on("download", lambda d: got.append(d))
+    return got
 
 
-def test_the_link_goes_before_the_full_stop_of_the_cited_sentence():
-    links = [{"url": SOURCES[2][0], "label": "OFA: Breed statistics, " + SOURCES[2][0],
-              "text": "OFA", "before": "its own population."}]
-    md = "Screening results should be read against its own population. " + _run("turn1view0") + " Next."
-    out, linked, _seen = research._chatgpt_cite_runs_to_links(md, links)
-    assert linked == 1
-    assert out == ("Screening results should be read against its own population "
-                   f"[OFA]({SOURCES[2][0]}).  Next."), out
-
-
-def test_the_report_is_downloaded_inside_the_app_frame(chrome, page, logs, run_dir, monkeypatch):
+def test_the_report_is_exported_inside_the_app_frame_and_caught(chrome, page, logs, run_dir,
+                                                                 monkeypatch):
     """⭐ The finished app shows a download icon at its top right and a menu with
     "Export to Markdown" (what computer use pressed on 09-30): the page presses
-    both, the file is the report, and computer use is never asked — when the
-    press is turned on (it is off by default since 10-01: see the next test)."""
-    monkeypatch.setenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", "1")
+    both, the top page makes the file, the catcher takes it — Chrome downloads
+    nothing — and computer use is never asked. (No "Export to PDF" here: the
+    page presses the icon again for it, finds no row, and the document is the
+    export with its runs removed, as before.)"""
     _serve(chrome, page, _dr_host_html(35),
            _app_html("finished", download=True, report=_rendered(), export=_export()))
+    downloads = _downloads(page)
     cua = _NoCua("")
     md = _extract(chrome, page, monkeypatch, cua)
-    assert cua.calls == 0, "computer use was asked although the page could download"
-    assert _pressed_in_app(chrome, page) == ["download", "row:Export to Markdown"]
-    assert md.startswith("# Golden Retriever") and SOURCES[0][0] in md
-    assert any("Extracted via T0 page download (Export to Markdown)" in m for _lv, m in logs)
+    assert cua.calls == 0, "computer use was asked although the page could export"
+    assert downloads == [], "Chrome downloaded the report"
+    assert _pressed_in_app(chrome, page) == ["download", "row:Export to Markdown", "download"]
+    assert md == research._strip_chatgpt_citation_tokens(_export())
+    assert any("export caught in the page, no download: markdown" in m for _lv, m in logs)
+    assert any("Extracted via ChatGPT's Markdown export, caught in the page" in m
+               for _lv, m in logs)
 
 
-def test_by_default_the_page_never_presses_export_in_the_app(chrome, page, logs, run_dir,
-                                                              monkeypatch):
-    """⛔⛔ 2026-10-01: Chrome crashed (SIGSEGV in its browser main thread) the
-    instant the page pressed "Export to Markdown" in the app's frame, and the run
-    redid all of Phase 2. By default the page presses nothing in the frame —
-    computer use downloads, as it did on 09-30 — and the finished-state census
-    is still written."""
-    monkeypatch.delenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", raising=False)
-    _serve(chrome, page, _dr_host_html(35),
-           _app_html("finished", download=True, report=_rendered(), export=_export()))
-    cua = _NoCua(_export())
-    md = _extract(chrome, page, monkeypatch, cua)
-    assert _pressed_in_app(chrome, page) == [], "the page pressed inside the app's frame"
-    assert cua.calls == 1 and md.startswith("# Golden Retriever")
-    assert (run_dir / "chatgpt_dr_census_done.json").exists()
-    assert not any("T0 page download" in m for _lv, m in logs)
-
-
-def test_no_download_control_leaves_the_download_to_computer_use(chrome, page, logs, run_dir,
-                                                                  monkeypatch):
+def test_no_download_control_leaves_the_export_to_computer_use(chrome, page, logs, run_dir,
+                                                                monkeypatch):
     """No control in the frame: nothing is pressed, a census of the miss is
-    written, and computer use downloads it as before (the press turned on)."""
-    monkeypatch.setenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", "1")
+    written, and computer use presses the export as before — its file caught."""
     _serve(chrome, page, _dr_host_html(35),
            _app_html("finished", download=False, report=_rendered()))
     cua = _NoCua(_export())
     md = _extract(chrome, page, monkeypatch, cua)
     assert cua.calls == 1 and md.startswith("# Golden Retriever")
     assert _pressed_in_app(chrome, page) == []
-    assert (run_dir / "chatgpt_dr_census_miss-download.json").exists()
+    assert (run_dir / "chatgpt_dr_census_miss-export-markdown.json").exists()
     assert (run_dir / "chatgpt_dr_census_done.json").exists()
 
 
-def test_the_download_never_fires_while_the_research_runs(chrome, page, logs, run_dir):
+def test_the_export_is_never_pressed_while_the_research_runs(chrome, page, logs, run_dir):
     """⛔ The running app (the recording at 39.8 s): no download control — the
-    page download finds nothing and presses nothing."""
+    page's export finds nothing and presses nothing."""
     _serve(chrome, page, _dr_host_html(17), _app_html("running"))
-    assert chrome.run(research._chatgpt_dr_dom_download(page)) == ""
+    assert chrome.run(research._chatgpt_dr_press_export(page, "markdown")) is None
     assert _pressed_in_app(chrome, page) == []
 
 
-def test_a_link_in_the_report_is_never_taken_for_the_download(chrome, page, logs, run_dir):
+def test_a_link_in_the_report_is_never_taken_for_the_export(chrome, page, logs, run_dir):
     """⛔ The report's own link saying "Download the dataset" is not a control."""
     rep = '<p><a href="https://example.org/data.csv">Download the dataset</a></p>'
     _serve(chrome, page, _dr_host_html(35), _app_html("finished", download=False, report=rep))
-    assert chrome.run(research._chatgpt_dr_dom_download(page)) == ""
+    assert chrome.run(research._chatgpt_dr_press_export(page, "markdown")) is None
     assert _pressed_in_app(chrome, page) == []
 
 

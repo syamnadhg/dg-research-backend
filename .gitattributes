@@ -12,3 +12,8 @@
 # else. Pin LF so the bytes are the same everywhere and the digest means what it
 # says.
 bundle-contract.json text eol=lf
+
+# 2026-10-02 — ChatGPT's PDF export (tests/fixtures/documents_1001/
+# chatgpt_dr_papertrade.pdf) is bytes the tests read as bytes: never a
+# line-ending conversion.
+*.pdf binary

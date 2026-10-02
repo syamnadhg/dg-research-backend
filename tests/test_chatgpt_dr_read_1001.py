@@ -16,8 +16,14 @@ frame — nothing pressed, nothing downloaded — and a dead browser gets no car
 
 1. The report was already in the frame — 88,718 characters, 37 headings — in a
    card 400 px tall that only CLIPS it. It is now read from there and turned
-   into markdown by the converter every HTML read uses; computer use downloads
-   it (as on 09-30) only when the frame does not hold the whole report.
+   into markdown by the converter every HTML read uses.
+   ⭐ 2026-10-02: since the export's file is caught on the top page and Chrome
+   downloads nothing (tests/test_chatgpt_exports_1002.py), the export comes
+   first again — it is the document the owner chose — and this read is what is
+   taken when no export is caught. Here the export gives a ten-character file,
+   which is no report, so every test below reaches the read; what comes after
+   the read (the page's HTML read and the copy tier) is stood in, and is not
+   this file's subject.
 2. An empty extraction asks the browser before it becomes a card: a dead one
    takes the crash path at once, with no card, and ChatGPT is not first shown
    "failed" or saved "errored" for a crash the run retries silently.
@@ -87,7 +93,6 @@ def run_dir(tmp_path, monkeypatch):
     """Every census goes to a temporary folder, never the machine's logs."""
     monkeypatch.setattr(research, "_active_run_sink", lambda: SimpleNamespace(dir=tmp_path))
     monkeypatch.setattr(research, "_CHATGPT_DR_CENSUS_SEEN", {}, raising=False)
-    monkeypatch.delenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", raising=False)
     return tmp_path
 
 
@@ -100,7 +105,7 @@ def _host_html():
     assert fr["ms"] == 6301 and not fr["stopButtons"]
     turn = "".join(cp.node_html(n) for n in fr["lastTurn"]).replace(app.REC_APP, APP)
     assert turn.count(f'src="{APP}"') == 1, "the app's frame is not in the recorded card"
-    return cp.page_html("<main>" + turn + "</main><form></form>")
+    return cp.page_html("<main>" + turn + "</main><form></form>" + app.TOP_SAVER)
 
 
 #: done, frame 0: the sandbox's own page, the report's frame inside it.
@@ -110,7 +115,9 @@ WRAPPER = ('<!doctype html><html><head><meta charset="utf-8"><title>sandbox</tit
 
 #: Records every press in the frame (pointer, mouse, click, key), and plays the
 #: Export menu (⚠ ASSUMED: the census shows Export with aria-haspopup=menu; the
-#: 09-30 computer use then pressed "Export to Markdown", which downloads).
+#: 09-30 computer use then pressed "Export to Markdown"). The row asks the top
+#: page to make the file, as the owner's 10-01 recording shows the top page
+#: does — here a ten-character one, which is no report.
 _FRAME_SCRIPT = """<script>
 (() => {
   const rec = (e) => {
@@ -123,9 +130,7 @@ _FRAME_SCRIPT = """<script>
   document.getElementById('export').addEventListener('click', () => {
     document.getElementById('menu').hidden = false; });
   document.querySelector('#menu [role=menuitem]').addEventListener('click', () => {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob(['# Exported'], {type: 'text/markdown'}));
-    a.download = 'deep-research-report.md'; document.body.appendChild(a); a.click(); });
+    window.top.postMessage({srExport: 'md', text: '# Exported'}, '*'); });
 })();
 </script>"""
 
@@ -288,8 +293,32 @@ def _downloads(page):
     return got
 
 
-def _extract(chrome, page, monkeypatch, cua, **kw):
-    monkeypatch.setattr(research, "_extract_via_cua_download", cua.download)
+class _Copy:
+    """The tiers after the read, stood in: the page's HTML read finds nothing,
+    and the copy tier hands back the export (how often it was asked)."""
+
+    def __init__(self, text=""):
+        self.calls, self.text = 0, text
+
+    async def html(self, *a, **k):
+        return ""
+
+    async def copy(self, *a, **k):
+        self.calls += 1
+        return self.text
+
+
+def _after_the_read(monkeypatch, text=""):
+    copy = _Copy(text)
+    monkeypatch.setattr(research, "_extract_html_to_md_anyframe", copy.html)
+    monkeypatch.setattr(research, "_run_with_clipboard_hijack", copy.copy)
+    return copy
+
+
+def _extract(chrome, page, monkeypatch, cua, *, copy=None, **kw):
+    monkeypatch.setattr(research, "_cua_export_caught", cua.caught)
+    if copy is None:
+        _after_the_read(monkeypatch)
     return chrome.run(research.extract_chatgpt_response(
         page, browser=SimpleNamespace(page=page), cua_client=object(), **kw))
 
@@ -300,24 +329,25 @@ def _said(logs, text):
 
 # ═══ 1. The report, read off the frame ════════════════════════════════════════
 
-@pytest.mark.parametrize("press_on", [False, True])
-def test_the_report_is_read_off_the_frame_nothing_pressed(chrome, page, fast, logs, monkeypatch,
-                                                          press_on):
-    """⭐⭐ THE 10-01 FRAME. The finished report is read straight off the app's
-    frame: its headings, list and table kept, its numbered citations (buttons
-    with no link in them) left out rather than glued to the words, the frame's
-    header, buttons and diagram left out. Nothing is pressed in the frame,
-    nothing downloads, computer use is never asked — and with the page's own
-    Export press turned back on, the read still comes first."""
-    if press_on:
-        monkeypatch.setenv("SR_CHATGPT_DR_PAGE_DOWNLOAD", "1")
+def test_the_report_is_read_off_the_frame_when_no_export_is_the_report(
+        chrome, page, fast, logs, monkeypatch):
+    """⭐⭐ THE 10-01 FRAME. The export is pressed first (its file caught, never
+    downloaded) and gives no report; the finished report is then read straight
+    off the app's frame: its headings, list and table kept, its numbered
+    citations (buttons with no link in them) left out rather than glued to the
+    words, the frame's header, buttons and diagram left out. Nothing downloads
+    and computer use is never asked."""
     _serve(chrome, page, _report_frame(_report()))
     downloads = _downloads(page)
     cua = app._NoCua(app._export())
     md = _extract(chrome, page, monkeypatch, cua)
     assert cua.calls == 0, "computer use was asked for a report the frame holds"
-    assert _pressed(chrome, page) == [], "something was pressed inside the app's frame"
+    # the Export press opened the menu its row is in (the press lands on the
+    # button's icon, which the frame's recorder names by its tag)
+    assert "click:menuitem" in _pressed(chrome, page), _pressed(chrome, page)
     assert downloads == [], "a file was downloaded"
+    assert _said(logs, "Deep research markdown export by the page: pressed")
+    assert _said(logs, "the Markdown export holds only 10 chars")
     assert md.startswith("# " + TITLE + "\n"), md[:200]
     assert "\n## Executive summary\n" in md and "\n### Coat and colour\n" in md
     assert "\n## Bibliography\n" in md
@@ -335,7 +365,6 @@ def test_the_report_is_read_off_the_frame_nothing_pressed(chrome, page, fast, lo
     said = _said(logs, "Report read from the Deep research app's frame")
     assert len(said) == 1 and "7 citations had no link in the frame" in said[0], said
     assert "1 diagram left out" in said[0], said
-    assert not _said(logs, "Deep research download by the page")
 
 
 def _done_len(chrome, page):
@@ -483,17 +512,21 @@ def test_a_citation_that_carries_its_source_keeps_it_and_the_document_numbers_it
     assert research._doc_source_marker(1, AKC) in doc[:doc.rindex("Sources")]
 
 
-# ═══ 2. Not the whole report: computer use downloads it, as on 09-30 ══════════
+# ═══ 2. Not the whole report: the tiers after the read get it ════════════════
+# (Before 10-02 computer use downloaded it next; computer use now presses the
+# export BEFORE the read, and the copy tier comes after it.)
 
-def test_a_frame_holding_only_a_card_goes_to_computer_use(chrome, page, fast, logs, monkeypatch):
+def test_a_frame_holding_only_a_card_is_not_the_report(chrome, page, fast, logs, monkeypatch):
     """⚠ ASSUMED card: the title as a heading and a few lines. Too little to be
-    the report — computer use downloads it, and nothing is pressed in the frame."""
+    the report — the read refuses it and the copy tier gets the report."""
     rep = f'<div class="markdown"><h1>{TITLE}</h1><p>{cp.filler(500, 1)}</p></div>'
     _serve(chrome, page, _report_frame(rep))
     cua = app._NoCua(app._export())
-    md = _extract(chrome, page, monkeypatch, cua)
-    assert cua.calls == 1 and md.startswith("# Golden Retriever")
-    assert _pressed(chrome, page) == []
+    copy = _after_the_read(monkeypatch, app._export())
+    md = _extract(chrome, page, monkeypatch, cua, copy=copy)
+    assert copy.calls == 1 and md.startswith("# Golden Retriever")
+    # the copy's citation token runs come out, as every tier's do
+    assert chr(0xE200) not in md and "turn10view0" not in md
     said = _said(logs, "Report not read from the Deep research app's frame")
     assert said and "characters of report" in said[0], said
 
@@ -510,9 +543,11 @@ def test_the_activity_list_is_never_taken_for_the_report(chrome, page, fast, log
     # sources check lets it through.
     assert research._doc_img_prose_len(md0) > 2000
     assert not research._is_sources_not_document(md0, platform="chatgpt")
-    cua = app._NoCua(app._export())
-    md = _extract(chrome, page, monkeypatch, cua)
-    assert cua.calls == 1 and md.startswith("# Golden Retriever")
+    # (this frame shows no Export control, and computer use's press catches nothing)
+    cua = app._NoCua("")
+    copy = _after_the_read(monkeypatch, app._export())
+    md = _extract(chrome, page, monkeypatch, cua, copy=copy)
+    assert copy.calls == 1 and md.startswith("# Golden Retriever")
     said = _said(logs, "Report not read from the Deep research app's frame")
     assert said and "no heading" in said[0], said
 
@@ -527,8 +562,9 @@ def test_a_numbered_list_of_addresses_is_never_taken_for_the_report(chrome, page
         for i in range(34)) + "</ol></div>")
     _serve(chrome, page, _report_frame(rep))
     cua = app._NoCua(app._export())
-    md = _extract(chrome, page, monkeypatch, cua)
-    assert cua.calls == 1 and md.startswith("# Golden Retriever")
+    copy = _after_the_read(monkeypatch, app._export())
+    md = _extract(chrome, page, monkeypatch, cua, copy=copy)
+    assert copy.calls == 1 and md.startswith("# Golden Retriever")
     said = _said(logs, "Report not read from the Deep research app's frame")
     assert said and "sources list" in said[0], said
 
@@ -620,12 +656,12 @@ async def _to_front(_page):
     return None
 
 
-def test_a_frame_that_lost_text_after_the_done_check_goes_to_computer_use(
+def test_a_frame_that_lost_text_after_the_done_check_is_not_the_report(
         chrome, page, fast, logs, monkeypatch):
     """⭐ The poll loop hands the extraction what the done check read in the
     frame. Here the REAL done check reads the whole report, then the frame is
     left holding its first sections only: long enough and headed, but the frame
-    lost text after the done check, so computer use downloads the report.
+    lost text after the done check, so the copy tier gets the report.
     ⚠ This is all that length can catch: the done check reads this same frame,
     so a frame that never held the whole report passes it."""
     _serve(chrome, page, _report_frame(_report()))
@@ -638,31 +674,33 @@ def test_a_frame_that_lost_text_after_the_done_check_goes_to_computer_use(
     cut = chrome.run(fr.evaluate("() => document.body.innerText.length"))
     assert 2500 < cut < 0.5 * t1, (cut, t1)
     cua = app._NoCua(app._export())
-    monkeypatch.setattr(research, "_extract_via_cua_download", cua.download)
+    monkeypatch.setattr(research, "_cua_export_caught", cua.caught)
+    copy = _after_the_read(monkeypatch, app._export())
     browser = SimpleNamespace(page=page, context=chrome.ctx, switch_to_page=_to_front)
     _run_block(chrome, monkeypatch, PAGE_DONE, page, browser, cua_client=object(), t1=t1)
-    assert cua.calls == 1, "a frame that lost text after the done check was taken for the report"
+    assert copy.calls == 1, "a frame that lost text after the done check was taken for the report"
     said = _said(logs, "Report not read from the Deep research app's frame")
     assert said and f"of the {t1} characters the done check read" in said[0], said
     assert "the frame changed after the done check" in said[0], said
-    assert _said(logs, "Extracted via T1 CUA download")
+    assert _said(logs, "Extracted via T3 CUA + clipboard hijack")
 
 
 def _dying_browser(chrome):
-    """A browser of its own, which dies the moment computer use downloads — as
-    Chrome did on 10-01 the instant the Export press started the file."""
+    """A browser of its own, which dies the moment the export is pressed — as
+    Chrome did on 09-30 and 10-01 the instant the Export press started the file
+    (before the export's file was caught on the page)."""
     ctx = chrome.run(chrome.ctx.browser.new_context())
     pg = chrome.run(ctx.new_page())
 
-    class _CrashingCua:
+    class _CrashingPress:
         calls = 0
 
-        async def download(self, *a, **k):
-            _CrashingCua.calls += 1
+        async def press(self, *a, **k):
+            _CrashingPress.calls += 1
             await ctx.close()
-            return ""
+            return None
 
-    return ctx, pg, _CrashingCua()
+    return ctx, pg, _CrashingPress()
 
 
 @pytest.mark.parametrize("marker", [PAGE_DONE, CUA_DONE])
@@ -676,7 +714,8 @@ def test_a_dead_browser_takes_the_crash_path_with_no_card(chrome, fast, logs, mo
     ctx, pg, cua = _dying_browser(chrome)
     _serve(chrome, pg, _report_frame(
         f'<div class="markdown"><h1>{TITLE}</h1><p>{cp.filler(500, 1)}</p></div>'))
-    monkeypatch.setattr(research, "_extract_via_cua_download", cua.download)
+    monkeypatch.setattr(research, "_chatgpt_dr_press_export", cua.press)
+    monkeypatch.setattr(research, "_cua_export_caught", app._NoCua("").caught)
     browser = SimpleNamespace(page=pg, context=ctx, switch_to_page=_to_front)
     cards, emits, saved = [], [], []
     with pytest.raises(RuntimeError) as exc:

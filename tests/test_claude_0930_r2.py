@@ -16,7 +16,8 @@ the run used (df26bdd):
      sources rows read on every check without pressing anything; Claude's new
      left sidebar kept out of the steps.
   4. The report: its card pressed, its panel detected, and "Download as
-     Markdown" taken by the page — no computer use.
+     Markdown" taken by the page — no computer use, and (2026-10-02) its file
+     caught on the page, never downloaded by Chrome.
   5. One Sources list: a report shaped like Claude's (no url in the prose, its
      own numbered "## Sources") is no longer given a second numbered copy.
 
@@ -359,25 +360,31 @@ def test_the_steps_leave_claudes_left_sidebar_out(chrome, open_page, lines):
 # 4. The report, by the page
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_the_report_is_opened_and_downloaded_by_the_page(chrome, open_page, lines,
-                                                         monkeypatch):
+def _downloads(page):
+    got = []
+    page.on("download", lambda d: got.append(d))
+    return got
+
+
+def test_the_report_is_opened_and_exported_by_the_page_and_chrome_downloads_nothing(
+        chrome, open_page, lines, monkeypatch):
     """Capture 2, frames 86-91: the report card (`artifact-card-open`), its
     panel (`[role=region][aria-label^="Artifact panel"]`), "Copy options", then
     "Download as Markdown" (`export-download`). Computer use is THERE and must
     not be called: on 09-30 it opened the report (3 steps) and downloaded it
     (2), and the mount probe never once saw Claude's panel in the corpus.
-    The page's own download is off by default since 10-01 (the next test); this
-    is the path with it turned on."""
-    monkeypatch.setenv("SR_CLAUDE_PAGE_DOWNLOAD", "1")
+    ⛔⛔ 2026-10-02 — and Chrome downloads NOTHING: the page makes the file as
+    claude.ai does (a Blob's address on an `<a download>`, then `click()`), and
+    the export catcher takes it instead of Chrome."""
     cua = []
 
     async def _cua(*a, **k):
         cua.append(k.get("current_step") or (a[4] if len(a) > 4 else "?"))
         return {"text": ""}
 
-    async def _cua_download(*a, **k):
-        cua.append("cua_download")
-        return ""
+    async def _cua_export(*a, **k):
+        cua.append("cua_export")
+        return None
 
     async def _agent_loop(*a, **k):
         cua.append("agent_loop")
@@ -388,56 +395,106 @@ def test_the_report_is_opened_and_downloaded_by_the_page(chrome, open_page, line
             return None
 
     monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
-    monkeypatch.setattr(research, "_extract_via_cua_download", _cua_download)
+    monkeypatch.setattr(research, "_cua_export_caught", _cua_export)
     monkeypatch.setattr(research, "agent_loop", _agent_loop)
     page = open_page(finished=True)
+    downloads = _downloads(page)
     text = chrome.run(research.extract_claude_response(page, browser=_Browser(),
                                                        cua_client=object()))
     assert text == P.REPORT_MD, (text[:200], lines)
     assert cua == [], (cua, lines)
+    assert downloads == [], "Chrome downloaded Claude's report"
     presses = _presses(chrome, page)
     for what in ("report-card", "copy-options", "download-md"):
         assert {"what": what, "trusted": True} in presses, (what, presses)
-    assert any("Download as Markdown" in m for _, m in lines), lines
+    assert any("export caught in the page, no download: markdown "
+               "\"large-breed-dog-food.md\"" in m for _, m in lines), lines
+    assert any("Chrome downloads seen during the export: 0" in m for _, m in lines), lines
+    assert any("Extracted via the page's Download as Markdown, caught in the page" in m
+               for _, m in lines), lines
     # Claude's own left sidebar is not an open panel to close first.
     assert not any("Closing artifact panel" in m for _, m in lines), lines
 
 
-def test_by_default_computer_use_downloads_the_report_as_on_0930(chrome, open_page, lines,
-                                                                 monkeypatch):
-    """⛔⛔ 2026-10-01: a page-pressed download on ChatGPT's app crashed Chrome the
-    instant its file started, and every good run got Claude's report by computer
-    use's download. By default the page still opens the report, but it never
-    presses Copy options or Download as Markdown: computer use downloads."""
-    monkeypatch.delenv("SR_CLAUDE_PAGE_DOWNLOAD", raising=False)
+def test_nothing_is_pressed_for_the_export_without_the_catcher(chrome, open_page, lines,
+                                                               monkeypatch):
+    """⛔ The catcher cannot be put on the page: neither the page nor computer
+    use presses the export (a press would be a Chrome download); the report is
+    read from its open panel instead."""
     calls = []
 
     async def _cua(*a, **k):
         return {"text": ""}
 
-    async def _cua_download(*a, **k):
-        calls.append("cua_download")
-        return P.REPORT_MD
+    async def _cua_export(*a, **k):
+        calls.append("cua_export")
+        return None
 
-    async def _agent_loop(*a, **k):
-        return {}
+    real = research._page_world_evaluate
+
+    async def _no_catcher(target, js, *a, **k):
+        if js == research._EXPORT_CATCH_JS:
+            raise RuntimeError("the page refused the script")
+        return await real(target, js, *a, **k)
 
     class _Browser:
         async def switch_to_page(self, page):
             return None
 
     monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
-    monkeypatch.setattr(research, "_extract_via_cua_download", _cua_download)
-    monkeypatch.setattr(research, "agent_loop", _agent_loop)
+    monkeypatch.setattr(research, "_cua_export_caught", _cua_export)
+    monkeypatch.setattr(research, "_page_world_evaluate", _no_catcher)
     page = open_page(finished=True)
-    text = chrome.run(research.extract_claude_response(page, browser=_Browser(),
-                                                       cua_client=object()))
-    assert calls == ["cua_download"], (calls, lines)
-    assert P.REPORT_MD[:200] in text, (text[:200], lines)
+    downloads = _downloads(page)
+    chrome.run(research.extract_claude_response(page, browser=_Browser(), cua_client=object()))
     presses = _presses(chrome, page)
     for what in ("copy-options", "download-md"):
         assert not any(p.get("what") == what for p in presses), (what, presses)
-    assert not any("Extracted via the page's Download as Markdown" in m for _, m in lines), lines
+    assert calls == [] and downloads == []
+    assert any("the export catcher could not be put on the page" in m for _, m in lines), lines
+
+
+def test_computer_use_presses_the_export_when_the_page_cannot(chrome, open_page, lines,
+                                                              monkeypatch):
+    """The page cannot press the export (a future rename): computer use presses
+    Copy options and Download as Markdown — stood in here by presses on the
+    page's own controls — and the catcher still takes the file: no download."""
+    prompts = []
+
+    async def _cua(*a, **k):
+        return {"text": ""}
+
+    async def _no_page_export(*a, **k):
+        return ""
+
+    async def _agent_loop(client, browser, prompt, msg, *, abort_event=None, target_page=None,
+                          **k):
+        prompts.append(prompt)
+        await research._page_world_evaluate(target_page, """() => {
+            document.querySelector('#sr-copy-options').click();
+            document.querySelector('[data-testid="export-download"]').click(); }""")
+        for _ in range(100):
+            if abort_event is not None and abort_event.is_set():
+                return {"status": "aborted"}
+            await asyncio.sleep(0.05)
+        return {"status": "max_iterations"}
+
+    class _Browser:
+        async def switch_to_page(self, page):
+            return None
+
+    monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
+    monkeypatch.setattr(research, "_claude_export_report_by_page", _no_page_export)
+    monkeypatch.setattr(research, "agent_loop", _agent_loop)
+    page = open_page(finished=True)
+    downloads = _downloads(page)
+    text = chrome.run(research.extract_claude_response(page, browser=_Browser(),
+                                                       cua_client=object()))
+    assert prompts == [research.PROMPT_CLAUDE_DOWNLOAD_MD], (prompts, lines)
+    assert text == P.REPORT_MD, (text[:200], lines)
+    assert downloads == [], "Chrome downloaded Claude's report"
+    assert any("Extracted via T1 computer use export (.md), caught in the page" in m
+               for _, m in lines), lines
 
 
 # ═════════════════════════════════════════════════════════════════════════════

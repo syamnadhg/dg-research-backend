@@ -13,11 +13,13 @@
       decides it; the rule is the app's only.
   C*  a census of the app's frames: at launch and five minutes in, once each, no
       long text, from the Phase 2 poll for ChatGPT.
-  L*  the report downloaded inside the app's frame: its download control, then
-      the Markdown row; never a link in the report.
-  R*  the export's citation runs become the links the report shows: before the
-      cited sentence's full stop, runs side by side together, never a link's own
-      words taken for the report's.
+  L*  the report's export pressed inside the app's frame: its download control,
+      then the Markdown row (since 2026-10-02 its file is caught on the page —
+      .mutants/chatgpt_exports_1002_mutants.py); never a link in the report.
+  ⛔ R* (the export's citation runs linked to the links the rendered report
+      shows) LEFT ON 2026-10-02 with the matcher they measured
+      (`_chatgpt_cite_runs_to_links`): the 10-01 frame held not one link, and
+      the citations are numbered from ChatGPT's PDF export now.
 
 ⛔ The browser tests need patchright and Chrome; where they SKIP the baseline is
 not a measurement, so the runner refuses to score a skipped baseline.
@@ -52,9 +54,7 @@ SUITES = {
     "done": ["tests/test_chatgpt_dr_app_0930.py", "-k",
              "done or worked_for or without_the_app"],
     "census": ["tests/test_chatgpt_dr_app_0930.py", "-k", "census"],
-    "download": ["tests/test_chatgpt_dr_app_0930.py", "-k", "download"],
-    "sources": ["tests/test_chatgpt_dr_app_0930.py", "-k",
-                "document or citation or link_goes"],
+    "download": ["tests/test_chatgpt_dr_app_0930.py", "-k", "download or export"],
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"}
 
@@ -164,7 +164,7 @@ MUTANTS = [
      "census"),
 
     # ── L: the download in the frame ───────────────────────────────────────
-    ("L1", RESEARCH, "⛔⛔ the page never downloads — computer use every time (the consumer)",
+    ("L1", RESEARCH, "⛔⛔ the finished state's census is never written (the consumer)",
      [("    if _chatgpt_dr_app_frames(page):\n"
        "        await _chatgpt_dr_census(page, \"done\", label=label)\n",
        "    if False:\n"
@@ -175,40 +175,14 @@ MUTANTS = [
        "")],
      "download"),
     ("L3", RESEARCH, "the Markdown row is never pressed — no file",
-     [("                    second = await _chatgpt_dr_press(g, \"dr-markdown\", "
-       "_CHATGPT_DR_MARKDOWN_RE)\n",
-       "                    second = None\n")],
+     [("                second = await _chatgpt_dr_press(g, f\"dr-{kind}\", "
+       "_CHATGPT_DR_ROW_RE[kind])\n",
+       "                second = None\n")],
      "download"),
     ("L4", RESEARCH, "a miss writes no census",
-     [("            await _chatgpt_dr_census(page, \"miss-download\", label=label)\n", "")],
+     [("        await _chatgpt_dr_census(page, f\"miss-export-{kind}\", label=label)\n", "")],
      "download"),
 
-    # ── R: the sources ──────────────────────────────────────────────────────
-    ("R1", RESEARCH, "⛔⛔ the export's citations are deleted again — no sources (09-30)",
-     [("                md = await _chatgpt_link_citations(page, md, label)\n"
-       "                log(f\"[{label}] Extracted via T1 CUA download",
-       "                md = _strip_chatgpt_citation_tokens(md)\n"
-       "                log(f\"[{label}] Extracted via T1 CUA download")],
-     "sources"),
-    ("R2", RESEARCH, "the link lands after the full stop — the NEXT sentence is numbered",
-     [("            pm = re.search(r\"([.!?])(\\s*)$\", seg)\n            if pm:\n"
-       "                out.append(seg[:pm.start()] + \" \" + links_md",
-       "            pm = None\n            if pm:\n"
-       "                out.append(seg[:pm.start()] + \" \" + links_md")],
-     "sources"),
-    ("R3", RESEARCH, "runs side by side are split — the second source leaves the sentence",
-     [("        while j < len(runs) and not md[runs[j - 1].end():runs[j].start()].strip():\n",
-       "        while False:\n")],
-     "sources"),
-    ("R4", RESEARCH, "⛔ another citation's words are taken for the report's — side-by-side "
-     "citations no longer match",
-     [("                if (n.parentElement && n.parentElement.closest('a[href]')) continue;\n",
-       "")],
-     "sources"),
-    ("R5", RESEARCH, "a link near the start of its paragraph never matches",
-     [("                    (e for e in pool if k.endswith(e[0]) or e[0].endswith(k)), None)\n",
-       "                    (e for e in pool if False), None)\n")],
-     "sources"),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.
