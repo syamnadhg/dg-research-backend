@@ -51,53 +51,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
     # `max(alert, wait)` and `alert` can no longer differ. The tie N1 measured
     # is now that floor, and .mutants/gemini_plan_wait_1001_mutants.py W1
     # removes it.
-    ("N2", "over", "the operator's setting is discarded, so an explicitly "
-     "quieter card becomes a louder one",
-     [("    return elapsed >= max(float(alert_sec), float(wait_max_sec))",
-       "    return elapsed >= float(wait_max_sec)")],
-     [T_NEW]),
-    ("N3", "under", "`max` becomes `min`+something unreachable — the card never "
-     "fires on time at all",
-     [("    return elapsed >= max(float(alert_sec), float(wait_max_sec))",
-       "    return elapsed >= max(float(alert_sec), float(wait_max_sec)) * 10")],
-     [T_NEW]),
-    ("N4", "over", "⛔⛔ EXHAUSTED RE-DRAFTS HAVE TO WAIT OUT THE ALERT CLOCK — "
-     "#921 exists precisely so proof of failure does not (since 2026-10-01 it "
-     "waits for the plan wait, and no longer than that)",
-     [("    if regen_capped:\n        return True",
-       "    if regen_capped:\n        pass")],
-     [T_NEW]),
-    ("N5", "under", "a visibly streaming plan is carded again — the 2026-07-09 "
-     "false alarm that auto-skipped a working Gemini",
-     [("    if streaming_recent:\n        return False\n    if elapsed < float(wait_max_sec):",
-       "    if False:\n        return False\n    if elapsed < float(wait_max_sec):")],
-     [T_NEW]),
-    ("N6", "over", "the regen cap outranks live streaming, so a plan drafting in "
-     "front of us is declared dead on its history",
-     [("    if streaming_recent:\n        return False\n    if elapsed < float(wait_max_sec):\n"
-       "        return False\n    if regen_capped:\n        return True",
-       "    if regen_capped:\n        return True\n    if streaming_recent:\n        return False\n"
-       "    if elapsed < float(wait_max_sec):\n        return False")],
-     [T_NEW]),
-    ("N7", "over", "a clicked Start still cards — an alert about something that "
-     "has already happened",
-     [("    if start_clicked:\n        return False", "    if False:\n        return False")],
-     [T_NEW]),
+    # N2-N10 measured the [2D] plan card's timing (`_gemini_plan_card_due`) and its one site; both went in wave 15 (10-02) — the plan wait raises no card.
     # ⛔ N8 RETIRED 2026-10-01, not re-anchored: its site (the in-loop early
     # card) is gone by design — the owner ruled nothing is raised before the plan
     # wait is over, and the break below is now the one place the card goes up.
-    ("N9", "under", "⛔⛔ the card is not raised at the give-up point — and since "
-     "the break sits ABOVE the card block, the timer arm becomes unreachable "
-     "and #921's protection is silently gone",
-     [('                if _gemini_plan_card_due(\n                        elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,\n                        alert_sec=_PLAN_ALERT_SEC,\n                        regen_capped=_regen_cap_emitted,\n                        streaming_recent=_streaming_recent,\n                        start_clicked=bool(start_clicked),\n                        # ⛔⛔ FALSE HERE, AND NOT AS A SHORTCUT. `redraft_pending`\n                        # means "keep waiting, a re-draft is in flight" — and this\n                        # call site is the loop DECIDING TO STOP WAITING: the next\n                        # statement is an unconditional `break`, so there is no\n                        # next attempt for the card to defer to. Passing the flag\n                        # here deferred the alert to a retry the following line\n                        # cancelled, which left the owner with nothing on screen\n                        # until the CUA ladder\'s terminal card ~12 minutes later.\n                        # That is the seventeen-minute ladder #921 exists to\n                        # remove, deleted by a boolean instead of by an edit —\n                        # exactly what the comment above this block warns about.\n                        # ⭐ The rule both directions: an alert that fires while\n                        # its caller intends to keep waiting is wrong, and an\n                        # alert held while its caller is giving up is wrong too.\n                        redraft_pending=False):\n                    _raise_plan_alert("our own plan-wait budget is spent")\n                break',
-       "                break")],
-     [T_NEW]),
-    ("N10", "over", "the once-only guard goes, so every tick re-cards a stalled "
-     "plan",
-     [("            if _plan_alert_emitted or _controls.is_stop():\n                return",
-       "            if False:\n                return")],
-     [T_NEW]),
-
     # ── narration ───────────────────────────────────────────────────────────
     ("N11", "under", "⛔ THE `and` IS BACK — a 4-word fragment that is 24 "
      "characters long is shown to the owner again",

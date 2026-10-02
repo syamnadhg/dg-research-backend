@@ -62,9 +62,12 @@ MUTANTS = [
        '_THINKING_TIME_HEADER = re.compile(r"\\bthought\\s+for\\s+\\d+\\s*(?:m|min|s|sec)\\b")')]),
     ("U4", "under", "the P2 completion probe ships the raw placeholder to the browser",
      # 2026-09-30 (round 2): the probe also returns `drApp` — re-aimed.
-     [('             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };\n'
+     # Wave 15: and its body length counts only a drawn document — re-aimed again.
+     [('             assistantLen, panelLen, bodyLen: drawn ? bl.length : 0, sources, steps, vw, vh,\n'
+       '             drApp };\n'
        '}""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS)',
-       '             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };\n'
+       '             assistantLen, panelLen, bodyLen: drawn ? bl.length : 0, sources, steps, vw, vh,\n'
+       '             drApp };\n'
        '}"""')]),
     ("U5", "under", "the host verify ships the raw placeholder",
      [("            return !!document.querySelector('.result-streaming, [data-is-streaming=\"true\"]');\n"

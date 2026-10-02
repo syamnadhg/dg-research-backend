@@ -68,36 +68,13 @@ MUTANTS = [
        '            if (detect_fn is not None and name in ("ChatGPT", "Claude", "Gemini")\n')]),
 
     # ── G: Gemini's plan wait ───────────────────────────────────────────────
-    ("G1", RESEARCH, "⛔⛔ the recovery's vision step is not told about Skip — it runs "
-     "to its ten-step limit after the owner skipped",
-     [('                            model=CUA_MODEL, max_iterations=10, verbose=verbose,\n'
-       '                            abort_event=_SkipPressed("gemini"))\n',
-       '                            model=CUA_MODEL, max_iterations=10, verbose=verbose)\n')]),
-    ("G2", RESEARCH, "⛔ the Skip tripwire never trips",
-     [("            return self._agent in (_controls.skipped_agents or ())\n",
-       "            return False\n")]),
-    ("G3", RESEARCH, "⛔⛔ a reply with nothing to click gets the vision step again — "
-     "seven steps opening the owner's brief bubble",
-     [("                if _lad_quiet:\n                    _, _lad_state",
-       "                if False:\n                    _, _lad_state")]),
-    ("G4", RESEARCH, "⛔ a reply WITH a button is taken for 'nothing to click' — its "
-     "vision step is lost",
-     [('    if reading.get("controls") or reading.get("rows"):\n        return False\n',
-       '    if reading.get("rows"):\n        return False\n')]),
-    ("G5", RESEARCH, "⛔ a read that FAILED is taken for 'nothing to click'",
-     [('    if not isinstance(reading, dict) or not reading.get("found"):\n',
-       '    if not isinstance(reading, dict):\n')]),
-    ("G6", RESEARCH, "⛔⛔ with no vision step the attempt also skips the Start watch — "
-     "a slow plan is never started",
-     [('                        f"{_FALLBACK_MAX_REGEN})")\n                else:\n',
-       '                        f"{_FALLBACK_MAX_REGEN})")\n                    continue\n'
-       '                else:\n')]),
+    # G1-G6 measured the computer-use recovery after the plan wait (its
+    # Skip tripwire, its 'nothing to click' rule, its Start watch);
+    # removed with it in wave 15 (10-02).
     ("G7", RESEARCH, "⛔ what the page shows about Gemini is never logged",
      [('            if _gemini_state.split(" (", 1)[0] != _gemini_state_logged:\n',
        '            if False:\n')]),
-    ("G8", RESEARCH, "⛔ the stall line drops what the page shows about Gemini",
-     [('                            f"page reads: {_gemini_state_words(_gemini_state)}", "WARN")\n',
-       '                            f"page reads: ?", "WARN")\n')]),
+    # G8 (the stall line) went with the stall line in wave 15.
     ("G9", RESEARCH, "⛔ a hidden 'Stop response' reads as 'unknown', not 'still working'",
      [('    ("running_hidden_stop_btn",\n',
        '    ("running_hidden_stop_btn_x",\n')]),

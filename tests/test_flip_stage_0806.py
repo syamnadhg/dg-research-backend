@@ -39,21 +39,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import research  # noqa: E402
 
 
-def _stage_fn():
-    """`_flip_txn_stage` is a closure inside the worker factory; lift it out."""
-    src = inspect.getsource(research)
-    i = src.index("    def _flip_txn_stage(tx, root) -> str:")
-    j = src.index("    def _flip_queued_to_ongoing(", i)
-    body = "\n".join(ln[4:] if ln.startswith("    ") else ln
-                     for ln in src[i:j].split("\n"))
-    ns: dict = {}
-    exec(compile(body, "<flip_stage>", "exec"), ns)
-    return ns["_flip_txn_stage"]
-
-
-STAGE = _stage_fn()
-
-
 class _OneRecord:
     """`users/{uid}/researches/{rid}` for the worker's fallback read: a dict is
     the record, None is no record, an exception is a read that fails."""
@@ -84,46 +69,11 @@ def _worker(monkeypatch, tmp_path, flip, record):
                            update_research=lambda *a, **k: True)
 
 
-class _Tx:
-    def __init__(self, tid=None):
-        self._id = tid
-
-
-class _Root:
-    def __init__(self, dbg=""):
-        self.debug_error_string = dbg
-
-
-class TestTheStageIsNamed:
-
-    def test_no_transaction_id_means_the_open_was_refused(self):
-        out = STAGE(_Tx(None), None)
-        assert "BeginTransaction" in out, out
-        assert "not on the document read" in out, out
-
-    def test_an_id_narrows_it_to_the_document(self):
-        out = STAGE(_Tx(b"\x01\x02"), None)
-        assert "read_or_commit" in out, out
-        assert "BeginTransaction" not in out, out
-
-    def test_the_grpc_detail_is_carried_when_there_is_one(self):
-        out = STAGE(_Tx(b"\x01"), _Root("UNAUTHENTICATED: bad claim"))
-        assert "grpc=" in out and "bad claim" in out, out
-
-    def test_a_missing_grpc_detail_is_simply_absent(self):
-        assert "grpc=" not in STAGE(_Tx(b"\x01"), _Root(""))
-
-    def test_a_transaction_object_that_cannot_be_read_says_so(self):
-        class _Hostile:
-            @property
-            def _id(self):
-                raise RuntimeError("gone")
-        out = STAGE(_Hostile(), None)
-        assert "unknown" in out, out
-
-    def test_none_is_treated_as_never_begun(self):
-        # The except block may run before the transaction object exists.
-        assert "BeginTransaction" in STAGE(None, None)
+# ⛔⛔ WAVE 15 (10-02): THE FLIP IS NO LONGER A TRANSACTION. The stage this
+# file named — BeginTransaction, refused before any document is touched — is
+# exactly why: the rules deny this machine a transaction on the user tree, so
+# the flip is now a read plus a compare-and-set update
+# (tests/test_w15_lows_1002.py). The tests of `_flip_txn_stage` went with it.
 
 
 class TestTheFailurePathNoLongerReadsAsSuccess:
@@ -171,22 +121,3 @@ class TestTheFailurePathNoLongerReadsAsSuccess:
         """⛔⛔ Wave 10.10: the read succeeded and found nothing — the research
         was deleted — and that must never run."""
         assert _worker(monkeypatch, tmp_path, "error", None) == []
-
-
-class TestTheDiagnosisIsRecordedWhereTheNextReaderWillLookFirst:
-
-    def test_the_heal_comment_states_which_rpc_is_refused(self):
-        src = inspect.getsource(research)
-        i = src.index("def _flip_queued_to_ongoing(")
-        block = src[i:i + 4000]
-        assert "BeginTransaction RPC" in block
-        assert "re-minting cannot help" in block
-
-    def test_the_stage_is_appended_to_the_failure_line(self):
-        # 2026-08-20: the line is DEBUG now and no longer calls a compensated
-        # no-op a failure — it has failed on every run in the corpus while the
-        # fallback read resolved the status every time. The STAGE still has to
-        # ride it, which is what this test is actually for.
-        src = inspect.getsource(research)
-        i = src.index("could not open the queued→ongoing transaction")
-        assert "_flip_txn_stage(" in src[i:i + 400]

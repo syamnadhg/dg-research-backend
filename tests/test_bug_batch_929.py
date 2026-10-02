@@ -122,43 +122,10 @@ def test_poke_and_wait_longer_disarm_auto_skip():
     assert 'p["stuck_alerted_at"] = 0.0' in wait_block
 
 
-def test_2d_cua_recovery_retracts_early_card():
-    # The shared retraction helper runs on the main-loop click AND both
-    # CUA-recovery success paths (pre-fix only the main loop retracted).
-    #
-    # 2026-08-17 RE-ANCHORED, invariant unchanged and strengthened. The intent
-    # here is "the re-draft path must not leave a stale [Retry][Skip] card on a
-    # recovered Gemini", and it still holds — but the retraction moved OFF the
-    # re-draft click. That click returning true is not evidence the research
-    # began: in a live run this exact call fired at 08:51:26 and the running
-    # verify disagreed six seconds later, so the card was withdrawn from a run
-    # that never started and the owner lost their only actionable surface for
-    # ninety minutes. The re-draft path still flows into the verified block, so
-    # it is still covered — only now by evidence rather than by a click's return
-    # value.
-    assert _P2.count("_retract_plan_alert(") >= 4  # def + 3 call sites
-    assert '_retract_plan_alert("CUA recovery")' in _P2
-    assert '_retract_plan_alert("verified running")' in _P2, (
-        "the re-draft path's retraction must be gated on a verified start"
-    )
-    assert '_retract_plan_alert("CUA recovery re-draft")' not in _P2, (
-        "retracting on the click alone claims a start nothing has confirmed"
-    )
-
-
-# ── B5: 2D streaming hold-off ────────────────────────────────────────────────
-
-def test_2d_streaming_holdoff_exists():
-    assert "GEMINI_PLAN_STREAM_MAX_SEC" in _P2
-    assert "_last_stream_seen_at" in _P2
-    # The early card must wait out fresh streaming evidence.
-    assert "not _streaming_recent" in _P2
-
-
-def test_2d_streaming_clock_feeds_only_on_raw_generating():
-    # A failed scrape must NOT fake streaming (the emit path defaults
-    # missing status to "generating"; the clock reads the RAW value).
-    assert '(_gm.get("status") or "") == "generating"' in _P2
+# ⛔ Wave 15 (10-02): the [2D] plan wait raises no card, keeps no streaming
+# clock and runs no computer-use recovery any more, so the tests of the card's
+# retraction and the streaming hold-off went with them
+# (tests/test_w15_gemini_waits_1002.py measures the wait as it is now).
 
 
 # ── C1: skip finalization in every path ──────────────────────────────────────
@@ -171,11 +138,6 @@ def test_2d_plan_wait_consumes_mid_wait_skip():
     block = _P2[idx:idx + 700]
     assert 'emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")' in block
     assert "_close_skipped_agent_tab" in block
-
-
-def test_2d_cua_recovery_consumes_skip():
-    assert "User skipped Gemini during CUA recovery" in _P2
-    assert "User skipped Gemini at the end of CUA recovery" in _P2
 
 
 def test_2d_skipped_agent_not_registered_for_round_robin():

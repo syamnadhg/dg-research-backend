@@ -64,20 +64,26 @@ def test_the_late_start_watch_arms_when_a_click_could_not_be_verified():
     """⭐⭐ THE FIX. `start_clicked and not verified_b` is precisely the state both
     lost runs ended in, and it used to arm nothing."""
     expr = _watch_arming_expr(_src())
-    assert "_streaming_handoff" in expr, "the original streaming case must survive"
-    assert "start_clicked" in expr and "not verified_b" in expr, (
-        "an unverified Start click must arm the watch — that is the reported bug"
-    )
+    assert "or (start_clicked and not verified_b))}" in expr, (
+        "an unverified Start click must arm the watch — that is the reported bug")
+
+
+def test_the_wait_that_ended_with_nothing_pressed_arms_it_on_the_runs_own_chat():
+    """⭐ Wave 15: Gemini starts by itself, and a plan that shows its Start after
+    the wait is pressed by the watch. ⛔ Only on the run's own chat — the watch
+    presses — and never for a Gemini that already finished on its own."""
+    expr = _watch_arming_expr(_src())
+    assert ("(not start_clicked and not _finished_handoff\n"
+            "                                     and not _controls.is_stop() and _chat_ok)"
+            in expr), expr
 
 
 def test_the_watch_is_not_armed_unconditionally():
-    """⛔ Arming it always would press Start on the auto-started case, where the
-    plan bubble keeps a grayed Start forever. The watch's own enabled-only guard
-    would refuse, but arming it on every run would also keep the wall-clock
-    rebasing and hide a genuinely dead Gemini behind endless re-arming."""
+    """⛔ Arming it always would press Start on a tab that is not the run's chat,
+    and keep the wall-clock rebasing on a Gemini that finished."""
     expr = _watch_arming_expr(_src())
     assert "bool(True)" not in expr
-    assert re.search(r'"gemini_watch_start": bool\(\s*\n?\s*_streaming_handoff', expr), expr
+    assert re.search(r'"gemini_watch_start": bool\(\s*\n\s*\(not start_clicked', expr), expr
 
 
 def test_needs_start_verify_and_the_watch_now_agree_on_the_same_evidence():
@@ -87,7 +93,7 @@ def test_needs_start_verify_and_the_watch_now_agree_on_the_same_evidence():
     nsv = src.index('"needs_start_verify": bool(start_clicked and not verified_b)')
     watch = src.index('"gemini_watch_start": bool(', nsv)
     assert watch > nsv
-    assert "start_clicked and not verified_b" in src[watch:watch + 200]
+    assert "start_clicked and not verified_b" in src[watch:watch + 400]
 
 
 # ── the verdict that was parsed and thrown away ─────────────────────────────
@@ -135,55 +141,5 @@ def test_the_re_arm_is_announced_once_not_every_check():
     )
 
 
-# ── the card that was withdrawn from a dead run ─────────────────────────────
-
-def test_the_stall_card_is_not_retracted_on_an_unverified_click():
-    """⛔ The card says "Gemini recovered and began its deep research". A click
-    that returned true is not that evidence: in the live run the retraction fired
-    at 08:51:26 and the verify disagreed six seconds later, leaving the user with
-    no actionable surface on a run that was already dead."""
-    src = _src()
-    at = src.index("CUA recovery: 'Start research' appeared after re-draft")
-    region = src[at:at + 1100]
-    # the retraction must NOT be in this block any more
-    assert "_retract_plan_alert(" not in region, (
-        "retracting here claims a start that has not been verified"
-    )
-
-
-def test_the_retraction_happens_where_the_claim_is_provable():
-    src = _src()
-    at = src.index('log("[2D] Gemini is researching ✓")')
-    region = src[at:at + 400]
-    assert '_retract_plan_alert("verified running")' in region
-
-
-def test_retraction_is_idempotent():
-    """It now fires from more than one path, so a second call must be a no-op
-    rather than a duplicate 'recovered' event."""
-    src = _src()
-    at = src.index("def _retract_plan_alert")
-    body = src[at:at + 1400]
-    assert "if not _plan_alert_emitted:" in body and "return" in body
-    assert "_plan_alert_emitted = False" in body
-
-
-# ── the detector that names the state ───────────────────────────────────────
-
-def test_the_pre_research_reason_is_still_reported_verbatim():
-    """The watch is what acts, but the reason string is how a human greps for
-    this. It named the state correctly ninety times; keep it exact."""
-    assert 'return (False, "start_research_btn_visible (pre-research)", snap)' in _src()
-
-
-def test_done_markers_still_outrank_a_stale_start_button():
-    """⛔ The 2026-07-13 disease, which must not come back while fixing its
-    opposite: a FINISHED report leaves its Start button in the scrollback, and
-    the trio/completion markers have to win — otherwise arming the watch more
-    often would start clicking a leftover button on a completed research."""
-    src = _src()
-    trio = src.index('return (True, f"no_stop + report_button_trio')
-    start = src.index('return (False, "start_research_btn_visible (pre-research)", snap)')
-    assert trio < start, "done markers must be checked BEFORE the Start-button gate"
-    chat = src.index('return (True, f"no_stop + completed_chat_text')
-    assert chat < start
+# ⛔ Wave 15 (10-02): the plan wait raises no card any more, so the tests of
+# where its card was taken down went with it.

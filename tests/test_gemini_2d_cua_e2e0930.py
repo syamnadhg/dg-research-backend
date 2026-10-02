@@ -11,12 +11,10 @@ up and the vision recovery started on a page with nothing to press:
     05:19:28 Command received: SKIP_AGENT agent=gemini
     05:20:33 [2D] User skipped Gemini during CUA recovery — finalizing skip
 
-⭐ NOW
-  · a reply that was read and holds no button, no open menu and no failure text
-    gets NO vision step — the 'Start research' watch still runs every attempt;
-  · pressing Skip stops the vision step at once (before its next model turn);
-  · the log says what the page shows about Gemini whenever that changes, puts it
-    in the stall line, and names the chat and how long it took to land.
+⭐ NOW (wave 15, 10-02: the vision recovery itself is gone — Gemini starts its
+research by itself and the plan wait hands it on with nothing pressed)
+  · the log says what the page shows about Gemini whenever that changes, and
+    names the chat and how long it took to land.
 
 ── How it is measured ──────────────────────────────────────────────────────
 The REAL `run_phase2` Gemini launch (2C/2D) runs against a local page in headless
@@ -196,78 +194,22 @@ def _said(out, text):
     return [m for _lv, m in out.lines if text in m]
 
 
-# ── Nothing to click: no vision step ─────────────────────────────────────────
-
-def test_a_reply_with_nothing_to_click_gets_no_vision_step(launch):
-    """⭐⭐ THE 09-30 SCREEN. Before: three vision passes ("gemini-start" ×3),
-    the first of which clicked the owner's brief bubble."""
-    out = launch(SILENT)
-    assert "gemini-start" not in out.looks, out.looks
-    quiet = _said(out, "shows nothing to click")
-    assert len(quiet) == 3, quiet
-    assert all("no computer use" in m and "still watching for 'Start research'" in m
-               for m in quiet)
-    # ⭐ The card and the end of the recovery are unchanged.
-    assert out.cards, "the couldn't-start card must still go up"
-    assert _said(out, "CUA recovery exhausted")
-    progress = [k.get("progress") for n, k in out.events
-                if n == "agent_progress" and k.get("agent") == "gemini"]
-    assert "Still waiting for Gemini's plan (1/3)…" in progress
-    assert not [p for p in progress if p and "didn't start — retrying" in p]
-
-
-def test_a_slow_plan_is_still_started_by_the_watch_without_a_vision_step(launch):
-    """The August precedent: Gemini took 6.6-7.4 minutes to draft, and the Start
-    click that saved it came from the watch that runs AFTER the vision pass —
-    which keeps running with no vision pass. Here the plan, with its Start
-    research button, arrives during the first attempt's watch."""
-    out = launch(SILENT, plan_arrives_at="Still waiting for Gemini's plan (1/3)…")
-    assert "gemini-start" not in out.looks, out.looks
-    assert _said(out, "'Start research' appeared after re-draft — clicked")
-    assert len(_said(out, "shows nothing to click")) == 1
-
-
-def test_a_reply_with_a_button_still_gets_the_vision_step(launch):
-    """Only 'nothing to click' is skipped: a reply holding a control the vision
-    step might need keeps it, as before."""
-    out = launch(WITH_BUTTON)
-    assert out.looks.count("gemini-start") == 3, out.looks
-    assert not _said(out, "shows nothing to click")
-
-
-def test_a_reply_that_could_not_be_read_still_gets_the_vision_step(launch):
-    """A read that failed is "cannot tell", never "nothing to click"."""
-    out = launch(NO_REPLY)
-    assert out.looks.count("gemini-start") == 3, out.looks
-    assert not _said(out, "shows nothing to click")
-
-
-# ── Skip stops the vision step at once ───────────────────────────────────────
-
-def test_skip_stops_the_vision_step_before_its_next_turn(launch):
-    """⭐⭐ Skip pressed during the vision model's second turn: no third turn.
-    Before: the pass ran on to its ten-step limit (the 09-30 pass ran four more
-    steps and a minute after Skip)."""
-    out = launch(WITH_BUTTON, real_vision=True)
-    assert out.model.turns == 2, out.model.turns
-    assert _said(out, "computer use on Gemini stopped at once")
-    assert _said(out, "User skipped Gemini during CUA recovery")
-    assert not out.handed, "a skipped Gemini is not handed to the round-robin"
+# ⛔⛔ WAVE 15 (10-02): THE COMPUTER-USE RECOVERY AFTER THE PLAN WAIT IS GONE,
+# and with it the tests of when it looked and when Skip stopped it. Gemini starts
+# its research by itself; the wait hands it to the round-robin with nothing
+# pressed and nothing raised (tests/test_w15_gemini_waits_1002.py).
 
 
 # ── What the page says about Gemini ──────────────────────────────────────────
 
 def test_the_log_says_when_gemini_is_still_working(launch):
     """The hidden 'Stop response' button is Gemini's own running signal; the
-    log now says so, and the stall line carries it."""
+    log says so, once."""
     out = launch(SILENT_BUT_WORKING)
     reads = _said(out, "Gemini's page now reads:")
     assert len(reads) == 1, reads
     assert "still working (its hidden 'Stop response' button is on the page)" in reads[0]
-    stall = _said(out, "plan stall diag")
-    assert len(stall) == 1, stall
-    assert "its reply: 0 chars, 0 buttons" in stall[0]
-    assert "Gemini's page reads: still working" in stall[0]
+    assert out.looks == [] and out.cards == []
 
 
 def test_the_log_says_when_nothing_is_running(launch):
@@ -275,8 +217,7 @@ def test_the_log_says_when_nothing_is_running(launch):
     reads = _said(out, "Gemini's page now reads:")
     assert len(reads) == 1, reads
     assert "nothing running and nothing finished" in reads[0]
-    assert "Gemini's page reads: nothing running and nothing finished" in \
-        _said(out, "plan stall diag")[0]
+    assert out.looks == [] and out.cards == []
 
 
 # ── The landing line: which chat, and how long after Send ────────────────────

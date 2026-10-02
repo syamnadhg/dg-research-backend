@@ -101,7 +101,9 @@ DEFERRED_BATCH_UID = ("                _commit_chunk, uid=uid_b,\n"
                       '                what=f"deferred queue-pos batch')
 LOCAL_BATCH_UID = ("                    _commit_chunk, uid=uid_b,\n"
                    '                    what=f"queue-pos batch')
-FLIP_UID = '                what=f"flip queued→ongoing {research_id_val[:8]}…", uid=uid_val,'
+# Re-anchored in wave 15: the flip's heal call is the compare-and-set's now.
+FLIP_UID = ('                    _flip_once, what=f"flip queued→ongoing {research_id_val[:8]}…",\n'
+            '                    uid=uid_val)')
 
 # ── anchors: a token with no claim is this computer's own pairing ──────────
 OWN_PAIRING = "        own_pairing = not tok_did or bool(cfg_did and tok_did != cfg_did)"
@@ -207,7 +209,7 @@ MUTANTS = [
     # ═══ W — the dequeue's flip names the job's account ═══════════════════
     ("W1", RESEARCH, "⛔ the flip, the 09-28 log's FIRST refused write, hands the "
      "heal no uid — re-pair required for another account's job",
-     [(FLIP_UID, '                what=f"flip queued→ongoing {research_id_val[:8]}…",')]),
+     [(FLIP_UID, '                    _flip_once, what=f"flip queued→ongoing {research_id_val[:8]}…")')]),
 ]
 
 #: ⛔ A MUTANT THAT HANGS IS A FAULT, NOT A KILL.

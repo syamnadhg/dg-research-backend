@@ -128,7 +128,6 @@ from prompts import (
     PROMPT_FIX_ISSUE,
     PROMPT_GEMINI_COPY_CONTENTS,
     PROMPT_GEMINI_DEEP_RESEARCH,
-    PROMPT_GEMINI_START_RESEARCH,
     PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
     PROMPT_NOTEBOOKLM_RENAME,
     PROMPT_NOTEBOOKLM_REUPLOAD,
@@ -9775,12 +9774,18 @@ def _waiting_run_stop_patch() -> dict:
     }
 
 
-def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None":
+def _park_waiting_run(job, *, from_worker, behind: bool = False,
+                      p2_chats: "dict | None" = None) -> "Path | None":
     """Put `job`'s run at the front of this computer's queue: write its marker,
     naming the whole job, so whichever worker takes it can resume it without
     asking anyone. The run folder, or None when the job names no person, or
     the write failed — which is also the answer for a run with no folder yet:
     it has nothing to keep, and a folder is never made up for it here.
+
+    ⭐ `p2_chats` (wave 15, 10-02) — {agent: chat address}, the Phase-2 chats
+    the run was in when it was moved. Kept in the marker beside `from_worker`,
+    so the worker that takes the run back can go into them again instead of
+    sending the brief to new chats (`_waiting_p2_chats` decides whether it may).
 
     ⭐ `behind` — a job a RESTING worker had only QUEUED in its own line when a
     restart came (wave 13 repair). It goes to the BACK of the waiting runs, in
@@ -9820,6 +9825,8 @@ def _park_waiting_run(job, *, from_worker, behind: bool = False) -> "Path | None
     }
     if behind:
         rec["queued_job"] = dict(job)
+    if p2_chats:
+        rec["p2_chats"] = {str(k): str(v) for k, v in p2_chats.items() if k and v}
     tmp = run_dir / f"{WAITING_MARKER}.tmp"
     try:
         for stale in run_dir.glob(f"{WAITING_MARKER}.w*"):
@@ -9968,7 +9975,7 @@ def _claim_waiting_run(worker_id) -> "dict | None":
                         kept_work=_waiting_kept_work(rec))
         log(f"[moved-run] worker {worker_id}: taking {rid[:8]}… from the front of "
             f"the queue — it goes on from the start of the step it was on", "INFO")
-        return {
+        job = {
             "topic": str(rec.get("topic") or ""),
             "email": str(rec.get("email") or ""),
             "config": dict(rec.get("config") or {}),
@@ -9980,9 +9987,40 @@ def _claim_waiting_run(worker_id) -> "dict | None":
             # It was running: until it starts here its pill says so (`moved`).
             "kept_work": True,
         }
+        _chats = _waiting_p2_chats(rec, worker_id)
+        if _chats:
+            job["p2_rejoin"] = _chats
+        return job
     if dropped:
         _kick_queue_publish()
     return None
+
+
+def _waiting_p2_chats(rec, worker_id) -> dict:
+    """{agent: chat address} a moved run goes back into on worker `worker_id`,
+    or {} when it kept none (wave 15, the owner's yes on 10-02: "picked up again
+    by the SAME computer re-adopts that run's chats; a different computer starts
+    the phase fresh").
+
+    ⭐ ANY WORKER OF THIS COMPUTER TRIES THEM (review 10-02). A moved run waits in
+    this computer's own queue folder, so only this computer's workers can take it,
+    and the worker it was moved off stays off (`_keep_worker_resting`): limiting
+    the chats to that worker meant another worker took the run and sent every
+    brief again — the usage the owner asked to stop wasting. Each worker is its
+    own Chrome profile and may be signed in to other accounts, and that is what
+    the retry's proof is for: a chat of another account does not open, or its
+    first message cannot be read, so that agent starts again the usual way — only
+    that one. A different computer never sees this run's chats at all."""
+    chats = (rec or {}).get("p2_chats")
+    if not isinstance(chats, dict) or not chats:
+        return {}
+    came_from = (rec or {}).get("from_worker")
+    rid = str((rec or {}).get("research_id") or "")
+    log(f"[moved-run] {rid[:8]}… comes back to worker {worker_id} (it was moved off "
+        f"{f'worker {came_from}' if came_from is not None else 'a worker it did not record'})"
+        f" — its Phase 2 goes back into its chats, and any it cannot prove are its own "
+        f"start again", "INFO")
+    return {str(k): str(v) for k, v in chats.items() if k and v}
 
 
 def _drop_waiting_claim(run_dir, worker_id) -> None:
@@ -10238,7 +10276,8 @@ def _move_run_to_queue(data) -> str:
             f"startup, so worker {WORKER_ID} cannot restart to let the run go; "
             f"it keeps running", "WARN")
         return "not-supervised"
-    if _park_waiting_run(current, from_worker=WORKER_ID) is None:
+    if _park_waiting_run(current, from_worker=WORKER_ID,
+                         p2_chats=_p2_chats_to_move()) is None:
         log(f"[device-cmds] REQUEUE: ignored — {rid[:8]}… has nothing saved on this "
             f"computer yet to go on from; it keeps running", "WARN")
         return "not-saved"
@@ -17142,8 +17181,9 @@ def start_firestore_start_listener(job_queue, loop):
                 # fresh and any orphan Patchright/Chromium dies with the
                 # parent process. Mark the research status="stopped" too
                 # so the FE chat + tile reflect cancelled immediately;
-                # `_flip_queued_to_ongoing` is now transactional and
-                # honors this even if the worker dequeues concurrently.
+                # `_flip_queued_to_ongoing` flips only a record that still says
+                # "queued" (a compare-and-set since wave 15) and honors this
+                # even if the worker dequeues concurrently.
                 # (Replaces the old cancelTooLate band-aid: the cancel
                 # actually cancels now, so no "couldn't cancel" message
                 # path is needed.)
@@ -21309,10 +21349,29 @@ def _answered_without_phase_5(body_text) -> bool:
     return isinstance(parsed, dict) and "p5" not in parsed
 
 
-def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0) -> str:
+def _route_answered(body_text) -> bool:
+    """Is this 2xx body the route's own answer — its JSON, after the keep-alive
+    spaces it streams first?
+
+    ⛔⛔ 10-01 (3NH9Q7CH, and twice more in CJFYMAB1's backend logs). The hand-off
+    logged "the route ran it ✓" on a 200 whose body was the keep-alive spaces and
+    then a Google front-end "Internal Server Error" page: the front door cut the
+    call at 300 s, after the status had gone out with the first spaces. The
+    cloud finished that run (20:04Z, the email sent). The web reads such an
+    answer as a transport failure (`cloudKickOutcome`: "the route's answer could
+    not be read"), and so does this now."""
+    try:
+        return isinstance(json.loads(body_text or ""), dict)
+    except Exception:
+        return False
+
+
+def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0,
+                      body=None) -> str:
     """What one attempt at the cloud kick means. One of:
 
-      "ran"     — the route ran the chain and answered (HTTP 2xx).
+      "ran"     — the route ran the chain and answered (HTTP 2xx, with its JSON
+                  when the `body` is given).
       "claimed" — HTTP 202: ANOTHER caller holds the claim. The work is
                   somebody's; it is not this call's, and it is not a failure.
       "cut"     — the connection died AFTER the cloud had the request. The route
@@ -21342,6 +21401,11 @@ def _dispatch_verdict(status_code=None, exc=None, elapsed_sec: float = 0.0) -> s
     if status_code == 202:
         return "claimed"
     if isinstance(status_code, int) and 200 <= status_code < 300:
+        # ⭐ Wave 15: a 2xx whose body is not the route's answer is the front
+        # door cutting the call after the status went out — the cloud has the
+        # request and keeps working (`_route_answered`).
+        if body is not None and not _route_answered(body):
+            return "cut"
         return "ran"
     if status_code in (401, 403):
         return "retry"
@@ -21475,9 +21539,16 @@ def _drive_cloud_phases(uid, research_id, *, post, mint_token, sleep, note,
             _t0 = time.monotonic()
             try:
                 _status, _text = post(id_token, _p5_only)
-                verdict = _dispatch_verdict(status_code=_status)
-                why = f"HTTP {_status}" + (f" ({str(_text)[:160]})"
-                                           if _text and _quote_reply else "")
+                _elapsed = int(time.monotonic() - _t0)
+                verdict = _dispatch_verdict(status_code=_status, body=_text)
+                if verdict == "cut":
+                    # The front door's error page is not the route's reply: say
+                    # what happened, never quote the page.
+                    why = (f"HTTP {_status}, then the cloud's front door ended the "
+                           f"answer with an error page in place of the route's reply")
+                else:
+                    why = f"HTTP {_status}" + (f" ({str(_text)[:160]})"
+                                               if _text and _quote_reply else "")
             except Exception as _e:
                 _elapsed = int(time.monotonic() - _t0)
                 verdict = _dispatch_verdict(exc=_e, elapsed_sec=_elapsed)
@@ -23603,6 +23674,17 @@ class PipelineRuntime:
         self.active_pages: dict = {}  # platform → page object
         self.agent_statuses: dict = {}  # platform → 'generating'|'done'|'failed'
         self.agent_chat_urls: dict = {}  # platform → URL (conversation/chat)
+        # ⭐ WAVE 13 (10-01) — platform → the chat PHASE 2 sent this run's brief
+        # into, and nothing else. Read once, at a Phase-2 browser crash, so the
+        # retry goes back into each agent's own chat instead of sending the
+        # brief again (`_p2_rejoin_chat`). ⛔ Not `agent_chat_urls`: Phase 1
+        # registers ChatGPT's brief chat in that map too, and until the
+        # round-robin registers the Phase-2 tabs a crash would carry it.
+        self.p2_chat_urls: dict = {}
+        # platform → the TAB that chat is in. At the crash the tab's last
+        # address wins when it is one of the agent's chats: Gemini moves a run
+        # to a new chat after the brief goes in (`_p2_chats_to_rejoin`).
+        self.p2_chat_pages: dict = {}
         # ⭐ STRETCH 7.5 — platform → the tokens that identify the brief we
         # pasted into that platform's tab. Written ONCE per platform, by
         # `verified_paste_brief`, and read by the identity check that replaced
@@ -23738,6 +23820,13 @@ class PipelineRuntime:
                 self.agent_chat_urls[platform] = page.url
             except Exception:
                 pass
+        # A chat Phase 2 sent the brief into follows its tab when the tab moves
+        # (a hard retry's new chat, Gemini's re-adopted one). Phase 1's ChatGPT
+        # tab is never in `p2_chat_urls`, so it is never added here.
+        if platform in self.p2_chat_urls and self.agent_chat_urls.get(platform):
+            self.p2_chat_urls[platform] = self.agent_chat_urls[platform]
+            if page is not None:
+                self.p2_chat_pages[platform] = page
         self.agent_statuses[platform] = "generating"
 
     def unregister_page(self, platform, final_status="done"):
@@ -32103,6 +32192,83 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None, *,
 # generic one would overwrite the specific message).
 _AGENT_ERROR_CARD_TS: dict = {}
 
+#: agent key → (research id, phase) of the card `fail_agent` last raised for it.
+_AGENT_ERROR_CARD_OF: dict = {}
+
+
+def _drop_agent_card_stamp(agent_key) -> None:
+    """`agent_key`'s card is no longer up — it was skipped automatically, or its
+    phase is over — so nothing may "take it down" again.
+
+    ⛔ Review 10-02. A person's Skip and Retry drop the stamp, and so does the
+    agent finishing; an automatic skip did not. A crash later in the run then
+    "took down" a card that was long gone, and the app showed that as a new
+    alert — "Claude is going again" — about an agent that had been skipped."""
+    _AGENT_ERROR_CARD_TS.pop(agent_key, None)
+    _AGENT_ERROR_CARD_OF.pop(agent_key, None)
+
+
+def _forget_research_cards(research_id) -> None:
+    """Chrome died after Phase 2: that phase is over, so none of this research's
+    cards is one the crash's retry should take down (it takes down Phase 2's
+    only). Their stamps go now (review 10-02: a card nobody answered before the
+    phase was skipped, then a crash in Phase 3, told the app the agent "is going
+    again")."""
+    rid = str(research_id or "")
+    for agent_key, (card_rid, _phase) in list(_AGENT_ERROR_CARD_OF.items()):
+        if card_rid == rid:
+            _drop_agent_card_stamp(agent_key)
+
+
+def _retract_crashed_attempt_cards(research_id) -> list:
+    """A crash retry has started: take down every Phase-2 agent card the
+    crashed attempt raised for this research. Returns the agents whose card was
+    taken down.
+
+    ⛔⛔ 10-01. Chrome died during ChatGPT's extraction and the attempt put up
+    "Couldn't read ChatGPT's report"; the retry relaunched Chrome and carried on
+    with the card still up, and it stayed up fifteen minutes, until ChatGPT
+    finished again and its completion took it down. The attempt that raised it
+    was gone; its Retry and Skip were about a browser that no longer existed.
+
+    ⭐ The same retraction the completion uses: the card's own alert id, no
+    actions, `auto_clear_on_resume` (the app's sign that an agent recovered by
+    itself — it clears the card and the pause), the durable decision cleared,
+    and the stamp dropped. The tile is set running again — never over a
+    finished or skipped agent (`_write_agent_terminal_status` refuses both).
+
+    ⛔ ONLY THIS RESEARCH'S CARDS, ONLY PHASE 2's. The stamps outlive a run in a
+    long-lived worker, so a card another research raised earlier must not be
+    "retracted" into this one; and the app reads a retraction only for a Phase-2
+    agent card — on any other phase it would put up a new notice instead."""
+    rid = str(research_id or "")
+    if not rid:
+        return []
+    taken = []
+    for agent_key, (card_rid, phase) in list(_AGENT_ERROR_CARD_OF.items()):
+        if card_rid != rid or phase != 2 or agent_key not in _AGENT_ERROR_CARD_TS:
+            continue
+        name = _agent_display_name(agent_key)
+        try:
+            emit_event("pipeline_warning", phase=2, agent=agent_key,
+                       error=f"{name} is going again",
+                       details=(f"Chrome restarted and the run carried on; the earlier "
+                                f"alert about {name} no longer applies."),
+                       actions=[], alert_id=_agent_error_alert_id(agent_key, 2),
+                       auto_clear_on_resume=True)
+            _clear_pending_decision(agent_key)
+            _write_agent_terminal_status(agent_key, "running")
+        except Exception as e:
+            log(f"[restart] could not take down {name}'s card ({type(e).__name__})", "WARN")
+            continue
+        _AGENT_ERROR_CARD_TS.pop(agent_key, None)
+        _AGENT_ERROR_CARD_OF.pop(agent_key, None)
+        taken.append(agent_key)
+    if taken:
+        log("[restart] Chrome restarted — took down the card(s) the crashed attempt "
+            f"raised: {', '.join(_agent_display_name(a) for a in taken)}")
+    return taken
+
 
 def _agent_error_recently_carded(agent_key: str, within: float = 45.0) -> bool:
     """True if fail_agent emitted a card for this agent in the last `within`
@@ -32273,6 +32439,9 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # brief to ChatGPT" and then clobbered it with "ChatGPT didn't start".
     # Monotonic clock (paired with _agent_error_recently_carded).
     _AGENT_ERROR_CARD_TS[agent_key] = time.monotonic()
+    # Wave 15: whose card it is and on which phase, so a crash retry takes down
+    # only the cards its own crashed attempt raised (`_retract_crashed_attempt_cards`).
+    _AGENT_ERROR_CARD_OF[agent_key] = (str(_fb_research_id or ""), _eff_phase)
     # Tile/Icon Consistency: persist errored status. If user picks Retry
     # and the agent eventually completes, the phase_complete handler
     # overwrites this with "complete". If they pick Skip, the
@@ -37520,14 +37689,10 @@ async def scrape_progress_gemini(page):
             // `aria-label="Stop response"` matches nothing; this tier selects on
             // CLASS names while Gemini's live skeletons carry `pulse` in the
             // ANIMATION NAME. Both misses are real. What is NOT measured is
-            // Gemini's DOM while it DRAFTS THE PLAN — and `isActive` feeds
-            // `status`, which the 2D plan-wait reads as its streaming clock
-            // (in `run_phase2`): a status of 'generating' resets the clock and
-            // can flip `_streaming_handoff`, which SKIPS the CUA recovery ladder
-            // for a genuinely dead plan. So making this tier see more, off a
-            // capture taken while research was already running, would change
-            // the dead-plan recovery path on evidence that says nothing about
-            // it. The completion detector had two captures; this needs its own.
+            // Gemini's DOM while it DRAFTS THE PLAN. (Until wave 15 `isActive`
+            // fed the 2D plan-wait's streaming clock and its six-minute
+            // hand-off; both are gone, and the wait no longer reads it.) The
+            // completion detector had two captures; this needs its own.
             // ⇒ WANTED before touching this: a capture during PLAN DRAFTING
             // (running animation names + visibility, and whether a stop-ish
             // button exists), plus one of a FAILED plan.
@@ -38093,6 +38258,13 @@ _CHATGPT_DONE_PROBE_JS = _cg_js("""() => {
         }
     }
     const bl = (document.body?.innerText || '');
+    // ⛔ Wave 15 (10-02): a document that is not DRAWN answers innerText with its
+    // whole source — scripts included. The hidden old report frame's inline
+    // `<script type=module>` read as text_len 13391747 on 10-01, and the done
+    // check handed that to the report read. So its length counts only when the
+    // document is drawn: a body with boxes, in a frame with a size.
+    const drawn = !!(document.body && document.body.getClientRects().length
+                     && (window.innerWidth || 0) > 0 && (window.innerHeight || 0) > 0);
     // The thinking-time badge — renders only AFTER the thinking phase
     // completes. With Stop button gone + this badge present, we're as
     // confident as we can be that DR is fully settled.
@@ -38179,7 +38351,8 @@ _CHATGPT_DONE_PROBE_JS = _cg_js("""() => {
         '[data-mcp-app-frame] iframe, [data-mcp-app-side-panel-frame-container] iframe, ' +
         'iframe[src*="web-sandbox.oaiusercontent.com"]');
     return { hasStop, thoughtFor, researchDone, completedChip, docPanelAffordances,
-             assistantLen, panelLen, bodyLen: bl.length, sources, steps, vw, vh, drApp };
+             assistantLen, panelLen, bodyLen: drawn ? bl.length : 0, sources, steps, vw, vh,
+             drApp };
 }""".replace("__DONE_BADGE_RE__", _THINKING_TIME_HEADER_JS))
 
 # A non-main context must be a real surface before its download-button scan may
@@ -38962,23 +39135,6 @@ def _gemini_state_words(reason: str) -> str:
         if reason.startswith(key):
             return words
     return "unknown"
-
-
-def _gemini_nothing_to_click(reading) -> bool:
-    """True when Gemini's latest reply was READ and holds nothing a vision step
-    could press: no button in it, no open menu, no failure text.
-
-    ⭐ 2026-09-30: on exactly that screen (no plan, no error, "controls read:
-    []") the vision recovery spent seven steps opening the owner's own brief
-    bubble; its mission has nothing it is allowed to click there. Only the
-    'Start research' watch that runs after it can help, and that keeps running.
-    ⛔ A read that FAILED is "cannot tell", never "nothing to click": it keeps
-    the vision step, as before."""
-    if not isinstance(reading, dict) or not reading.get("found"):
-        return False
-    if reading.get("controls") or reading.get("rows"):
-        return False
-    return not _gemini_reads_as_failed(reading.get("text") or "")
 
 
 # ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
@@ -42391,24 +42547,8 @@ async def execute_action(browser, action, params):
 
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
 
-class _SkipPressed:
-    """An `abort_event` for `agent_loop` that is set the moment the owner
-    presses Skip on `agent`.
-
-    ⭐ 2026-09-30: Gemini's plan recovery kept its vision step running for a
-    minute after the owner pressed Skip (05:19:28 → 05:20:33, four more steps),
-    because the loop checked the skip only between attempts. This reads the
-    Skip set itself, so no task has to be scheduled to set it, and it is seen
-    even while the loop's model call holds the event loop."""
-
-    def __init__(self, agent: str):
-        self._agent = agent
-
-    def is_set(self) -> bool:
-        try:
-            return self._agent in (_controls.skipped_agents or ())
-        except Exception:
-            return False
+# (`_SkipPressed`, the Skip tripwire of Gemini's plan recovery, went with that
+# recovery in wave 15: the plan wait points no computer use at Gemini.)
 
 
 async def agent_loop(client, browser, system_prompt, user_message,
@@ -46238,7 +46378,10 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
     agent's own setup in isolation.
 
     Returns `(new_page, verified_bool)` or `None` on hard failure (including
-    paste/setup failure where start_agent_no_gemini_wait returned ok=False)."""
+    paste/setup failure where start_agent_no_gemini_wait returned ok=False).
+    ⭐ Wave 15: for Gemini the second item is `None` when its brief went in and
+    its research has not started yet — Gemini starts it by itself, and the
+    caller hands it to the round-robin's late-Start watch (no card)."""
     # Re-deliver user source docs on hard-retry too (read from disk so the
     # retried agent gets the same attachments the original run did).
     source_paths = _read_p2_source_paths()
@@ -46288,13 +46431,19 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         await browser.switch_to_page(new_page)
         await asyncio.sleep(2)
 
-        # Gemini needs an extra click: wait up to 90s for "Start research"
-        # button, click via JS, fall back to CUA if JS can't find it.
-        # #953 (audit): use the module-hoisted, #905-hardened finder
-        # (_GEMINI_CLICK_START_JS: enabled + visible + role/aria) — the old
-        # inline `<button>`-only match here clicked disabled skeleton buttons
-        # (a DOM no-op that reported success) and today's auto-start makes the
-        # disabled Start the COMMON state on this path.
+        # ⭐⭐ WAVE 15 (10-02) — AFTER A PERSON'S RETRY, GEMINI JUST WAITS TOO.
+        # This path pointed computer use at a plan still being drafted and, about
+        # four minutes in, raised the couldn't-start card (_GEMINI_CANT_START) —
+        # the planning alert the plan wait (2D) no longer raises. Gemini starts its
+        # research by itself on a timer, and a plan can take far longer than four
+        # minutes (10-01: 47). So, as in 2D: a 'Start research' that appears in
+        # the first ninety seconds is pressed; a Gemini that started by itself is
+        # researching; anything else goes to the round-robin NOT STARTED (None),
+        # where the late-Start watch presses a late 'Start research' and the
+        # research is left to finish. No computer use, no Redo, no card.
+        # #953 (audit): the module-hoisted, #905-hardened finder
+        # (_GEMINI_CLICK_START_JS: enabled + visible + role/aria) — never a
+        # disabled skeleton button, which today's auto-start leaves behind.
         start_clicked = False
         _auto_started = False
         for attempt in range(45):
@@ -46313,59 +46462,27 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             except Exception:
                 pass
             await asyncio.sleep(2)
-        if not start_clicked and not _auto_started and cua_client:
-            await browser.switch_to_page(new_page)
-            # agent_loop CLICK dismisses the plan-FAIL screen; return text unused (#776).
-            # #953: the mission forbids clicking a grayed/disabled Start (that
-            # adds nothing and, on the auto-start layout, means research is
-            # already running) — aligned with PROMPT_GEMINI_START_RESEARCH.
-            await agent_loop(cua_client, browser,
-                PROMPT_GEMINI_START_RESEARCH,
-                "If an ENABLED (blue) 'Start research' button is visible, click it "
-                "ONCE. If it is grayed/disabled or research is already running, do "
-                "NOT click — say 'research already running'. Do NOT type.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
-            # #776: confirm the click via the DOM, not the CUA narration (see the
-            # 2D note) — re-poll the deterministic JS after the CUA returns so a
-            # post-Retry re-draft's fresh "Start research" button is actually
-            # clicked, instead of inferring success from prose like "clicked retry".
-            for _i in range(24):   # ~120s — covers a slow post-Retry re-draft
-                if _controls.is_stop():
-                    break
-                if await _gemini_research_started(new_page):
-                    _auto_started = True
-                    break
-                try:
-                    _rb = await new_page.evaluate(_GEMINI_CLICK_START_JS)
-                except Exception:
-                    _rb = False
-                if _rb:
-                    start_clicked = True
-                    await asyncio.sleep(5)
-                    break
-                await asyncio.sleep(5)
-
-        # #776: don't let the spinner-based verify stamp a not-yet-started run as
-        # researching when "Start research" was never confirmed-clicked. Returning
-        # verified=False keeps the tab in the round-robin (it doesn't drop a
-        # not-verified agent) so the wall-clock cap can surface an honest failure.
-        # #953: an auto-started research needs no click — treat it as started so
-        # the fresh retry isn't failed while it's genuinely researching.
         if _auto_started:
             log("[2C-retry] Gemini researching after auto-start — handing to round-robin", "INFO")
             return (new_page, True)
-        if not start_clicked:
-            # The user-retry's fresh chat ALSO failed to produce a startable plan
-            # — re-raise the Retry/Skip alert immediately (close the gap where a
-            # second failure silently dropped to the wall-clock cap). dedup-safe.
-            if not _controls.is_stop():
-                fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
-            return (new_page, False)
-        verified = await wait_until_verified(
-            verify_gemini_generating, new_page, "2C-retry",
-            browser=browser, cua_client=cua_client,
-            max_retries=15, interval=3, verbose=verbose)
-        return (new_page, verified)
+        if start_clicked:
+            # One instant look, as 2D takes after its press: `verify_gemini_
+            # generating` cannot tell a drafting plan from a research, so it is
+            # asked only once Start was pressed — and when it does not confirm,
+            # the round-robin's watch does (it clears itself once the research
+            # shows, and presses again while an enabled Start is still there).
+            try:
+                if await verify_gemini_generating(new_page):
+                    return (new_page, True)
+            except Exception:
+                pass
+            log("[2C-retry] 'Start research' pressed; the round-robin confirms the "
+                "research started", "INFO")
+        else:
+            log("[2C-retry] No 'Start research' to press yet — Gemini starts its "
+                "research by itself. Handing it to the round-robin, which presses a "
+                "late 'Start research' if one appears (nothing refreshed, no card)", "INFO")
+        return (new_page, None)
 
     return None
 
@@ -48464,6 +48581,45 @@ async def _gemini_research_started(page) -> bool:
     return bool(_GEMINI_RESEARCH_CARD_RE.search(body) or _GEMINI_COMPLETION_RE.search(body))
 
 
+#: How far apart the two reads of a failed-looking plan are taken.
+_GEMINI_PLAN_FAIL_SETTLE_SEC = 2.0
+
+
+async def _gemini_watched_plan_failed(page) -> str:
+    """A watched Gemini — its research not started — whose plan FAILED: the
+    failure's own words, or "".
+
+    ⛔⛔ Review 10-02. Gemini's own failed plan ("Sorry, something went wrong",
+    the owner's capture) shows no Stop and does show Share & export, which the
+    round-robin's done check reads as a finished report: computer use was sent
+    to copy it, the read failed, and "Couldn't read Gemini's report" went up
+    about every ten minutes. A failed plan is not a finished report.
+
+    ⭐ The same reader and the same verdict the plan screen has always been
+    judged by (`_gemini_reads_as_failed`, `_gemini_plan_verdict`), on a SETTLED
+    turn: the same text twice, a moment apart. A plan still streaming that
+    restates a brief about a failure is never byte-identical two seconds apart;
+    a failed turn never changes again. Never raises; "" on any doubt."""
+    try:
+        first = await _gemini_regen_read(page)
+        latest = first.get("text") or ""
+        if not (first.get("found") and _gemini_reads_as_failed(latest)):
+            return ""
+        await asyncio.sleep(_GEMINI_PLAN_FAIL_SETTLE_SEC)
+        second = await _gemini_regen_read(page)
+        if not second.get("found") or (_gemini_norm(second.get("text") or "")
+                                       != _gemini_norm(latest)):
+            return ""
+        started = await _gemini_research_started(page)
+        start_present = bool(await page.evaluate(_GEMINI_START_PRESENT_JS))
+    except Exception:
+        return ""
+    verdict = _gemini_plan_verdict(research_started=started,
+                                   start_present=start_present,
+                                   streaming=False, latest_text=latest)
+    return " ".join(latest.split())[:200] if verdict == "failed" else ""
+
+
 # ── The stale deep research: a BOUNDED CADENCE, not a stall detector ─────────
 #
 # ⛔⛔ THERE IS NO STALL DETECTOR TO BUILD ON THIS SCREEN, AND A FIX THAT CLAIMS
@@ -50205,6 +50361,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _bre:
                     log(f"[{_agent_name}] Hard retry: brief.md read failed ({_bre})", "WARN")
             old_page = p.get("page")
+            # 10-01: the chat it is leaving is not one a crash retry may go back
+            # into; its new chat is noted once the set-up below hands it over.
+            _p2_forget_chat(_agent_key)
             # Gap #3 (2026-07-15): reuse the warm, challenge-passed tab for the
             # restart (same-tab New chat) instead of a cold load, which is a
             # Cloudflare bot-score event. Fall back to a FRESH tab when the page
@@ -50345,9 +50504,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # no cadence at all — and a hard retry is exactly the run most
                 # likely to need one.
                 "brief": _brief_text_hr or "",
+                # ⭐ Wave 15: a Gemini handed back before its research started
+                # (`_restart_phase2_agent` → None) is watched for its late
+                # 'Start research', and left to wait — no "seems stuck" check,
+                # no computer-use look — exactly as after the plan wait.
+                "gemini_watch_start": _agent_name == "Gemini" and verified_h is None,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
+            if new_page is not None:
+                _p2_note_chat(_agent_key, new_page)  # 10-01: a crash retry rejoins it
             # Gap #1: a hard-retry that landed in chat mode (DR still
             # unavailable) left a chat_mode_pending marker; re-seed the
             # kind="chat_mode" park on the rebuilt entry (a marker on the old `p`
@@ -50378,6 +50544,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
                 log(f"[{_agent_name}] Hard retry successful ✓")
+            elif verified_h is None:
+                log(f"[{_agent_name}] Hard retry: the brief is in and its research has not "
+                    "started yet — it starts by itself; the round-robin waits for it", "INFO")
             else:
                 log(f"[{_agent_name}] Hard retry tab opened but not verified yet — polling will re-check", "WARN")
 
@@ -50537,7 +50706,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "cap — auto-skipping (the card went unanswered too long)", "WARN")
                     p["awaiting_decision"] = None
                     _hc_partial = ""
-                    if _pk_key not in _controls.hv_blocked:
+                    # A failed Gemini plan holds nothing to salvage (review 10-02).
+                    if (_pk_key not in _controls.hv_blocked
+                            and (results.get(name) or {}).get("status") != "plan_failed"):
                         try:
                             await browser.switch_to_page(p["page"])
                             _hc_partial = await extract_fns[name](
@@ -50642,17 +50813,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         # work but verified a beat too late. This is where that
                         # verification lands, so it is where the card's claim
                         # becomes true. Same alert_id, so it is the same
-                        # retraction and a no-op if 2D already did it.
-                        try:
-                            emit_event("pipeline_warning", phase=2, agent="gemini",
-                                       error="Gemini's research plan started",
-                                       details="Gemini recovered and began its deep research.",
-                                       actions=[],
-                                       alert_id=_agent_error_alert_id("gemini", 2),
-                                       auto_clear_on_resume=True)
-                            _clear_pending_decision("gemini")
-                        except Exception:
-                            pass
+                        # retraction.
+                        # ⛔⛔ Wave 15 (10-02): ONLY WHEN A CARD IS UP. It is not a
+                        # no-op without one: the app takes a retraction only for
+                        # a live card, and otherwise shows it as a notice of its
+                        # own — "Gemini recovered and began its deep research"
+                        # about a Gemini nothing had gone wrong with. The plan
+                        # wait raises no card any more, so this is the common case.
+                        if _AGENT_ERROR_CARD_TS.get("gemini"):
+                            try:
+                                emit_event("pipeline_warning", phase=2, agent="gemini",
+                                           error="Gemini's research plan started",
+                                           details="Gemini recovered and began its deep research.",
+                                           actions=[],
+                                           alert_id=_agent_error_alert_id("gemini", 2),
+                                           auto_clear_on_resume=True)
+                                _clear_pending_decision("gemini")
+                                _AGENT_ERROR_CARD_TS.pop("gemini", None)
+                            except Exception:
+                                pass
                         try:
                             await inject_agent_observer(p["page"], "gemini")
                         except Exception:
@@ -50679,6 +50858,31 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #   (c) else the plan is still drafting (streaming, no enabled Start
             #       yet) → leave the watch armed and wait.
             if name == "Gemini" and p.get("gemini_watch_start"):
+                # ⭐ Review 10-02: a FAILED plan is not a finished report. One
+                # honest card and the agent parked, exactly as a research that
+                # fails mid-run (kind "agent_error": Retry starts a fresh chat,
+                # the card's window or a Skip ends it) — no done check, no
+                # extraction, no computer use on a page that holds nothing.
+                _ws_failed = await _gemini_watched_plan_failed(p["page"])
+                if _ws_failed:
+                    _pf_window = unacted_window_sec(_runtime.auto_skip_stuck)
+                    log(f"[{name}] its research plan failed (\"{_ws_failed}\") — asking "
+                        "you: Retry starts a fresh chat, or Skip it", "WARN")
+                    fail_agent("gemini", "Gemini's plan failed",
+                               f"Gemini showed: {_ws_failed} Retry starts a fresh chat, "
+                               "or Skip it.",
+                               raw_err=_ws_failed,
+                               **({"auto_skip_deadline": (time.time() + _pf_window) * 1000,
+                                   "arm_registry": False} if _pf_window else {}))
+                    # Its status says it never started: an unanswered card's
+                    # auto-skip then says "couldn't start", not "failed partway".
+                    results[name] = {"status": "plan_failed", "text": "",
+                                     "url": p.get("url", ""), "page": p["page"],
+                                     "elapsed_sec": int(elapsed)}
+                    void_completion_signals(p)
+                    p["awaiting_decision"] = {"kind": "agent_error", "key": "gemini",
+                                              "since": time.time(), "timeout": _pf_window}
+                    continue
                 try:
                     _ws_running = (p.get("done_count", 0) > 0
                                    or await _gemini_research_started(p["page"]))
@@ -52054,6 +52258,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     results=results, results_name=name)
                 del pending[name]
                 continue
+            # ⭐ Review 10-02: AUTO-SKIP OFF MEANS "ASK ME", NOT "NEVER TELL ME".
+            # A Gemini whose research has not started is left to wait (wave 15):
+            # no "seems stuck" check and no computer-use look while its watch is
+            # armed. With auto-skip off, the ceiling above was the one thing left
+            # that could end that wait, and it stood down — a Gemini stuck on its
+            # plan waited for ever with nothing on screen. So at the ceiling the
+            # person is asked, once: the card Gemini's plan wait used to raise at
+            # ten minutes. The watch stays armed, so a late Start is still pressed.
+            if (_hit_hard_cap and name == "Gemini" and p.get("gemini_watch_start")
+                    and not p.get("hard_cap_asked")):
+                p["hard_cap_asked"] = True
+                log(f"[{name}] its research has not started after "
+                    f"{PER_AGENT_HARD_CAP_SEC // 60} min and auto-skip is off — "
+                    "asking you: Retry or Skip", "WARN")
+                fail_agent(agent_key_stuck, *_GEMINI_CANT_START)
 
             # ── #921 Layer 1 — CUA-arbitrated stuck card at 10 min no-growth ──
             # When nothing has grown for STUCK_NO_GROWTH_SEC (and we're past the
@@ -52069,10 +52288,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # if scrape-blind) from an EMPTY/placeholder/frozen state (stuck),
             # defaulting to WORKING on any doubt so a healthy agent is never
             # wrongly carded (and, with Layer 3 live, never wrongly auto-skipped).
+            # ⭐ Wave 15: and never for a Gemini whose research has not started
+            # (its late-Start watch is armed). Gemini starts by itself on a timer
+            # and its plan legitimately sits for many minutes with nothing to
+            # grow (47 on 10-01); "Gemini seems stuck" there is a false alarm.
             _active_no_growth = (no_growth_secs > STUCK_NO_GROWTH_SEC
                                  and elapsed > STUCK_MIN_ELAPSED_SEC
                                  and since_warn > STUCK_WARN_THROTTLE_SEC
-                                 and not status_is_active)
+                                 and not status_is_active
+                                 and not (name == "Gemini" and p.get("gemini_watch_start")))
             if _active_no_growth:
                 # ⭐ 2026-08-12 — THE THROTTLE HELD ONLY WHILE IT WAS NOT NEEDED.
                 # `since_warn` is the whole re-probe throttle, and `stuck_warned_at`
@@ -52752,6 +52976,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "working — no computer-use completion check while it does "
                         "(one runs 5 minutes after Stop goes, if the page cannot "
                         "tell by then)")
+                continue
+
+            # ⭐⭐ WAVE 15 (10-02) — A GEMINI WHOSE RESEARCH HAS NOT STARTED JUST
+            # WAITS. While its late-Start watch is armed (the watch above presses
+            # a 'Start research' that appears, and clears itself the moment the
+            # research shows), there is nothing a computer-use look can finish,
+            # and its "error" verdict was the door to a Redo, a card and a drop —
+            # for a plan that starts by itself on a timer. The owner: "wait for
+            # the research without refreshing and then let the research finish".
+            # The page's own done check above still runs on every leg.
+            if name == "Gemini" and p.get("gemini_watch_start"):
                 continue
 
             # Check completion — CUA-primary fallback (only if Playwright was
@@ -62857,226 +63092,17 @@ _CLAUDE_EFFORT_SUBMENU_JS = r"""(P) => {
 }"""
 
 
-def _gemini_plan_card_due(*, elapsed: float, wait_max_sec: float,
-                          alert_sec: float, regen_capped: bool,
-                          streaming_recent: bool, start_clicked: bool,
-                          redraft_pending: bool = False) -> bool:
-    """May the early [Retry][Skip] card fire yet?
-
-    ⛔ THE FALSE ALARM (owner's e2e, 2026-08-17). The card went up at 248s and
-    Gemini's plan arrived 25 seconds later; the very next line in the log was
-    "Still waiting for Gemini research plan... (248s / 300s)". We told the owner
-    Gemini could not start while we ourselves were still waiting patiently, with
-    52 seconds of our own budget left — and then retracted it 43 seconds later.
-    Owner: keep it non-blocking, which it is, but stop crying wolf.
-
-    ⭐⭐ The two numbers were configured INDEPENDENTLY: `GEMINI_PLAN_ALERT_SEC`
-    (240) and the loop's own `_start_wait_max_sec` (300). Nothing tied them, so
-    the alarm was free to drift in front of the patience it describes. Tying them
-    is the fix, and it is not a tuning change — an alert that fires while its own
-    caller intends to keep waiting is wrong at ANY pair of numbers.
-
-    ⭐ The REGEN arm is untouched and still fires the instant it is true: three
-    exhausted re-drafts is evidence of failure, not a timer, and #921 exists so
-    that evidence reaches the owner early instead of after a 17-minute ladder.
-
-    `streaming_recent` keeps its #929 meaning: a plan that is visibly still
-    generating is healthy-slow, and `start_clicked` means there is nothing to
-    alert about at all.
-
-    ⭐⭐ `redraft_pending` (2026-09-10) IS THE OWNER'S "THE ALERT COMES LAST",
-    and it sits BELOW the regen arm on purpose. It means: we have clicked
-    Gemini's own re-draft control, the plan has not come back yet, and attempts
-    remain — so the clicks are not exhausted and the card would be describing a
-    recovery that is still in progress. It is deliberately FALSE when nothing
-    was clickable, because no amount of waiting produces a re-draft there; the
-    plain-chat stall is exactly that case, and it is the one the timer arm below
-    exists for.
-
-    ⛔ THIS ARM ONLY BECAME REACHABLE ON 2026-09-10, AND SO DID THE ONE ABOVE
-    IT. `regen_capped` is fed from a counter that only advances when a re-draft
-    is clicked, and until this wave nothing could click Gemini's control — its
-    label is "Redo" and the finder's word list was
-    `retry|regenerate|try again|rerun|restart`. So the evidence arm had eight
-    passing tests and had never once fired in production, and every card this
-    predicate ever raised came from the clock.
-
-    ⭐⭐ 2026-10-01 — NOTHING BEFORE THE WAIT IS OVER, NOT EVEN THE EVIDENCE ARM.
-    The owner: "wait for at least 10 minutes in that planning session before
-    raising anything." So no arm may fire while `elapsed` is short of the wait,
-    three spent re-drafts included; past it, the arms read exactly as above.
-    Before this, the evidence arm was the one way the card could go up early, and
-    it went up about three minutes in.
-    """
-    if start_clicked:
-        return False
-    if streaming_recent:
-        return False
-    if elapsed < float(wait_max_sec):
-        return False
-    if regen_capped:
-        return True
-    if redraft_pending:
-        return False
-    return elapsed >= max(float(alert_sec), float(wait_max_sec))
-
-
-# ── The plan wait refreshes a quiet Gemini chat (2026-10-01, the owner) ───────
-#
-# "You should be refreshing the chat, and also checking we are in the right chat
-# while refreshing, because Gemini might drift the chats too."
-#
-# ⭐ MEASURED in the owner's 10-01 run: Gemini's reply read 36 characters and no
-# buttons at 91 s, the page was loaded afresh at 111 s, and at 121 s the plan
-# was there with 'Start research', which was pressed. On 09-30 the same silent
-# screen sat untouched for five minutes, and then the card went up.
-#
-# ⛔⛔ ONLY EVER INSIDE THE RUN'S OWN /app/<id>, AND PROVEN AFTERWARDS. Gemini's
-# bare /app is its empty home: refreshing it loses the chat. A loaded page is
-# believed only once `_gemini_reload_identity_ok` — the round-robin's prover,
-# the address AND this run's brief in the first user turn — says it is ours.
-# Going BACK to the chat presses its entry in Gemini's side list first (the
-# click Gemini's app routes itself) and loads its address only when the list
-# does not hold it, because of the 2026-07 finding that `page.goto` of a chat
-# address can land on the empty home.
-_GEMINI_PLAN_REFRESH_SEC = int(os.environ.get("GEMINI_PLAN_REFRESH_SEC", "120"))
-
-#: Press the entry for chat `id` in Gemini's side list; True when there was one.
-#: ⛔ The press is put off to the next task on purpose: where pressing it loads a
-#: whole page, the load would otherwise tear down this very call, and a "pressed"
-#: that comes back as an error would send a second load after it.
-_GEMINI_OPEN_CHAT_JS = """
-(id) => {
-  for (const a of document.querySelectorAll('a[href*="/app/"]')) {
-    let path = '';
-    try { path = new URL(a.getAttribute('href'), location.href).pathname; }
-    catch (e) { continue; }
-    if (path.replace(/\\/+$/, '').endsWith('/app/' + id)) {
-      setTimeout(() => a.click(), 0);
-      return true;
-    }
-  }
-  return false;
-}
-"""
-
-
-def _gemini_wait_words(secs: float) -> str:
-    """A wait as a person says it in the log: "2 min", or "45 s" under a minute."""
-    secs = max(0, int(secs))
-    return f"{secs // 60} min" if secs >= 60 else f"{secs} s"
-
-
-def _gemini_plan_page_quiet(state_reason: str, *, reply_found: bool,
-                            reply_len: int, last_reply_len: int) -> bool:
-    """Has Gemini's plan screen shown nothing new since the last look?
-
-    All of: the page reads "nothing running and nothing finished" — no Stop, no
-    moving part, no 'Start research' (pressable or not), no report; Gemini's
-    reply was read and is short (a plan runs to hundreds of characters, which is
-    what `_GEMINI_PLAN_FAIL_MAX_CHARS` already measures); and the reply is the
-    same length as at the last look. The heartbeat's "generating" restarts the
-    quiet clock where the heartbeat is read.
-
-    ⛔ "Cannot tell" is never quiet: an unreadable page, or a reply that could not
-    be read, leaves the tab alone exactly as before.
-    ⛔ No research-card test, deliberately. That pattern reads the page's whole
-    text, the brief included, and a brief that says "researching sources" would
-    have switched refreshing off for its run without a word.
-    """
-    if not str(state_reason or "").startswith("no_done_marker"):
-        return False
-    if not reply_found or reply_len > _GEMINI_PLAN_FAIL_MAX_CHARS:
-        return False
-    return reply_len == last_reply_len
-
-
-def _gemini_plan_refresh_due(now: float, *, quiet_since: float,
-                             last_refresh_at: float,
-                             window_sec: "float | None" = None) -> bool:
-    """May the plan wait load Gemini's chat on this look?
-
-    Only when the page has shown nothing new for a whole window AND the tab was
-    not loaded inside the last window — at most one load per window, whatever it
-    is for. A zero or negative window turns refreshing off.
-    """
-    w = _GEMINI_PLAN_REFRESH_SEC if window_sec is None else float(window_sec)
-    return w > 0 and (now - quiet_since) >= w and (now - last_refresh_at) >= w
-
-
-async def _gemini_plan_refresh(page, chat: dict, brief: str, why: str, *,
-                               settle_sec: float = 3.0) -> bool:
-    """Load the run's own Gemini chat again, then prove it is ours.
-
-    On the run's chat it is refreshed in place (`why` is the log's reason);
-    anywhere else — another chat, or Gemini's empty home — the tab goes back to
-    ours. Mutates `chat`, the plan wait's record of the run's chat, and returns
-    whether the page is now provably ours; that is also left in
-    `chat["trusted"]`, and nothing on a page that is not is read or pressed.
-
-    ⛔ The window is spent BEFORE the load, never after: a load that throws must
-    still wait its turn, or a wedged tab would be loaded on every look.
-    """
-    ours = chat.get("convo") or ""
-    try:
-        here = page.url or ""
-    except Exception:
-        here = ""
-    chat["last_refresh_at"] = time.time()
-    chat["refreshes"] = int(chat.get("refreshes") or 0) + 1
-    n = chat["refreshes"]
-    if _gemini_convo_url_id(here) == ours:
-        log(f"[2D] {why} — refreshing its chat (#{n})")
-        try:
-            await page.reload(wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            log(f"[2D] The refresh did not finish ({e}) — reading the page as it is",
-                "WARN")
-    else:
-        log(f"[2D] Gemini's tab drifted to another chat — going back to ours (#{n}; "
-            f"it was on {redacted_chat_url(here) or 'no address'})", "WARN")
-        try:
-            pressed = bool(await page.evaluate(_GEMINI_OPEN_CHAT_JS, ours))
-        except Exception:
-            pressed = False
-        if pressed:
-            # The press counts only once the tab is there; one that went nowhere
-            # falls back to the address.
-            try:
-                await page.wait_for_url(lambda u: _gemini_convo_url_id(u) == ours,
-                                        timeout=15000)
-            except Exception:
-                pressed = False
-        if not pressed:
-            try:
-                await page.goto(chat.get("url") or "", wait_until="domcontentloaded",
-                                timeout=30000)
-            except Exception as e:
-                log(f"[2D] Loading the run's chat did not finish ({e}) — reading the "
-                    "page as it is", "WARN")
-    await asyncio.sleep(settle_sec)
-    ok = await _gemini_reload_identity_ok(page, ours, brief)
-    if not ok:
-        # Gemini can answer a load of the chat at a new address of its own.
-        try:
-            now_url = page.url or ""
-        except Exception:
-            now_url = ""
-        ok = await _gemini_plan_follow(page, chat, now_url, brief)
-    chat["trusted"] = ok
-    if ok:
-        _, state = await _gemini_done_read(page)
-        log(f"[2D] …back on the run's own chat — Gemini's page now reads: "
-            f"{_gemini_state_words(state)}")
-    else:
-        try:
-            now_at = redacted_chat_url(page.url or "") or "no address"
-        except Exception:
-            now_at = "no address"
-        log(f"[2D] …the tab is not provably the run's own chat ({now_at}) — nothing "
-            f"on it is pressed; it is loaded again in "
-            f"{_gemini_wait_words(_GEMINI_PLAN_REFRESH_SEC)}", "WARN")
-    return ok
+# ── The plan wait: what it no longer does (wave 15, 10-02) ───────────────────
+# ⛔⛔ REMOVED: the plan wait's quiet-chat refresh (`_GEMINI_PLAN_REFRESH_SEC`,
+# 2 min), the reload of a chat it could not prove, and the early
+# "couldn't start" card's timing rule (`_gemini_plan_card_due`). Gemini starts
+# its research by itself on a timer now, and the owner: "wait for the research
+# without refreshing and then let the research finish … keep it simple without
+# making it complicated and causing alerts". On 10-01 and 10-02 the refreshed
+# chat came back showing Gemini's Stop and the plan took no less time. The run's
+# own chat is still proven before anything on it is read or pressed
+# (`_gemini_plan_chat_ok`), and a chat Gemini moves is still followed
+# (`_gemini_plan_follow`) — reading the tab, never reloading it.
 
 
 async def _gemini_plan_follow(page, chat: dict, url: str, brief: str) -> bool:
@@ -63111,19 +63137,22 @@ async def _gemini_plan_chat_ok(page, chat: dict, brief: str) -> bool:
         is read as it always was — unless its first turn provably holds another
         brief. The address is taken the first time the page PROVES it is ours
         (address and brief), never from the address bar alone.
-      · Once it has one, a tab anywhere else is not believed, and it is taken
-        back to ours as soon as a load is allowed (one per refresh window) —
-        unless that other address proves it is this run's chat, moved by Gemini
+      · Once it has one, a tab anywhere else is not believed — unless that other
+        address proves it is this run's chat, moved by Gemini
         (`_gemini_plan_follow`).
-      · A tab back on our address by any route — our load, or Gemini's own — is
-        believed again only once it is proven.
+      · A tab back on our address by Gemini's own doing is believed again only
+        once it is proven.
+
+    ⛔ WAVE 15: IT NEVER RELOADS. A tab that is not provably the run's chat is
+    left as it is: nothing on it is read or pressed, and the wait hands Gemini to
+    the round-robin without the late-Start watch when it is over. It used to
+    take the tab back with a reload, and the owner's rule is now that Gemini's
+    chat is never refreshed.
 
     ⭐⭐ WHY THE ADDRESS WAITS FOR A PROOF. No capture of Gemini's live user turn
     has been checked against this prover, so it is not known to say yes there.
     Taken this way, a prover that cannot recognise the brief means the address is
-    never taken and nothing is ever refreshed — the wait is what it was. Taken
-    from the address bar alone, the first refresh would leave a page that could
-    never be believed, and a plan that then arrived would never be started.
+    never taken — and the page is read as it always was.
     """
     try:
         url = page.url or ""
@@ -63133,7 +63162,7 @@ async def _gemini_plan_chat_ok(page, chat: dict, brief: str) -> bool:
     if not chat.get("convo"):
         if here and await _gemini_reload_identity_ok(page, here, brief, attempts=1):
             chat["convo"], chat["url"] = here, url
-            log("[2D] This run's chat has its address — every refresh comes back to it")
+            log("[2D] This run's chat has its address — only that chat is read or pressed")
         elif here:
             # ⛔ Before the address is taken, a chat whose first turn PROVABLY
             # holds another brief is still somebody else's — its 'Start research'
@@ -63159,11 +63188,7 @@ async def _gemini_plan_chat_ok(page, chat: dict, brief: str) -> bool:
         return True
     else:
         chat["trusted"] = False
-    if not _gemini_plan_refresh_due(time.time(), quiet_since=0.0,
-                                    last_refresh_at=chat.get("last_refresh_at") or 0.0):
-        return False
-    return await _gemini_plan_refresh(
-        page, chat, brief, "The run's chat could not be proven after its last load")
+    return False
 
 
 def _claude_effort_submenu_verdict(probe) -> str:
@@ -66781,13 +66806,21 @@ async def _ensure_brief_attached(browser, page, brief_path, platform, label,
     return False
 
 
+#: The first sentence of the message typed beside an attached brief — and of the
+#: computer-use fallback's, which opens with the same words. When the brief goes
+#: as a file, this sentence is what the chat's first message holds, so it is what
+#: a crash retry recognises the chat by (`_p2_turn_holds_our_send`).
+_P2_ATTACHED_BRIEF_ASK = ("Please perform deep research on the topic described "
+                          "in the attached brief.")
+
+
 async def type_short_inline_prompt(page, platform, label):
     """Type a short inline prompt instructing the agent to research the
     attached brief. Keeps the platform's 'Deep Research' mode as the
     operative instruction; the full brief content lives in the file."""
     # One message, short enough that no platform converts it to an attachment.
     prompt = (
-        "Please perform deep research on the topic described in the attached brief. "
+        _P2_ATTACHED_BRIEF_ASK + " "
         "Use the brief as the complete context — objectives, scope, sections, sources to target. "
         "Produce a comprehensive research report. " + _P2_CITE_SENTENCE
     )
@@ -67509,6 +67542,7 @@ async def _finalize_agent_autoskip(browser, page, key: str, name: str, *,
                details=_detail,
                actions=[], alert_id=f"agent_{key}_autoskip",
                auto_clear_on_resume=True)
+    _drop_agent_card_stamp(key)
     try:
         await _close_skipped_agent_tab(browser, page, key, name,
                                        final_status=final_status)
@@ -67567,6 +67601,7 @@ async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
                details=_autoskip_details("hv_wall", _name),
                actions=[], alert_id=f"agent_{agent_key}_autoskip",
                auto_clear_on_resume=True)
+    _drop_agent_card_stamp(agent_key)
     _clear_pending_decision()
     await _close_skipped_agent_tab(browser, page, agent_key, label,
                                    preserve_tab=preserve_tab)
@@ -70654,7 +70689,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     return page, True
 
 
-async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None):
+async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None,
+                     rejoin=None):
     """Phase 2: ChatGPT → Claude → Gemini (submit+plan) → scrape-pass → Gemini (Start) → Poll all.
 
     Sequence change: Gemini moved to last of the setup trio. One round-robin scrape
@@ -70664,7 +70700,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     main-rotation poll tick. Gemini stays in 'planning' (never 'complete') until its
     'Start research' button is clicked — gated by scrape_progress_gemini's planning-gate.
 
-    enabled_agents: list of agent keys to run (e.g. ["chatgpt", "gemini"]). None = all."""
+    enabled_agents: list of agent keys to run (e.g. ["chatgpt", "gemini"]). None = all.
+
+    rejoin: {agent key: chat URL} a browser-crash retry carried over (10-01). Each
+    of those agents is taken back into its own chat and handed to the round-robin
+    as it is; only the rest are set up and sent the brief."""
     log("=" * 60)
     log("PHASE 2: Deep Research")
     if enabled_agents:
@@ -70723,6 +70763,24 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     if source_paths:
         log(f"Phase 2: delivering {len(source_paths)} user source doc(s) to each agent: "
             f"{[Path(p).name for p in source_paths]}")
+
+    # ⭐ 10-01: a browser-crash retry goes back into each agent's own chat FIRST.
+    # An agent it is back with is not set up again below; one it is not (no chat,
+    # signed out, not provably this run's) is, exactly as before.
+    rejoined = {}
+    if rejoin:  # a Stop, before or during it, ends it (`_p2_rejoin_chats`)
+        _launch = (list(enabled_agents) if enabled_agents is not None
+                   else ["chatgpt", "gemini", "claude"])
+        rejoined = await _p2_rejoin_chats(
+            browser, _p2_rejoin_plan(rejoin, _launch), _launch, brief_text)
+        enabled_agents = [a for a in _launch
+                          if _agent_display_name(a) not in rejoined]
+    # 10-01: every agent set up below leaves the chat it had (a person's Retry or
+    # new input, a crash retry's chat that could not be proven). A crash before
+    # its new brief goes in must not carry the chat it was leaving.
+    for _a in (enabled_agents if enabled_agents is not None
+               else ("chatgpt", "gemini", "claude")):
+        _p2_forget_chat(str(_a).lower())
 
     agents = {}
     chatgpt_page = None
@@ -70798,6 +70856,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                        stage="researching",
                        progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
+            _p2_note_chat("chatgpt", chatgpt_page)  # 10-01: a crash retry rejoins it
             await inject_agent_observer(chatgpt_page, "chatgpt")
         else:
             # 2026-05-14: page-alive gating before fail_agent. If the URL
@@ -70837,6 +70896,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="generating",
                            stage="researching",
                            progress="ChatGPT DR submitted — verifying via round-robin polling")
+                _p2_note_chat("chatgpt", chatgpt_page)  # 10-01, as above
                 await inject_agent_observer(chatgpt_page, "chatgpt")
             elif _controls.is_stop():
                 # #737: a user Stop during the setup/chat-mode pause returns
@@ -70971,6 +71031,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                        stage="researching",
                        progress="Claude deep research started and verified")
             log("[2B] Claude is running ✓")
+            _p2_note_chat("claude", claude_page)  # 10-01: a crash retry rejoins it
             await inject_agent_observer(claude_page, "claude")
         else:
             # 2026-05-14: mirror Fix #5 from ChatGPT 2A. If the URL
@@ -70992,6 +71053,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_progress", phase=2, agent="claude", status="generating",
                            stage="researching",
                            progress="Claude DR submitted — verifying via round-robin polling")
+                _p2_note_chat("claude", claude_page)  # 10-01, as above
                 await inject_agent_observer(claude_page, "claude")
             elif _controls.is_stop():
                 # #737: a user Stop during the setup/chat-mode pause returns
@@ -71069,6 +71131,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             source_paths=source_paths)
         if gemini_setup_ok:
             log("[2C] Gemini brief submitted — letting it generate research plan")
+            _p2_note_chat("gemini", gemini_page)  # 10-01: a crash retry rejoins it
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", stage="planning", progress="Gemini generating research plan...")
             # #893 tier backstop: with verification off by default, the P0
             # walk + gate tier checks no longer run — this DOM read on the
@@ -71278,151 +71341,61 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # close), so the recovery/verify/round-robin hand-off below must
         # all stand down for this agent.
         _gemini_2d_skipped = False
-        # The plan-draft wait. ⭐ 2026-10-01, back to ten minutes, by the owner:
-        # "In Gemini the planning is taking a little more time now. Wait for at
-        # least 10 minutes in that planning session before raising anything." (It
-        # was five, after the user's 07 "Start research in 3-5 min max".) Inside
-        # it the chat is refreshed while it shows nothing new — see
-        # `_gemini_plan_refresh`. Env-overridable. After this window the bounded
-        # CUA recovery runs, then an honest fail_agent (Retry/Skip).
+        # ⭐⭐ WAVE 15 (10-02) — GEMINI JUST WAITS. Gemini now starts its research
+        # by itself on a timer, as ChatGPT does. The owner: "wait for the
+        # research without refreshing and then let the research finish … keep it
+        # simple without making it complicated and causing alerts". So this wait
+        # never reloads the chat, never presses Stop or Redo, never opens a new
+        # chat, never points computer use at it and never raises a card. It
+        # watches the run's own chat for up to `_start_wait_max_sec` (the owner's
+        # ten minutes, env-settable), presses a 'Start research' that appears (a
+        # plan Gemini did not start by itself), and hands Gemini to the
+        # round-robin when it was pressed, when Gemini finished on its own, or
+        # when the wait is over. The round-robin's late-Start watch presses a
+        # 'Start research' that appears after that, and lets the research finish.
+        #
+        # ⛔⛔ REMOVED, and why each was wrong:
+        #   · the six-minute "a plan never streams this long, so Gemini has almost
+        #     certainly auto-started" hand-off (#953). 10-01 (3NH9Q7CH retry2):
+        #     Gemini sat on "Generating research plan" from 11:38 to 12:25 — 47
+        #     minutes — while that line said its research was running;
+        #   · the two-minute quiet-chat refresh and the reload of a chat that
+        #     could not be proven (10-01): on 10-01 and 10-02 the reloaded page came
+        #     back showing Gemini's Stop, and the plan took no less time;
+        #   · the plan re-draft (Redo), the computer-use recovery ladder that
+        #     pressed Retry/Regenerate, and the "Gemini couldn't start Deep
+        #     Research" card when the wait gave up.
+        # The general run ceiling is unchanged.
         _start_wait_max_sec = int(os.environ.get("GEMINI_PLAN_WAIT_SEC", str(10 * 60)))
         # Shared JS: click the "Start research" button, and a sibling probe for
         # whether it's STILL present (used to confirm a click actually took).
         # #953: hoisted to module scope (_GEMINI_CLICK_START_JS /
         # _GEMINI_START_PRESENT_JS) so the round-robin's late-Start watch leg
-        # runs the exact same #905-hardened predicate — local aliases kept so
-        # this block reads unchanged.
+        # runs the exact same #905-hardened predicate.
         _click_start_js = _GEMINI_CLICK_START_JS
         _start_present_js = _GEMINI_START_PRESENT_JS
         _loop_start = time.time()
         _last_plan_emit = 0.0
         _last_claude_q_probe = 0.0  # #953: background Claude question-card sweep
-        # #755 (2026-06-02): Gemini sometimes fails to draft the research plan
-        # (shows "...something went wrong" + a Regenerate/Retry button instead of
-        # "Start research"). Auto-click that retry, bounded, so the plan re-drafts
-        # and the loop can then click "Start research" — instead of dwelling the
-        # full 10 min and escalating to a needless human alert.
-        _regen_count = 0
-        _GEMINI_MAX_PLAN_REGEN = 3
-        _GEMINI_REGEN_COOLDOWN_SEC = 45   # space attempts so a slow-but-healthy
-        # ⛔ STARTS WITH THE LOOP, NOT AT ZERO. At 0.0 the cooldown is already
-        # satisfied on the very first tick, so a re-draft could fire ~2 seconds
-        # after the brief was submitted — at a turn still painting, whose first
-        # words may be Gemini's own transient narration. Harmless while nothing
-        # could click; a live hazard now. The same 45 seconds every later
-        # attempt gets is the right grace for the first, and it needs no new
-        # constant.
-        _last_regen_at = time.time()      # re-draft can't burn the 3-cap
-        _regen_cap_emitted = False
-        _logged_stall_diag = False
-        # #921 incident-3: surface a [Retry][Skip] card EARLY. Before this, the
-        # honest fail_agent lived only after the full 300s plan-wait + a 3× CUA
-        # recovery ladder (~17 min) — so the 2026-07-08 stale run (Gemini
-        # answered the brief as plain chat, no plan / no 'Start research' ever
-        # rendered) sat with no card until the user hit Stop. We now raise a
-        # NON-BLOCKING card the moment the plan has clearly failed (3 error
-        # regens OR no plan at all after _PLAN_ALERT_SEC), while the loop + CUA
-        # recovery keep self-healing. If a plan then appears we retract it.
-        # ⭐ 2026-10-01: never before the wait is over, three re-drafts or not —
-        # the card now goes up where the wait gives up (see 1d below).
-        _plan_alert_emitted = False
-        # ⭐ 2026-10-01: the wait itself — ten minutes, and nothing is raised
-        # before it (was 240 s). `_gemini_plan_card_due` takes the later of the
-        # two, so a fixed default here would silently drop the card where a
-        # shorter GEMINI_PLAN_WAIT_SEC gives up.
-        _PLAN_ALERT_SEC = int(os.environ.get("GEMINI_PLAN_ALERT_SEC",
-                                             str(_start_wait_max_sec)))
-        # #929: plan-STREAMING hold-off. The flat 300s budget + 4-min card
-        # fired on a healthy plan that simply took >5 min to draft
-        # (2026-07-09 live false alarm → card → auto-skip of a working
-        # Gemini). While the heartbeat scrape shows the plan actively
-        # generating (status='generating': stop button / streaming attr /
-        # running animation — scrape_progress_gemini), we hold the
-        # early card and extend the wait, bounded by a hard cap so a
-        # misread animation can't dwell forever.
-        _stream_max_sec = int(os.environ.get("GEMINI_PLAN_STREAM_MAX_SEC", "900"))
-        _last_stream_seen_at = time.time()  # grace: the submit just happened
-        # #953 (2026-07-13 run): Gemini AUTO-STARTED its research (plan at
-        # ~95s, Start button rendered already-disabled, research ran with no
-        # click) — the streaming heartbeat then read the RUNNING RESEARCH as
-        # "plan still streaming", so the #929 extension dwelt the full 900s
-        # cap, the CUA recovery ladder spent ~7 min re-clicking the grayed
-        # Start button ("spamming Start Research"), a false "couldn't start"
-        # card fired on a healthy agent, and ChatGPT/Claude went unpolled for
-        # 22 minutes. A PLAN never streams for more than a few minutes — so
-        # past this hand-off point, persistent streaming means the research
-        # is (almost certainly) already running. Instead of dwelling, HAND
-        # OFF to the round-robin: its detectors decide (they correctly
-        # declared this very run done at 98k chars), and its late-Start
-        # watch leg (#953, poll loop) clicks a slow plan's Start button if
-        # one appears after all. No CUA ladder, no card — both are for the
-        # truly-dead (non-streaming) plan only.
-        _stream_handoff_sec = int(os.environ.get("GEMINI_PLAN_STREAM_HANDOFF_SEC", "360"))
-        _streaming_handoff = False
         # Wave 13: Gemini started AND finished on its own inside this wait — see
-        # `_gemini_finished_on_its_own`. No card, no vision re-drafts.
+        # `_gemini_finished_on_its_own`. The round-robin collects the report.
         _finished_handoff = False
         # ⭐ 2026-09-30: what the per-tick page reading says about Gemini (still
-        # working, nothing running, finished), logged whenever it CHANGES. The
-        # 09-30 log could not say whether Gemini was working in the seven
-        # minutes before its card went up, although this reading was taken
-        # every ten seconds.
+        # working, nothing running, finished), logged whenever it CHANGES.
         _gemini_state = ""
         _gemini_state_logged = None
-        # ⭐⭐ 2026-10-01 (the owner): "refresh the chat, and check we are in the
-        # right chat while refreshing". The run's own chat — its address, taken
-        # once the page proves it holds this brief — when the page last showed
-        # anything new, and when the tab was last loaded. Read and kept by
-        # `_gemini_plan_chat_ok` and `_gemini_plan_refresh`.
-        _chat = {"convo": "", "url": "", "trusted": True, "quiet_since": _loop_start,
-                 "last_refresh_at": 0.0, "refreshes": 0, "last_len": -1,
-                 "held_logged": False}
+        # ⭐⭐ 2026-10-01: the run's own chat — its address, taken once the page
+        # proves it holds this brief. A tab that is not provably the run's chat
+        # is never read or pressed (`_gemini_plan_chat_ok`), and never reloaded.
+        _chat = {"convo": "", "url": "", "trusted": True}
         _chat_ok = True
 
-        def _raise_plan_alert(where: str):
-            """Put the non-blocking [Retry][Skip] card up, once."""
-            nonlocal _plan_alert_emitted
-            if _plan_alert_emitted or _controls.is_stop():
-                return
-            _plan_alert_emitted = True
-            log(f"[2D] Plan not started after {int(time.time() - _loop_start)}s "
-                f"(regens={_regen_count}) — surfacing early [Retry][Skip] card "
-                f"({where}; non-blocking, recovery continues)", "WARN")
-            try:
-                fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
-            except Exception:
-                pass
-
-        def _retract_plan_alert(where: str):
-            # #921/#929: retract the early plan-stall card once the plan
-            # recovers. The main-loop click path always did this; the two
-            # CUA-recovery success paths didn't — leaving a stale
-            # [Retry][Skip] card sitting on a healthy researching Gemini.
-            nonlocal _plan_alert_emitted
-            if not _plan_alert_emitted:
-                return
-            try:
-                emit_event("pipeline_warning", phase=2, agent="gemini",
-                           error="Gemini's research plan started",
-                           details="Gemini recovered and began its deep research.",
-                           actions=[], alert_id=_agent_error_alert_id("gemini", 2),
-                           auto_clear_on_resume=True)
-                _clear_pending_decision("gemini")
-            except Exception:
-                pass
-            _plan_alert_emitted = False
-            log(f"[2D] Retracted the early plan-stall card — plan recovered ({where})", "INFO")
-
         while True:
-            # #929: dynamic budget — original 300s window, extended while the
-            # plan is visibly streaming, hard-capped at _stream_max_sec.
             _elapsed = int(time.time() - _loop_start)
             # ⭐⭐ 2026-10-01: before ANY reading is believed, is this the run's
             # own chat? A finished report on another chat is somebody else's.
-            # A tab that drifted is taken back here.
             _chat_ok = await _gemini_plan_chat_ok(gemini_page, _chat, brief_text)
-            # ⛔ Wave 13: FIRST, before the budget below can raise "couldn't
-            # start" — a Gemini whose report is already on the page started and
+            # ⛔ Wave 13: a Gemini whose report is already on the page started and
             # finished by itself. Hand it to the round-robin to collect.
             _gemini_done, _gemini_state = ((await _gemini_done_read(gemini_page))
                                            if _chat_ok else (False, _gemini_state))
@@ -71436,72 +71409,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     f"({_elapsed}s, no 'Start research' was needed) — handing it to "
                     "the round-robin to collect the report", "INFO")
                 break
-            # ⭐ 2026-10-01: Gemini's own VISIBLE 'Stop response' is streaming too.
-            # The heartbeat's stop test (scrape_progress_gemini) is case-sensitive
-            # and misses it, so a Gemini already researching behind it read as a
-            # dead plan: no #953 hand-off at six minutes — the whole wait, the card
-            # and the ladder instead (the 10-01 crash retry). Only the visible one:
-            # a hidden Stop or a leftover animation can stay on a page for good
-            # (08-19), and would hand a dead plan off past its card.
-            if _chat_ok and _gemini_state.startswith("stop_btn_present"):
-                _last_stream_seen_at = time.time()
-            _streaming_recent = (time.time() - _last_stream_seen_at) < 45
-            # #953: still streaming past the hand-off point → the research
-            # (almost certainly) auto-started — hand off to the round-robin
-            # instead of dwelling to the hard cap + CUA ladder + false card.
-            # ⛔⛔ AND NOT WHEN THE STREAMING IS OUR OWN RE-DRAFT. This branch
-            # reads persistent streaming as "a plan never streams this long, so
-            # the research has almost certainly auto-started" — and a Redo we
-            # clicked ourselves restarts the plan, legitimately, which the
-            # heartbeat then reports as `generating`. Before this wave nothing
-            # could click, so the premise held by accident. Unfixed it hands a
-            # planless Gemini to the round-robin as though its research were
-            # already running, skips the CUA ladder, retracts the card, and
-            # writes a log line that is false. So the hand-off window must have
-            # elapsed since OUR last attempt too; with no attempt yet
-            # `_last_regen_at` is the loop start, and this reads exactly as it
-            # did before.
-            if (_elapsed >= _stream_handoff_sec and _streaming_recent
-                    and (time.time() - _last_regen_at) >= _stream_handoff_sec):
-                _streaming_handoff = True
-                log(f"[2D] Still streaming at {_elapsed}s (≥ {_stream_handoff_sec}s) — a plan "
-                    "never streams this long, so Gemini has almost certainly auto-started its "
-                    "research. Handing off to the round-robin (detectors decide; its watch leg "
-                    "clicks a late 'Start research' if one appears)", "INFO")
-                break
-            if _elapsed >= _stream_max_sec:
-                log(f"[2D] Plan wait hard cap reached ({_elapsed}s ≥ {_stream_max_sec}s) "
-                    "— handing off to recovery", "WARN")
-                break
-            if _elapsed >= _start_wait_max_sec and not _streaming_recent:
-                # ⛔ THE CARD HAS TO GO UP HERE, not merely be allowed to. The
-                # timer arm is now tied to this same budget, and this break sits
-                # ABOVE the card block — so leaving it out would make that arm
-                # unreachable and quietly delete the #921 protection, which is
-                # the exact "a guard that can never fire" shape this file spent
-                # 2026-08-17 removing from two other steps.
-                if _gemini_plan_card_due(
-                        elapsed=_elapsed, wait_max_sec=_start_wait_max_sec,
-                        alert_sec=_PLAN_ALERT_SEC,
-                        regen_capped=_regen_cap_emitted,
-                        streaming_recent=_streaming_recent,
-                        start_clicked=bool(start_clicked),
-                        # ⛔⛔ FALSE HERE, AND NOT AS A SHORTCUT. `redraft_pending`
-                        # means "keep waiting, a re-draft is in flight" — and this
-                        # call site is the loop DECIDING TO STOP WAITING: the next
-                        # statement is an unconditional `break`, so there is no
-                        # next attempt for the card to defer to. Passing the flag
-                        # here deferred the alert to a retry the following line
-                        # cancelled, which left the owner with nothing on screen
-                        # until the CUA ladder's terminal card ~12 minutes later.
-                        # That is the seventeen-minute ladder #921 exists to
-                        # remove, deleted by a boolean instead of by an edit —
-                        # exactly what the comment above this block warns about.
-                        # ⭐ The rule both directions: an alert that fires while
-                        # its caller intends to keep waiting is wrong, and an
-                        # alert held while its caller is giving up is wrong too.
-                        redraft_pending=False):
-                    _raise_plan_alert("our own plan-wait budget is spent")
+            if _elapsed >= _start_wait_max_sec:
+                log(f"[2D] No 'Start research' to press after {_elapsed // 60} min — Gemini "
+                    "starts its research by itself. Handing it to the round-robin, which "
+                    "presses a late 'Start research' if one appears and lets the research "
+                    "finish (nothing refreshed, no card)", "INFO")
                 break
             # #755: stop/pause-aware — a 10-min plan wait must honor Stop/Pause.
             if _controls.is_stop():
@@ -71513,9 +71425,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     break
             # #929: consume a user Skip DURING the plan wait — pre-fix this
             # loop only honored Stop, so a Skip on the early card left it
-            # regenerating/waiting on a dismissed agent with NO agent_skipped
-            # ever emitted (persisted tile stayed red — the grey-fade-on-skip
-            # rule broke) and the tab left open.
+            # waiting on a dismissed agent with NO agent_skipped ever emitted
+            # (persisted tile stayed red — the grey-fade-on-skip rule broke) and
+            # the tab left open.
             if "gemini" in _controls.skipped_agents:
                 log("[2D] User skipped Gemini during the plan wait — finalizing skip", "INFO")
                 _controls.consume_skip_marker("gemini")
@@ -71523,15 +71435,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
                 await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
                 break
-            # 1a. (2026-10-01, the owner) A chat that shows nothing new is
-            # refreshed: in the owner's 10-01 run the plan was there after a
-            # fresh load at 111 s. Only ever the run's own chat, at most once per
-            # window, never while anything on it moves or a plan is showing —
-            # and a refreshed page is believed only once it is proven ours.
             if not _chat_ok:
-                # Not provably the run's chat: nothing on it is read or pressed
-                # on this look. The top of the loop takes it back when a load is
-                # allowed again. The tile and the log still hear from the wait,
+                # Not provably the run's chat: nothing on it is read or pressed on
+                # this look. The tile and the log still hear from the wait,
                 # without a reading of a page that may be somebody else's.
                 if time.time() - _last_plan_emit >= 15:
                     try:
@@ -71545,43 +71451,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     f"{_start_wait_max_sec}s)")
                 await asyncio.sleep(10)
                 continue
-            _reply = await _gemini_regen_read(gemini_page)
-            _reply_len = len(_reply.get("text") or "")
-            if not _gemini_plan_page_quiet(_gemini_state,
-                                           reply_found=bool(_reply.get("found")),
-                                           reply_len=_reply_len,
-                                           last_reply_len=_chat["last_len"]):
-                _chat["quiet_since"] = time.time()
-            _chat["last_len"] = _reply_len
-            # Our own re-draft press is something new on the page too.
-            _quiet_since = max(_chat["quiet_since"], _last_regen_at)
-            if _gemini_plan_refresh_due(time.time(), quiet_since=_quiet_since,
-                                        last_refresh_at=_chat["last_refresh_at"]):
-                _quiet_for = _gemini_wait_words(time.time() - _quiet_since)
-                if _chat["convo"]:
-                    if not await _gemini_plan_refresh(
-                            gemini_page, _chat, brief_text,
-                            f"Gemini showed nothing new for {_quiet_for}"):
-                        await asyncio.sleep(10)
-                        continue
-                elif not _chat["held_logged"]:
-                    _chat["held_logged"] = True
-                    _where = _gemini_convo_url_id(gemini_page.url or "")
-                    log(f"[2D] Gemini showed nothing new for {_quiet_for}, but "
-                        + ("it has not given this chat its address yet — not "
-                           "refreshing (that would lose the chat)" if not _where
-                           else "the chat it is on could not be proven to be this "
-                                "run's — not refreshing a chat that may not be ours")
-                        + "; still waiting")
-            # 1. Check Start-research button on Gemini and click if present
-            # ⭐ `_start_present_now` is this tick's ANSWER to "is there an
-            # enabled Start control", and it comes from the finder that just
-            # ran rather than from a second probe that could disagree with it
-            # (#905: two finders reading the same DOM differently is how the
-            # disabled skeleton got clicked). A falsy click means the shared
-            # predicate found no enabled control; a click that did not take
-            # means the control is still sitting there.
-            _start_present_now = False
+            # 1. Check Start-research button on Gemini and click if present.
             try:
                 await browser.switch_to_page(gemini_page)
                 clicked = await gemini_page.evaluate(_click_start_js)
@@ -71617,194 +71487,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     if _took:
                         log("[2D] Clicked 'Start research' via JS ✓ (confirmed it took)")
                         start_clicked = True
-                        # #921: the plan recovered after we'd raised the early
-                        # [Retry][Skip] card — retract it so a stale error card
-                        # doesn't sit on a now-healthy agent (#929: shared
-                        # helper, also used by the CUA-recovery success paths).
-                        _retract_plan_alert("main loop")
                         await asyncio.sleep(5)
                         break
-                    _start_present_now = True
                     log("[2D] 'Start research' click didn't take after a patient "
                         "re-click (30s watch) — continuing to poll", "WARN")
             except Exception:
                 pass
 
-            # 1b. (#755; rebuilt 2026-09-10 from the owner's captured DOM)
-            # No "Start research" yet — read what the plan screen IS, and only
-            # when the LATEST turn says the draft failed, click Gemini's own
-            # re-draft control.
-            #
-            # ⛔⛔ THE PLAN'S NOTE ABOUT THIS LOOP, CORRECTED 2026-09-18. Wave
-            # 10's text says "nothing in the poll loop reads failure text". It
-            # does — right here, through `_gemini_reads_as_failed` below. What
-            # is true is the SCOPE: this whole branch is gated on `not
-            # start_clicked`, so it is dead from the moment Start research is
-            # clicked, and nothing reads failure text in the post-Start window
-            # at all. The retired helper never had a poll-loop caller either;
-            # both of its call sites were on the send path, before this screen.
-            #
-            # ⛔⛔ WHAT THIS REPLACED, AND WHY IT COULD NOT BE A TUNING CHANGE.
-            # This branch delegated to `_try_inpage_retry_on_research_fail`
-            # (retired 2026-09-18), whose button word list was `retry|
-            # regenerate|try again|rerun|restart`. Gemini's control is
-            # `aria-label="Redo"`. So this branch never clicked anything — not
-            # on a bad day, ever — and
-            # `_regen_count` has never left zero, which also means the
-            # `regen_capped` arm of `_gemini_plan_card_due` (eight tests, all
-            # green) has never been reachable in production. The other wording,
-            # "encountering an error", missed a fail-text alternation that says
-            # "encountered". Two words, and no test could see either: the only
-            # one that read that pattern re-compiled it in Python and fed it a
-            # sentence written to satisfy it.
-            #
-            # ⭐⭐ AND THE GATE IS THE STATE NOW, NOT THE TEXT. `not
-            # start_clicked` is true for the entire drafting window, so the old
-            # branch leaned wholly on that helper's page-wide fail-text probe to
-            # stay off a healthy plan. `_gemini_plan_verdict` is asked instead,
-            # from four measured inputs — and the expensive one is bought only
-            # on the tick where a click is imminent, because re-drafting a
-            # RUNNING research is the single destructive move available on this
-            # screen and the 2026-07-13 auto-start layout renders Start
-            # permanently disabled, so "no Start control" cannot tell a dead
-            # plan from a live run by itself.
-            if (not start_clicked and _regen_count < _GEMINI_MAX_PLAN_REGEN
-                    and not _controls.is_stop()
-                    and (time.time() - _last_regen_at) > _GEMINI_REGEN_COOLDOWN_SEC):
-                _reading = await _gemini_regen_read(gemini_page)
-                _latest = _reading.get("text") or ""
-                _already_running = False
-                if _gemini_reads_as_failed(_latest):
-                    try:
-                        _already_running = await _gemini_research_started(gemini_page)
-                    except Exception:
-                        # ⛔ TRUE, NOT FALSE, AND THE POLARITY IS THE POINT.
-                        # `_gemini_research_started` is documented fail-closed
-                        # "so a probe miss never fakes a start" — but at THIS
-                        # call site False is what authorises the click, and the
-                        # click is the one destructive move on this screen. A
-                        # probe that could not answer must read as "assume it is
-                        # running": the cost is one re-draft skipped, against
-                        # re-drafting a live research run.
-                        _already_running = True
-                _verdict = _gemini_plan_verdict(
-                    research_started=_already_running,
-                    start_present=_start_present_now,
-                    streaming=_streaming_recent, latest_text=_latest)
-                if _verdict == "failed":
-                    (_redrafted, _acted, _in_flight,
-                     _why_rd) = await _gemini_redraft_plan(gemini_page, "2D-plan")
-                    if _acted:
-                        # ⭐ THE ATTEMPT IS SPENT ON THE CLICK, NOT ON THE
-                        # OUTCOME. A control that clicks and never re-drafts
-                        # would otherwise be clicked every ten seconds forever
-                        # — the Start-button spam #953 removed.
-                        _regen_count += 1
-                        _last_regen_at = time.time()
-                        log(f"[2D] Gemini plan re-draft "
-                            f"{_regen_count}/{_GEMINI_MAX_PLAN_REGEN}: {_why_rd}",
-                            "INFO" if _redrafted else "WARN")
-                        try:
-                            emit_event("agent_progress", phase=2, agent="gemini",
-                                       status="generating", stage="planning",
-                                       progress=(f"Gemini's plan hit an error — retrying "
-                                                 f"({_regen_count}/{_GEMINI_MAX_PLAN_REGEN})…"))
-                        except Exception:
-                            pass
-                    # ⭐ 2026-10-01: nothing waits on `_in_flight` here any more.
-                    # It held the early card while a re-draft was under way (the
-                    # owner's "the alert comes last", 09-10); the card now never
-                    # goes up before the wait is over, so there is no early card
-                    # to hold.
-                    if not _acted and not _logged_stall_diag and _elapsed > 90:
-                        log(f"[2D] Gemini plan reads as FAILED at {_elapsed}s but no "
-                            f"re-draft control was reachable ({_why_rd}); controls "
-                            f"read: {_reading.get('controls')}", "WARN")
-                        _logged_stall_diag = True
-                else:
-                    if (_verdict == "silent" and not _reading.get("found")
-                            and not _logged_stall_diag and _elapsed > 90):
-                        # ⛔ A READ THAT FAILED IS NOT A SILENT PLAN. Without
-                        # this, the one artefact meant to make a Gemini UI
-                        # revision visible reported "no plan, no error text, not
-                        # streaming" with `controls read: None` — naming the
-                        # wrong cause for the exact failure it exists to catch.
-                        log(f"[2D] Gemini plan reading FAILED at {_elapsed}s — no "
-                            f"model turn matched {list(_GEMINI_TURN_SELECTORS)}; the "
-                            f"re-draft path is blind until that is fixed", "WARN")
-                        _logged_stall_diag = True
-                    elif (_verdict == "silent" and not _logged_stall_diag
-                            and _elapsed > 90):
-                        # No plan, no error, nothing moving — the 2026-07-08
-                        # plain-chat run. Read-only, once: there is nothing to
-                        # click here and clicking an unidentified control is a
-                        # destructive misclick waiting to happen. This is the
-                        # state the early card exists for.
-                        # ⭐ 2026-09-30: + the reply's size and button count and
-                        # what the page says about Gemini, so this one line tells
-                        # "still working" from "a reply that stopped".
-                        log(f"[2D] Gemini plan stall diag @ {_elapsed}s: no plan, no "
-                            f"error text, not streaming (verdict={_verdict}); "
-                            f"controls read: {_reading.get('controls')}; its reply: "
-                            f"{len(_reading.get('text') or '')} chars, "
-                            f"{len(_reading.get('controls') or [])} buttons; Gemini's "
-                            f"page reads: {_gemini_state_words(_gemini_state)}", "WARN")
-                        _logged_stall_diag = True
-
-            # 1c. (#755) Auto-regenerate exhausted but still no plan — surface it
-            # ONCE so the eventual not-verified outcome reads as a known repeated
-            # failure in the FE, not a silent stall (the user previously had to
-            # retry by hand ~3×). We keep polling until the window/CUA fallback.
-            # ⛔ AND NOT UNTIL THE LAST ATTEMPT HAS HAD ITS OWN WINDOW. This arm
-            # was unreachable in production until this wave (nothing could click
-            # Gemini's control, so the counter never moved), and making it
-            # reachable exposed a missing grace: attempts 1 and 2 each get the
-            # full cooldown to produce a plan, while attempt 3 was judged ~10
-            # seconds after its click — the settle window and nothing more. Same
-            # page, same failure, and a card on the third that the first would
-            # not have raised. Cross-verify caught it; the fix is to spend the
-            # same patience on the last attempt as on the others.
-            if (not start_clicked and _regen_count >= _GEMINI_MAX_PLAN_REGEN
-                    and not _regen_cap_emitted and not _controls.is_stop()
-                    and (time.time() - _last_regen_at) > _GEMINI_REGEN_COOLDOWN_SEC):
-                _regen_cap_emitted = True
-                log(f"[2D] Gemini plan auto-regenerate exhausted ({_regen_count} tries) "
-                    f"— still no 'Start research'; will keep polling then escalate", "WARN")
-                try:
-                    emit_event("agent_progress", phase=2, agent="gemini",
-                               status="generating", stage="planning",
-                               progress=(f"Gemini's plan keeps failing — retried "
-                                         f"{_regen_count}× and still waiting…"))
-                except Exception:
-                    pass
-
-            # 1d. (#921 incident-3) RETIRED 2026-10-01. This raised the card
-            # inside the wait — after three spent re-drafts, about three minutes
-            # in. The owner: "wait for at least 10 minutes in that planning
-            # session before raising anything", and `_gemini_plan_card_due` now
-            # refuses every arm before the wait is over. Past it, this loop only
-            # keeps going while Gemini is visibly streaming, when the card is not
-            # due either — so the card goes up in one place, where the wait gives
-            # up (above), and is still non-blocking and still retracted.
-
             # 2. Emit a Gemini planning heartbeat every ~15s so the frontend
-            # shows smooth live motion while Gemini drafts the plan (was 60s,
-            # which read as frozen during the wait). No rotation — we do NOT
-            # scrape ChatGPT/Claude here; they kept their first-wave state and
-            # will refresh on the official round-robin.
+            # shows smooth live motion while Gemini drafts the plan. No rotation
+            # — we do NOT scrape ChatGPT/Claude here; they kept their first-wave
+            # state and will refresh on the official round-robin.
             if time.time() - _last_plan_emit >= 15:
                 try:
                     _gm = await scrape_progress_gemini(gemini_page) or {}
-                    # #929: streaming clock — RAW scrape status only ('generating'
-                    # = stop button / streaming attr / running animation, incl.
-                    # the plan-ready-awaiting-Start state, which the clicker
-                    # resolves within a tick). A failed scrape ('scrape_error')
-                    # or idle/complete page does NOT feed the clock, so a dead
-                    # plan still ages out on the original 300s budget.
-                    if (_gm.get("status") or "") == "generating":
-                        _last_stream_seen_at = time.time()
-                        # (2026-10-01) a page that is generating is not quiet
-                        _chat["quiet_since"] = _last_stream_seen_at
                     _gm_status = (_gm.get("status") or "generating")
                     if _gm_status in ("complete", "done"):
                         _gm_status = "generating"
@@ -71842,229 +71538,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     except Exception:
                         pass
 
-            # #929: name the wait mode — past the base budget the loop only
-            # keeps going while streaming evidence is fresh, and the log must
-            # say so (a "320s / 300s" line read as a bug).
-            if _elapsed >= _start_wait_max_sec:
-                log(f"[2D] Plan still visibly streaming — extended wait ({_elapsed}s / "
-                    f"hard cap {_stream_max_sec}s)")
-            else:
-                log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
+            log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
             # Tighter tick (was 30s) so a "Start research" button is clicked within
             # ~10s of appearing and the wait feels responsive, not stalled.
             await asyncio.sleep(10)
-
-        # CUA recovery for "Start research" (#776 + #755). #755: skip on Stop —
-        # agent_loop would just return status='stopped' and the round-robin is
-        # itself stop-aware. The 10-min loop above exited without a click, which on
-        # a plan-FAIL screen means Gemini showed "…something went wrong" with an
-        # ICON-ONLY Regenerate/Retry control the in-page JS selector can't match
-        # (only the CUA's vision can click it). Per user spec (2026-06-03): KEEP
-        # retrying the plan via the CUA, wait ~2 min after each retry for the plan
-        # to re-draft, and the instant a real "Start research" button renders,
-        # click it via deterministic JS — then verify + hand back to the
-        # round-robin. Bounded so a permanently-failing plan still escalates
-        # honestly (verified_b=False below) instead of dwelling forever.
-        # #953: `not _streaming_handoff` — a STREAMING Gemini is healthy (plan
-        # drafting or auto-started research); pointing the CUA at it is what
-        # produced the 2026-07-13 "spamming Start Research" (3 vision clicks on
-        # the grayed button) + the false "couldn't start" card. The ladder is
-        # for the truly-dead, non-streaming plan only.
-        # ⛔ 2026-10-01: AND NOT ON A TAB THAT IS NOT PROVABLY THE RUN'S OWN CHAT.
-        # The ladder presses things — 'Start research', a re-draft, whatever the
-        # vision step picks — and on another chat every one of those lands on
-        # somebody else's conversation. The card the wait raised stays up.
-        if (not _chat_ok and not start_clicked and not _gemini_2d_skipped
-                and not _controls.is_stop()):
-            log("[2D] Gemini's tab is not provably on the run's own chat — no "
-                "computer use on it and nothing on it is pressed; the card stays up",
-                "WARN")
-        if (not _gemini_2d_skipped and not start_clicked and not _streaming_handoff
-                and not _finished_handoff and not _controls.is_stop()
-                and _chat_ok):
-            _FALLBACK_MAX_REGEN = 3   # CUA-driven re-draft attempts (the in-loop #755 path already tried 3 via JS)
-            log(f"[2D] No 'Start research' after {_start_wait_max_sec}s — CUA recovery: "
-                f"retry the plan (≤{_FALLBACK_MAX_REGEN}×) until 'Start research' appears, then click it")
-            # #905: reuse the hardened _click_start_js from the plan-wait loop
-            # above — the recovery path previously redefined a `<button>`-only
-            # variant, so the two finders could disagree about the same DOM.
-            for _regen_attempt in range(_FALLBACK_MAX_REGEN):
-                if _controls.is_stop():
-                    break
-                # #929: honor a user Skip between recovery attempts — same
-                # finalize as the plan-wait loop (agent_skipped + tab close),
-                # and never point the CUA at an agent the user dismissed.
-                if "gemini" in _controls.skipped_agents:
-                    log("[2D] User skipped Gemini during CUA recovery — finalizing skip", "INFO")
-                    _controls.consume_skip_marker("gemini")
-                    _gemini_2d_skipped = True
-                    emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
-                    await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
-                    break
-                # #953: re-probe streaming before poking the page — Gemini may
-                # have (re)started generating since the wait loop's last scrape
-                # (e.g. research auto-started late). A streaming page is healthy;
-                # the CUA must never click at it (that's the spam + false card).
-                try:
-                    _gm_lad = await scrape_progress_gemini(gemini_page) or {}
-                except Exception:
-                    _gm_lad = {}
-                if (_gm_lad.get("status") or "") == "generating":
-                    _streaming_handoff = True
-                    log("[2D] Gemini is streaming again mid-recovery — standing down the "
-                        "CUA ladder and handing off to the round-robin", "INFO")
-                    break
-                # 1. The plan may already expose a Start-research button (a prior
-                #    re-draft just succeeded, or it was simply slow) — click it.
-                try:
-                    await browser.switch_to_page(gemini_page)
-                    _sr = await gemini_page.evaluate(_click_start_js)
-                except Exception:
-                    _sr = False
-                if _sr:
-                    start_clicked = True
-                    log("[2D] CUA recovery: clicked 'Start research' via JS ✓")
-                    # #929 (B4iii gap): this success path never retracted the
-                    # early plan-stall card — a healthy researching Gemini kept
-                    # a stale [Retry][Skip] card for the rest of the run.
-                    _retract_plan_alert("CUA recovery")
-                    await asyncio.sleep(5)
-                    break
-                # ⭐⭐ 2026-09-30 — NOTHING TO CLICK, NO VISION STEP. When Gemini's
-                # reply was read and holds no button, no open menu and no failure
-                # text, the vision mission below has nothing it is allowed to
-                # press: on 09-30 it spent seven steps opening the owner's own
-                # brief bubble. The 'Start research' watch under it still runs
-                # every attempt, and that is what caught the slow August plans.
-                _lad_quiet = _gemini_nothing_to_click(
-                    await _gemini_regen_read(gemini_page))
-                if _lad_quiet:
-                    _, _lad_state = await _gemini_done_read(gemini_page)
-                    log(f"[2D] Gemini's page shows nothing to click (no plan, no error, "
-                        f"no button in its reply; the page reads: "
-                        f"{_gemini_state_words(_lad_state)}) — no computer use; still "
-                        f"watching for 'Start research' (attempt {_regen_attempt + 1}/"
-                        f"{_FALLBACK_MAX_REGEN})")
-                else:
-                    # 2. No Start-research → the plan is in a FAIL state. CUA clicks the
-                    #    Regenerate/Retry control (or Start research if it IS there).
-                    #    Return text intentionally unused — #776 confirms via the DOM,
-                    #    never by parsing the CUA's narration.
-                    log(f"[2D] CUA recovery: plan not ready — CUA retrying the plan "
-                        f"(attempt {_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})")
-                    await browser.switch_to_page(gemini_page)
-
-                    async def _gemini_start_cua():
-                        # ⭐ 2026-09-30: Skip stops it at once — see `_SkipPressed`.
-                        _res = await agent_loop(cua_client, browser,
-                            PROMPT_GEMINI_START_RESEARCH,
-                            "If an ENABLED (blue) 'Start research' button is visible, click it "
-                            "ONCE. If it is grayed out/disabled or the page shows research "
-                            "progress or a finished report, do NOT click — say 'research "
-                            "already running'. Only on a failed plan ('something went wrong') "
-                            "click Retry/Regenerate once. Do NOT type anything.",
-                            model=CUA_MODEL, max_iterations=10, verbose=verbose,
-                            abort_event=_SkipPressed("gemini"))
-                        if (_res or {}).get("status") == "aborted":
-                            log("[2D] Skip pressed — computer use on Gemini stopped at once",
-                                "INFO")
-                        return _res
-
-                    # #839 act tier: DUAL-target mission — click 'Start research' OR
-                    # the icon-only Regenerate/Retry the JS selector can't match.
-                    # Return text is unused in EVERY mode (#776 confirms via the
-                    # deterministic JS poll below), so an act success vs a CUA run
-                    # is indistinguishable downstream — start_clicked is set only by
-                    # _click_start_js. Non-blocking recovery, never the pipeline pause.
-                    await _shadow_observed_cua(
-                        gemini_page, hotspot_id="gemini-start", phase=2, platform="gemini",
-                        current_step="start_or_regenerate_plan",
-                        context_hint="Gemini plan not ready — click an ENABLED (blue) 'Start "
-                                     "research' button ONCE if present; if it is grayed/disabled "
-                                     "or research is already running, do NOT click (say 'research "
-                                     "already running'); else click the Retry/Regenerate control "
-                                     "on the 'something went wrong' error once. NEVER type",
-                        expected_outcome="the research plan starts or is re-drafted",
-                        cua_coro_factory=_gemini_start_cua,
-                        mission_prompt=PROMPT_GEMINI_START_RESEARCH,
-                        act_timeout_s=120.0)
-                try:
-                    emit_event("agent_progress", phase=2, agent="gemini", status="generating",
-                               stage="planning",
-                               progress=((f"Still waiting for Gemini's plan "
-                                          f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…")
-                                         if _lad_quiet else
-                                         (f"Gemini's plan didn't start — retrying "
-                                          f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…")))
-                except Exception:
-                    pass
-                # 3. Wait ~2 min for the re-draft, polling for "Start research"
-                #    every ~5s and clicking it the instant it renders.
-                for _i in range(24):   # ~120s
-                    # #929: a Skip mid-poll exits fast — the next outer-attempt
-                    # check finalizes it (or the loop ends and the guard below
-                    # stands down).
-                    if _controls.is_stop() or "gemini" in _controls.skipped_agents:
-                        break
-                    try:
-                        await browser.switch_to_page(gemini_page)
-                        _sr2 = await gemini_page.evaluate(_click_start_js)
-                    except Exception:
-                        _sr2 = False
-                    if _sr2:
-                        start_clicked = True
-                        log("[2D] CUA recovery: 'Start research' appeared after re-draft — clicked ✓")
-                        # #929 (B4iii gap): same retraction as the other
-                        # success paths — was missing here too.
-                        #
-                        # ⛔ 2026-08-17 — but NOT from here any more. The card it
-                        # withdraws says "Gemini recovered and began its deep
-                        # research", and a click that returned true is not that
-                        # evidence: in the live run this retraction fired at
-                        # 08:51:26 and the verify disagreed six seconds later, so
-                        # the user's only actionable surface was taken away from a
-                        # run that was already dead. The retraction now happens
-                        # where the claim can be proven — the verified_b block
-                        # below.
-                        await asyncio.sleep(5)
-                        break
-                    await asyncio.sleep(5)
-                if start_clicked:
-                    break
-            # #929: a Skip that landed during the FINAL attempt's poll loop
-            # exits the for-loop without hitting the top-of-attempt finalize —
-            # consume it here so the skip is never silently dropped.
-            if (not _gemini_2d_skipped and not start_clicked
-                    and "gemini" in _controls.skipped_agents):
-                log("[2D] User skipped Gemini at the end of CUA recovery — finalizing skip", "INFO")
-                _controls.consume_skip_marker("gemini")
-                _gemini_2d_skipped = True
-                emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
-                await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
-            if not start_clicked and not _gemini_2d_skipped and not _streaming_handoff:
-                log(f"[2D] CUA recovery exhausted ({_FALLBACK_MAX_REGEN} attempts) — "
-                    f"plan never produced a clickable 'Start research'", "WARN")
-                # Surface the Retry/Skip alert NOW — don't make the user wait for
-                # the wall-clock cap. Per spec: after the bounded plan retries fail
-                # (or 'Start research' never appears), raise skip/retry. Retry runs
-                # a HARD retry = fresh Gemini chat + re-submitted topic. fail_agent
-                # dedups by alert_id, so a later wall-clock re-assert is harmless.
-                # #953: one last streaming probe guards the card — a Gemini that
-                # is actively generating is NOT failed, whatever the ladder saw
-                # (the 2026-07-13 false "couldn't start" card fired on an agent
-                # that was mid-research and finished 4 min later at 98k chars).
-                _final_streaming = False
-                try:
-                    _gm_fin = await scrape_progress_gemini(gemini_page) or {}
-                    _final_streaming = (_gm_fin.get("status") or "") == "generating"
-                except Exception:
-                    _final_streaming = False
-                if _final_streaming:
-                    _streaming_handoff = True
-                    log("[2D] Final probe: Gemini is streaming — suppressing the "
-                        "'couldn't start' card and handing off to the round-robin", "INFO")
-                elif not _controls.is_stop():
-                    fail_agent("gemini", *_GEMINI_CANT_START)  # #63: centralized copy
 
         # Verify Gemini is actually researching. #755: on Stop, skip the ~45s
         # DOM-verify retry churn — record not-verified and let the stop-aware
@@ -72074,9 +71551,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # plan" from "running the research", so without a confirmed click it would
         # falsely stamp a not-yet-started run as researching (+ research_started_at).
         # No confirmed click ⇒ not running; the round-robin keeps the tab (it does
-        # NOT drop a not-verified agent — see `poll_all_agents_round_robin`)
-        # and the wall-clock cap
-        # surfaces an honest fail_agent if the plan never starts.
+        # NOT drop a not-verified agent — see `poll_all_agents_round_robin`).
         if _gemini_2d_skipped:
             # #929: the skip was finalized in place (agent_skipped emitted,
             # tab closed) — Gemini must NOT be handed to the round-robin,
@@ -72088,31 +71563,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log("[2D] Stop requested — skipping Gemini verify", "INFO")
             verified_b = False
         elif _finished_handoff:
-            # Wave 13: its report is on the page — it ran. The block below
-            # takes back any "couldn't start" card; the round-robin collects.
+            # Wave 13: its report is on the page — it ran. The round-robin collects.
             verified_b = True
-        elif _streaming_handoff:
-            # #953: Gemini was still actively streaming past the hand-off point —
-            # research almost certainly auto-started (2026-07-13 run: plan at
-            # 95s, Start rendered pre-disabled, research ran unclicked to 98k
-            # chars). Not CONFIRMED researching (no click took), so verified
-            # stays False and the round-robin's detectors + late-Start watch
-            # leg decide — but this is a healthy hand-off, not a failure.
-            log("[2D] Gemini handed off while streaming — round-robin detectors "
-                "decide (late 'Start research' is clicked by the watch leg)", "INFO")
+        elif not start_clicked:
+            # ⭐ Wave 15: the wait is over and nothing was pressed. Gemini starts
+            # its research by itself; the round-robin waits for it (its watch
+            # presses a late 'Start research'). Not a failure, and nothing says so.
             verified_b = False
             try:
-                _retract_plan_alert("streaming hand-off")
                 emit_event("agent_progress", phase=2, agent="gemini",
                            status="generating", stage="planning",
-                           progress="Gemini is taking its time — monitoring in the "
-                                    "background while the other agents are polled")
+                           progress="Gemini is still planning — it starts its research by "
+                                    "itself; watching it while the other agents are polled")
             except Exception:
                 pass
-        elif not start_clicked:
-            log("[2D] 'Start research' never confirmed-clicked — not marking Gemini "
-                "as researching (avoids a false 'running' on a stale/failed plan)", "WARN")
-            verified_b = False
         else:
             # #905 (2026-07-06 user directive, superseding the same-day ≤30s
             # verify): after a CONFIRMED "Start research" click, the round-
@@ -72144,49 +71608,39 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                 # question the paste would.
                                 "brief": brief_text,
                                 "needs_start_verify": bool(start_clicked and not verified_b),
-                                # #953: streaming hand-off — the round-robin's
-                                # Gemini leg watches for a late 'Start research'
-                                # (slow plan) and clicks it; a verified-running
-                                # probe clears the watch (auto-started case).
+                                # The round-robin's late-Start watch: it presses a
+                                # 'Start research' that appears after hand-off, and
+                                # clears itself once the research is running.
                                 #
-                                # ⛔⛔ 2026-08-17 — AND THE CASE IT WAS MISSING,
-                                # which cost a whole agent. `start_clicked and not
-                                # verified_b` is the single most obvious state in
-                                # which a 'Start research' button may still need
-                                # pressing: we pressed it and could not confirm it
-                                # took. Two live runs ended there — the click
-                                # reported success, the verify disagreed, and
-                                # because only the streaming path armed this
-                                # watch, nobody ever pressed again. The round-robin
-                                # then read `start_research_btn_visible
-                                # (pre-research)` once a minute for NINETY MINUTES
-                                # and auto-skipped, salvaging the plan instead of
-                                # a research. Five earlier runs were fine for one
-                                # reason: their click verified, so neither flag
-                                # was ever set.
-                                #
-                                # ⭐ Nothing new is trusted here. The watch's own
-                                # (a)/(b)/(c) ladder is already bounded,
-                                # enabled-only so it cannot spam a grayed button,
-                                # and took-checked on the following leg. This
-                                # arms machinery that was already correct.
+                                # ⭐ Wave 15: armed for every Gemini handed off
+                                # before its research started — the wait that
+                                # ended with nothing pressed (Gemini starts by
+                                # itself; a late plan with Start is pressed), and
+                                # ⛔⛔ 2026-08-17 — a press that could not be
+                                # confirmed: two live runs ended there, the watch
+                                # never armed, and the round-robin read
+                                # `start_research_btn_visible (pre-research)` for
+                                # ninety minutes. ⛔ Never on a tab that is not
+                                # provably the run's own chat: the watch presses.
                                 "gemini_watch_start": bool(
-                                    _streaming_handoff
+                                    (not start_clicked and not _finished_handoff
+                                     and not _controls.is_stop() and _chat_ok)
                                     or (start_clicked and not verified_b))}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating",
                        stage="researching",
                        progress="Gemini Deep Research plan created and started")
             log("[2D] Gemini is researching ✓")
-            # The one place the plan-stall card's claim ("Gemini recovered and
-            # began its deep research") is actually true. Idempotent — a no-op
-            # when an earlier path already retracted it.
-            _retract_plan_alert("verified running")
             await inject_agent_observer(gemini_page, "gemini")
-        elif _streaming_handoff:
-            log("[2D] Gemini streaming hand-off — round-robin takes it from here")
-        elif not _gemini_2d_skipped:
-            log("[2D] Gemini may not be running", "WARN")
+        elif not _gemini_2d_skipped and not _controls.is_stop():
+            log("[2D] Gemini handed to the round-robin before its research started — "
+                "it starts by itself; the round-robin waits for it")
+
+    # 10-01: the agents a crash retry is back with join the ones just started,
+    # in the usual order, and the round-robin takes them all the same way.
+    if rejoined:
+        agents.update(rejoined)
+        agents = {n: agents[n] for n in ("ChatGPT", "Claude", "Gemini") if n in agents}
 
     # ── Verify all launched agents are running ──
     total = len(agents)
@@ -74179,6 +73633,201 @@ def _find_recent_audio(dirs, *, min_bytes=4096):
     return (best[1], best[2], best[3])
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# THE PODCAST WITHOUT A CHROME DOWNLOAD (wave 15, 10-02)
+# ─────────────────────────────────────────────────────────────────────────────
+# ⛔⛔ A NOTEBOOKLM AUDIO DOWNLOAD IS THE SAME CRASH CLASS AS A REPORT EXPORT.
+# Chrome 154 crashes in its own downloads button while a download updates
+# (#Dev/wave15/crash/crash-analysis-1001.json), and on 09-16 two NotebookLM audio
+# downloads killed the browser the instant the page pressed them ("Download
+# save failed: Download.save_as: Target page, context or browser has been
+# closed", 12:57:54 and 13:35:58). Every run until now still downloaded the
+# podcast in Chrome ("Audio downloaded via Playwright: ….m4a").
+# ⭐ WHAT THE DOWNLOAD IS. This Mac's agent-profile download history: every
+# NotebookLM audio download (ids 85-118, 3 MB to 120 MB) starts at
+# `https://lh3.googleusercontent.com/notebooklm/<token>=m140-dv-mp2?authuser=0`
+# and is redirected to `drum.usercontent.google.com/download/…`, which serves it
+# to the signed-in account (its cookies).
+# ⭐ SO: while the page's own Download is pressed, the browser context stops the
+# request for that address before Chrome can start a download, keeps the
+# address, and the file is fetched straight from it with the context's own
+# request API — cookies included, redirects followed, and nothing in Chrome's
+# downloads at all. If no address comes, or the fetch fails, the catch comes off
+# and the download goes through Chrome as before, with one log line saying so.
+#: The audio's own address. Images and the player's stream (the same host) are
+#: never stopped — only the request that would become a download.
+_NLM_AUDIO_URL_RE = re.compile(r"^https://lh3\.googleusercontent\.com/notebooklm/")
+#: How long the press waits for the page to ask for that address.
+_NLM_AUDIO_CATCH_WAIT_S = 10.0
+#: How long the fetch may take (120 MB on 09-30) — the request API's own limit, ms.
+_NLM_AUDIO_FETCH_TIMEOUT_MS = 10 * 60 * 1000
+#: Smaller than this is not an audio overview (the shortest on record is 3.2 MB).
+_NLM_AUDIO_MIN_BYTES = 64 * 1024
+
+
+class _NlmAudioCatch:
+    """While armed, the browser context stops NotebookLM's audio request before
+    Chrome can make it a download, and keeps its address (`url`).
+
+    ⛔ A page route, not a page listener: a `download` event arrives only after
+    Chrome has started the download — the thing that crashes it. The route is on
+    the CONTEXT, so a Download the page opens in a new tab is stopped too, and
+    that tab is closed. It is taken off again (`disarm`) before anything else
+    may download."""
+
+    def __init__(self, browser, label="Audio"):
+        self.browser, self.label = browser, label
+        self.url = ""
+        self._ctx = None
+        self._tabs_before: set = set()
+
+    async def arm(self) -> bool:
+        ctx = getattr(self.browser, "context", None)
+        if ctx is None:
+            return False
+        try:
+            # The tabs open before the press: only a tab the press itself opened
+            # is closed afterwards, never one of the run's own.
+            self._tabs_before = {id(p) for p in (getattr(ctx, "pages", None) or [])}
+            await ctx.route(_NLM_AUDIO_URL_RE, self._on_route)
+        except Exception as e:
+            log(f"[{self.label}] the audio catch could not be put on the browser "
+                f"({type(e).__name__}) — Chrome downloads the podcast, as before", "WARN")
+            return False
+        self._ctx = ctx
+        return True
+
+    async def _on_route(self, route, request=None):
+        req = request if request is not None else route.request
+        try:
+            kind = str(req.resource_type or "")
+        except Exception:
+            kind = ""
+        if kind in ("image", "media") or self.url:
+            try:
+                await route.fallback()
+            except Exception:
+                pass
+            return
+        self.url = str(req.url or "")
+        # ⛔ ANSWERED "204 No Content", NOT ABORTED. An aborted navigation commits
+        # Chrome's error page in its place — a Download that follows a link in the
+        # notebook's own tab would leave the tab on that error page, and the rest
+        # of Phase 3 with no notebook. A 204 is the one answer a browser neither
+        # navigates to nor downloads.
+        try:
+            await route.fulfill(status=204, body="")
+        except Exception:
+            try:
+                await route.abort()
+            except Exception:
+                pass
+    async def disarm(self) -> None:
+        if self._ctx is None:
+            return
+        try:
+            await self._ctx.unroute(_NLM_AUDIO_URL_RE, self._on_route)
+        except Exception:
+            pass
+        # A Download that opened a tab of its own leaves it blank (or on the
+        # audio's address): close it. ⛔ Found from the context's tabs, not from
+        # the request — a new tab's first request has no frame to ask yet.
+        # Only a tab opened since the catch went on, and only a blank one.
+        for tab in list(getattr(self._ctx, "pages", None) or []):
+            if id(tab) in self._tabs_before:
+                continue
+            try:
+                url = str(tab.url or "")
+            except Exception:
+                url = ""
+            if url in ("", "about:blank") or _NLM_AUDIO_URL_RE.match(url):
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+        self._ctx = None
+
+    async def wait(self, seconds: float = _NLM_AUDIO_CATCH_WAIT_S) -> str:
+        """The address the press asked for, or "" when none came in `seconds`."""
+        for _ in range(max(1, int(seconds / 0.25))):
+            if self.url:
+                break
+            await asyncio.sleep(0.25)
+        return self.url
+
+
+def _nlm_audio_name(disposition: str, kind: str) -> str:
+    """A file name for the fetched audio: the server's own, made safe for
+    ffmpeg as the download path's is, else a plain one — with the extension the
+    content says."""
+    m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", disposition or "", re.I)
+    name = ""
+    if m:
+        try:
+            from urllib.parse import unquote
+            name = unquote(m.group(1))
+        except Exception:
+            name = m.group(1)
+    name = re.sub(r'[^\w\s.-]', '', Path(name).name).strip()
+    stem = Path(name).stem if name else "audio_overview"
+    return f"{stem or 'audio_overview'}{kind or '.m4a'}"
+
+
+async def _nlm_fetch_audio(browser, url: str, dest_dir: Path, label="Audio"):
+    """Fetch the podcast from its address with the browser context's own request
+    API (its cookies, its redirects) into `dest_dir`. The saved file, or None —
+    and None logs why, in one line, without the address (it is a credential)."""
+    ctx = getattr(browser, "context", None)
+    if ctx is None or not url:
+        return None
+    resp = None
+    try:
+        resp = await ctx.request.get(url, timeout=_NLM_AUDIO_FETCH_TIMEOUT_MS)
+        status = int(resp.status)
+        if not resp.ok:
+            log(f"[{label}] fetching the audio from its address was refused (HTTP "
+                f"{status})", "WARN")
+            return None
+        body = await resp.body()
+        headers = dict(resp.headers or {})
+    except Exception as e:
+        log(f"[{label}] fetching the audio from its address failed "
+            f"({type(e).__name__}: {str(e)[:120]})", "WARN")
+        return None
+    finally:
+        if resp is not None:
+            try:
+                await resp.dispose()
+            except Exception:
+                pass
+    if len(body) < _NLM_AUDIO_MIN_BYTES:
+        log(f"[{label}] the audio's address answered {len(body)} bytes — not an audio "
+            "overview", "WARN")
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dest_dir / ".audio_fetch.part"
+    try:
+        tmp.write_bytes(body)
+        kind = _audio_kind(tmp, trusted=True)
+        if not kind:
+            log(f"[{label}] what the audio's address answered is not audio "
+                f"({headers.get('content-type') or 'no type'}, {len(body)} bytes)", "WARN")
+            tmp.unlink(missing_ok=True)
+            return None
+        dest = dest_dir / _nlm_audio_name(headers.get("content-disposition", ""), kind)
+        os.replace(tmp, dest)
+    except Exception as e:
+        log(f"[{label}] the fetched audio could not be saved ({type(e).__name__})", "WARN")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    log(f"Audio fetched straight from its address, no Chrome download: {dest.name} "
+        f"({len(body)} bytes)")
+    return dest
+
+
 def _audio_search_plan(browser):
     """Where to look for the podcast, and what we are allowed to do there.
 
@@ -74995,36 +74644,64 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # (The ROW is chosen by label. The CARD is the picker's: with two audio
         # cards the menu opened is `_target_ord`'s, never simply the topmost.)
         _dl_via_dom = False
-        try:
-            _dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)
-            if _dl_menu.get("verified"):
-                _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
-                # `blocked` is ADVISORY — the denied rows the picker filtered out
-                # and skipped — and it is returned ALONGSIDE `clicked: true`. The
-                # audio menu always contains Delete, so it is always non-empty.
-                # Treating it as a failure (as the first version of this rung did)
-                # meant the rung clicked Download, reported failure, and the visual
-                # agent then clicked Download again: two files, one run. `clicked`
-                # is the only field that says what happened. The share flow below
-                # has always read it this way.
-                if _dl_pick.get("blocked"):
-                    log(f"[Audio] download menu skipped destructive row(s): "
-                        f"{_dl_pick.get('blocked')}", "DEBUG")
-                if _dl_pick.get("clicked"):
-                    _dl_via_dom = True
-                    log(f"[dom] p3 notebooklm.download_audio: verified "
-                        f"via={_dl_pick.get('via')!r}")
-                else:
+
+        async def _dom_press_download() -> bool:
+            try:
+                _dl_menu = await _nlm_open_audio_menu(browser.page, nth=_target_ord)
+                if _dl_menu.get("verified"):
+                    _dl_pick = await _nlm_menu_pick(browser.page, want=("download",))
+                    # `blocked` is ADVISORY — the denied rows the picker filtered out
+                    # and skipped — and it is returned ALONGSIDE `clicked: true`. The
+                    # audio menu always contains Delete, so it is always non-empty.
+                    # Treating it as a failure (as the first version of this rung did)
+                    # meant the rung clicked Download, reported failure, and the visual
+                    # agent then clicked Download again: two files, one run. `clicked`
+                    # is the only field that says what happened. The share flow below
+                    # has always read it this way.
+                    if _dl_pick.get("blocked"):
+                        log(f"[Audio] download menu skipped destructive row(s): "
+                            f"{_dl_pick.get('blocked')}", "DEBUG")
+                    if _dl_pick.get("clicked"):
+                        log(f"[dom] p3 notebooklm.download_audio: verified "
+                            f"via={_dl_pick.get('via')!r}")
+                        return True
                     log(f"[dom] p3 notebooklm.download_audio: missed "
                         f"({_dl_pick.get('reason', 'no Download row')}) — CUA will drive it",
                         "WARN")
                     await _nlm_close_dialogs(browser.page, label="Audio")
-            else:
-                log(f"[dom] p3 notebooklm.download_audio: menu not opened "
-                    f"({_dl_menu.get('why', 'unknown')}) — CUA will drive it", "WARN")
-        except Exception as _dl_dom_err:
-            log(f"[dom] p3 notebooklm.download_audio: errored "
-                f"({type(_dl_dom_err).__name__}) — CUA will drive it", "WARN")
+                else:
+                    log(f"[dom] p3 notebooklm.download_audio: menu not opened "
+                        f"({_dl_menu.get('why', 'unknown')}) — CUA will drive it", "WARN")
+            except Exception as _dl_dom_err:
+                log(f"[dom] p3 notebooklm.download_audio: errored "
+                    f"({type(_dl_dom_err).__name__}) — CUA will drive it", "WARN")
+            return False
+
+        # ⭐⭐ Wave 15 (10-02): THE PODCAST IS FETCHED FROM ITS ADDRESS, NOT
+        # DOWNLOADED BY CHROME (`_NlmAudioCatch`). The catch is on the browser
+        # while the page's own Download is pressed; the address that press asks
+        # for is fetched with the context's request API. With no address, or a
+        # fetch that fails, the catch comes off and the download goes through
+        # Chrome exactly as before — pressed again by the page when the catch
+        # had stopped the first press. Computer use, when the page could not
+        # press it, downloads through Chrome as before too.
+        _audio_catch = _NlmAudioCatch(browser, "Audio")
+        _catch_on = await _audio_catch.arm()
+        _fetched = None
+        try:
+            _dl_via_dom = await _dom_press_download()
+            _addr = (await _audio_catch.wait()) if (_catch_on and _dl_via_dom) else ""
+        finally:
+            await _audio_catch.disarm()
+        if _addr:
+            _fetched = await _nlm_fetch_audio(browser, _addr, queue_dir / "podcasts")
+            if _fetched is None:
+                log("[Audio] the audio could not be fetched from its address — "
+                    "pressing Download again, and Chrome downloads it as before", "WARN")
+                _dl_via_dom = await _dom_press_download()
+        elif _catch_on and _dl_via_dom:
+            log("[Audio] the page's Download asked for no audio address this run "
+                "knows — Chrome downloads it, as before", "WARN")
 
         # ── did the click actually download something? ──
         #
@@ -75052,7 +74729,12 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # nothing, after we have already held the finished file in our hand.
         _dl_seen = False
         _dl_evidence = ""
-        if _dl_via_dom:
+        if _fetched is not None:
+            # Wave 15: the file is already ours — no visual agent, no wait.
+            _dl_seen, _dl_evidence = True, "fetched"
+            if not download_future.done():
+                download_future.set_result(_fetched)
+        if _dl_via_dom and not _dl_seen:
             _dl_deadline = time.time() + 25
             while time.time() < _dl_deadline:
                 if download_future.done() and download_future.result() is not None:
@@ -75130,7 +74812,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # from Playwright with no scan at all. When it doesn't, the timeout falls
         # into the very same scan that would have run at 30s, having found the same
         # file — the fallback below is unchanged and still owns every other path.
-        _dl_wait_s = 0.5 if _dl_evidence == "file" else 30
+        _dl_wait_s = 0.5 if _dl_evidence in ("file", "fetched") else 30
         try:
             audio_path = await asyncio.wait_for(download_future, timeout=_dl_wait_s)
             # Track-B success-path observe (P3 audio download). Page still alive here
@@ -79286,8 +78968,9 @@ def detect_resume_phase(queue_dir):
 # the agent's latest attempt. It is a file because the in-process status map
 # dies with the daemon.
 #
-# ⚠ Not covered: an agent still GENERATING when Chrome died is re-run from zero
-# (reattaching it through the pause checkpoint's addresses is a separate change).
+# ⭐ An agent still GENERATING when Chrome died — or finished but not yet
+# extracted — is not re-run either: the crash retry goes back into its own chat
+# (`_p2_rejoin_chat`, 10-01). Only an agent it cannot get back to starts again.
 _P2_AGENTS_DONE_FILE = "phase2_agents_done.json"
 
 
@@ -79541,6 +79224,349 @@ def _p2_only_enabled(results, enabled_agents) -> dict:
         return dict(results or {})
     names = {_agent_display_name(a) for a in enabled_agents}
     return {n: r for n, r in (results or {}).items() if n in names}
+
+
+# ── A Phase-2 browser crash goes back into each agent's own chat (10-01) ─────
+# ⛔⛔ THE 09-30 EVENING RUN. Chrome crashed at 18:33:45 with ChatGPT's report
+# finished on its page and Claude and Gemini researching; the crash retry then
+# set all three up again and sent the brief three more times, which threw away
+# seventeen minutes of three Deep Researches and bought them again. The record
+# above keeps an agent only once its report is EXTRACTED, and ChatGPT's
+# extraction was what the crash interrupted.
+#
+# ⭐ SO THE RETRY REJOINS. The serve process outlives Chrome, and at the crash it
+# still knows the chat each agent was sent the brief in (`p2_chat_urls`). The
+# retry opens each one in the new Chrome, proves it is this run's, and hands it to
+# the round-robin like a freshly started agent: a finished one is extracted there,
+# a running one is polled, and a Gemini whose plan still waits for "Start
+# research" gets the round-robin's start watch, which presses it. An agent with no
+# chat, or one whose chat cannot be opened or proven, starts again the usual way
+# — only that agent.
+#
+# ⛔ ONLY THE CRASH RETRY CARRIES CHATS, and only into its first Phase-2 attempt.
+# A person's Retry, Skip or new input re-runs the whole phase, as before.
+#
+# ⭐ THE CHATS STAY CARRIED UNTIL THE RETRY HAS DEALT WITH THEM. `run_pipeline`
+# puts the chats it was handed back into `p2_chat_urls` at its start, so a second
+# crash before the rejoin, or during it, hands them on again. An agent leaves its
+# chat only when it is set up again (`_p2_forget_chat`): then the chat it had is
+# the one somebody, or a failed proof, chose to leave.
+
+def _p2_note_chat(platform: str, page) -> None:
+    """Phase 2 sent `platform` the brief in this tab: remember the chat, and
+    the tab, whose own address is read again at a crash."""
+    try:
+        url = page.url or ""
+    except Exception:
+        url = ""
+    if url:
+        _runtime.p2_chat_urls[platform] = url
+        _runtime.p2_chat_pages[platform] = page
+
+
+def _p2_forget_chat(platform: str) -> None:
+    """`platform` is being set up again: the chat it is leaving is not one a
+    crash retry may go back into."""
+    _runtime.p2_chat_urls.pop(platform, None)
+    _runtime.p2_chat_pages.pop(platform, None)
+
+
+def _p2_chats_to_rejoin() -> dict:
+    """{platform: chat URL} for a Phase-2 crash retry, as `_runtime` holds them
+    now. Taken before the run's `finally` resets `_runtime`. A "Move to queue"
+    keeps the same ones (`_p2_chats_to_move`).
+
+    GEMINI: the chat its TAB is on at the crash, when that is one of its chats.
+    09-30: Gemini's brief went in on /app/3a6f…, and two minutes later the same
+    tab held its plan and its research on /app/e91e…; nothing in 2D notes the
+    move. Playwright keeps a page's last address after Chrome dies. The address
+    noted at the send is the fallback: a tab that cannot be read, or one off its
+    chats (a home page, mid-reset).
+
+    ⛔⛔ CHATGPT AND CLAUDE: THE CHAT NOTED WHEN THE BRIEF WENT IN, and the tab's
+    address only when that note is not a chat. Neither moves its research to
+    another chat, and their tabs are known to wander: on 2026-08-05 a press
+    landed on a sidebar link titled "Deep research request" and ChatGPT's tab ran
+    on the previous evening's chat. Their brief goes as a file, so the chat's
+    first message is the same fixed line on every run, and the retry's proof
+    cannot tell this run's chat from an older one — following a wandered tab
+    would have the retry collect the older chat's report as this run's.
+    ⛔ And a ChatGPT chat whose own id dates it as older than the run is never
+    carried, whichever address it came from (`_chatgpt_tab_is_foreign`): that
+    agent starts again the usual way.
+
+    ⛔ An agent in chat mode is left out. The retry resets its mode and its
+    keep/skip hold, and a rejoin puts neither back, so its plain chat answer would
+    be read as a Deep Research. Its own set-up finds its mode again."""
+    out = {}
+    for k, u in dict(_runtime.p2_chat_urls).items():
+        if not k or not u:
+            continue
+        _mode = _runtime.agent_modes.get(k)
+        if isinstance(_mode, dict) and _mode.get("actual") == "chat":
+            continue
+        try:
+            live = _runtime.p2_chat_pages[k].url or ""
+        except Exception:
+            live = ""
+        if k == "gemini":
+            pick = live if _p2_chat_id(k, live) else u
+        else:
+            pick = live if (_p2_chat_id(k, live) and not _p2_chat_id(k, u)) else u
+        if k == "chatgpt" and _chatgpt_tab_is_foreign(pick):
+            log("[resume] ChatGPT: the chat it was on is older than this run — "
+                "not going back into it", "WARN")
+            continue
+        out[k] = pick
+    return out
+
+
+def _p2_chats_to_move() -> dict:
+    """{platform: chat URL} a "Move to queue" keeps with the run (wave 15): the
+    same chats a Phase-2 crash would hand its retry, taken the same way, and
+    only while the run is in Phase 2 or before it — after it there is nothing
+    to go back into. Read from the device-command thread while the pipeline
+    still holds them: plain reads of the run's own maps and its tabs' last
+    addresses. Never raises — a move must not fail over its chats."""
+    try:
+        phase = getattr(_runtime, "phase", None)
+        if isinstance(phase, int) and phase > 2:
+            return {}
+        return _p2_chats_to_rejoin()
+    except Exception:
+        return {}
+
+
+def _p2_take_rejoin(left: dict, *, new_input: bool) -> dict:
+    """The carried chats for ONE Phase-2 attempt, and none for any after it: a
+    person's Retry, Skip or new input re-runs the whole phase. None at all when
+    this entry added the person's input to the brief — the old chats never saw
+    it."""
+    taken = {} if new_input else dict(left or {})
+    if left:
+        left.clear()
+    return taken
+
+
+_CLAUDE_CHAT_URL_RE = re.compile(r"claude\.ai/chat/([0-9A-Za-z-]{8,})")
+
+
+def _p2_chat_id(platform: str, url: str) -> str:
+    """The chat's own id in `url`, or "" when `url` is not one of its chats."""
+    if platform == "chatgpt":
+        return _chatgpt_convo_id(url) or ""
+    if platform == "gemini":
+        return _gemini_convo_url_id(url)
+    if platform == "claude":
+        m = _CLAUDE_CHAT_URL_RE.search((url or "").split("?", 1)[0])
+        return m.group(1) if m else ""
+    return ""
+
+
+def _p2_rejoin_plan(carried, launch) -> dict:
+    """{platform: chat URL} to rejoin: the agents this attempt would launch that
+    the crash left a chat for. A URL that is not a chat (a bare home page) is
+    nothing to rejoin."""
+    out = {}
+    for agent in launch or ():
+        key = str(agent).lower()
+        url = (carried or {}).get(key) or ""
+        if _p2_chat_id(key, url):
+            out[key] = url
+    return out
+
+
+def _p2_turn_holds_our_send(turn_text: str, brief_text: str) -> bool:
+    """Does a chat's first message hold what this run sent there?
+
+    The brief's head when the brief was pasted; the line typed beside it when the
+    brief went as a file (`_P2_ATTACHED_BRIEF_ASK`). Positive evidence only — an
+    empty or unreadable message is not this run's chat."""
+    if conversation_holds_brief(turn_text, brief_fingerprint(brief_text)) is True:
+        return True
+    return conversation_holds_brief(
+        turn_text, brief_fingerprint(_P2_ATTACHED_BRIEF_ASK)) is True
+
+
+#: Claude's first user message — never the page's own text, for the reason
+#: `read_chatgpt_first_user_message` gives.
+_CLAUDE_FIRST_USER_MSG_JS = (
+    "(cap) => { const n = document.querySelector('[data-testid=\"user-message\"]');"
+    " return (n && n.innerText || '').slice(0, cap); }")
+
+
+async def _claude_first_user_message(page, cap: int = 4000) -> str:
+    """The FIRST user message in the open Claude chat, or "". Never raises."""
+    try:
+        return (await page.evaluate(_CLAUDE_FIRST_USER_MSG_JS, cap)) or ""
+    except Exception:
+        return ""
+
+
+#: A reopened chat's first message mounts after its URL settles: read it this
+#: many times, this far apart, before the chat counts as not this run's.
+_P2_REJOIN_READS = 4
+_P2_REJOIN_SETTLE_SEC = 2.5
+
+
+async def _p2_rejoined_page_is_ours(page, platform: str, want: str,
+                                    brief_text: str) -> bool:
+    """ChatGPT and Claude: the tab is on the saved chat's own id AND its first
+    message holds what this run sent there. Both halves, every read."""
+    reader = (read_chatgpt_first_user_message if platform == "chatgpt"
+              else _claude_first_user_message)
+    for i in range(_P2_REJOIN_READS):
+        try:
+            live = page.url or ""
+        except Exception:
+            live = ""
+        if _p2_chat_id(platform, live) == want:
+            if _p2_turn_holds_our_send(await reader(page), brief_text):
+                return True
+        if i < _P2_REJOIN_READS - 1:
+            await asyncio.sleep(_P2_REJOIN_SETTLE_SEC)
+    return False
+
+
+async def _p2_rejoined_state(page, platform: str) -> str:
+    """What a rejoined chat shows: "finished", "researching", or (Gemini only)
+    "plan" — a plan not yet started. Read once, for the log line and the
+    round-robin's entry; the round-robin's own detectors still decide."""
+    if platform == "gemini":
+        if (await _gemini_done_read(page))[0]:
+            return "finished"
+        return "researching" if await _gemini_research_started(page) else "plan"
+    try:
+        done, _reason, _snap = await DETECT_FNS[_agent_display_name(platform)](page)
+    except Exception:
+        done = False
+    return "finished" if done else "researching"
+
+
+_P2_REJOIN_WORDS = {
+    "finished": ("finished, extracting",
+                 "collecting the report it finished"),
+    "researching": ("still researching", "still researching"),
+    "plan": ("its plan has not started — the round-robin presses 'Start research'",
+             "starting the research its plan is waiting on"),
+}
+
+
+async def _p2_rejoin_chat(browser, platform: str, url: str, brief_text: str):
+    """Open one agent's own chat in the relaunched Chrome and prove it is this
+    run's. Returns its round-robin entry, or None — and None costs only this
+    agent, which then starts again the usual way.
+
+    Gemini does not reopen a chat from its address (#897a: it lands on its
+    home), so a Gemini that is not back in its chat is found again by the
+    sidebar hunt that already exists, scoped to the chat's id, and must then sit
+    on that same id."""
+    name = _agent_display_name(platform)
+    want = _p2_chat_id(platform, url)
+    page = None
+
+    async def _give_up(why: str):
+        # ⛔ A Chrome that died is not a chat that cannot come back. Setting the
+        # agent up again would send its brief into a browser that is gone, and
+        # forget its chat. Unwind as a crash instead: the next retry is handed
+        # this chat, and every one not reached yet.
+        if await _browser_context_is_dead(browser):
+            _runtime.last_failure_kind = "browser_crash"
+            raise RuntimeError("research browser died while going back into the "
+                               "phase 2 chats (browser crash)")
+        log(f"[resume] {name}: {why} — starting it again", "WARN")
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        return None
+
+    try:
+        page = await browser.open_isolated_tab(url)
+    except Exception as e:
+        # The error's own text holds the address twice, and Send logs uploads
+        # the run log: its kind is enough here.
+        return await _give_up(f"its chat would not open ({type(e).__name__})")
+
+    await asyncio.sleep(_P2_REJOIN_SETTLE_SEC)
+    try:
+        await check_auth(page, platform)
+    except SessionExpiredError:
+        return await _give_up("signed out")
+    if platform == "gemini":
+        ours = await _gemini_reload_identity_ok(page, want, brief_text)
+        # The hunt clicks rail entries: none after a Stop (#737).
+        if not ours and not _controls.is_stop():
+            try:
+                found, adopted = await _gemini_adopt_lost_conversation(
+                    page, brief_text, name, post_start=True, lost_convo_id=want)
+            except Exception as e:
+                found, adopted = page, False
+                log(f"[resume] {name}: the sidebar hunt raised ({type(e).__name__})",
+                    "WARN")
+            if adopted and found is not page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                page = found
+            try:
+                live = page.url or ""
+            except Exception:
+                live = ""
+            ours = bool(adopted) and _p2_chat_id(platform, live) == want
+    else:
+        ours = await _p2_rejoined_page_is_ours(page, platform, want, brief_text)
+    if not ours:
+        return await _give_up("the chat that opened is not provably this run's")
+
+    state = await _p2_rejoined_state(page, platform)
+    _log_words, _app_words = _P2_REJOIN_WORDS[state]
+    log(f"[resume] {name}: back on its own chat — {_log_words}")
+    _p2_note_chat(platform, page)
+    try:
+        _write_agent_terminal_status(platform, "running", force=True)
+    except Exception:
+        pass
+    emit_event("agent_progress", phase=2, agent=platform, status="generating",
+               stage=("planning" if state == "plan" else "researching"),
+               progress=f"Back on its own chat after Chrome restarted — {_app_words}")
+    try:
+        await inject_agent_observer(page, platform)
+    except Exception:
+        pass
+    try:
+        live = page.url or url
+    except Exception:
+        live = url
+    entry = {"page": page, "verified": state != "plan", "url": live,
+             "research_started_at": time.time()}
+    if platform == "gemini":
+        # The stale-reload prover reads it, as it does on 2D's own entry.
+        entry["brief"] = brief_text
+        entry["gemini_watch_start"] = state == "plan"
+    return entry
+
+
+async def _p2_rejoin_chats(browser, plan: dict, launch, brief_text: str) -> dict:
+    """{display name: round-robin entry} for each agent in `plan` whose own chat
+    the relaunched Chrome is back on. One log line per agent of `launch`."""
+    rejoined = {}
+    launching = {str(a).lower() for a in (launch or ())}
+    for key in ("chatgpt", "claude", "gemini"):
+        if key not in launching:
+            continue
+        if _controls.is_stop():
+            break  # no page actions after Stop (#737)
+        if key not in plan:
+            log(f"[resume] {_agent_display_name(key)}: no chat of its own to go "
+                f"back to — starting it the usual way")
+            continue
+        entry = await _p2_rejoin_chat(browser, key, plan[key], brief_text)
+        if entry is not None:
+            rejoined[_agent_display_name(key)] = entry
+    return rejoined
 
 
 async def _p2_run_with_resume(queue_dir, enabled_agents, research_brief, *,
@@ -80151,8 +80177,15 @@ def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        api_key=None, email=None, resume_dir=None, config=None,
                        run_id=None, uid=None, research_id=None, brief_text="",
-                       user_sources=None, user_links=None, _crash_retries=0):
+                       user_sources=None, user_links=None, _crash_retries=0,
+                       _p2_rejoin=None):
     """Run the full pipeline. Supports resume from a previous queue directory.
+
+    _p2_rejoin (10-01): {agent key: chat URL} — the chats a Phase-2 browser crash
+    left, handed over by that crash's own retry so the first Phase-2 attempt goes
+    back into them instead of sending the brief again. The one other caller is
+    a worker of this computer taking back a run that was moved to the queue
+    (wave 15, `_waiting_p2_chats`).
 
     brief_text (2026-04): inline brief content passed from the frontend when
     the user toggled Phase 1 off. Written to the new run's
@@ -80244,6 +80277,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # Clear dedup cache — stale keys from a prior run in the same process
     # would otherwise suppress early events in this run.
     _last_progress.clear()
+    # 10-01: the chats a Phase-2 crash handed this retry stay carried until this
+    # attempt goes back into them or sets their agents up again, so a crash
+    # before that, or during the rejoin, hands them on instead of nothing.
+    # (After the cross-run wipes above, which leave `_runtime` alone.)
+    _runtime.p2_chat_urls.update(_p2_rejoin or {})
     # Stamp the live per-run id into the env so Vision shadow + observe-only records
     # carry the REAL run id (both paths read DG_RUN_ID from the env at log time).
     # Without this they inherit whatever DG_RUN_ID was last set to in the environment
@@ -80280,6 +80318,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     if uid:
         # Use frontend research_id for Firestore paths (not run_id which is the backend dir name)
         setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop(), run_id=run_id)
+        # ⭐ Wave 15: a crash's own retry takes down the cards the crashed
+        # attempt raised — a crash that recovers leaves no alert behind.
+        if _crash_retries > 0:
+            _retract_crashed_attempt_cards(research_id or run_id)
     if _cli_mode:
         # CLI mode has no Firestore command listener — wire stdin instead so
         # the user can resume/skip/stop from the same terminal.
@@ -81074,6 +81116,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # wipes last_failure_kind) and read by the post-finally auto-retry block.
     # Pre-initialized so the clean-exit path (no exception) reads "".
     _captured_failure_kind = ""
+    # 10-01: the chats the previous attempt's Phase-2 crash left, spent by this
+    # attempt's FIRST Phase-2 attempt only (`_p2_attempt`) — and the ones THIS
+    # attempt leaves if Chrome dies in Phase 2, taken in the except below while
+    # `_runtime` still holds them.
+    _p2_rejoin_left = dict(_p2_rejoin or {})
+    _p2_rejoin_next = {}
     # Wave 13: set only when the login command paused this run and it can
     # continue by itself once the login finishes (see the end of this function).
     _login_resume = None
@@ -82646,10 +82694,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
             async def _p2_attempt(_launch, _brief):
                 """One Phase-2 attempt, under the phase's active-time ceiling."""
+                # 10-01: a crash retry's chats, for the first attempt only.
+                _rejoin = _p2_take_rejoin(_p2_rejoin_left,
+                                          new_input=bool(extra_ctx or fb2))
                 return await _await_phase_with_active_deadline(
                     2, PHASE_2_MAX_MIN,
                     lambda: run_phase2(browser, cua_client, _brief, verbose,
-                                       enabled_agents=_launch),
+                                       enabled_agents=_launch, rejoin=_rejoin),
                     soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
                 )
 
@@ -84257,6 +84308,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # block runs. (This is the latent half of the #725 bug: even the
         # poll-loop's browser_crash tag was being wiped before it was read.)
         _captured_failure_kind = getattr(_runtime, "last_failure_kind", "") or ""
+        # 10-01: and the chats Chrome took with it in Phase 2 — the crash
+        # retry goes back into them instead of sending the brief again. Before
+        # Phase 2 they are the ones a crash retry was itself handed (none on a
+        # first attempt); after it, there is nothing to go back into.
+        if _captured_failure_kind == "browser_crash" and last_phase <= 2:
+            _p2_rejoin_next = _p2_chats_to_rejoin()
+        elif _captured_failure_kind == "browser_crash":
+            # Review 10-02: and its retry takes down none of Phase 2's cards.
+            _forget_research_cards(research_id or run_id)
         # Will the post-finally block silently re-run this from checkpoint? If
         # so, SUPPRESS the user-facing card — the silent-self-heal rule says we
         # only show Retry/Skip AFTER auto-retries are exhausted. Same predicate
@@ -84549,7 +84609,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            # retry — the attempt most likely to be the one worth
                            # sending — attributable to nobody.
                            _submitted_by=_run_submitted_by(),
-                           _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries))
+                           _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries),
+                           # 10-01: empty unless Chrome died in Phase 2.
+                           _p2_rejoin=_p2_rejoin_next)
     # ⭐ WAVE 13: a run the login command paused waits for the login to finish,
     # then continues from its checkpoint by itself. Started HERE, after the
     # `finally` closed this attempt and the auto-retry above stood down — a
@@ -86408,139 +86470,85 @@ async def run_server(port=8000):
     _QUEUE_STATE["queue_ref"] = _job_queue
     _QUEUE_STATE["recompute_fn"] = None  # set below after defining helper
 
-    def _flip_txn_stage(tx, root) -> str:
-        """Which Firestore RPC was refused — the one thing 20 logged failures
-        never said.
-
-        The library masks a denial inside a transaction as "the transaction has
-        no transaction ID, so it cannot be rolled back", which describes the
-        rollback and not the fault. But that message is itself the evidence:
-        `Transaction._id` is set only AFTER BeginTransaction returns, so an
-        absent id means BeginTransaction is what was refused — before any
-        document was read or written, and therefore upstream of every rule
-        predicate about deviceId or ownership. An id that IS present narrows it
-        to the read or the commit instead.
-
-        Kept a named function, not an f-string at the call site, so the polarity
-        can be tested without provoking a real denial.
-        """
-        try:
-            began = getattr(tx, "_id", None) is not None
-        except Exception:
-            return "stage=unknown (transaction object unreadable)"
-        if not began:
-            return ("stage=BeginTransaction — no transaction id was ever issued, "
-                    "so the denial is on opening the transaction itself, not on "
-                    "the document read or the write payload")
-        _dbg = getattr(root, "debug_error_string", "") or ""
-        return ("stage=read_or_commit — the transaction opened, so the denial is "
-                "on the document"
-                + (f" | grpc={str(_dbg)[:200]}" if _dbg else ""))
-
     def _flip_queued_to_ongoing(uid_val, research_id_val):
         """Worker pickup: flip status from queued → ongoing and clear queue
-        fields. Transactional — only flips if current status is "queued",
-        so a concurrent cancel that wrote status="stopped" between dequeue
-        and this call wins the race. Without this, a cancel landing in the
-        ms between worker dequeue and worker.flip() would be silently
-        overwritten back to "ongoing" and the user would see "Cancelled" in
-        chat while the tile said running. No-op if Firestore is unavailable
-        or uid/rid missing (HTTP /api/runs path doesn't carry them)."""
+        fields — only while the record still says "queued", so a concurrent
+        cancel that wrote status="stopped" between dequeue and this call wins
+        the race. Without that, a cancel landing in the ms between worker
+        dequeue and worker.flip() would be silently overwritten back to
+        "ongoing" and the user would see "Cancelled" in chat while the tile said
+        running. No-op if Firestore is unavailable or uid/rid missing (HTTP
+        /api/runs path doesn't carry them).
+
+        ⛔⛔ WAVE 15 (10-02): NO TRANSACTION, BECAUSE THIS MACHINE MAY NOT OPEN
+        ONE. The flip used to be a Firestore transaction, and it failed on every
+        run in the corpus — twenty of twenty, and on 10-02 on a sharer's run —
+        with the stage read as "BeginTransaction": the rules deny this machine's
+        synth user a transaction on the user tree (#720, "Track D denies
+        synth-user transactional reads"), before any document is touched, which
+        is why re-minting the token never helped. The plain read the caller
+        fell back to has worked every time. So the flip IS that read now, plus
+        an update with a precondition on the record's update time — the
+        compare-and-set `_try_claim_queue_doc` already uses: a write that lands
+        between our read and ours fails the precondition, and the record is
+        read again. Same guarantee, no BeginTransaction."""
         if not (_firebase_db and uid_val and research_id_val):
             return
         try:
             from google.cloud import firestore as _firestore
+            import google.api_core.exceptions as _gax
             doc_ref = _firebase_db.collection("users").document(uid_val) \
                 .collection("researches").document(research_id_val)
 
-            @_firestore.transactional
-            def _flip_txn(tx):
-                snap = doc_ref.get(transaction=tx)
+            def _flip_once():
+                snap = doc_ref.get()
                 if not snap.exists:
                     return "missing"
                 cur = (snap.to_dict() or {}).get("status")
                 if cur != "queued":
                     return f"skipped({cur})"
-                tx.update(doc_ref, _be_payload({
-                    "status": "ongoing",
-                    "queuePosition": _firestore.DELETE_FIELD,
-                    "queuedBehindRunId": _firestore.DELETE_FIELD,
-                    "queuedBehindTitle": _firestore.DELETE_FIELD,
-                }))
+                try:
+                    doc_ref.update(_be_payload({
+                        "status": "ongoing",
+                        "queuePosition": _firestore.DELETE_FIELD,
+                        "queuedBehindRunId": _firestore.DELETE_FIELD,
+                        "queuedBehindTitle": _firestore.DELETE_FIELD,
+                    }), option=_firebase_db.write_option(
+                        last_update_time=snap.update_time))
+                except _gax.FailedPrecondition:
+                    return "raced"   # somebody wrote it after our read
                 return "flipped"
 
-            # #720: a stale gRPC idToken (missing the deviceId claim) makes the
-            # transaction's first READ fail deviceMemberOf → google-cloud-firestore
-            # masks it as "transaction has no transaction ID". Heal re-mints a
-            # claim-bearing token and re-runs with a FRESH transaction object.
-            #
-            # ⚠ 2026-08-06 — THAT DIAGNOSIS IS NOT WHAT THE LIBRARY DOES, and the
-            # heal's own output says so: "the re-minted token did NOT clear the
-            # denial — so a stale credential was not the cause", 20 occurrences
-            # across the corpus and not one success. Reading the installed
-            # google-cloud-firestore: `_Transactional._pre_commit` calls
-            # `transaction._begin(...)` EAGERLY, `_begin` issues a real
-            # BeginTransaction RPC and only sets `self._id` afterwards, and
-            # `_rollback` opens with `if not self.in_progress: raise ValueError`
-            # where `in_progress` is `self._id is not None`. A denied READ, a
-            # denied COMMIT and a denied ROLLBACK all leave `_id` set and would
-            # surface as a bare PermissionDenied — so the ValueError we see can
-            # only come from BeginTransaction ITSELF being denied, before any
-            # document is touched. That is upstream of every rule predicate the
-            # heal reasons about, which is exactly why re-minting cannot help.
-            # `_flip_tx` is captured so the except block can report whether an id
-            # was ever obtained, and turn that reading into proof next run.
-            _flip_tx = _firebase_db.transaction()
-            outcome = _grpc_write_with_heal(
-                lambda: _flip_txn(_flip_tx),
-                what=f"flip queued→ongoing {research_id_val[:8]}…", uid=uid_val,
-            )
+            outcome = "raced"
+            for _attempt in range(2):
+                outcome = _grpc_write_with_heal(
+                    _flip_once, what=f"flip queued→ongoing {research_id_val[:8]}…",
+                    uid=uid_val)
+                if outcome != "raced":
+                    break
+            if outcome == "raced":
+                # Written twice under us: let the caller's own read decide.
+                log(f"[flip] {research_id_val[:8]}… changed under the flip twice — "
+                    f"the caller reads it once more", "DEBUG")
+                return "error"
             if outcome.startswith("skipped"):
                 log(f"[flip] {research_id_val[:8]}… {outcome} — leaving status as-is (cancel race won)", "INFO")
             elif outcome == "missing":
                 log(f"[flip] {research_id_val[:8]}… research doc missing — Q3 cascade-cancel should catch this", "WARN")
             return outcome
         except Exception as e:
-            # 2026-05-28: surface the ROOT cause. A permission error inside the
-            # transaction makes google-cloud-firestore raise "transaction has no
-            # transaction ID, so it cannot be rolled back", which MASKS the real
-            # 403 (the flip's research-doc update was denied — see the
-            # deviceUpdatingFor self-heal fix). Log __cause__/__context__ so any
-            # future flip failure is diagnosable instead of misleading.
-            # ⚠ Lead with the ROOT. Appending it was not enough: the line opened
-            # with "The transaction has no transaction ID, so it cannot be rolled
-            # back", which is an artifact of the rollback and not a fault anyone
-            # can act on, and the PermissionDenied that actually happened sat at
-            # the end past a device id. Every occurrence in the live corpus reads
-            # that way.
+            # Lead with the ROOT cause, as the heal's own line does.
             _root = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
             _head = f"{type(_root).__name__}: {_root}" if _root is not None else str(e)
-            # ⛔⛔ 2026-08-20 — THIS WAS A WARN FOR A WRITE THAT IS NEVER NEEDED.
-            # The comment on the caller's fallback says it plainly: this flip has
-            # failed on EVERY run in the corpus, twenty occurrences and zero
-            # successes — and the fallback plain-read has resolved the status
-            # every single time, because the app has already set it. So the run is
-            # never affected, and the operator was handed two WARNs and a
-            # paragraph of transaction diagnostics per run for a no-op.
-            #
-            # Owner, 2026-08-20, on this exact line: take care of the false alarm.
-            # The alerting rule this file already follows is "speak when a PERSON
-            # must act"; nobody can act on this and nothing is lost.
-            #
-            # ⭐ Kept at full detail, ONCE per process, keyed on the root cause's
-            # class — via the same `logquiet` primitive wave 2 added for the
-            # telemetry flood. The root cause is still unnamed, so the day it
-            # changes class the new one still speaks. What stops is the repetition
-            # (and the level: the caller downgrades this to DEBUG the moment its
-            # read resolves the status, which is the measured 100% case).
+            # ⛔ 2026-08-20 (the owner): nobody can act on this and the caller's
+            # read decides the run — so DEBUG, once per process per root cause.
             _emit_flip, _flip_dropped = _FLIP_403_QUIET.consider(
-                "flip-txn-refused", f"{type(_root).__name__ if _root else type(e).__name__}")
+                "flip-refused", f"{type(_root).__name__ if _root else type(e).__name__}")
             if _emit_flip:
                 log(
-                    f"[flip] could not open the queued→ongoing transaction for "
-                    f"{research_id_val}: {_head}"
+                    f"[flip] could not flip {research_id_val} from queued to ongoing: "
+                    f"{_head}"
                     + (f" | surfaced as: {e}" if _root is not None else "")
-                    + f" | {_flip_txn_stage(locals().get('_flip_tx'), _root)}"
                     + " | the caller falls back to a plain read; this is not a "
                       "run-affecting failure"
                     + logquiet.suppressed_note(_flip_dropped),
@@ -87408,7 +87416,10 @@ async def run_server(port=8000):
                                      _submitted_by=job.get("submitted_by"),
                                      brief_text=job.get("brief_text", ""),
                                      user_sources=job.get("user_sources") or [],
-                                     user_links=job.get("user_links") or []))
+                                     user_links=job.get("user_links") or [],
+                                     # Wave 15: a moved run's chats
+                                     # (`_waiting_p2_chats`).
+                                     _p2_rejoin=job.get("p2_rejoin") or None))
                     _wd_active_sec = 0.0
                     _wd_tick = 10.0
                     while not _pipe_task.done():

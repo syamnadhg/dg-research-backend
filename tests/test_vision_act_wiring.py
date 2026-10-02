@@ -203,11 +203,8 @@ def test_round_robin_diagnose_read_only():
         assert "read_only=True" in blk
 
 
-def test_gemini_start_wrapped_dual_target():
-    (blk,) = _block_for(_src(research.run_phase2), "gemini-start")
-    assert "mission_prompt=PROMPT_GEMINI_START_RESEARCH" in blk
-    # dual-target intent preserved in the hint (Start OR Regenerate)
-    assert "Retry" in blk or "Regenerate" in blk
+# ⛔ Wave 15 (10-02): the "gemini-start" site in run_phase2 — the plan wait's
+# computer-use recovery — is gone: the wait points no computer use at Gemini.
 
 
 def test_select_pro_both_sites_wrapped_no_success_text():

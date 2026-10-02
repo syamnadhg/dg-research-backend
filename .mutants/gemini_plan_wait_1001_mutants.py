@@ -1,7 +1,13 @@
 """Mutation harness — Gemini's plan wait: nothing raised for ten minutes, and a
 quiet chat refreshed, always on the run's own chat (2026-10-01).
 
-⛔⛔ WHAT THIS CODE DECIDES (research.py).
+⛔⛔ WAVE 15 (10-02): THE REFRESH, THE CARD, THE RECOVERY AND THE SIX-MINUTE
+HAND-OFF ARE GONE, and their rows with them. What is left: the ten-minute wait
+(W2) and which chat is believed (W11-W39 that still stand). The new behaviour —
+nothing reloaded, pressed or raised; Gemini handed on watched — is measured by
+.mutants/w15_crash_gemini_1002_mutants.py.
+
+⛔⛔ WHAT THIS CODE DECIDED (research.py, before wave 15).
   W1-W3   — the clock: no card before the wait is over (three spent re-drafts
             included), the wait is ten minutes, a refresh needs two quiet ones.
   W4-W10  — when the chat is refreshed: only after a window of nothing new — no
@@ -47,56 +53,26 @@ ROOT = Path(__file__).resolve().parents[1]
 RESEARCH = "research.py"
 
 # `-x`: a kill needs one red test, and every run drives headless Chrome.
+# Wave 15: + the file that measures the wait as it is now (it uses this file's
+# fixture), so W2 and the hand-off it ends in are still measured.
 SUITES = {
-    RESEARCH: (ROOT, "tests/test_gemini_plan_wait_1001.py -x"),
+    RESEARCH: (ROOT, "tests/test_gemini_plan_wait_1001.py "
+                     "tests/test_w15_gemini_waits_1002.py -x"),
 }
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"}
 _INFLIGHT = Path(__file__).with_suffix(".inflight")
 
 MUTANTS = [
-    # ── W1-W3: the clock ────────────────────────────────────────────────────
-    ("W1", RESEARCH, "⛔⛔ the floor goes — three spent re-drafts card about four "
-     "minutes in again, before the owner's ten",
-     [("    if elapsed < float(wait_max_sec):\n        return False\n", "")]),
-    ("W2", RESEARCH, "⛔⛔ the wait is five minutes again — the card and the vision "
-     "step at ~300 s",
+    # ── the clock ───────────────────────────────────────────────────────────
+    # ⛔ W1, W3-W10, W13, W15-W22, W26, W28 and W31-W33 RETIRED in wave 15
+    # (10-02), not re-anchored: they measured the quiet-chat refresh, the card,
+    # the computer-use recovery and the six-minute hand-off, all removed by the
+    # owner's decision ("wait for the research without refreshing").
+    ("W2", RESEARCH, "⛔⛔ the wait is five minutes again — Gemini is handed on at "
+     "~300 s instead of the owner's ten minutes",
      [('os.environ.get("GEMINI_PLAN_WAIT_SEC", str(10 * 60))',
        'os.environ.get("GEMINI_PLAN_WAIT_SEC", str(5 * 60))')]),
-    ("W3", RESEARCH, "⛔ a refresh after one quiet minute, not two",
-     [('os.environ.get("GEMINI_PLAN_REFRESH_SEC", "120")',
-       'os.environ.get("GEMINI_PLAN_REFRESH_SEC", "60")')]),
-
     # ── W4-W10: when ────────────────────────────────────────────────────────
-    ("W4", RESEARCH, "⛔⛔ the quiet chat is never refreshed — the 09-30 silent "
-     "screen sits untouched to the card",
-     [("            if _gemini_plan_refresh_due(time.time(), quiet_since=_quiet_since,",
-       "            if False and _gemini_plan_refresh_due(time.time(), quiet_since=_quiet_since,")]),
-    ("W5", RESEARCH, "⛔⛔ growing text reads as quiet — a reply still being written "
-     "is refreshed",
-     [("    return reply_len == last_reply_len\n", "    return True\n")]),
-    ("W6", RESEARCH, "⛔⛔ the page reading is not asked — Gemini 'still working' "
-     "(its hidden Stop) is refreshed",
-     [('    if not str(state_reason or "").startswith("no_done_marker"):\n'
-       '        return False\n', "")]),
-    ("W7", RESEARCH, "⛔ a plan already on the page is refreshed",
-     [("    if not reply_found or reply_len > _GEMINI_PLAN_FAIL_MAX_CHARS:",
-       "    if not reply_found:")]),
-    ("W8", RESEARCH, "⛔ a reply that could not be read reads as quiet",
-     [("    if not reply_found or reply_len > _GEMINI_PLAN_FAIL_MAX_CHARS:",
-       "    if reply_len > _GEMINI_PLAN_FAIL_MAX_CHARS:")]),
-    ("W9", RESEARCH, "⛔⛔ no limit between loads — a tab that cannot be proven is "
-     "loaded on every look",
-     [("    return w > 0 and (now - quiet_since) >= w and (now - last_refresh_at) >= w",
-       "    return w > 0 and (now - quiet_since) >= w")]),
-    ("W10", RESEARCH, "⛔ a page quiet for exactly the window waits one more look",
-     [("    return w > 0 and (now - quiet_since) >= w and (now - last_refresh_at) >= w",
-       "    return w > 0 and (now - quiet_since) > w and (now - last_refresh_at) >= w")]),
-    ("W20", RESEARCH, "⛔ what the heartbeat sees moving no longer holds the refresh off",
-     [('                        _chat["quiet_since"] = _last_stream_seen_at\n', "")]),
-    ("W21", RESEARCH, "⛔ a refresh can cut into a re-draft we pressed a moment ago",
-     [('            _quiet_since = max(_chat["quiet_since"], _last_regen_at)',
-       '            _quiet_since = _chat["quiet_since"]')]),
-
     # ── W11-W26: which chat ─────────────────────────────────────────────────
     ("W11", RESEARCH, "⛔⛔ the address is taken from the address bar alone — a chat "
      "holding another brief becomes 'ours' and is refreshed",
@@ -106,36 +82,10 @@ MUTANTS = [
      "is pressed",
      [('    else:\n        chat["trusted"] = False\n',
        '    else:\n        return True\n')]),
-    ("W13", RESEARCH, "⛔⛔ a loaded page is believed without the proof — another "
-     "brief's plan is started",
-     [("    ok = await _gemini_reload_identity_ok(page, ours, brief)\n",
-       "    ok = True\n")]),
     ("W14", RESEARCH, "⛔⛔ a page that is not provably ours is still read and pressed "
      "by the wait",
      [("            if not _chat_ok:\n                # Not provably the run's chat",
        "            if False:\n                # Not provably the run's chat")]),
-    ("W15", RESEARCH, "⛔ a refresh that could not be proven goes on to press on the "
-     "same look",
-     [("                    if not await _gemini_plan_refresh(\n",
-       "                    if 0 * await _gemini_plan_refresh(\n")]),
-    ("W16", RESEARCH, "⛔⛔ the recovery runs on a tab that is not provably ours — "
-     "computer use and presses on somebody else's chat",
-     [("                and not _finished_handoff and not _controls.is_stop()\n"
-       "                and _chat_ok):",
-       "                and not _finished_handoff and not _controls.is_stop()):")]),
-    ("W17", RESEARCH, "⛔⛔ Gemini's bare /app is refreshed before the chat has an "
-     "address — the chat is lost",
-     [('                if _chat["convo"]:\n', "                if True:\n")]),
-    ("W18", RESEARCH, "⛔ going back never uses Gemini's side list — always the "
-     "address load the 2026-07 finding warns about",
-     [("            pressed = bool(await page.evaluate(_GEMINI_OPEN_CHAT_JS, ours))",
-       "            pressed = False")]),
-    ("W19", RESEARCH, "⛔ with no side-list entry there is no way back",
-     [('await page.goto(chat.get("url") or "",', 'await page.goto("",')]),
-    ("W22", RESEARCH, "⛔⛔ a drifted tab is refreshed in place — the wrong chat is "
-     "reloaded instead of going back to ours",
-     [('    if _gemini_convo_url_id(here) == ours:\n        log(f"[2D] {why}',
-       '    if True:\n        log(f"[2D] {why}')]),
     ("W23", RESEARCH, "⛔⛔ a tab back on our address is believed without a proof — "
      "after a load that could not be proven, its plan is pressed",
      [('        if chat.get("trusted", True):\n            return True',
@@ -144,18 +94,11 @@ MUTANTS = [
      "chat's finished report is taken for this run's",
      [("                                           if _chat_ok else (False, _gemini_state))",
        "                                           if True else (False, _gemini_state))")]),
-    ("W26", RESEARCH, "⛔ the side-list press takes the first chat it sees, not ours",
-     [(".endsWith('/app/' + id)) {", ".includes('/app/')) {")]),
-
     # ── W27-W39: review round 1 ─────────────────────────────────────────────
     ("W27", RESEARCH, "⛔⛔ the owner's 10-01 run: Gemini moves the run's chat to a "
      "new address and it is called a drift — Start is never pressed",
      [("    elif await _gemini_plan_follow(page, chat, url, brief):\n"
        "        return True\n", "")]),
-    ("W28", RESEARCH, "⛔ a refresh Gemini answers at a new address is called not "
-     "the run's own",
-     [("        ok = await _gemini_plan_follow(page, chat, now_url, brief)\n",
-       "        ok = False\n")]),
     ("W29", RESEARCH, "⛔⛔ an earlier attempt's FINISHED chat (same brief) is "
      "followed — its report taken for this run's",
      [("    if (await _gemini_done_read(page))[0]:\n        return False\n"
@@ -165,20 +108,6 @@ MUTANTS = [
      "another chat's Start is pressed",
      [("    if not await _gemini_reload_identity_ok(page, here, brief):\n"
        "        return False\n", "")]),
-    ("W31", RESEARCH, "⛔⛔ Gemini's visible Stop is not 'still working' — no hand-off "
-     "at six minutes, the card and the ladder instead",
-     [('            if _chat_ok and _gemini_state.startswith("stop_btn_present"):\n',
-       "            if False:\n")]),
-    ("W32", RESEARCH, "⛔ a Stop read before the tab stopped being believed keeps "
-     "Gemini 'working' — handed off with no evidence",
-     [('if _chat_ok and _gemini_state.startswith("stop_btn_present"):',
-       'if _gemini_state.startswith("stop_btn_present"):')]),
-    ("W33", RESEARCH, "⛔ the alert is fixed at ten minutes — a shorter wait set "
-     "by hand gives up with no card",
-     [('os.environ.get("GEMINI_PLAN_ALERT_SEC",\n'
-       "                                             str(_start_wait_max_sec))",
-       'os.environ.get("GEMINI_PLAN_ALERT_SEC",\n'
-       '                                             "600")')]),
     ("W34", RESEARCH, "⛔ the tile hears nothing while the tab is not provably ours",
      [("                if time.time() - _last_plan_emit >= 15:\n"
        "                    try:\n"

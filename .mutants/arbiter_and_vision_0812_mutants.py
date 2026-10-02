@@ -73,7 +73,10 @@ MUTANTS = [
      [('STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "900"))',
        'STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "300"))')]),
     ("A7", "over", "⛔ the planning clause is dropped — the 2026-07-09 false card returns",
-     [("                                 and not status_is_active)", ")")]),
+     # Re-anchored in wave 15: a Gemini still planning was added as the line after.
+     [("                                 and not status_is_active\n"
+       "                                 and not (name == \"Gemini\" and p.get(\"gemini_watch_start\")))",
+       "\n                                 and not (name == \"Gemini\" and p.get(\"gemini_watch_start\")))")]),
     ("A8", "over", "the throttle is a day long — the arbiter never re-probes at all",
      [('STUCK_WARN_THROTTLE_SEC = int(os.environ.get("DG_STUCK_WARN_THROTTLE_SEC", "600"))',
        'STUCK_WARN_THROTTLE_SEC = int(os.environ.get("DG_STUCK_WARN_THROTTLE_SEC", "86400"))')]),
