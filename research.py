@@ -27697,16 +27697,24 @@ class LinkResult:
     caller of this class survives at all: the only link extraction left in the
     pipeline is phase 3's NotebookLM notebook link. The class is a phase-3 type
     now, and the Gemini tab spam it mentions belongs to a removed extractor.
-    """
-    __slots__ = ("url", "label", "platform", "verified", "error", "cua_attempted")
 
-    def __init__(self, url="", label="", platform="", verified=False, error="", cua_attempted=False):
+    access_set (wave 17 review): True only when the page's own share dialog
+    pressed "Anyone with the link" (or found it already set). The link alone
+    cannot say so — a notebook's private address and its public one look the
+    same, and the extractor falls back to the tab's own address when the share
+    step fails. The NotebookLM pop-up says "Shared" only on this.
+    """
+    __slots__ = ("url", "label", "platform", "verified", "error", "cua_attempted", "access_set")
+
+    def __init__(self, url="", label="", platform="", verified=False, error="", cua_attempted=False,
+                 access_set=False):
         self.url = url
         self.label = label
         self.platform = platform
         self.verified = verified
         self.error = error
         self.cua_attempted = cua_attempted
+        self.access_set = access_set
 
     def to_dict(self):
         return {"url": self.url, "label": self.label, "verified": self.verified}
@@ -28326,8 +28334,11 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
                 f"{url[:100] or '<blank>'}")
         if _dom_err:
             _err += f"; DOM share attempt: {_dom_err}"
+    # ⭐ Wave 17 review: `access_set` goes out with the link. It is the page's
+    # own share dialog pressing "Anyone with the link" — the one thing here that
+    # says the notebook was shared; the tab-address fallback above is not.
     return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm",
-                      verified=verified, error=_err)
+                      verified=verified, error=_err, access_set=access_set)
 
 
 
@@ -73446,7 +73457,10 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # value-set + Angular events sidesteps the keyboard entirely;
             # CUA stays as fallback (best-effort — nothing downstream gates
             # on the notebook name).
-            if not await _nlm_dom_rename(page, title):
+            # ⭐ Wave 17 review: whether the rename WORKED is kept, so the pop-up
+            # names the notebook only when the page, or computer use, says so.
+            _renamed = bool(await _nlm_dom_rename(page, title))
+            if not _renamed:
                 async def _nlm_rename_cua():
                     return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
                         f"Rename this notebook to: {title}. If Ctrl+A does not select the "
@@ -73455,7 +73469,7 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
                 # #839 act tier: this site TYPES (the only P3 upload-family site
                 # that types into the page).
-                await _shadow_observed_cua(
+                _rename_cua = await _shadow_observed_cua(
                     browser.page, hotspot_id="nlm-rename", phase=3, platform="notebooklm",
                     current_step="rename_notebook",
                     context_hint=f"rename the notebook to '{title}': click the notebook title, "
@@ -73464,9 +73478,16 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     cua_coro_factory=_nlm_rename_cua,
                     mission_prompt=PROMPT_NOTEBOOKLM_RENAME,
                     act_timeout_s=90.0)
+                # Computer use's own word: "done" when it finished the job,
+                # "vision_success" when Vision did. A stop, an error or running
+                # out of turns is not a rename.
+                _renamed = (isinstance(_rename_cua, dict)
+                            and _rename_cua.get("status") in ("done", "vision_success"))
 
-            # ⭐ Wave 17: the notebook card takes this run's own name.
-            _p3_step("renamed", f"Named “{title}”", stage="notebook")
+            # ⭐ Wave 17: the notebook card takes this run's own name — only
+            # when the rename worked. A failed one leaves NotebookLM's own name.
+            if _renamed:
+                _p3_step("renamed", f"Named “{title}”", stage="notebook")
 
             # C1: make notebook public (Share → "Anyone with the link" → Save)
             # BEFORE emitting the URL, so the frontend's link is always viewable.
@@ -73490,9 +73511,13 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                 # a separate, honest signal — logged, not gating.
                 if is_notebooklm_url(nlm_share_res.url):
                     notebook_url = nlm_share_res.url
-                    # ⭐ Wave 17: the share step ran and handed back the link.
-                    _p3_step("shared", "Shared: anyone with the link can view",
-                             stage="notebook", url=notebook_url)
+                    # ⭐ Wave 17: "Shared" only when the share dialog actually
+                    # set "Anyone with the link" (review: a notebook address
+                    # comes back even when sharing failed — the extractor falls
+                    # back to the tab's own address, private or not).
+                    if getattr(nlm_share_res, "access_set", False):
+                        _p3_step("shared", "Shared: anyone with the link can view",
+                                 stage="notebook", url=notebook_url)
                     if nlm_share_res.verified:
                         log(f"NotebookLM public share OK (DOM-verified): {notebook_url}")
                     else:

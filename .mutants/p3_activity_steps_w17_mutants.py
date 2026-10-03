@@ -102,10 +102,8 @@ MUTANTS = [
     ('U1', RESEARCH, '⛔ the notebook is named and the pop-up never says so',
      [('            _p3_step("renamed", f"Named “{title}”", stage="notebook")\n',
        '            pass\n')]),
-    ('U2', RESEARCH, '⛔ the share is never shown',
-     [('                    _p3_step("shared", "Shared: anyone with the link can view",\n'
-       '                             stage="notebook", url=notebook_url)\n',
-       '                    pass\n')]),
+    # U2 ("the share is never shown") moved to p3_activity_w17_review_mutants
+    # as A4: the review's access gate nested its line one level deeper.
     ('U3', RESEARCH, 'the share row carries no link to the notebook',
      [('                             stage="notebook", url=notebook_url)\n',
        '                             stage="notebook")\n')]),

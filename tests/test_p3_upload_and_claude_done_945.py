@@ -173,8 +173,15 @@ def test_agent_loop_retries_transient_5xx():
 # ── A4: DOM-first rename ─────────────────────────────────────────────────────
 
 def test_rename_tries_dom_before_cua():
+    # Wave 17 review: the page rename's result is now KEPT (the pop-up names the
+    # notebook only when a rename worked), so the guard reads it off a name.
+    # The order itself is executed by test_p3_activity_steps_w17's
+    # test_a_rename_that_failed_does_not_name_the_notebook: computer use is
+    # asked only when the page's own rename failed.
     src = inspect.getsource(research.run_phase3_upload)
-    assert "if not await _nlm_dom_rename(page, title):" in src, (
+    assert ("_renamed = bool(await _nlm_dom_rename(page, title))" in src
+            and "if not _renamed:" in src
+            and src.index("_nlm_dom_rename(page, title)") < src.index("_nlm_rename_cua")), (
         "rename must be DOM-first — NLM's title input ignores Ctrl+A, so CUA "
         "typing APPENDS (FIFA shipped 'FIFA World Cup Evolution And "
         "EconomicsThe FIFA W')"

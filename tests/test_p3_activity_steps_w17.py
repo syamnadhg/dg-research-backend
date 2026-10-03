@@ -283,8 +283,37 @@ class _Controls:
         return None
 
 
-def _upload_phase(monkeypatch, tmp_path, dom_uploaded, share_url=NB_URL):
-    page = SimpleNamespace(url=HOME_URL)
+class _Button:
+    async def click(self, *a, **k):
+        return None
+
+
+#: The Share control's selector, as the real extractor asks for it.
+_SHARE_SELECTOR = 'button[aria-label*="Share"]'
+#: The computer-use jobs the upload phase asked for, by hotspot, in order.
+_CUA_ASKED: list = []
+
+
+def _upload_phase(monkeypatch, tmp_path, dom_uploaded, *, share="set", rename=True, rename_cua="done"):
+    """Run the real upload phase. ⭐ The share step is the REAL extractor
+    (`extract_notebooklm_url`) driving a fake page — only its dialog helper is
+    replaced:
+
+      share="set"      the Share control is there and its dialog presses
+                       "Anyone with the link" (the helper answers access_set);
+      share="missing"  the Share control is not on the page, and the extractor
+                       falls back to the tab's own (notebook) address.
+
+    rename: whether the page's own rename worked; rename_cua: what computer use
+    answered when it did not."""
+    page = SimpleNamespace(url=HOME_URL, keyboard=SimpleNamespace(press=_none))
+
+    async def _query(sel):
+        if _SHARE_SELECTOR in sel:
+            return _Button() if share == "set" else None
+        return None   # no stale overlay, no dialog
+
+    page.query_selector = _query
 
     async def _new_tab(url):
         page.url = url
@@ -301,7 +330,12 @@ def _upload_phase(monkeypatch, tmp_path, dom_uploaded, share_url=NB_URL):
             pg.url = NB_URL
         return set(dom_uploaded)
 
+    _CUA_ASKED.clear()
+
     async def _cua(pg, **k):
+        _CUA_ASKED.append(k.get("hotspot_id"))
+        if k.get("hotspot_id") == "nlm-rename":
+            return {"status": rename_cua}
         page.url = NB_URL     # computer use made the notebook / added the file
         return {"status": "done"}
 
@@ -324,9 +358,12 @@ def _upload_phase(monkeypatch, tmp_path, dom_uploaded, share_url=NB_URL):
     monkeypatch.setattr(research, "start_narration_ticker", lambda *a, **k: (None, None))
     monkeypatch.setattr(research, "stop_narration_ticker", _none)
     monkeypatch.setattr(research, "smart_title", lambda t: "Fusion economics")
-    monkeypatch.setattr(research, "_nlm_dom_rename", _true)
-    monkeypatch.setattr(research, "extract_notebooklm_url",
-                        lambda *a, **k: _ret(SimpleNamespace(url=share_url, verified=False, error="")))
+    monkeypatch.setattr(research, "_nlm_dom_rename", _true if rename else _false)
+    # The share dialog's own work: it hands back the link and that it pressed
+    # "Anyone with the link". Everything around it is the real extractor.
+    monkeypatch.setattr(research, "_set_nlm_public_and_get_link",
+                        lambda *a, **k: _ret((NB_URL, False, True)))
+    monkeypatch.setattr(research, "selfheal", None)
     monkeypatch.setattr(research, "_observe_dom_success", lambda *a, **k: None)
     monkeypatch.setattr(research, "emit_validated_link", lambda *a, **k: None)
     return asyncio.run(research.run_phase3_upload(browser, None, {}, "fusion", tmp_path))
@@ -345,10 +382,68 @@ def test_the_notebook_is_named_then_shared_with_its_link(monkeypatch, sent, tmp_
         assert e["stage"] == "notebook"
 
 
-def test_a_share_that_did_not_hand_back_a_link_is_not_shown_as_shared(monkeypatch, sent, tmp_path):
-    _upload_phase(monkeypatch, tmp_path, set(NAMES), share_url="")
+def test_a_share_that_never_happened_is_not_shown_as_shared(monkeypatch, sent, tmp_path):
+    # ⛔⛔ REVIEW (wave 17): the Share control is not on the page, so nothing set
+    # "Anyone with the link" — and the REAL extractor still hands back a
+    # notebook address: the tab's own. ⛔ WHY IT FAILS ON THE LANE'S CODE: the
+    # row was sent for any notebook-shaped address, so this run told the person
+    # a possibly private notebook was public.
+    out = _upload_phase(monkeypatch, tmp_path, set(NAMES), share="missing")
+    assert out["notebook_url"] == NB_URL      # the link is still kept, as before
     assert "shared" not in [i for i, _ in _ids(sent)]
     assert "renamed" in [i for i, _ in _ids(sent)]
+
+
+def test_the_extractor_says_whether_access_was_set(monkeypatch, sent):
+    """The real extractor: access is "set" only when its own share dialog set it.
+    A link copied by computer use is kept, but nothing read the access back."""
+    monkeypatch.setattr(research, "selfheal", None)
+    monkeypatch.setattr(research, "_arm_clipboard", lambda: None)
+    monkeypatch.setattr(research, "_read_clipboard_after_copy", lambda *a, **k: _ret((NB_URL, NB_URL)))
+    monkeypatch.setattr(research, "_shadow_observed_cua", lambda *a, **k: _ret({"status": "done"}))
+
+    def _browser(has_share):
+        async def _query(sel):
+            return _Button() if has_share and _SHARE_SELECTOR in sel else None
+        page = SimpleNamespace(query_selector=_query, keyboard=SimpleNamespace(press=_none))
+        return SimpleNamespace(page=page, current_url=lambda: _ret(NB_URL))
+
+    for answer, expected in (((NB_URL, False, True), True), ((NB_URL, False, False), False)):
+        monkeypatch.setattr(research, "_set_nlm_public_and_get_link", lambda *a, _v=answer, **k: _ret(_v))
+        res = asyncio.run(research.extract_notebooklm_url(_browser(True), cua_client=None))
+        assert (res.url, res.access_set) == (NB_URL, expected)
+    # The Share control missing, computer use copies the link: the link is
+    # kept, and access is NOT claimed — nothing read it back.
+    res = asyncio.run(research.extract_notebooklm_url(_browser(False), cua_client=object()))
+    assert (res.url, res.access_set) == (NB_URL, False)
+    # The tab's own address, with no computer use at all.
+    res = asyncio.run(research.extract_notebooklm_url(_browser(False), cua_client=None))
+    assert (res.url, res.access_set) == (NB_URL, False)
+    # ⭐ And the plain result keeps its old default: no access claimed.
+    assert research.LinkResult(url=NB_URL).access_set is False
+
+
+def test_a_rename_that_failed_does_not_name_the_notebook(monkeypatch, sent, tmp_path):
+    # ⛔⛔ REVIEW (wave 17): the page's rename failed and so did computer use.
+    # ⛔ WHY IT FAILS ON THE LANE'S CODE: "Named “…”" was sent however the
+    # rename ended.
+    for answer in ("failed", "max_iterations", "error", "stopped"):
+        sent.clear()
+        _upload_phase(monkeypatch, tmp_path, set(NAMES), rename=False, rename_cua=answer)
+        assert "renamed" not in [i for i, _ in _ids(sent)], answer
+        assert "shared" in [i for i, _ in _ids(sent)]
+        assert "nlm-rename" in _CUA_ASKED
+    # …and when computer use did rename it (or Vision did), it is named.
+    for answer in ("done", "vision_success"):
+        sent.clear()
+        _upload_phase(monkeypatch, tmp_path, set(NAMES), rename=False, rename_cua=answer)
+        assert _row(sent, "renamed")["label"] == "Named “Fusion economics”", answer
+    # ⭐ The page's own rename worked: named, and computer use is never asked —
+    # so its answer, whatever it would have been, cannot unname it.
+    sent.clear()
+    _upload_phase(monkeypatch, tmp_path, set(NAMES), rename=True, rename_cua="failed")
+    assert _row(sent, "renamed")["label"] == "Named “Fusion economics”"
+    assert "nlm-rename" not in _CUA_ASKED
 
 
 def test_the_fallback_confirms_each_source_and_announces_the_notebook_once(monkeypatch, sent, tmp_path):
