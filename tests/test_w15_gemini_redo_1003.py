@@ -225,7 +225,9 @@ def round_robin(chrome, monkeypatch):
     monkeypatch.setattr(ctl, "is_stop", lambda: False)
     monkeypatch.setattr(ctl, "is_pause", lambda: False)
 
-    def run(script, *, minutes, brief, entry=None, on_minute=None):
+    def run(script, *, minutes, brief, entry=None, on_minute=None, before=None):
+        """`before(page)`: run on the chat once it is open, before the round-robin
+        is handed it — the send step's own work on a chat a Retry just opened."""
         for seen in (lines, cards, cua, looks, collected):
             seen.clear()
         loads, presses = [], []
@@ -247,6 +249,9 @@ def round_robin(chrome, monkeypatch):
         pg = chrome.run(chrome.ctx.new_page())
         try:
             chrome.run(pg.route("**/*", _answer))
+            # This run's minute 0 — its first load is at 0.0, not at the end of
+            # the run before it in the same test.
+            run_state["t"] = clock.t
             chrome.run(pg.goto(f"{APP}/{OURS}"))
 
             class _Browser:
@@ -261,6 +266,8 @@ def round_robin(chrome, monkeypatch):
 
             run_state.update(t=clock.t, limit=minutes * 60, page=pg,
                              hooks=[on_minute] if on_minute else [])
+            if before is not None:
+                chrome.run(before(pg))
             agents = {"Gemini": {"page": pg, "verified": True, "url": pg.url,
                                  "research_started_at": clock.t, "brief": brief,
                                  "needs_start_verify": False, "gemini_watch_start": False,
@@ -501,6 +508,272 @@ def test_a_research_view_that_stays_stale_is_refreshed_three_times_and_no_more(
     assert len(reloads) == 3, out.loads
     assert all(b - a >= 12 for a, b in zip([0.0] + reloads, reloads)), reloads
     assert out.collected == []
+
+
+# ══ the plan's own words are not the research card (review, 10-03) ═══════════
+
+#: ⛔⛔ Gemini's plan restates the brief in its own words, and one of its steps
+#: says "researching sources" in the middle of a sentence — the review's page.
+PLAN_SAYS_RESEARCHING = (
+    "<p>Here is my research plan for the Hanseatic League.</p>"
+    "<p>(1) Find the main Hanseatic trading towns and the charters that bound them.</p>"
+    "<p>(2) Review how historians approach researching sources on medieval Baltic "
+    "trade, and which archives they draw on.</p>")
+#: The plan's 'Start research' greyed out, as Gemini leaves it while it plans
+#: (and on the auto-start layout).
+GREYED_START = '<button aria-label="Start research" disabled>Start research</button>'
+#: A 240-character brief: on 0c2d077 the page's first 8,000 characters then
+#: reached the plan, so it read the plan the same way.
+SHORT_BRIEF = "brief " * 40
+WATCHED = {"verified": False, "gemini_watch_start": True}
+
+
+def test_a_plan_that_says_researching_sources_is_still_a_plan_its_start_is_pressed_and_it_is_never_refreshed(
+        round_robin):
+    """⭐⭐ Gemini reaches the round-robin still planning, watched for its 'Start
+    research', and its plan says "researching sources" mid-sentence. With an
+    enabled 'Start research' that Start is pressed, once; with it greyed out the
+    plan is waited on. Either way the chat is loaded once and never refreshed,
+    the watch does not let go, and computer use is never sent to it — with a
+    short brief and with a real-size one. Before (8009b05): the watch read the
+    plan as a research that had started, let go without pressing Start, and the
+    planning chat was refreshed at 12, 24 and 36 minutes (27, 42 with Start
+    greyed). On 0c2d077 the same happened with the short brief."""
+    for brief in (REAL_BRIEF, SHORT_BRIEF):
+        size = len(brief)
+        ready = round_robin(lambda n: page(PLAN_SAYS_RESEARCHING + PLAN, brief=brief),
+                            minutes=40, brief=brief, entry=WATCHED)
+        assert [what for _t, what in ready.presses] == [OURS], (size, ready.presses)
+        assert ready.loads == [0.0], (size, ready.loads)
+        assert _said(ready, "late 'Start research' appeared — clicked #1/3"), size
+        assert not _said(ready, "Watch-start: research is running"), size
+        assert ready.cua == [] and ready.looks == [], (size, ready.cua, ready.looks)
+
+        greyed = round_robin(lambda n: page(PLAN_SAYS_RESEARCHING + GREYED_START,
+                                            brief=brief),
+                             minutes=50, brief=brief, entry=WATCHED)
+        assert greyed.presses == [] and greyed.loads == [0.0], (size, greyed.presses,
+                                                                greyed.loads)
+        assert not _said(greyed, "Watch-start: research is running"), size
+        assert greyed.cua == [] and greyed.looks == [], (size, greyed.cua, greyed.looks)
+
+
+def test_the_refresh_does_not_take_the_plans_words_for_the_research_card(round_robin):
+    """'Start research' was pressed and the research has not shown yet: the page
+    holds the plan (its Start greyed) and Gemini's hidden 'Stop response'. The
+    twelve-minute refresh is for a research that shows; the plan's own
+    "researching sources" is not one, so the chat is never reloaded — short
+    brief or real-size. Before (8009b05): reloaded at 12, 24 and 36 minutes; on
+    0c2d077 the same with the short brief."""
+    for brief in (REAL_BRIEF, SHORT_BRIEF):
+        out = round_robin(lambda n: page(PLAN_SAYS_RESEARCHING + GREYED_START, brief=brief,
+                                         extra=HIDDEN_STOP),
+                          minutes=40, brief=brief)
+        assert out.loads == [0.0], (len(brief), out.loads)
+        assert not _said(out, "refreshing it"), len(brief)
+
+
+class _Replies:
+    """A page whose replies read (`_GEMINI_REPLIES_TEXT_JS`) is `text`."""
+
+    def __init__(self, text):
+        self.text = text
+
+    async def evaluate(self, script, *a):
+        assert script == research._GEMINI_REPLIES_TEXT_JS, script[:60]
+        return self.text
+
+
+#: (what Gemini's replies read, research started?, its card showing?)
+_CARD_LINES = [
+    ("Here is my plan.\nResearching 143 websites\nShow thinking", True, True),
+    ("Here is my plan.\nResearching websites...", True, True),
+    ("Here is my plan.\n  Researching 25 sources…", True, True),
+    ("Here is my plan.\n(2) Review how historians approach researching sources on "
+     "medieval Baltic trade.", False, False),
+    ("Gemini is researching 12 websites for you", False, False),
+    ("I've completed your research. Feel free to ask me follow-up questions.", True, False),
+]
+
+
+def test_the_research_card_is_a_line_of_its_own():
+    """Both research reads: the card's words start a line (after any spaces);
+    inside a sentence they are not the card. The completion line counts
+    wherever it is. Before (8009b05): the plan's sentence read as the card; on
+    0c2d077 these reads did not read Gemini's replies at all."""
+    for text, started, card in _CARD_LINES:
+        assert asyncio.run(research._gemini_research_started(_Replies(text))) is started, text
+        assert asyncio.run(research._gemini_research_surface(_Replies(text)))[0] is card, text
+
+
+def _served(chrome, html, clicks):
+    """A headless tab on the run's chat, showing `html`; a press of the page's
+    'Start research' is recorded in `clicks`."""
+    pg = chrome.run(chrome.ctx.new_page())
+
+    async def _answer(route):
+        path = urlsplit(route.request.url).path
+        if path.startswith("/__clicked/"):
+            clicks.append(path.rsplit("/", 1)[1])
+            await route.fulfill(status=204, body="")
+        elif re.fullmatch(r"/gemini\.google\.com/app/[A-Za-z0-9_-]*", path):
+            await route.fulfill(status=200, content_type="text/html", body=html)
+        else:
+            await route.abort()
+
+    chrome.run(pg.route("**/*", _answer))
+    chrome.run(pg.goto(f"{APP}/{OURS}"))
+    return pg
+
+
+def test_a_crash_rejoin_and_a_persons_retry_read_that_plan_as_a_plan(chrome, monkeypatch):
+    """The same plan, met by the two other readers of the research card. A crash
+    rejoin that lands on it reads 'plan' (so the round-robin watches it for its
+    Start), and a person's Retry that opens it presses its 'Start research' —
+    with a short brief and a real-size one. Before (8009b05): the rejoin read
+    'researching' and the Retry said "Gemini auto-started its research" without
+    pressing Start; on 0c2d077 the same with the short brief."""
+    lines = []
+    monkeypatch.setattr(research, "log", lambda m, level="INFO": lines.append(str(m)))
+
+    class _FastAsyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        @staticmethod
+        async def sleep(delay=0, *a, **k):
+            await asyncio.sleep(0)
+
+    async def _not_confirmed(page, *a, **k):
+        return False
+
+    class _Browser:
+        async def switch_to_page(self, p):
+            self.page = p
+
+    opened = []
+    for brief in (REAL_BRIEF, SHORT_BRIEF):
+        size, clicks = len(brief), []
+        html = page(PLAN_SAYS_RESEARCHING + PLAN, brief=brief)
+        rejoined = _served(chrome, html, clicks)
+        opened.append(rejoined)
+        assert chrome.run(research._p2_rejoined_state(rejoined, "gemini")) == "plan", size
+
+        retried = _served(chrome, html, clicks)
+        opened.append(retried)
+
+        async def _open(*a, **k):
+            return retried, True
+
+        lines.clear()
+        with monkeypatch.context() as m:
+            m.setattr(research, "start_agent_no_gemini_wait", _open)
+            m.setattr(research, "_read_p2_source_paths", lambda: [])
+            m.setattr(research, "verify_gemini_generating", _not_confirmed)
+            m.setattr(research, "asyncio", _FastAsyncio())
+            got = chrome.run(research._restart_phase2_agent(
+                "Gemini", _Browser(), None, brief, None, False))
+        for _ in range(40):          # the press's request reaches the test's server
+            if clicks:
+                break
+            chrome.run(asyncio.sleep(0.05))
+        assert got == (retried, None), (size, got)
+        assert clicks == [OURS], (size, clicks)
+        assert not [ln for ln in lines if "auto-started" in ln], (size, lines)
+    for pg in opened:
+        chrome.run(pg.close())
+
+
+# ══ one budget of two Redo presses per chat, the send step's included ════════
+
+def test_the_send_steps_redo_and_the_plan_waits_share_two_presses(launch):
+    """⭐ The plan fails right after the brief is sent. The send step's own watch
+    (`_gemini_retry_failed_turn`, the 90 s after Send) presses Gemini's Redo once;
+    the plan wait then presses it ONCE more — "2 of 2", 45 seconds after the
+    first — and never again. Two presses on the chat in all, never refreshed,
+    nothing raised. Before (8009b05): the plan wait counted from zero and pressed
+    twice more, three on one chat; on 0c2d077 it never pressed at all."""
+    out = launch(lambda cid, n: failed_plan(), send_step=True)
+    assert out.clicks == ["redo", "redraft", "redo", "redraft"], out.clicks
+    redo_at = [t for t, c in zip(out.click_at, out.clicks) if c == "redo"]
+    assert redo_at[1] - redo_at[0] >= 45, redo_at
+    assert [m.split(PRESSED + ", ", 1)[1][:6] for _t, m in said(out, PRESSED)] == ["2 of 2"]
+    assert len(said(out, "its Redo, pressed twice, did not bring it back")) == 1
+    assert [k["progress"] for n, k in out.events if n == "agent_progress"
+            and "pressed its Redo" in (k.get("progress") or "")] == [
+        "Gemini's plan hit an error — pressed its Redo (2 of 2)"]
+    assert out.loads == Counter({OURS: 1}), out.loads
+    assert out.cards == [] and out.looks == []
+    # Handed on: the wait's own press (the send step's stays with the chat's tab,
+    # where the round-robin counts it too).
+    assert _gemini(out)["gemini_plan_redos"] == 1, _gemini(out)
+
+
+def test_after_a_retry_the_send_steps_redo_and_the_round_robins_share_two_presses(
+        round_robin):
+    """A person's Retry opens a new chat whose plan fails at once: the send step
+    presses Gemini's Redo, and the chat goes to the round-robin's watch, which
+    presses it once more, 45 seconds later, and then — the plan still failed,
+    the second press's 45 seconds over — raises the card. Two presses in all.
+    Before (8009b05): three; on 0c2d077 one, and the card on the first look."""
+    async def send_step(pg):
+        await research._gemini_retry_failed_turn(pg, "2C-retry", max_wait_s=90)
+
+    out = round_robin(lambda n: failed_plan(), minutes=10, brief=SHORT_BRIEF,
+                      entry=WATCHED, before=send_step)
+    redos = [t for t, what in out.presses if what == "redo"]
+    assert len(redos) == 2 and redos[1] - redos[0] >= 0.75, out.presses
+    assert _said(out, PRESSED + ", 2 of 2"), out.lines[-20:]
+    assert len(out.cards) == 1 and out.cards[0][0] >= redos[1] + 0.75, out.cards
+    assert out.cards[0][1][:2] == ("gemini", "Gemini's plan failed"), out.cards
+    assert out.loads == [0.0], out.loads
+
+
+def test_a_new_chat_on_the_same_tab_starts_its_own_two_presses(monkeypatch):
+    """A Retry can reuse Gemini's tab for its new chat. The send step's REAL
+    statements from Send onward, on a tab whose last chat spent both presses:
+    by the time its failed-turn watch runs, that tab's count is the new chat's —
+    zero — so the new chat gets its own two. Before: there was no shared count
+    to clear (8009b05 and 0c2d077 alike)."""
+    from test_gemini_2d_cua_e2e0930 import SRC_PATH, _LandedPage, _send_onward
+
+    clock = _Clock()
+    seen = []
+
+    class _FastAsyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        @staticmethod
+        async def sleep(delay=0, *a, **k):
+            clock.t += float(delay or 0)
+
+    async def _watch(page, label, max_wait_s=90):
+        seen.append(research._gemini_plan_redos_spent(page, {}))
+        return False
+
+    page_ = _LandedPage()
+    research._gemini_send_redo_note(page_)
+    research._gemini_send_redo_note(page_)
+    assert research._gemini_plan_redos_spent(page_, {})[0] == 2
+    import ast
+    shell = ast.parse("async def _after_send(page):\n    pass\n")
+    shell.body[0].body = _send_onward()
+    ast.fix_missing_locations(shell)
+    scope = {**vars(research), "label": "2C-retry", "platform": "Gemini",
+             "platform_l": "gemini", "browser": None, "cua_client": None,
+             "verbose": False, "brief_to_paste": "brief", "time": clock,
+             "asyncio": _FastAsyncio(), "_gemini_retry_failed_turn": _watch,
+             "log": lambda m, level="INFO": None}
+    exec(compile(shell, str(SRC_PATH), "exec"), scope)
+
+    async def _read(p):
+        return ("brief", True)
+
+    scope["_gemini_read_conversation_text"] = _read
+    scope["_gemini_conversation_ownership"] = lambda *a, **k: True
+    assert asyncio.run(scope["_after_send"](page_)) == (page_, True)
+    assert seen == [(0, 0.0)], seen
 
 
 # ══ one look, between two reads ══════════════════════════════════════════════

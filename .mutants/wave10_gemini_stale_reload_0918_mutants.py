@@ -170,7 +170,7 @@ SURFACE_RAISE = ('        return str(await page.evaluate(_GEMINI_REPLIES_TEXT_JS
                  '    except Exception:\n'
                  '        return ""')
 SURFACE_EMPTY = ('    if not body:\n        return False, False\n'
-                 '    return (bool(_GEMINI_RESEARCH_CARD_RE.search(body)),')
+                 '    return (bool(_GEMINI_RESEARCH_CARD_LINE_RE.search(body)),')
 #: THE WIRING: the leg's one call, and run_phase2's brief seed.
 LEG_CALL = '                await _gemini_stale_reload_tick(p, name)'
 BRIEF_SEED = '                                "brief": brief_text,'

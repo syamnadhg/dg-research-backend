@@ -380,9 +380,13 @@ class _Tab:
 
 def test_the_surface_read_tells_the_card_and_the_completion_line_apart():
     """`_gemini_research_started` ORs them; the cadence needs them APART — the
-    card says a research is mounted, the completion line says leave it alone."""
+    card says a research is mounted, the completion line says leave it alone.
+    ⛔ 10-03 review: the card is a line of its own; the same words inside a
+    sentence (a plan that says "researching 41 websites") are not the card."""
     assert asyncio.run(research._gemini_research_surface(
-        _Tab(body=f"chatter {CARD} chatter"))) == (True, False)
+        _Tab(body=f"chatter\n{CARD}\nchatter"))) == (True, False)
+    assert asyncio.run(research._gemini_research_surface(
+        _Tab(body=f"a plan step about {CARD.lower()} on trade"))) == (False, False)
     assert asyncio.run(research._gemini_research_surface(
         _Tab(body=f"{CARD}\n{DONE}"))) == (True, True)
     assert asyncio.run(research._gemini_research_surface(

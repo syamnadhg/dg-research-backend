@@ -60,6 +60,7 @@ import collections
 import threading        # the console-quiet flag below `log()` needs it at import time
 import contextlib       # ditto — `_console_quiet_for_prompt` is a contextmanager
 import logging          # only to reshape uvicorn's own records — see _uvicorn_log_config
+import weakref          # Gemini's send-step Redo presses, kept by the chat's tab
 # The content-free tier. ⭐ Imports NOTHING from this file, so instrumenting a
 # call site can never create a circular import, and a telemetry failure can
 # never be in the path of the thing it measures — every entry point swallows.
@@ -48800,6 +48801,10 @@ async def _gemini_retry_failed_turn(page, label, *, max_wait_s: float = 20.0,
                 return False
             redrafted, _acted, _in_flight, why = await _gemini_redraft_plan(
                 page, label, settle_s=settle_s)
+            if _acted:
+                # ⭐ Review 10-03: the plan wait and the round-robin count this
+                # press too — two Redo presses per chat in all.
+                _gemini_send_redo_note(page)
             log(f"[{label}] Gemini failed-turn re-draft: {why} "
                 f"(redrafted={redrafted}, acted={_acted}, in_flight={_in_flight})",
                 "INFO" if redrafted else "WARN")
@@ -48866,6 +48871,26 @@ async def _gemini_replies_text(page) -> str:
         return ""
 
 
+#: Gemini's research card in `_gemini_replies_text`: the card's words
+#: (`_GEMINI_RESEARCH_CARD_RE`) at the START of a line.
+#:
+#: ⛔⛔ Review 10-03. The replies read keeps Gemini's plan, and a plan restates the
+#: brief in its own words. A plan step reading "(2) Review how historians approach
+#: researching sources on medieval Baltic trade…" matched the card's words in the
+#: middle of its sentence, so a plan still waiting for its 'Start research' read
+#: as a research that had started: the round-robin's watch let go without
+#: pressing Start, the planning chat was refreshed at 12, 24 and 36 minutes, a
+#: person's Retry said Gemini had started by itself, and a crash rejoin read it as
+#: researching. Measured on a page with a real-size (46,183-character) brief; with
+#: a 240-character brief the first-8,000-characters read did the same before.
+#: Gemini's card is a line of its own (its icons are drawn from an attribute,
+#: `mat-icon fonticon=…`, not from text), so its words start a line; the same
+#: words inside a sentence are not the card.
+_GEMINI_RESEARCH_CARD_LINE_RE = re.compile(
+    r"^[^\S\n]*(?:" + _GEMINI_RESEARCH_CARD_RE.pattern + r")",
+    re.IGNORECASE | re.MULTILINE)
+
+
 async def _gemini_research_started(page) -> bool:
     """True when Gemini's DEEP RESEARCH has genuinely started or finished.
 
@@ -48876,12 +48901,15 @@ async def _gemini_research_started(page) -> bool:
     running research (the exact conflation behind the 2026-07-13 auto-start
     incident). Reads Gemini's own text, not the person's turns
     (`_GEMINI_REPLIES_TEXT_JS` — 10-03: the first 8,000 characters of the page
-    were the brief). Fail-closed (False) on any error so a probe miss never
+    were the brief), and the card only as a line of its own
+    (`_GEMINI_RESEARCH_CARD_LINE_RE` — a plan that says "researching sources" is
+    still a plan). Fail-closed (False) on any error so a probe miss never
     fakes a start."""
     body = await _gemini_replies_text(page)
     if not body:
         return False
-    return bool(_GEMINI_RESEARCH_CARD_RE.search(body) or _GEMINI_COMPLETION_RE.search(body))
+    return bool(_GEMINI_RESEARCH_CARD_LINE_RE.search(body)
+                or _GEMINI_COMPLETION_RE.search(body))
 
 
 #: How far apart the two reads of a failed-looking plan are taken.
@@ -48945,6 +48973,47 @@ _GEMINI_PLAN_REDO_MAX = 2
 #: the plan back before the card goes up. The retired plan re-draft's spacing.
 _GEMINI_PLAN_REDO_COOLDOWN_SEC = 45
 
+#: Gemini's Redo presses made by the SEND step, by the chat's tab: each press of
+#: `_gemini_retry_failed_turn` (the 90 s after Send, and the dropped-send ladder)
+#: that touched the page.
+#:
+#: ⛔ Review 10-03. The send step's own watch presses Gemini's Redo on a plan that
+#: fails right after Send, and the plan wait counted from zero, so one chat could
+#: get three presses: the send step's, then two more. The send step, the plan wait
+#: and the round-robin now share ONE budget of two per chat
+#: (`_gemini_plan_redos_spent`). Kept weakly: a closed tab takes its count with it.
+_GEMINI_SEND_REDOS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _gemini_send_redo_note(page) -> None:
+    """The send step pressed Gemini's Redo on this tab's chat just now. Never raises."""
+    try:
+        n, _at = _GEMINI_SEND_REDOS.get(page, (0, 0.0))
+        _GEMINI_SEND_REDOS[page] = (n + 1, time.time())
+    except Exception:
+        pass    # a tab that cannot be kept weakly: its presses are not shared
+
+
+def _gemini_send_redos_new_chat(page) -> None:
+    """A new chat is being sent on this tab — a Retry can reuse the tab — so the
+    send step's presses on its last chat are not this chat's. Never raises."""
+    try:
+        _GEMINI_SEND_REDOS.pop(page, None)
+    except Exception:
+        pass
+
+
+def _gemini_plan_redos_spent(page, state: dict) -> "tuple[int, float]":
+    """`(presses, last_press_at)` spent on this chat's failed plan: the send
+    step's (`_GEMINI_SEND_REDOS`) and the plan wait's or the round-robin's
+    (`state`) together. Never raises."""
+    try:
+        sent, sent_at = _GEMINI_SEND_REDOS.get(page, (0, 0.0))
+    except Exception:
+        sent, sent_at = 0, 0.0
+    return (int(state.get("gemini_plan_redos", 0) or 0) + sent,
+            max(float(state.get("gemini_plan_redo_at", 0.0) or 0.0), sent_at))
+
 
 async def _gemini_plan_redo_tick(page, state: dict, label: str) -> "tuple[str, str]":
     """One look at a Gemini plan that may have failed. `(verdict, failure_text)`.
@@ -48959,16 +49028,18 @@ async def _gemini_plan_redo_tick(page, state: dict, label: str) -> "tuple[str, s
     `'spent'`      · failed after both presses, the last one's cooldown over.
                      The caller's card is the answer.
 
-    `state` carries the count and the time of the last press between looks
-    (`gemini_plan_redos`, `gemini_plan_redo_at`): the plan wait's own dict, then
-    the round-robin's entry for Gemini, which the plan wait hands them to. Never
-    refreshes, navigates or opens a chat. Never raises."""
+    `state` carries this look's own count and the time of its last press between
+    looks (`gemini_plan_redos`, `gemini_plan_redo_at`): the plan wait's own dict,
+    then the round-robin's entry for Gemini, which the plan wait hands them to.
+    The send step's press on the same chat counts too (review 10-03,
+    `_gemini_plan_redos_spent`): two per chat in all. Never refreshes, navigates
+    or opens a chat. Never raises."""
     try:
         failed = await _gemini_watched_plan_failed(page)
         if not failed:
             return "not_failed", ""
-        n = int(state.get("gemini_plan_redos", 0) or 0)
-        if n and time.time() - float(state.get("gemini_plan_redo_at", 0.0) or 0.0) \
+        n, last_at = _gemini_plan_redos_spent(page, state)
+        if n and time.time() - last_at \
                 < _GEMINI_PLAN_REDO_COOLDOWN_SEC:
             return "hold", failed
         if n >= _GEMINI_PLAN_REDO_MAX:
@@ -48984,7 +49055,8 @@ async def _gemini_plan_redo_tick(page, state: dict, label: str) -> "tuple[str, s
         return "hold", ""
     if not acted:
         return "no_redo", failed   # no Redo on it, or it could not be pressed
-    state["gemini_plan_redos"] = n + 1
+    # This look's own count: the send step's press stays in `_GEMINI_SEND_REDOS`.
+    state["gemini_plan_redos"] = int(state.get("gemini_plan_redos", 0) or 0) + 1
     state["gemini_plan_redo_at"] = time.time()
     log(f"[{label}] Gemini's plan failed (\"{failed}\") — pressed Gemini's own Redo, "
         f"{n + 1} of {_GEMINI_PLAN_REDO_MAX} ({why}). A plan is never refreshed.",
@@ -49074,13 +49146,15 @@ async def _gemini_research_surface(page) -> "tuple[bool, bool]":
     of the page, which on a real run are all brief, so it never saw the card
     and the refresh never reloaded a research that went stale — not even one
     that had finished on Gemini's side while the page kept its "researching"
-    view. Fail-closed — `(False, False)` on any error, so a probe miss can never
-    manufacture a reload.
+    view. The card only as a line of its own (`_GEMINI_RESEARCH_CARD_LINE_RE`):
+    a plan that says "researching sources" mid-sentence is not a research to
+    refresh (review, 10-03). Fail-closed — `(False, False)` on any error, so a
+    probe miss can never manufacture a reload.
     """
     body = await _gemini_replies_text(page)
     if not body:
         return False, False
-    return (bool(_GEMINI_RESEARCH_CARD_RE.search(body)),
+    return (bool(_GEMINI_RESEARCH_CARD_LINE_RE.search(body)),
             bool(_GEMINI_COMPLETION_RE.search(body)))
 
 
@@ -51254,8 +51328,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # ⭐ 10-03, the owner: a plan that fails and shows Gemini's Redo
                 # gets that Redo — "we will try redo, but we are not refreshing".
                 # At most two presses per chat (the plan wait's count comes
-                # with it), 45 s apart; nothing on this leg runs while a press
-                # has its moment, and nothing ever refreshes a plan.
+                # with it, and the send step's press counts too), 45 s apart;
+                # nothing on this leg runs while a press has its moment, and
+                # nothing ever refreshes a plan.
                 # ⭐ Review 10-02: a FAILED plan is not a finished report. When
                 # both presses left it failed — or Gemini shows no Redo — one
                 # honest card and the agent parked, exactly as a research that
@@ -70556,6 +70631,10 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # by the platform check.
     if platform_l == "gemini":
         try:
+            # ⭐ Review 10-03: a new chat starts here, and so does its count of
+            # Gemini's Redo presses — this watch's, the plan wait's and the
+            # round-robin's share two (a Retry can reuse the last chat's tab).
+            _gemini_send_redos_new_chat(page)
             retried = await _gemini_retry_failed_turn(page, label, max_wait_s=90)
             if retried:
                 log(f"[{label}] Gemini failed turn re-drafted — research re-kicked", "INFO")
@@ -71867,7 +71946,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _chat = {"convo": "", "url": "", "trusted": True}
         _chat_ok = True
         # ⭐ 10-03: Gemini's own Redo on a plan that visibly failed — how many
-        # presses (at most two) and when the last was. Handed to the round-robin.
+        # presses this wait made and when the last was. Handed to the round-robin.
+        # The send step's press on this chat counts too: two in all (review 10-03).
         _plan_redo = {"gemini_plan_redos": 0, "gemini_plan_redo_at": 0.0}
         _plan_redo_said = False
 
@@ -71986,7 +72066,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     emit_event("agent_progress", phase=2, agent="gemini",
                                status="generating", stage="planning",
                                progress=(f"Gemini's plan hit an error — pressed its Redo "
-                                         f"({_plan_redo['gemini_plan_redos']} of "
+                                         f"({_gemini_plan_redos_spent(gemini_page, _plan_redo)[0]} of "
                                          f"{_GEMINI_PLAN_REDO_MAX})"))
                 except Exception:
                     pass

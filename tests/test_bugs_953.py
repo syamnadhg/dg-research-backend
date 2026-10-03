@@ -115,7 +115,9 @@ def test_watch_leg_clears_on_research_specific_evidence_not_verify_alone():
 
 def test_gemini_research_started_uses_research_regex_not_verify():
     src = inspect.getsource(research._gemini_research_started)
-    assert "_GEMINI_RESEARCH_CARD_RE" in src
+    # 10-03 review: the card as a line of its own (a plan that says
+    # "researching sources" mid-sentence is still a plan).
+    assert "_GEMINI_RESEARCH_CARD_LINE_RE" in src
     assert "_GEMINI_COMPLETION_RE" in src
     # It must not CALL the ambiguous verifier (docstring may name it).
     assert "await verify_gemini_generating" not in src

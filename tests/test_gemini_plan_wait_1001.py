@@ -154,15 +154,18 @@ def launch(chrome, monkeypatch, tmp_path):
 
     monkeypatch.setattr(research, "poll_all_agents_round_robin", _round_robin)
 
-    def run(script, *, start=OURS, on_tick=None, app=APP):
+    def run(script, *, start=OURS, on_tick=None, app=APP, send_step=False):
         """`script(chat_id, nth_load)` is the page each load of a chat address
-        gets; `start` is the chat the brief landed in ("" = Gemini's bare /app)."""
-        loads, clicks, urls, opened = Counter(), [], [], []
+        gets; `start` is the chat the brief landed in ("" = Gemini's bare /app).
+        `send_step`: the tab opener ends as the send step does — the REAL
+        failed-turn watch (`_gemini_retry_failed_turn`, 90 s) on the chat."""
+        loads, clicks, urls, opened, click_at = Counter(), [], [], [], []
 
         async def _answer(route):
             path = urlsplit(route.request.url).path
             if path.startswith("/__clicked/"):
                 clicks.append(path.rsplit("/", 1)[1])
+                click_at.append(clock.t)
                 await route.fulfill(status=204, body="")
                 return
             m = re.fullmatch(r"/gemini\.google\.com/(?:u/\d+/)?app/?([A-Za-z0-9_-]*)", path)
@@ -179,6 +182,8 @@ def launch(chrome, monkeypatch, tmp_path):
             await pg.route("**/*", _answer)
             await pg.goto(f"{app}/{start}" if start else app)
             opened.append(pg)
+            if send_step:
+                await research._gemini_retry_failed_turn(pg, "2C", max_wait_s=90)
             return pg, True
 
         monkeypatch.setattr(research, "start_agent_no_gemini_wait", _open)
@@ -212,7 +217,7 @@ def launch(chrome, monkeypatch, tmp_path):
                     pass
         return SimpleNamespace(lines=lines, events=events, cards=cards, looks=looks,
                                handed=handed, loads=loads, clicks=clicks, urls=urls,
-                               beats=beats)
+                               beats=beats, click_at=click_at)
 
     return run
 
