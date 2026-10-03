@@ -71839,7 +71839,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         #     could not be proven (10-01): on 10-01 and 10-02 the reloaded page came
         #     back showing Gemini's Stop, and the plan took no less time;
         #   · the computer-use recovery ladder that pressed Retry/Regenerate, and
-        #     the "Gemini couldn't start Deep Research" card when the wait gave up.
+        #     the couldn't-start card (_GEMINI_CANT_START) when the wait gave up.
         #     (The plan's Redo, removed with them on 10-02, came back on 10-03 for
         #     a plan that VISIBLY failed — above.)
         # The general run ceiling is unchanged.
