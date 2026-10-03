@@ -193,6 +193,36 @@ def test_the_one_shot_retry_says_it_tried_again(pipeline, monkeypatch):
     assert [a["status"] for a in _meta(folders[0])["attempts"]] == ["failed", "complete"]
 
 
+def test_a_retry_after_a_long_first_attempt_still_reads_running(monkeypatch):
+    """⛔⛔ The dead-or-alive ceiling, in-process: a first attempt that ran for
+    five hours before Chrome died must not make its retry read dead an hour
+    later. The joined attempt's start is the folder's `startedUtc` now."""
+    import datetime as _dt
+    long_ago = time.time() - research.RUN_LOG_DEAD_AFTER_SEC - 60
+    old_iso = _dt.datetime.fromtimestamp(long_ago, _dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    real_iso = research._utc_iso
+    monkeypatch.setattr(research, "_utc_iso", lambda when=None: old_iso)
+    with research._RunLogCapture(research_id=RID) as outer:
+        monkeypatch.setattr(research, "_utc_iso", real_iso)
+        with research._RunLogCapture(research_id=RID, attempt=1, why="browser-restart"):
+            meta = _meta(outer.dir)
+            assert research._derive_run_status(meta) == "running"
+            assert meta["firstStartedUtc"] == old_iso and meta["startedUtc"] != old_iso
+
+
+def test_a_joined_attempt_ending_after_a_move_keeps_the_folder_moved():
+    """The move said "moved"; an attempt that ends after it must not write
+    "running" back over it — the folder would read live again and the pick-up
+    would open a folder of its own."""
+    with research._RunLogCapture(research_id=RID) as sink:
+        assert research._mark_run_log_moved(RID) is True
+        with research._RunLogCapture(research_id=RID, attempt=1, why="retry"):
+            pass
+        assert _meta(sink.dir)["status"] == "moved"
+        assert research._folder_is_live(sink.dir) is False
+
+
 def test_a_different_research_nested_inside_keeps_a_folder_of_its_own():
     """Only the SAME research joins. Anything else nested inside a run (never
     seen, but possible) still gets its own folder, names its parent, and the
