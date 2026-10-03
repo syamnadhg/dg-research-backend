@@ -28,7 +28,10 @@ mutated file must still COMPILE. Both are harness faults, counted OUT.
   .venv/bin/python .mutants/wave16_19_be_1002_mutants.py W1 N2
 
 ⭐ Run once on 2026-10-02 against 187c1a5: 57/58 killed; the one survivor (W16)
-was equivalent and is retired below with the reason.
+was equivalent and is retired below with the reason. N1 and N2 were
+re-anchored, same mutation, for the review repair (the topic counts as no name
+only on the chat assistant's record); the repair's own mutants are in
+`wave16_19_repair_1002_mutants.py`.
 """
 import hashlib
 import os
@@ -164,11 +167,13 @@ MUTANTS = [
     # ── N: one short name ───────────────────────────────────────────────────
     ('N1', RESEARCH, '⛔⛔ the person\'s own rename is named over when it is the topic',
      [('    if title and (bool(record.get("titleLocked"))\n'
-       '                  or not _research_name_missing(title, topic)):\n',
-       '    if title and not _research_name_missing(title, topic):\n')]),
+       '                  or not _research_name_missing(title, topic,\n'
+       '                                                record.get("viaAgent"))):\n',
+       '    if title and not _research_name_missing(title, topic,\n'
+       '                                            record.get("viaAgent")):\n')]),
     ('N2', RESEARCH, '⛔ "New Research" and the whole topic are taken for names',
      [('    return (not t or t.lower() in _RESEARCH_NAME_PLACEHOLDERS\n'
-       '            or _is_the_topic(t, topic))\n',
+       '            or (bool(via_agent) and _is_the_topic(t, topic)))\n',
        '    return not t\n')]),
     ('N3', RESEARCH, '⛔ the agent\'s topic is not recognised once the pipeline flattened it',
      [('    return bool(t) and t == " ".join(str(topic or "").split())\n',

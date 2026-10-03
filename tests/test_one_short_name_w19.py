@@ -23,6 +23,14 @@ title until that second naming.
   · the person's own rename wins; a run that keeps nothing asks no one;
   · the podcast's name never reaches the computer's log.
 
+⭐ And from the review (10-02), each measured on 34d980c:
+  · the end of Phase 2 names a research still on "New Research" — with the
+    podcast off nothing after it does;
+  · only the chat assistant's record (`viaAgent`) counts its topic as no
+    name — a web research named like its short topic is never asked again;
+  · the chat's opening line takes the name at pick-up, not the topic;
+  · no test reaches this computer's real sign-in (conftest's guard).
+
 Run:  pytest tests/test_one_short_name_w19.py -v
 """
 import ast
@@ -48,12 +56,13 @@ CHAT_NAME = "Decisions API vs TypeSafe Jev"
 
 
 class _Store:
-    """`users/{uid}/researches/{rid}` — reads answered from `records`, every
-    update recorded."""
+    """`users/{uid}/researches/{rid}` — reads answered from `records`; every
+    `.update()` on any document (the chat's messages included) recorded in
+    `updates` as (path, data)."""
 
     def __init__(self, records):
         self.records = dict(records)
-        self.reads, self.writes = [], []
+        self.reads, self.writes, self.updates = [], [], []
 
     def collection(self, name):
         return _Node(self, (name,))
@@ -76,6 +85,16 @@ class _Node:
         return types.SimpleNamespace(exists=data is not None,
                                      to_dict=lambda: dict(data or {}))
 
+    def update(self, data):
+        self._s.updates.append(("/".join(self.path), dict(data)))
+
+
+#: The chat assistant's record of a research it started (agent/facade/bridge.py
+#: `_new_research_fields`): its title IS its whole topic, and it says so.
+AGENT_RECORD = {"title": TOPIC, "topic": TOPIC, "viaAgent": True}
+#: Where the chat's opening line lives (`seed_chat_messages`, `intro-{rid}`).
+INTRO = f"users/{UID}/researches/{RID}/messages/intro-{RID}"
+
 
 @pytest.fixture
 def world(monkeypatch):
@@ -88,6 +107,8 @@ def world(monkeypatch):
                         lambda topic: w.asked.append(topic) or "Decisions API Versus Jev")
     monkeypatch.setattr(research, "_update_research_doc",
                         lambda u, r, p: w.wrote.append((u, r, dict(p))) or True)
+    # The device's own id on every write it makes (`_be_payload`), stated.
+    monkeypatch.setattr(research, "_be_payload", lambda d: {**d, "deviceId": "dev-w19"})
     monkeypatch.setattr(research, "log",
                         lambda msg, level="INFO", *a, **k: w.logs.append(str(msg)))
     monkeypatch.setattr(research, "_fb_uid", UID)
@@ -193,7 +214,7 @@ def test_the_notebook_is_named_what_the_chat_shows(world):
 def test_an_agent_started_research_gets_its_short_name_on_the_notebook(world):
     """The chat assistant creates its research with `title: topic` — the whole
     paragraph — and on 10-02 the notebook got 52 characters of it."""
-    world.set(title=TOPIC, topic=TOPIC)
+    world.set(**AGENT_RECORD)
     name = asyncio.run(_notebook_title_site()(TOPIC))
     assert name == "Decisions API Versus Jev"
     assert world.asked == [TOPIC]
@@ -222,7 +243,7 @@ def test_the_podcast_file_takes_the_name_whatever_notebooklm_called_it(
 def test_the_podcast_row_shows_the_name_not_the_whole_topic(world, monkeypatch, tmp_path):
     """The Podcasts page row: an agent-shaped record (title = whole topic) is
     named once and the row shows the short name."""
-    world.set(title=TOPIC, topic=TOPIC)
+    world.set(**AGENT_RECORD)
     (tmp_path / "checkpoint.json").write_text(json.dumps({"topic": TOPIC}),
                                               encoding="utf-8")
     (tmp_path / "podcasts").mkdir()
@@ -276,7 +297,7 @@ def test_a_placeholder_is_not_a_name(world, placeholder):
 
 
 def test_the_persons_own_rename_wins_even_when_it_is_the_topic(world):
-    world.set(title=TOPIC, topic=TOPIC, titleLocked=True)
+    world.set(**AGENT_RECORD, titleLocked=True)
     assert research._research_name(TOPIC, UID, RID) == TOPIC.strip()
     assert world.asked == [] and world.wrote == []
 
@@ -334,6 +355,7 @@ def test_the_names_shape(world):
         "Research Brief"
 
 
+@pytest.mark.real_sign_in("_ask_web_namer")
 def test_the_computer_asks_the_web_namer_with_its_own_sign_in(monkeypatch):
     sent = []
 
@@ -350,6 +372,7 @@ def test_the_computer_asks_the_web_namer_with_its_own_sign_in(monkeypatch):
     assert research._RESEARCH_NAME_TIMEOUT_S == 10
 
 
+@pytest.mark.real_sign_in("_ask_web_namer")
 @pytest.mark.parametrize("answer", [
     types.SimpleNamespace(status_code=500, json=lambda: {"fallback": True}),
     TimeoutError("read timed out"),
@@ -368,6 +391,7 @@ def test_a_namer_that_cannot_answer_says_nothing_of_the_topic(monkeypatch, answe
     assert logs and not any("divorce" in m for m in logs)
 
 
+@pytest.mark.real_sign_in("_ask_web_namer")
 def test_no_sign_in_no_question(monkeypatch):
     monkeypatch.setattr(research, "_fresh_user_mode_id_token", lambda: None)
     monkeypatch.setitem(sys.modules, "requests", None)
@@ -377,7 +401,7 @@ def test_no_sign_in_no_question(monkeypatch):
 # ══ 4. at pick-up: only the chat assistant's research is named ═══════════════
 
 def test_at_pick_up_an_agent_started_research_is_named(world):
-    world.set(title=TOPIC, topic=TOPIC)
+    world.set(**AGENT_RECORD)
     assert research._name_an_agent_started_run(UID, RID, TOPIC) == "Decisions API Versus Jev"
     assert [p["title"] for _u, _r, p in world.wrote] == ["Decisions API Versus Jev"]
 
@@ -385,7 +409,8 @@ def test_at_pick_up_an_agent_started_research_is_named(world):
 @pytest.mark.parametrize("rec", [
     {"title": "New Research"},            # the web is naming it — nothing races
     {"title": CHAT_NAME},                 # already named
-    {"title": TOPIC, "titleLocked": True},
+    {**AGENT_RECORD, "titleLocked": True},
+    {"title": TOPIC, "topic": TOPIC},     # a WEB record named like its topic
     None,                                 # no record
 ])
 def test_at_pick_up_nothing_else_is_named(world, rec):
@@ -395,6 +420,207 @@ def test_at_pick_up_nothing_else_is_named(world, rec):
         world.set(**rec)
     assert research._name_an_agent_started_run(UID, RID, TOPIC) == ""
     assert world.asked == [] and world.wrote == []
+    assert world.store.updates == [], "a chat's opening line was rewritten"
+
+
+# ══ 4b. a web research named exactly like its topic IS named (review) ════════
+
+SHORT = "Quantum Computing"
+
+
+def test_a_web_research_named_like_its_topic_is_never_asked_again(world):
+    """⛔⛔ MEASURED (review, 10-02): {topic: 'Quantum Computing', title: 'Quantum
+    Computing'} with no `viaAgent` was taken for the chat assistant's record —
+    asked again at pick-up, the chat's name written over mid-run, and asked
+    again by every later process because the title still equalled the topic."""
+    world.set(title=SHORT, topic=SHORT)
+    assert research._name_an_agent_started_run(UID, RID, SHORT) == ""
+    for _process in range(2):                 # a later process: an empty cache
+        research._RESEARCH_NAMES_MADE.clear()
+        assert research._research_name(SHORT, UID, RID) == SHORT
+    asyncio.run(_notebook_title_site()(SHORT))
+    assert world.asked == [] and world.wrote == []
+
+
+def test_the_assistants_record_named_like_its_short_topic_is_still_named(world):
+    """The other side of the same line: the assistant's record of a short topic
+    is its topic too, and it has no web page to name it."""
+    world.set(title=SHORT, topic=SHORT, viaAgent=True)
+    assert research._name_an_agent_started_run(UID, RID, SHORT) == "Decisions API Versus Jev"
+    assert world.asked == [SHORT]
+
+
+# ══ 4c. the chat's opening line says the name, not the topic (review) ════════
+
+def test_at_pick_up_the_chats_opening_line_takes_the_name(world):
+    """⛔ MEASURED (review): the assistant seeds `Researching **"<the first 100
+    characters of the topic>…"**`, and only a web tab open at the first
+    phase_start rewrote it. The same id and the same words the web writes."""
+    world.set(**AGENT_RECORD)
+    research._name_an_agent_started_run(UID, RID, TOPIC)
+    assert world.store.updates == [
+        (INTRO, {"content": 'Researching **"Decisions API Versus Jev"**',
+                 "deviceId": "dev-w19"})]
+
+
+def test_an_opening_line_that_cannot_be_written_leaves_the_name_made(world, monkeypatch):
+    """No intro to update (the assistant's seeding is best-effort) is a WARN
+    line with no name in it, and the name stands."""
+    def _gone(self, data):
+        raise LookupError("404 No document to update")
+    monkeypatch.setattr(_Node, "update", _gone)
+    world.set(**AGENT_RECORD)
+    assert research._name_an_agent_started_run(UID, RID, TOPIC) == "Decisions API Versus Jev"
+    warned = [m for m in world.logs if "opening line" in m]
+    assert warned and not any("Decisions" in m or "OpenAI" in m for m in warned)
+
+
+def test_no_name_made_leaves_the_opening_line_alone(world, monkeypatch):
+    """A topic with no words left to name it by, and a namer that cannot
+    answer: no name, and no `Researching **""**`."""
+    monkeypatch.setattr(research, "_ask_web_namer", lambda topic: "")
+    world.set(title="###", topic="###", viaAgent=True)
+    assert research._name_an_agent_started_run(UID, RID, "###") == ""
+    assert world.store.updates == []
+
+
+def test_a_run_that_keeps_nothing_has_no_opening_line_rewritten(world):
+    incog = "incog_1790831743868_4"
+    world.store.records[(UID, incog)] = dict(AGENT_RECORD)
+    research._name_an_agent_started_run(UID, incog, TOPIC)
+    assert world.store.updates == [] and world.asked == []
+
+
+# ══ 4d. the end of Phase 2 names a research still without one (review) ═══════
+
+def _persist(monkeypatch, tmp_path, topic):
+    """The REAL `_p2_persist_reports`, its writes stubbed, with two reports."""
+    monkeypatch.setattr(research, "save_document_to_firestore", lambda *a, **k: True)
+    monkeypatch.setattr(research, "_generate_research_summary_async", lambda *a, **k: None)
+
+    async def _rehost(text, label=None, **kw):
+        return text
+    monkeypatch.setattr(research, "_rehost_document_images", _rehost)
+    monkeypatch.setattr(research, "_runtime", types.SimpleNamespace(
+        agent_findings={}, agent_progress_snapshots={}), raising=False)
+    (tmp_path / "documents").mkdir(exist_ok=True)
+    results = {"ChatGPT": {"text": "## A\n\nThe Decisions API ships next month.\n",
+                           "status": "done"},
+               "Claude": {"text": "## B\n\nTypeSafe Jev validates at the edge.\n",
+                          "status": "done"}}
+    asyncio.run(research._p2_persist_reports(results, tmp_path, topic, "a brief"))
+
+
+@pytest.mark.parametrize("placeholder", ["New Research", "New Chat", ""])
+def test_the_end_of_phase_2_names_a_research_still_without_a_name(
+        world, monkeypatch, tmp_path, placeholder):
+    """⛔⛔ MEASURED (review, 10-02): with the podcast off nothing after Phase 2
+    names a research, so a "New Research" record (a two-letter topic the web
+    never sends to its namer; a tab closed before the answer) kept it for good —
+    and Phase 5 put it into the mail and the share links. The old after-Phase-2
+    rename fixed this case; the name now comes from the topic, once."""
+    world.set(title=placeholder, topic=TOPIC)
+    _persist(monkeypatch, tmp_path, TOPIC)
+    assert world.asked == [TOPIC]
+    assert [(u, r, p["title"]) for u, r, p in world.wrote] == [
+        (UID, RID, "Decisions API Versus Jev")]
+
+
+def test_the_end_of_phase_2_names_the_assistants_record_its_pick_up_missed(
+        world, monkeypatch, tmp_path):
+    world.set(**AGENT_RECORD)
+    _persist(monkeypatch, tmp_path, TOPIC)
+    assert [p["title"] for _u, _r, p in world.wrote] == ["Decisions API Versus Jev"]
+
+
+def test_a_naming_failure_never_fails_phase_2(world, monkeypatch, tmp_path):
+    def _boom(*_a):
+        raise RuntimeError("the record went away")
+    monkeypatch.setattr(research, "_name_a_research_left_unnamed", _boom)
+    _persist(monkeypatch, tmp_path, TOPIC)
+    assert any("naming after Phase 2 failed (RuntimeError)" in m for m in world.logs)
+
+
+def test_a_two_letter_topic_the_web_cannot_name_is_named_by_its_words(
+        world, monkeypatch, tmp_path):
+    monkeypatch.setattr(research, "_ask_web_namer",
+                        lambda topic: world.asked.append(topic) or "")
+    world.set(title="New Research", topic="AI")
+    _persist(monkeypatch, tmp_path, "AI")
+    assert [p["title"] for _u, _r, p in world.wrote] == ["AI"]
+
+
+@pytest.mark.parametrize("rec", [
+    {"title": CHAT_NAME},                          # named — the measured defect's other half
+    {"title": "New Research", "titleLocked": True},  # the person's own choice
+    {"title": SHORT, "topic": SHORT},              # a web record named like its topic
+    None,                                          # no record to read
+])
+def test_the_end_of_phase_2_names_nothing_else(world, monkeypatch, tmp_path, rec):
+    if rec is None:
+        world.store.records.clear()
+    else:
+        world.set(**rec)
+    _persist(monkeypatch, tmp_path, SHORT if rec and rec.get("topic") == SHORT else TOPIC)
+    assert world.asked == [] and world.wrote == []
+
+
+# ══ 4e. no test reaches this computer's real sign-in (review) ════════════════
+
+def _nothing_real_under_the_namer(monkeypatch):
+    """The keystore and the network, stubbed UNDER the helpers — so a guard
+    that failed would show here as a reach that did not register, never as a
+    real sign-in read or a real POST."""
+    from auth import keystore
+    touched = []
+    monkeypatch.setattr(keystore, "install_uuid",
+                        lambda: touched.append("install_uuid") or "probe")
+    monkeypatch.setattr(keystore, "try_recover",
+                        lambda *_a: touched.append("try_recover"))
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(
+        post=lambda *a, **k: touched.append("post")))
+    return touched
+
+
+def test_a_test_that_forgets_the_namer_reaches_the_guard_not_the_sign_in(
+        monkeypatch, live_sign_in_reached):
+    touched = _nothing_real_under_the_namer(monkeypatch)
+    monkeypatch.setattr(research, "_firebase_db",
+                        _Store({(UID, RID): {"title": "New Research"}}))
+    monkeypatch.setattr(research, "_RESEARCH_NAMES_MADE", {})
+    monkeypatch.setattr(research, "_update_research_doc", lambda *a, **k: True)
+    assert research._research_name(TOPIC, UID, RID) == "OpenAI's new Decisions API versus"
+    assert [name for name, _where in live_sign_in_reached] == ["_ask_web_namer"]
+    assert touched == []
+    live_sign_in_reached.clear()      # reached on purpose: this is the guard's test
+
+
+@pytest.mark.real_sign_in("_ask_web_namer")
+def test_the_real_namer_in_a_test_reaches_the_guard_not_the_token(
+        monkeypatch, live_sign_in_reached):
+    touched = _nothing_real_under_the_namer(monkeypatch)
+    assert research._ask_web_namer("Grid storage") == ""
+    assert [name for name, _where in live_sign_in_reached] == ["_fresh_user_mode_id_token"]
+    assert touched == []
+    live_sign_in_reached.clear()
+
+
+def test_a_test_that_forgets_the_namer_fails():
+    """The consumer is pytest itself: a test that forgets the stub must FAIL,
+    naming the helper. `tests/_live_sign_in_probe.py` is that test, run in a
+    child pytest (its underscore keeps it out of the ordinary run)."""
+    import os
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/_live_sign_in_probe.py", "-q",
+         "-p", "no:cacheprovider"],
+        cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONPATH": str(root)}, timeout=300)
+    out = r.stdout + r.stderr
+    assert "1 passed, 1 error" in out, out[-3000:]
+    assert "_ask_web_namer was reached UNSTUBBED" in out, out[-3000:]
+    assert "_research_name" in out, "the failure does not say where it was reached from"
 
 
 class _FakeBrowser:
@@ -410,8 +636,9 @@ class _FakeBrowser:
 
 def test_the_pipeline_names_an_agent_started_run_when_it_picks_it_up(
         world, monkeypatch, tmp_path):
-    """The consumer: the REAL `run_pipeline`, stopped at its first phase."""
-    world.set(title=TOPIC, topic=TOPIC)
+    """The consumer: the REAL `run_pipeline`, stopped at its first phase — the
+    tile's name AND the chat's opening line."""
+    world.set(**AGENT_RECORD)
     queue_dir = tmp_path / "Agent_run_20261002_051554"
     (queue_dir / "documents").mkdir(parents=True)
     for name, value in (("resolve_api_key", lambda _k: "k"),
@@ -450,6 +677,9 @@ def test_the_pipeline_names_an_agent_started_run_when_it_picks_it_up(
         research._controls.reset()
     assert [(u, r, p["title"]) for u, r, p in world.wrote] == [
         (UID, RID, "Decisions API Versus Jev")], world.logs
+    assert world.store.updates == [
+        (INTRO, {"content": 'Researching **"Decisions API Versus Jev"**',
+                 "deviceId": "dev-w19"})], world.logs
 
 
 # ══ 5. the podcast's name never reaches the computer's log ═══════════════════

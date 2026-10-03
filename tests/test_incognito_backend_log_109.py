@@ -415,7 +415,11 @@ class _Record:
 @pytest.mark.parametrize("rid", [INCOG, CHAT])
 def test_a_name_made_here_says_nothing_of_the_topic(monkeypatch, logged, rid):
     asked, wrote = [], []
-    monkeypatch.setattr(research, "_firebase_db", _Record({"title": SECRET}))
+    # The chat assistant's record of a run it started: its title IS its topic,
+    # and it says it is the assistant's (wave 19 review — only that record
+    # counts its topic as no name yet).
+    monkeypatch.setattr(research, "_firebase_db",
+                        _Record({"title": SECRET, "viaAgent": True}))
     monkeypatch.setattr(research, "_ask_web_namer",
                         lambda topic: asked.append(topic) or "Kept Name")
     monkeypatch.setattr(research, "_update_research_doc",

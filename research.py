@@ -22072,13 +22072,19 @@ def _is_the_topic(title, topic) -> bool:
     return bool(t) and t == " ".join(str(topic or "").split())
 
 
-def _research_name_missing(title, topic) -> bool:
+def _research_name_missing(title, topic, via_agent=False) -> bool:
     """Is this record's title not yet a name? Empty, the chat's placeholder, or
-    the topic itself — the chat assistant creates its research with
-    `title: topic` (agent/facade/bridge.py)."""
+    — for a research the chat assistant started — the topic itself: the
+    assistant creates its record with `title: topic` and `viaAgent: True`
+    (agent/facade/bridge.py `_new_research_fields`).
+
+    ⛔ ONLY THE ASSISTANT'S RECORD. A web research named exactly like its short
+    topic ("Quantum Computing", or the web's own five-word fallback) IS named:
+    counted as missing, it was asked for again by every process that touched it
+    and the chat's name changed mid-run (review, 10-02)."""
     t = str(title or "").strip()
     return (not t or t.lower() in _RESEARCH_NAME_PLACEHOLDERS
-            or _is_the_topic(t, topic))
+            or (bool(via_agent) and _is_the_topic(t, topic)))
 
 
 def _read_research_record(uid, research_id) -> "tuple[bool, dict]":
@@ -22140,7 +22146,8 @@ def _research_name(topic, uid=None, research_id=None) -> str:
     found, record = _read_research_record(uid, rid)
     title = str(record.get("title") or "").strip()
     if title and (bool(record.get("titleLocked"))
-                  or not _research_name_missing(title, topic)):
+                  or not _research_name_missing(title, topic,
+                                                record.get("viaAgent"))):
         return title
     made = _RESEARCH_NAMES_MADE.get((uid, rid)) if rid else None
     if made:
@@ -22165,15 +22172,69 @@ def _research_name(topic, uid=None, research_id=None) -> str:
 
 
 def _name_an_agent_started_run(uid, research_id, topic) -> str:
-    """At pick-up: name a research whose record's title IS its topic — a run
-    the chat assistant started, which has no web page to name it — so it has
-    its short name before its first share link is minted. A web run still
-    showing "New Research" is left alone: the web is naming it, and nothing
-    races. Returns the name made, or ""."""
+    """At pick-up: name a research the chat assistant started (`viaAgent`) whose
+    record's title IS its topic — it has no web page to name it — so it has its
+    short name before its first share link is minted, and its chat's opening
+    line says that name instead of the topic (`_rename_agent_intro`). A web run
+    is left alone: still showing "New Research", the web is naming it and
+    nothing races; named like its topic, it IS named. Returns the name made,
+    or ""."""
     found, record = _read_research_record(uid, research_id)
     title = str(record.get("title") or "").strip()
-    if (not found or bool(record.get("titleLocked"))
+    if (not found or not bool(record.get("viaAgent"))
+            or bool(record.get("titleLocked"))
             or not _is_the_topic(title, topic)):
+        return ""
+    name = _research_name(topic, uid, research_id)
+    if name:
+        _rename_agent_intro(uid, research_id, name)
+    return name
+
+
+def _rename_agent_intro(uid, research_id, name) -> None:
+    """The chat's opening line, `Researching **"…"**`, takes the research's name
+    (wave 19, review). The chat assistant seeds it with the first hundred
+    characters of the WHOLE topic (agent/facade/firestore_rest.py
+    `seed_chat_messages`), and only a web tab open at the run's first
+    phase_start rewrote it — so with no tab open the topic stayed there as the
+    name. Same id and the same words the web writes on that phase_start
+    (usePipeline.ts), so an open tab and this agree. An update, never a create:
+    a bubble the assistant did not seed stays absent. Never for a run that keeps
+    nothing — it has no transcript. ⛔ The log line carries no name.
+
+    Called only once the record was read and a name made, so the connection,
+    the ids and the name are already there."""
+    rid = str(research_id or "").strip()
+    if _is_incognito_research(rid):
+        return
+    try:
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(uid)
+                .collection("researches").document(rid)
+                .collection("messages").document(f"intro-{rid}")
+                .update(_be_payload({"content": f'Researching **"{name}"**'})),
+            what=f"rename the opening line of {rid[:8]}…", uid=uid)
+    except Exception as e:
+        log(f"[name] the chat's opening line kept the topic ({type(e).__name__})",
+            "WARN")
+
+
+def _name_a_research_left_unnamed(uid, research_id, topic) -> str:
+    """At the end of Phase 2: name a research whose record STILL has no name —
+    "New Research" because the web's namer never answered (a topic under three
+    characters, which the web never sends; a tab closed in the second before
+    the answer), or the assistant's topic when its pick-up naming failed.
+
+    ⛔⛔ WHY HERE (wave 19 review). The after-Phase-2 rename used to fix exactly
+    this case, and wave 19 took it out; the three namings left are all inside
+    Phase 3. With the podcast off they never run, so the chat kept "New
+    Research" for good and Phase 5 put it into the mail and the share links.
+    Same position, but the name comes from the topic, made once, and the
+    person's own rename wins (`_research_name`). Nothing is asked when the
+    record cannot be read. Returns the name made, or ""."""
+    found, record = _read_research_record(uid, research_id)
+    if not found or not _research_name_missing(record.get("title"), topic,
+                                               record.get("viaAgent")):
         return ""
     return _research_name(topic, uid, research_id)
 
@@ -80003,6 +80064,17 @@ async def _p2_persist_reports(results, queue_dir, topic, brief_text) -> None:
         # ⛔ WAVE 19: the research is NOT renamed here from its findings. Its
         # one short name was made from the topic (`_research_name`), and the
         # chat, the notebook and the podcast all keep it.
+        # ⭐ BUT ONE STILL WITHOUT A NAME GETS ITS NAME HERE (wave 19 review):
+        # this is where the old rename fixed a "New Research" record, and with
+        # the podcast off nothing after this names it. Awaited, not a raw
+        # thread, so Phase 3's naming finds it made instead of racing it; the
+        # research's own ids, read at dispatch.
+        try:
+            await asyncio.to_thread(_name_a_research_left_unnamed, _fb_uid,
+                                    _fb_research_id, topic)
+        except Exception as _nm_e:
+            log(f"[name] naming after Phase 2 failed ({type(_nm_e).__name__})",
+                "WARN")
 
 
 # ── Browser-crash recovery (#725) ───────────────────────────────────────────

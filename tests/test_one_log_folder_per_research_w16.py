@@ -214,13 +214,30 @@ def test_a_retry_after_a_long_first_attempt_still_reads_running(monkeypatch):
 def test_a_joined_attempt_ending_after_a_move_keeps_the_folder_moved():
     """The move said "moved"; an attempt that ends after it must not write
     "running" back over it — the folder would read live again and the pick-up
-    would open a folder of its own."""
+    would open a folder of its own. ⛔ (review) And the moved attempt itself
+    stays "moved": the retry's "failed" and the folder's final "moved" are
+    for the attempts still open, never one that has ended."""
     with research._RunLogCapture(research_id=RID) as sink:
         assert research._mark_run_log_moved(RID) is True
         with research._RunLogCapture(research_id=RID, attempt=1, why="retry"):
             pass
         assert _meta(sink.dir)["status"] == "moved"
         assert research._folder_is_live(sink.dir) is False
+    assert [a["status"] for a in _meta(sink.dir)["attempts"]] == ["moved", "complete"]
+
+
+def test_a_joined_attempt_counts_its_own_time(monkeypatch):
+    """⛔ (review) A joined retry starts its own clock: an hour-long first
+    attempt keeps its hour, and the retry's `durationSec` — its own and the
+    folder's top-level one, which is the current attempt's — is its own."""
+    with research._RunLogCapture(research_id=RID) as sink:
+        sink.started_mono -= 3600            # the first attempt ran an hour
+        with research._RunLogCapture(research_id=RID, attempt=1, why="browser-restart"):
+            pass
+    meta = _meta(sink.dir)
+    first, second = meta["attempts"]
+    assert first["durationSec"] >= 3600
+    assert second["durationSec"] < 60 and meta["durationSec"] < 60
 
 
 def test_a_different_research_nested_inside_keeps_a_folder_of_its_own():
@@ -317,6 +334,54 @@ def test_a_folder_another_process_still_writes_is_never_continued(monkeypatch):
         assert len(_meta(sink.dir)["attempts"]) == 1
     finally:
         sink.writer.close()
+
+
+def test_after_a_split_the_pick_up_continues_the_newest_folder(monkeypatch):
+    """⛔ (review) A research CAN still have two folders: a pick-up while
+    another process still wrote the first (expected on Windows, where an exited
+    worker reads alive for a while) opens a second. The next pick-up continues
+    the one started LAST — even though the first, finishing after it, was
+    touched last."""
+    import datetime as _dt
+    ten_min_ago = _dt.datetime.fromtimestamp(time.time() - 600, _dt.timezone.utc) \
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    real_iso = research._utc_iso
+    monkeypatch.setattr(research, "_utc_iso", lambda when=None: ten_min_ago)
+    cap = research._RunLogCapture(research_id=RID, submitted_by=ALICE, claimed_by=ALICE)
+    first = cap.__enter__()
+    monkeypatch.setattr(research, "_utc_iso", real_iso)
+    research._RUN_LOG_SINKS.clear()          # still being written "elsewhere"
+    try:
+        _attempt(monkeypatch, research_id=RID, uid=ALICE, _submitted_by=ALICE,
+                 _log_reason="resumed")
+    finally:
+        cap.__exit__(None, None, None)       # the first finishes after the second
+    (second,) = [f for f in _folders() if f != first.dir]
+    os.utime(first.dir, (time.time() + 100, time.time() + 100))
+    os.utime(second, (time.time() - 100, time.time() - 100))
+    _attempt(monkeypatch, line="THIRD-ATTEMPT-MARK", research_id=RID, uid=ALICE,
+             _submitted_by=ALICE, _log_reason="moved")
+    assert len(_folders()) == 2
+    assert "THIRD-ATTEMPT-MARK" in _log(second)
+    assert "THIRD-ATTEMPT-MARK" not in _log(first.dir)
+    assert len(_meta(second)["attempts"]) == 2 and len(_meta(first.dir)["attempts"]) == 1
+
+
+def test_a_carried_event_list_over_the_cap_keeps_the_newest_and_counts_the_rest(
+        monkeypatch):
+    """⛔ (review) A continued folder's events.json longer than the cap keeps
+    its NEWEST events, and the ones it drops are counted."""
+    monkeypatch.setattr(research, "RUN_LOG_EVENT_CAP", 10)
+    _attempt(monkeypatch, research_id=RID, uid=ALICE, _submitted_by=ALICE)
+    (folder,) = _folders()
+    (folder / "events.json").write_text(json.dumps(
+        [{"t": i, "type": f"e{i}", "phase": None, "agent": None} for i in range(15)]),
+        encoding="utf-8")
+    _attempt(monkeypatch, research_id=RID, uid=ALICE, _submitted_by=ALICE,
+             _log_reason="resumed")
+    events = json.loads((folder / "events.json").read_text(encoding="utf-8"))
+    assert [e["type"] for e in events] == [f"e{i}" for i in range(5, 15)]
+    assert _meta(folder)["counters"]["eventsDropped"] == 5
 
 
 def test_an_older_builds_split_folder_is_left_alone(monkeypatch):
