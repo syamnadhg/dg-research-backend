@@ -1,7 +1,7 @@
 # Push Instructions — DGOPS-7337 (A1)
 
 **Ticket:** DGOPS-7337 — A1: Create `main` default branch + switch from `DGOPS-6933`
-**Status:** Todo
+**Status:** Done — `dg-eng/super-research-backend` defaults to `main` (a clone's `org/HEAD` points at `org/main`). The steps below are kept as the record of how it was done.
 **Priority:** Medium
 **Due:** 2026-05-13
 **Source:** `dg-project-template/.claude/git-workflow.md` § "New Repository Setup" (lines 220-247)
