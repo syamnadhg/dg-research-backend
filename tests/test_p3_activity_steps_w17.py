@@ -357,7 +357,10 @@ def _upload_phase(monkeypatch, tmp_path, dom_uploaded, *, share="set", rename=Tr
     monkeypatch.setattr(research, "_verify_and_repair_nlm_sources", lambda *a, **k: _ret(set()))
     monkeypatch.setattr(research, "start_narration_ticker", lambda *a, **k: (None, None))
     monkeypatch.setattr(research, "stop_narration_ticker", _none)
-    monkeypatch.setattr(research, "smart_title", lambda t: "Fusion economics")
+    # The notebook's name is the research's one short name (wave 19), not the
+    # topic ("fusion"): only this stand-in can put "Fusion economics" on a row.
+    monkeypatch.setattr(research, "_research_name",
+                        lambda topic, uid=None, research_id=None: "Fusion economics")
     monkeypatch.setattr(research, "_nlm_dom_rename", _true if rename else _false)
     # The share dialog's own work: it hands back the link and that it pressed
     # "Anyone with the link". Everything around it is the real extractor.
@@ -565,7 +568,8 @@ def _publish(monkeypatch, tmp_path, stored="https://firebasestorage.googleapis.c
     monkeypatch.setattr(research, "upload_audio_to_storage", lambda p: stored)
     monkeypatch.setattr(research, "save_audio_to_firestore", lambda *a, **k: None)
     monkeypatch.setattr(research, "update_link_in_firestore", lambda *a, **k: None)
-    monkeypatch.setattr(research, "smart_title", lambda t: "Fusion")
+    monkeypatch.setattr(research, "_research_name",
+                        lambda topic, uid=None, research_id=None: "Fusion")
     return asyncio.run(research._p3_publish_audio(audio, rid))
 
 
