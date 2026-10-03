@@ -57,7 +57,8 @@ def test_the_folder_key_function_cannot_be_handed_a_run_id():
         "a `run_id` parameter reintroduces the topic leak this signature exists "
         f"to make unrepresentable — parameters are {sorted(params)}")
     assert "topic" not in params
-    assert params == {"research_id", "started_utc", "attempt"}
+    # ⭐ Wave 16: no `attempt` either — a research's attempts share its folder.
+    assert params == {"research_id", "started_utc"}
 
 
 def test_a_real_research_id_is_ACCEPTED_as_the_folder_key():
@@ -91,11 +92,12 @@ def test_no_research_id_falls_back_to_a_local_folder():
         "local_20260818T153044"
 
 
-def test_a_retry_gets_its_own_folder_name():
-    first = research._run_log_folder_name("chat_1755500000000_3", "2026-08-18T15:30:44Z", 0)
-    retry = research._run_log_folder_name("chat_1755500000000_3", "2026-08-18T15:30:44Z", 1)
-    assert first != retry
-    assert retry.endswith("_retry1")
+def test_a_folder_name_is_the_research_and_its_first_start_only():
+    """⭐ WAVE 16 (rewritten): `_retryN` names were how one research got split
+    across folders. The name is `<researchId>_<first start>` and nothing else."""
+    name = research._run_log_folder_name("chat_1755500000000_3", "2026-08-18T15:30:44Z")
+    assert name == "chat_1755500000000_3_20260818T153044"
+    assert "retry" not in name
 
 
 # ══ 2. meta at arm, and the corpse a reader derives ════════════════════
@@ -360,38 +362,42 @@ def test_the_event_mirror_is_bounded(monkeypatch):
 
 
 # ══ 7. nesting, because the pipeline awaits itself ═════════════════════
-def test_two_attempts_in_one_process_get_two_folders_and_the_outer_resumes():
-    """⛔ #725's crash-retry AWAITS run_pipeline from inside itself. A singleton
-    sink would give the retry the parent's folder and lose the outer's tail."""
+def test_two_attempts_of_one_research_in_one_process_share_one_folder():
+    """⛔ #725's crash-retry AWAITS run_pipeline from inside itself. ⭐ WAVE 16
+    (rewritten): the retry JOINS the outer's folder — one folder per research —
+    and the outer is still the one armed, before, during and after it."""
     with research._RunLogCapture(research_id="chat_1755500000000_7") as outer:
         research.log("outer before", "INFO")
         with research._RunLogCapture(research_id="chat_1755500000000_7",
-                                     attempt=1) as inner:
-            research.log("inner only", "INFO")
-            assert research._active_run_sink() is inner
-        assert research._active_run_sink() is outer, "the outer sink never resumed"
+                                     attempt=1, why="browser-restart") as inner:
+            research.log("inner line", "INFO")
+            assert research._active_run_sink() is outer
+        assert research._active_run_sink() is outer, "the outer sink was disarmed"
         research.log("outer after", "INFO")
 
-    assert outer.dir != inner.dir
-    outer_text = _read(outer.writer.primary)
-    inner_text = _read(inner.writer.primary)
-    assert "outer before" in outer_text and "outer after" in outer_text
-    assert "inner only" in inner_text
-    assert "inner only" not in outer_text
-    assert json.loads(_read(inner.meta_path))["parentResearchId"] == \
-        "chat_1755500000000_7"
-    assert json.loads(_read(inner.meta_path))["attempt"] == 1
+    assert inner is outer
+    assert [p.name for p in research._runs_log_root().iterdir()] == [outer.dir.name]
+    text = _read(outer.writer.primary)
+    assert text.index("outer before") < text.index("inner line") < text.index("outer after")
+    assert "=== browser restarted — attempt 2 of 3 ===" in text
+    meta = json.loads(_read(outer.meta_path))
+    assert meta["attempt"] == 1
+    assert [a["why"] for a in meta["attempts"]] == ["start", "browser-restart"]
 
 
-def test_both_metas_are_finalized():
+def test_a_joined_attempt_ends_only_itself_and_the_folder_is_finalized_once():
     with research._RunLogCapture(research_id="chat_1755500000000_8") as outer:
         with research._RunLogCapture(research_id="chat_1755500000000_8",
-                                     attempt=1) as inner:
+                                     attempt=1, why="browser-restart"):
             pass
-    for sink in (outer, inner):
-        meta = json.loads(_read(sink.meta_path))
-        assert meta["status"] == "complete", meta
-        assert "endedUtc" in meta and "durationSec" in meta
+        mid = json.loads(_read(outer.meta_path))
+        assert mid["status"] == "running", "a joined attempt finalized the folder"
+        assert "endedUtc" not in mid
+        assert mid["attempts"][-1]["status"] == "complete"
+    meta = json.loads(_read(outer.meta_path))
+    assert meta["status"] == "complete", meta
+    assert "endedUtc" in meta and "durationSec" in meta
+    assert [a["status"] for a in meta["attempts"]] == ["browser-crashed", "complete"]
 
 
 def test_a_run_that_raises_is_finalized_as_errored_with_the_class_named():

@@ -366,7 +366,8 @@ def resumed(tmp_path, monkeypatch):
     def _no_scan(*_a, **_k):
         return (None, "", False)
     monkeypatch.setattr(research, "_find_recent_audio", _no_scan)
-    monkeypatch.setattr(research, "_transcode_audio_to_mp3", lambda p: p)
+    # Wave 19: the fresh Phase 3 hands the transcode the research's name.
+    monkeypatch.setattr(research, "_transcode_audio_to_mp3", lambda p, title="": p)
 
     async def _publish(audio_path, _rid):
         seen["published"].append(audio_path)
@@ -398,6 +399,7 @@ def resumed(tmp_path, monkeypatch):
 
     async def _relaunch(**kw):
         kw.pop("_submitted_by", None)
+        kw.pop("_log_reason", None)   # wave 16: the wrapper's, like the claim
         await research.run_pipeline(**kw)
     monkeypatch.setattr(research, "run_pipeline_captured", _relaunch)
 
@@ -1047,7 +1049,8 @@ def _the_real_publish(monkeypatch, *, upload_ok=True):
                         lambda kind, url, **_f: _landed("links", kind, url)
                         if kind == "audio_file" else None)
     monkeypatch.setattr(research, "_audio_duration_sec", lambda _p: 600)
-    monkeypatch.setattr(research, "smart_title", lambda s: s)
+    # Wave 19: the row's name is the research's one short name.
+    monkeypatch.setattr(research, "_research_name", lambda *a, **k: "")
     return w
 
 

@@ -110,20 +110,20 @@ def test_the_stacked_file_is_not_written_anywhere_in_the_module():
     assert ".write_text(_consolidated_md" not in mod
 
 
-def test_the_merged_corpus_still_reaches_both_of_its_readers():
+def test_the_merged_corpus_still_reaches_its_reader():
     """⛔ THE ONE A WRITE-ONLY DELETION WOULD HAVE BROKEN SILENTLY. The merged
-    text is the input to the post-P2 summary and to the title refresh; both take
-    "what the research found" from all three reports at once.
+    text is the input to the post-P2 summary, which takes "what the research
+    found" from all three reports at once.
 
-    ⭐ Wave 10.9 — THREE uses now, by equality, and the one that went is the
-    Firestore mirror. The readers take the STRING, never a saved document, which
-    is exactly why retiring the mirror could leave them untouched — and why the
-    equality has to drop to three rather than be relaxed to a minimum: a fourth
-    use would be a re-added write."""
+    ⭐ Wave 10.9 — THREE uses, by equality, and the one that went is the
+    Firestore mirror. ⭐ Wave 19 — TWO: the build and the summary. The title
+    refresh was the other reader, and it is retired — the research is named
+    once, from its topic. The equality drops rather than being relaxed to a
+    minimum: a third use would be a re-added write, or the rename back."""
     src = _persist()
-    assert len(re.findall(r"_consolidated_md", src)) == 3
+    assert len(re.findall(r"_consolidated_md", src)) == 2
     build = src.index('_consolidated_md = "\\n".join(consolidated_parts)')
-    for call in ("_generate_research_summary_async(", "_refresh_research_title_async("):
+    for call in ("_generate_research_summary_async(",):
         at = src.index(call, build)
         window = src[at:at + 300]
         assert "_consolidated_md" in window, call

@@ -174,23 +174,50 @@ def test_transcode_zero_byte_output_keeps_source(tmp_path, monkeypatch):
 
 # ── Wiring in run_phase3_audio ────────────────────────────────────────────────
 
+def _transcode_calls():
+    """Every `asyncio.to_thread(_transcode_audio_to_mp3, …)` in run_phase3_audio,
+    each with the `if` tests that enclose it.
+
+    ⭐ Wave 19 (re-pointed): the call now also hands the research's name
+    (`title=`), and the file is renamed just before it — so the pins read the
+    parse tree instead of one exact line and a 160-character window."""
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(research.run_phase3_audio)))
+    found = []
+
+    def walk(node, guards):
+        for child in ast.iter_child_nodes(node):
+            g = guards + [ast.unparse(child.test)] if isinstance(child, ast.If) else guards
+            if (isinstance(child, ast.Call) and ast.unparse(child.func) == "asyncio.to_thread"
+                    and child.args and ast.unparse(child.args[0]) == "_transcode_audio_to_mp3"):
+                found.append((child, g))
+            walk(child, g)
+    walk(tree, [])
+    return found
+
+
 def test_run_phase3_audio_transcodes_off_thread():
-    src = inspect.getsource(research.run_phase3_audio)
-    call = "audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)"
-    assert call in src, (
+    calls = _transcode_calls()
+    assert len(calls) == 1, (
         "the podcast must be transcoded to mp3 via asyncio.to_thread so the "
         "encode never blocks the heartbeat loop"
     )
+    assert [ast_unparse(a) for a in calls[0][0].args] == [
+        "_transcode_audio_to_mp3", "audio_path"]
 
 
 def test_run_phase3_audio_transcode_is_guarded():
-    src = inspect.getsource(research.run_phase3_audio)
-    call = "audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)"
-    window = src[max(0, src.index(call) - 160): src.index(call)]
-    assert "if audio_path and audio_path.exists():" in window, (
+    (_call, guards), = _transcode_calls()
+    assert "audio_path and audio_path.exists()" in guards, (
         "the transcode must be guarded on a real file so a no-audio run "
         "(audio_path None / not downloaded) never invokes ffmpeg"
     )
+
+
+def ast_unparse(node):
+    import ast
+    return ast.unparse(node)
 
 
 def test_transcode_precedes_storage_upload_and_probe():

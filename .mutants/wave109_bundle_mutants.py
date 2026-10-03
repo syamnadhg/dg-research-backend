@@ -157,7 +157,6 @@ SITE_ORPHAN = ('            log(f"[idle-rescan] worker {WORKER_ID}: picking up o
 SITE_SIDEBAR_LIST = '        log(f"[{label}] top {len(_titles)} recent sidebar chat(s) "'
 SITE_SIDEBAR_OPEN = ('        log(f"[{label}] opening owned sidebar chat '
                      '#{_ci + 1}/{len(_owned)} "')
-SITE_REFUSE = '                        log(f"[title-refresh] REFUSING the generated title "'
 SITE_BRIEF_ANCHORS = ("""        f"distinctive terms ({', '.join(anchors[:6])}) """
                       '''— this is not a brief "''')
 #: The two rules as they shipped in the first pass, for T2 / T3.
@@ -555,11 +554,8 @@ MUTANTS = [
      [(SITE_SIDEBAR_OPEN,
        '        log(f"[{label}] opening owned sidebar chat {_cand_title} "')]),
 
-    ("V12", "under", RESEARCH,
-     "the title-refresh refusal prints the generated title again",
-     [(SITE_REFUSE,
-       '                        log(f"[title-refresh] REFUSING the generated '
-       'title {text} "')]),
+    # V12 retired 10-02 (wave 19): the title-refresh refusal line is gone with
+    # the after-Phase-2 rename.
 
     ("V13", "under", RESEARCH,
      "⛔ the Phase 1 brief gate keeps naming the topic's distinctive words — "

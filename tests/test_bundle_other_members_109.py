@@ -640,10 +640,12 @@ _SUBJECT_NAME_RE = re.compile(r"(?i)(title|topic|anchor)")
 #: …a dict key that fetches one…
 _SUBJECT_KEY = frozenset({"topic", "title"})
 #: …and a variable ASSIGNED from a function that returns one, which is how the
-#: title-refresh lines' `text` and the sweep's `_t` / `_a` are subjects without
-#: saying so in their names.
-_SUBJECT_CALLS = frozenset({"topic_anchors", "smart_title", "_shape_title",
-                            "_try_llm_title", "_run_topic_for_guard"})
+#: sweep's `_t` / `_a` are subjects without saying so in their names. ⭐ Wave 19:
+#: the research's one short name is made by the last four (the title refresh's
+#: makers are retired).
+_SUBJECT_CALLS = frozenset({"topic_anchors", "_run_topic_for_guard",
+                            "_research_name", "_shape_research_name",
+                            "_research_name_from_topic", "_ask_web_namer"})
 #: ⛔ THE ONLY WAY PAST THIS TEST, and each one is a claim a reviewer can check:
 #: the name says subject and the value is not one. Keyed by a literal from the
 #: line itself, and every row must still match a line (below), so a row left

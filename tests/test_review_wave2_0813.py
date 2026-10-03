@@ -161,36 +161,24 @@ def _logs(monkeypatch) -> list:
 _EMPTY_200 = {"candidates": [{"finishReason": "MAX_TOKENS", "content": {}}]}
 
 
-def test_the_title_leg_asks_for_a_ceiling_that_survives_thinking(monkeypatch) -> None:
-    """The finding. 40 → 120 was the compensating raise when the thinking-disable
-    field came out; the narrator needed 200 → 800 for the same removal. A ceiling
-    sized for a non-thinking request is spent before any answer is produced."""
+# ⭐ WAVE 19: the TITLE leg these were first written for is retired with the
+# after-Phase-2 rename (the research is named once, from its topic). The same
+# Gemini leg lives on in the SUMMARY, so the pins moved there.
+
+def test_the_summary_leg_asks_for_a_ceiling_that_survives_thinking(monkeypatch) -> None:
+    """The finding. A ceiling sized for a non-thinking request is spent before
+    any answer is produced; the narrator needed 200 → 800 for the same removal."""
     sent: list = []
     _logs(monkeypatch)
     _gemini_stub(monkeypatch, _Resp(200, {"candidates": [
-        {"content": {"parts": [{"text": "A Fine Title"}]}}]}), sent)
+        {"content": {"parts": [{"text": "A fine summary."}]}}]}), sent)
 
-    assert research._try_llm_title("t", "b") == "A Fine Title"
+    assert research._try_llm_summary("t", "b") == "A fine summary."
     assert sent, "the Gemini leg was never reached"
     ceiling = sent[0]["generationConfig"]["maxOutputTokens"]
     assert ceiling >= 600, (
-        f"the title leg still asks for {ceiling} output tokens with thinking on — "
+        f"the summary leg asks for {ceiling} output tokens with thinking on — "
         f"the budget is spent reasoning and the 200 comes back with no parts"
-    )
-
-
-def test_an_empty_200_on_the_title_leg_is_logged_with_its_reason(monkeypatch) -> None:
-    """The other half. The status check made a REFUSAL visible; an ACCEPTED call
-    that produced nothing was still silent, and produced the identical "" out of
-    this function. Zero log evidence is what made this survive."""
-    seen = _logs(monkeypatch)
-    _gemini_stub(monkeypatch, _Resp(200, _EMPTY_200), [])
-
-    assert research._try_llm_title("t", "b") == ""
-    warned = [m for lvl, m in seen if lvl == "WARN" and "no text" in m]
-    assert warned, f"an empty 200 was swallowed with no log at all: {seen!r}"
-    assert "finishReason=MAX_TOKENS" in warned[0], (
-        f"the log fired but does not name the cause: {warned[0]!r}"
     )
 
 
@@ -202,19 +190,19 @@ def test_a_blocked_prompt_reads_differently_from_a_spent_budget(monkeypatch) -> 
     _gemini_stub(monkeypatch, _Resp(200, {"candidates": [{}],
                                           "promptFeedback": {"blockReason": "SAFETY"}}), [])
 
-    assert research._try_llm_title("t", "b") == ""
+    assert research._try_llm_summary("t", "b") == ""
     warned = [m for lvl, m in seen if lvl == "WARN" and "no text" in m]
     assert warned and "blockReason=SAFETY" in warned[0], f"{seen!r}"
 
 
-def test_a_good_title_is_not_logged_as_a_failure(monkeypatch) -> None:
+def test_a_good_summary_is_not_logged_as_a_failure(monkeypatch) -> None:
     """⛔ Over-correction: a log that fires on every call is noise, and this one
     would fire on the success path of every run."""
     seen = _logs(monkeypatch)
     _gemini_stub(monkeypatch, _Resp(200, {"candidates": [
-        {"content": {"parts": [{"text": "Good Title Here"}]}}]}), [])
+        {"content": {"parts": [{"text": "A good summary."}]}}]}), [])
 
-    assert research._try_llm_title("t", "b") == "Good Title Here"
+    assert research._try_llm_summary("t", "b") == "A good summary."
     assert not [m for lvl, m in seen if "no text" in m], f"{seen!r}"
 
 
@@ -223,7 +211,7 @@ def test_the_refusal_log_still_fires_and_still_returns_empty(monkeypatch) -> Non
     seen = _logs(monkeypatch)
     _gemini_stub(monkeypatch, _Resp(400, {"error": {"message": "bad key"}}), [])
 
-    assert research._try_llm_title("t", "b") == ""
+    assert research._try_llm_summary("t", "b") == ""
     assert [m for lvl, m in seen if lvl == "WARN" and "refused" in m], f"{seen!r}"
 
 

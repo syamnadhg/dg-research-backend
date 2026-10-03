@@ -13,13 +13,14 @@ only runner of phases 4 and 5, and `/api/summary` and `/api/superresearch` no
 longer exist.
 
 ⛔⛔ WHAT MUST NOT GO WITH IT, AND IT IS WHY THIS FILE EXECUTES RATHER THAN READS.
-The string is still built, and it is still handed to TWO readers that take TEXT,
+The string is still built, and it is still handed to the reader that takes TEXT,
 never a saved document:
   · `_generate_research_summary_async` — the one-line `summary` FIELD, the
     paragraph the /researches tile animates.
-  · `_refresh_research_title_async` — the post-P2 title refresh.
-Both need all three reports at once. Removing the write and the build together
-stops both of them SILENTLY: the `len(consolidated_parts) > 1` gate goes False,
+(The post-P2 title refresh was its second reader until wave 19 retired it: the
+research is named once, from its topic.) It needs all three reports at once.
+Removing the write and the build together stops it SILENTLY: the
+`len(consolidated_parts) > 1` gate goes False,
 no exception, no log line, and every assertion about the write alone still
 passes. That is this repo's recorded shape for a silent outage, so the pin has to
 watch the readers as well as the writes.
@@ -34,7 +35,7 @@ assertion below is on what the run WROTE and on what the readers RECEIVED.
 
 ⭐ ACCEPT-POLARITY IS HALF THE FILE. An absence pin passes against a helper that
 does nothing at all, so the three agent documents are asserted PRESENT, with
-their numbered content, and both readers are asserted to have been CALLED with
+their numbered content, and the summary is asserted to have been CALLED with
 the merged text — in the same run that proves no combined document was saved.
 """
 from __future__ import annotations
@@ -76,7 +77,6 @@ class _Run:
         self.queue_dir = queue_dir
         self.saved = []       # (doc_type, content, name)
         self.summary = []     # (topic, brief, findings_text)
-        self.title = []       # (topic, brief, findings_text)
 
     @property
     def doc_types(self):
@@ -110,14 +110,10 @@ def _drive(monkeypatch, tmp_path, results, *, brief=BRIEF, summary_raises=False)
         if summary_raises:
             raise RuntimeError("no thread for you")
 
-    def _title(topic, brief_text="", findings_text=""):
-        run.title.append((topic, brief_text, findings_text))
-
     monkeypatch.setattr(R, "_runtime", _Runtime(), raising=False)
     monkeypatch.setattr(R, "save_document_to_firestore", _save)
     monkeypatch.setattr(R, "_rehost_document_images", _rehost)
     monkeypatch.setattr(R, "_generate_research_summary_async", _summary)
-    monkeypatch.setattr(R, "_refresh_research_title_async", _title)
 
     asyncio.run(R._p2_persist_reports(results, queue_dir, TOPIC, brief))
     return run
@@ -162,11 +158,11 @@ def test_a_completed_run_saves_the_three_agent_reports_and_no_combined_document(
         assert saved == (run.queue_dir / "documents" / f"{key}.md").read_text(encoding="utf-8")
 
 
-def test_both_readers_still_receive_the_merged_text_they_receive_today(
+def test_the_summary_still_receives_the_merged_text_it_receives_today(
         monkeypatch, tmp_path):
     """⛔⛔ THE ONE A WRITE-ONLY DELETION WOULD HAVE BROKEN SILENTLY. The merged
     corpus has no saved copy left, so nothing but this says it is still built —
-    and it is the input to the /researches one-liner and to the title refresh.
+    and it is the input to the /researches one-liner.
 
     The expected text is spelled out in `_expected_corpus`, not obtained from the
     code under test, so a build that changed its shape fails here rather than
@@ -174,14 +170,13 @@ def test_both_readers_still_receive_the_merged_text_they_receive_today(
     run = _drive(monkeypatch, tmp_path, _fresh("ChatGPT", "Gemini", "Claude"))
     corpus = _expected_corpus("ChatGPT", "Gemini", "Claude")
     assert run.summary == [(TOPIC, BRIEF, corpus)]
-    assert run.title == [(TOPIC, BRIEF, corpus)]
 
 
 def test_the_merged_text_carries_the_clean_extraction_not_the_numbered_document(
         monkeypatch, tmp_path):
     """⛔ The saved agent document is the NUMBERED copy — the sources pass rewrites
     the citations and appends a bibliography. The corpus must carry `r["text"]`,
-    or the summary and the title refresh are handed numbering markers as prose.
+    or the summary is handed numbering markers as prose.
     Executed: the two strings are compared, so this holds without naming either
     side's implementation."""
     run = _drive(monkeypatch, tmp_path, _fresh("ChatGPT"))
@@ -197,30 +192,29 @@ def test_the_merged_text_carries_the_clean_extraction_not_the_numbered_document(
 def test_a_run_where_every_agent_failed_saves_nothing_and_dispatches_nothing(
         monkeypatch, tmp_path):
     """⛔ THE GATE, EXECUTED. With no agent text the corpus is an H1 and nothing
-    else, and the two readers must not be asked to summarise a title. Loosening
+    else, and the summary must not be asked to summarise a title. Loosening
     `> 1` to `>= 1` is the mutant this kills."""
     run = _drive(monkeypatch, tmp_path,
                  {"ChatGPT": {"text": "", "status": "failed"},
                   "Gemini": {"text": "", "status": "failed"}})
     assert run.saved == [] and run.on_disk == []
-    assert run.summary == [] and run.title == []
+    assert run.summary == []
 
 
-def test_one_survivor_still_reaches_both_readers(monkeypatch, tmp_path):
+def test_one_survivor_still_reaches_the_summary(monkeypatch, tmp_path):
     """The other side of the gate: one agent IS a result worth summarising, and
     the corpus is that agent alone. Pins the gate at the right threshold from
     below, so tightening `> 1` to `> 2` fails too."""
     run = _drive(monkeypatch, tmp_path, _fresh("Gemini"))
     assert run.doc_types == ["gemini"]
     assert run.summary == [(TOPIC, BRIEF, _expected_corpus("Gemini"))]
-    assert run.title == [(TOPIC, BRIEF, _expected_corpus("Gemini"))]
 
 
 def test_a_kept_agents_copies_stand_and_its_text_is_still_merged(
         monkeypatch, tmp_path):
     """A resume keeps a finished agent's report: its file and its Firestore copy
     are the ones written when it finished, so the finalize pass must not re-wrap
-    them — but its TEXT still belongs in the corpus both readers get."""
+    them — but its TEXT still belongs in the corpus the summary gets."""
     results = _fresh("ChatGPT", "Gemini")
     results["Gemini"]["_restored"] = True
     run = _drive(monkeypatch, tmp_path, results)
@@ -229,26 +223,23 @@ def test_a_kept_agents_copies_stand_and_its_text_is_still_merged(
     assert run.summary == [(TOPIC, BRIEF, _expected_corpus("ChatGPT", "Gemini"))]
 
 
-def test_a_failed_summary_dispatch_does_not_cost_the_title_refresh(
+def test_a_failed_summary_dispatch_does_not_raise_out_of_the_phase(
         monkeypatch, tmp_path):
-    """Two independent daemon dispatches, two `try`s. They are the last thing the
-    phase does, so an exception out of either would also skip the run's own
-    `PHASE 2 COMPLETE` bookkeeping in the caller."""
+    """The dispatch is in its own `try`. It is the last thing the phase does, so
+    an exception out of it would also skip the run's own `PHASE 2 COMPLETE`
+    bookkeeping in the caller. (Wave 19 retired the title refresh beside it.)"""
     run = _drive(monkeypatch, tmp_path, _fresh("ChatGPT", "Claude"),
                  summary_raises=True)
     corpus = _expected_corpus("ChatGPT", "Claude")
     assert run.summary == [(TOPIC, BRIEF, corpus)]
-    assert run.title == [(TOPIC, BRIEF, corpus)]
 
 
-def test_the_brief_reaches_both_readers_as_the_caller_passes_it(
+def test_the_brief_reaches_the_summary_as_the_caller_passes_it(
         monkeypatch, tmp_path):
     """`run_pipeline` hands `brief_artifact.text if brief_artifact else ""`; a run
-    with no brief must still refresh its summary and title, from the reports
-    alone."""
+    with no brief must still refresh its summary, from the reports alone."""
     run = _drive(monkeypatch, tmp_path, _fresh("Claude"), brief="")
     assert run.summary == [(TOPIC, "", _expected_corpus("Claude"))]
-    assert run.title == [(TOPIC, "", _expected_corpus("Claude"))]
 
 
 # ── the caller, so the helper cannot be a decision nothing asks for ──────────
@@ -302,7 +293,6 @@ def test_run_pipeline_hands_the_phase_to_the_helper_unconditionally():
 
 
 @pytest.mark.parametrize("name", ["_generate_research_summary_async",
-                                  "_refresh_research_title_async",
                                   "save_document_to_firestore"])
 def test_the_faked_names_are_the_real_ones(name):
     """⛔ A monkeypatch on a name the module does not have would make every

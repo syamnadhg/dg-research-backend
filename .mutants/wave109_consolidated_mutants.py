@@ -70,13 +70,14 @@ SUITES = "tests/test_consolidated_write_retired_109.py"
 
 MINE = (
     "saves_the_three_agent_reports_and_no_combined_document or "
-    "both_readers_still_receive_the_merged_text or "
+    # Wave 19: four renamed with the title refresh's retirement.
+    "summary_still_receives_the_merged_text or "
     "merged_text_carries_the_clean_extraction or "
     "every_agent_failed_saves_nothing_and_dispatches_nothing or "
-    "one_survivor_still_reaches_both_readers or "
+    "one_survivor_still_reaches_the_summary or "
     "kept_agents_copies_stand or "
-    "failed_summary_dispatch_does_not_cost_the_title_refresh or "
-    "brief_reaches_both_readers or "
+    "failed_summary_dispatch_does_not_raise_out_of_the_phase or "
+    "brief_reaches_the_summary or "
     "hands_the_phase_to_the_helper_unconditionally or "
     "the_faked_names_are_the_real_ones"
 )
@@ -114,15 +115,6 @@ SUMMARY_CALL = ('        try:\n'
                 '            )\n'
                 '        except Exception as _sum_e:\n'
                 '            log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")')
-#: The second reader: the post-P2 title refresh.
-TITLE_CALL = ('        try:\n'
-              '            _refresh_research_title_async(\n'
-              '                topic,\n'
-              '                brief_text,\n'
-              '                _consolidated_md,\n'
-              '            )\n'
-              '        except Exception as _tit_e:\n'
-              '            log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")')
 #: The brief, on its way to the first reader.
 SUMMARY_BRIEF = ('            _generate_research_summary_async(\n'
                  '                topic,\n'
@@ -209,35 +201,8 @@ MUTANTS = [
      "KILLED BY tests/test_consolidated_write_retired_109.py::"
      "test_one_survivor_still_reaches_both_readers",
      [(GATE, '    if len(consolidated_parts) > 2:')]),
-    ("M8", "under",
-     "⛔ THE TITLE REFRESH IS DROPPED — the quiet half of the pair. The run keeps "
-     "the startup title built from the user's raw input, which is the paragraph "
-     "with \"Goal:\" sections the refresh exists to replace, and nothing in the "
-     "run reports anything wrong. "
-     "KILLED BY tests/test_consolidated_write_retired_109.py::"
-     "test_both_readers_still_receive_the_merged_text_they_receive_today",
-     [(TITLE_CALL, '        pass')]),
-    ("M9", "under",
-     "⛔⛔ THE TWO DISPATCHES SHARE ONE `try`, so a summary dispatch that raises "
-     "costs the title refresh as well — two independent daemon kicks collapsed "
-     "into one failure domain by a tidy-up that looks like a de-duplication. "
-     "KILLED BY tests/test_consolidated_write_retired_109.py::"
-     "test_a_failed_summary_dispatch_does_not_cost_the_title_refresh",
-     [(SUMMARY_CALL,
-       '        try:\n'
-       '            _generate_research_summary_async(\n'
-       '                topic,\n'
-       '                brief_text,\n'
-       '                _consolidated_md,\n'
-       '            )\n'
-       '            _refresh_research_title_async(\n'
-       '                topic,\n'
-       '                brief_text,\n'
-       '                _consolidated_md,\n'
-       '            )\n'
-       '        except Exception as _sum_e:\n'
-       '            log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")'),
-      (TITLE_CALL, '        pass')]),
+    # M8 and M9 retired 10-02 (wave 19): the title refresh — the second reader
+    # they measured — is gone; the research is named once, from its topic.
     ("M10", "under",
      "⛔ AN AGENT IS DROPPED FROM THE CORPUS. Claude's report is still written, "
      "still mirrored and still in the person's documents — and the one-line "

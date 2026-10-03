@@ -451,7 +451,6 @@ def test_the_finalize_resave_writes_the_same_linked_document(run, monkeypatch):
     text = CLAUDE_1001[len(CLAUDE_HEADER):]
     first = run.write("Claude", text)
     monkeypatch.setattr(research, "_generate_research_summary_async", lambda *a, **k: None)
-    monkeypatch.setattr(research, "_refresh_research_title_async", lambda *a, **k: None)
     before = len(run.sink)
     asyncio.run(research._p2_persist_reports(
         {"Claude": {"text": text, "status": "done"}}, run.dir, "Jev", "a brief"))

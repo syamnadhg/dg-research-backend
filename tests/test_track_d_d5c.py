@@ -30,6 +30,9 @@ research = importlib.import_module("research")
 # ─── _fresh_user_mode_id_token ────────────────────────────────────────
 
 
+# The real helper, with the keystore and the refresh stubbed under it — the
+# suite-wide guard (conftest `live_sign_in_reached`) stands in for it otherwise.
+@pytest.mark.real_sign_in("_fresh_user_mode_id_token")
 class TestFreshUserModeIdToken:
     def test_returns_none_when_keystore_empty(self, monkeypatch):
         # Stub the keystore.try_recover() to return None (no creds saved).

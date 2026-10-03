@@ -541,3 +541,65 @@ def _the_serve_token_never_lands_in_the_real_home(_serve_token_dir, monkeypatch)
     from auth import serve_token
     monkeypatch.setattr(serve_token, "_KEYSTORE_DIR", _serve_token_dir)
     yield
+
+
+# ══ no test reaches this computer's real sign-in ═════════════════════════════
+#
+#: The helpers that reach this computer's REAL sign-in and the live web app.
+#: `_fresh_user_mode_id_token` reads the real keystore and refreshes its token
+#: over the network, and WIPES the keystore when the refresh is refused.
+#: `_ask_web_namer` (wave 19) uses it to POST a research's topic to the live
+#: `/api/title`.
+LIVE_SIGN_IN = ("_ask_web_namer", "_fresh_user_mode_id_token")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_sign_in(*names): this test drives the REAL helper(s) it names "
+        "from conftest.LIVE_SIGN_IN, and stubs what is under them itself")
+
+
+@pytest.fixture(autouse=True)
+def live_sign_in_reached(request, monkeypatch):
+    """⛔⛔ No test reaches this computer's real sign-in (wave 19 review).
+
+    `_research_name` asks the web's namer whenever `_firebase_db` is set, and
+    many tests set a fake one. Before this, what kept the suite off the live
+    namer was only that a test had NO Firestore: a test that faked one, reached
+    Phase 3's naming and forgot to stub `_ask_web_namer` would read this Mac's
+    real keystore, refresh its token and POST the test's topic to the live
+    site. So both helpers are replaced for every test by a stand-in that
+    answers "no sign-in" and records the reach, and the test FAILS at teardown
+    naming who reached it and from where. A test that stubs a helper itself
+    patches after this and wins; a test of a helper itself says so with
+    `@pytest.mark.real_sign_in("<name>")` and stubs what is under it.
+
+    ⭐ Yields the list of reaches, so the guard's own tests can see it."""
+    import functools
+    import traceback
+    import research
+    marker = request.node.get_closest_marker("real_sign_in")
+    left_real = set(marker.args) if marker else set()
+    assert left_real <= set(LIVE_SIGN_IN), (
+        f"real_sign_in names a helper this guard does not hold: "
+        f"{sorted(left_real - set(LIVE_SIGN_IN))}")
+    reached = []
+    for name in LIVE_SIGN_IN:
+        if name in left_real:
+            continue
+        # "" is the namer's "cannot answer", None the token's "no sign-in".
+        cannot = "" if name == "_ask_web_namer" else None
+
+        @functools.wraps(getattr(research, name))
+        def _refused(*_a, _name=name, _cannot=cannot, **_k):
+            reached.append((_name, "".join(traceback.format_stack(limit=12)[:-1])))
+            return _cannot
+        monkeypatch.setattr(research, name, _refused, raising=True)
+    yield reached
+    if reached:
+        name, where = reached[0]
+        pytest.fail(f"⛔⛔ {name} was reached UNSTUBBED — the real one reads this "
+                    f"computer's sign-in and talks to the live site. Stub it in "
+                    f"the test (monkeypatch.setattr(research, {name!r}, …)).\n"
+                    f"Reached from:\n{where}", pytrace=False)

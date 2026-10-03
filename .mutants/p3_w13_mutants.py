@@ -283,9 +283,10 @@ MUTANTS = [
      [("    emit_event(\"phase_complete\", phase=3, durationSec=0, links=links,\n",
        "    (lambda *_a, **_k: None)(\"phase_complete\", phase=3, durationSec=0, links=links,\n")]),
     ("A7", RESEARCH, "⛔ Phase 3 is called complete on a podcast that never reached the app",
-     [("            f\"on this resume — going on without it\", \"WARN\")\n"
+     # Re-anchored 10-02 (wave 19): the line names the podcast's type, not its name.
+     [("            f\"did not reach the app on this resume — going on without it\", \"WARN\")\n"
        "        return audio_path, \"\"\n",
-       "            f\"on this resume — going on without it\", \"WARN\")\n")]),
+       "            f\"did not reach the app on this resume — going on without it\", \"WARN\")\n")]),
     ("A8", RESEARCH, "any file in podcasts/ is uploaded as the podcast",
      [("                 if f.is_file() and f.suffix.lower() in _P3_PODCAST_SUFFIXES]\n",
        "                 if f.is_file()]\n")]),
