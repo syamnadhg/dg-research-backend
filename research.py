@@ -2619,12 +2619,53 @@ class _CappedLogWriter:
         self._seg_written = 0
         self._live_segments: "list[int]" = []
         self.primary.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.primary, "a", encoding="utf-8",
-                        errors="replace", buffering=1)
         try:
             self._written = self.primary.stat().st_size
         except OSError:
             self._written = 0
+        # ⛔⛔ A REOPENED LOG ADOPTS ITS OLD TAIL (wave 16). A research's later
+        # attempts now append to its one folder, so a run.log that already
+        # overflowed is opened again. Started fresh, the writer went back to
+        # overflow1 — writing into the OLDEST kept segment and losing count of
+        # the rest, so more than `keep` segments piled up and the newest tail
+        # was no longer the last one. So: the segments already on disk are
+        # this writer's, the newest `keep` stay, numbering goes on from the
+        # highest, and writing goes on in the overflow tail.
+        old = self._segments_on_disk()
+        if old:
+            for index in old[:-self.keep]:
+                try:
+                    self.segment_path(index).unlink()
+                except OSError:
+                    pass
+                self.dropped_segments += 1
+            self._live_segments = old[-self.keep:]
+            self._in_overflow = True
+            self._seg_index = self._live_segments[-1]
+            tail = self.segment_path(self._seg_index)
+            try:
+                self._seg_written = tail.stat().st_size
+            except OSError:
+                self._seg_written = 0
+            self._fh = open(tail, "a", encoding="utf-8", errors="replace", buffering=1)
+        else:
+            self._fh = open(self.primary, "a", encoding="utf-8",
+                            errors="replace", buffering=1)
+
+    def _segments_on_disk(self) -> "list[int]":
+        """The overflow segment numbers already beside the primary, oldest
+        first. Only `<primary>.overflow<N>` — nothing else in the folder."""
+        found = []
+        prefix = f"{self.primary.name}.overflow"
+        try:
+            names = [p.name for p in self.primary.parent.iterdir()]
+        except OSError:
+            return found
+        for name in names:
+            rest = name[len(prefix):]
+            if name.startswith(prefix) and rest.isascii() and rest.isdigit():
+                found.append(int(rest))
+        return sorted(found)
 
     # ── paths ───────────────────────────────────────────────────────────
     def segment_path(self, index: int) -> "Path":
@@ -3397,10 +3438,25 @@ def _start_doc_identity_refused(data, where: str) -> bool:
 
 
 class _RunLogSink:
-    """One armed per-run log folder: `run.log` + `meta.json`, written live."""
+    """One armed per-run log folder: `run.log` + `meta.json`, written live.
+
+    ⭐⭐ WAVE 16 — ONE FOLDER PER RESEARCH, HOWEVER MANY TIMES IT RUNS. The
+    owner: logs grouped by research, not by how many times the browser opened.
+    Every attempt of one research on this computer — a browser restart, a try
+    again, a pick-up after a move to the queue, a Retry or Resume — writes into
+    the same folder, and `attempts` keeps each one's start, end and outcome.
+
+    ⛔⛔ THE TOP-LEVEL `startedUtc`, `pid`, `worker` AND `build` ARE THE CURRENT
+    ATTEMPT'S, NEVER THE FIRST ONE'S. A reader decides "dead or alive" from
+    them (`_derive_run_status`: the process, and a six-hour ceiling counted
+    from `startedUtc`). Counted from the first start, a research picked up
+    again days later would read dead while it runs, and another worker's prune
+    or Clear Logs would delete the folder it is writing. The first start has
+    its own key, `firstStartedUtc`."""
 
     def __init__(self, folder, research_id=None, attempt=0, parent_research_id=None,
-                 started_utc=None, submitted_by=None, claimed_by=None):
+                 started_utc=None, submitted_by=None, claimed_by=None,
+                 continues=None, why="start"):
         self.dir = Path(folder)
         self.research_id = research_id
         self.attempt = int(attempt or 0)
@@ -3415,9 +3471,84 @@ class _RunLogSink:
         self.started_mono = time.monotonic()
         self.counters = {"lines": 0, "warns": 0, "errors": 0, "eventsDropped": 0}
         self.events: "list[dict]" = []
+        self.first_started_utc = self.started_utc
+        self.attempts: "list[dict]" = []
+        # Set by a move to the queue: the status every later meta write keeps.
+        self.forced_status = None
+        if continues is not None:
+            self._carry_over(continues, why)
+        self.attempts.append(self._new_attempt(why))
         self.writer = _CappedLogWriter(self.dir / "run.log")
         self.meta_path = self.dir / "meta.json"
         self.write_meta("running")
+
+    # ── attempts ────────────────────────────────────────────────────────
+    def _new_attempt(self, why) -> dict:
+        return {"n": len(self.attempts) + 1, "why": str(why or "start"),
+                "startedUtc": self.started_utc, "endedUtc": None,
+                "status": "running", "pid": os.getpid(), "worker": WORKER_ID,
+                "build": _sr_build_label(), "durationSec": None}
+
+    def _carry_over(self, prior, why) -> None:
+        """Take on the folder's earlier attempts: its first start, its counters,
+        its attempts and its events. The prior attempt is closed here when its
+        process died with the meta still saying it runs."""
+        prior = prior if isinstance(prior, dict) else {}
+        self.first_started_utc = str(prior.get("firstStartedUtc")
+                                     or prior.get("startedUtc") or self.started_utc)
+        old_counters = prior.get("counters") if isinstance(prior.get("counters"), dict) else {}
+        for key in self.counters:
+            try:
+                self.counters[key] = int(old_counters.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        self.attempts = [dict(a) for a in (prior.get("attempts") or [])
+                         if isinstance(a, dict)]
+        if self.attempts and self.attempts[-1].get("status") == "running":
+            stored = str(prior.get("status") or "")
+            self.attempts[-1]["status"] = (
+                stored if stored and stored != "running"
+                else ("moved" if why == "moved" else "process-died"))
+        try:
+            events = json.loads((self.dir / "events.json").read_text(encoding="utf-8"))
+        except Exception:
+            events = []
+        if isinstance(events, list):
+            kept = [e for e in events if isinstance(e, dict)]
+            if len(kept) > RUN_LOG_EVENT_CAP:
+                self.counters["eventsDropped"] += len(kept) - RUN_LOG_EVENT_CAP
+                kept = kept[-RUN_LOG_EVENT_CAP:]
+            self.events = kept
+
+    def close_attempt(self, status: str, **extra) -> None:
+        """End the current attempt's entry. An entry already ended keeps what
+        it said."""
+        current = self.attempts[-1] if self.attempts else None
+        if current is None or current.get("status") != "running":
+            return
+        current.update(status=str(status), endedUtc=_utc_iso(),
+                       durationSec=round(time.monotonic() - self.started_mono, 3),
+                       **extra)
+
+    def begin_attempt(self, why, ended_status: str, attempt=0) -> None:
+        """A later attempt of the same research, in THIS process, joins the
+        folder: the attempt before it ends here, and the top-level start, the
+        clock and the attempt number become the new attempt's."""
+        self.close_attempt(ended_status)
+        self.started_utc = _utc_iso()
+        self.started_mono = time.monotonic()
+        self.attempt = int(attempt or 0)
+        self.attempts.append(self._new_attempt(why))
+        self.write_meta("running")
+
+    def mark_moved(self) -> None:
+        """Move to queue: this attempt ends as "moved", and the folder stops
+        reading live NOW — the worker that picks the run up must not have to
+        wait for this process to be gone to see it finished. The sink stays
+        armed, so this process's last lines still land here."""
+        self.close_attempt("moved")
+        self.forced_status = "moved"
+        self.write_meta("moved")
 
     # ── meta ────────────────────────────────────────────────────────────
     def meta(self, status: str, **extra) -> dict:
@@ -3433,6 +3564,9 @@ class _RunLogSink:
             "build": _sr_build_label(),
             "platform": sys.platform,
             "startedUtc": self.started_utc,
+            # ⭐ WAVE 16: when this research first ran here, and every attempt.
+            "firstStartedUtc": self.first_started_utc,
+            "attempts": [dict(a) for a in self.attempts],
             # ⭐ WHO FIRED THIS RUN — and, since Wave 8, whose support bundle
             # may carry it. It is granted only when the rules-pinned writer and
             # the executing tree agree; see `_resolve_run_submitter` for why the
@@ -3450,6 +3584,8 @@ class _RunLogSink:
         return data
 
     def write_meta(self, status: str, **extra) -> None:
+        if self.forced_status:
+            status = self.forced_status
         try:
             _atomic_write_json(self.meta_path, self.meta(status, **extra))
         except Exception:
@@ -3479,11 +3615,15 @@ class _RunLogSink:
             self.counters["eventsDropped"] += half
 
     def finalize(self, status: str, **extra) -> None:
+        status = self.forced_status or status
+        self.close_attempt(status, **extra)
         self.write_meta(status,
                         endedUtc=_utc_iso(),
                         durationSec=round(time.monotonic() - self.started_mono, 3),
                         **extra)
         try:
+            # ⭐ The folder's whole event list: an attempt that continued the
+            # folder loaded the earlier ones first (`_carry_over`).
             (self.dir / "events.json").write_text(
                 json.dumps(self.events, indent=1), encoding="utf-8")
         except Exception:
@@ -3492,8 +3632,12 @@ class _RunLogSink:
 
 
 # The sink STACK, not a singleton: run_pipeline awaits itself in the #725
-# crash-retry, so nesting is real. Each attempt gets its own folder and the
-# OUTER sink resumes the moment the inner one disarms.
+# crash-retry, so nesting is real. ⭐ WAVE 16: an attempt of the SAME research
+# joins the armed sink instead of pushing a folder of its own (`_RunLogCapture`
+# — one folder per research), and closes only its own attempt when it ends; the
+# outer capture finalizes the folder once. A different research nested inside
+# (never seen, but possible) still gets its own folder, and the outer sink
+# resumes the moment the inner one disarms.
 _RUN_LOG_SINKS: "list[_RunLogSink]" = []
 _RUN_LOG_LAST_DIR = None
 _RUN_LOG_TLS = _log_threading.local()
@@ -3875,22 +4019,23 @@ def _note_cloud_handoff(research_id, line: str) -> bool:
     return wrote
 
 
-def _run_log_folder_name(research_id, started_utc, attempt=0) -> str:
-    """Folder key for one run's log directory.
+def _run_log_folder_name(research_id, started_utc) -> str:
+    """Folder key for one research's log directory: `<researchId>_<first start>`.
 
     ⛔ THERE IS NO `run_id` PARAMETER, and that absence is the design. `run_id`
     is built from `safe_name(topic)` — it CARRIES THE USER'S TOPIC, and at the
     worker's claim both names sit in scope one line apart. A topic in a folder
     name would ship inside every support bundle. Unrepresentable beats
-    remembered."""
+    remembered.
+
+    ⭐ AND NO ATTEMPT EITHER (wave 16). A later attempt of the same research
+    joins its folder (`_RunLogCapture`), so the name never needs to tell
+    attempts apart — `_retryN` folders were how one research got split."""
     stamp = re.sub(r"[^0-9A-Za-z]", "", str(started_utc or ""))[:15] or "unknown"
     rid = str(research_id or "")
     safe = bool(_RUN_FOLDER_ID_RE.match(rid)) and not _RUN_ID_SUFFIX_RE.search(rid)
     key = rid if safe else "local"
-    name = f"{key}_{stamp}"
-    if attempt:
-        name = f"{name}_retry{int(attempt)}"
-    return name
+    return f"{key}_{stamp}"
 
 
 def _derive_run_status(meta, now_epoch=None) -> str:
@@ -4082,7 +4227,7 @@ def _run_log_folders_for_research(research_id, root=None) -> "list[Path]":
     """Every run-log folder this machine holds for one research, safe to delete.
 
     ⛔⛔ MATCHED ON `meta.json`'s researchId, NEVER ON THE FOLDER NAME. The name
-    is `{safe}_{attempt}_{started}` where `safe` has already been through
+    is `{safe}_{started}` where `safe` has already been through
     `_RUN_FOLDER_ID_RE`, so a research whose id contains anything the pattern
     strips does not appear in its own folder name — and a prefix match would
     then either miss the folder or, worse, match a DIFFERENT research that
@@ -4578,16 +4723,101 @@ def _prune_local_logs(runs_keep=LOCAL_RUNS_DISK_VALVE,
     return removed
 
 
+#: The line a research's run.log gets when a later pick-up continues its folder
+#: (wave 16), keyed by why it was picked up (`run_pipeline_captured`'s
+#: `_log_reason`). Anything else — the terminal's `--resume` — is the plain one.
+_RUN_LOG_PICKUP_LINES = {
+    "moved": "picked up again after a move to the queue",
+    "resumed": "picked up again from where it stopped",
+}
+_RUN_LOG_PICKUP_LINE = "picked up again"
+
+
+def _same_research(a, b) -> bool:
+    """Do two sinks' research ids name the same research? Compared as stripped
+    strings, the way `_line_is_another_runs` does; two runs with no id are the
+    same run only because nothing but the crash retry ever nests a capture."""
+    return str(a or "").strip() == str(b or "").strip()
+
+
+def _run_log_folder_to_continue(research_id, submitter_uid, root=None):
+    """(folder, its meta) a new attempt of this research continues, or None
+    for a new folder.
+
+    ⭐ WAVE 16 — A LATER PICK-UP ON THIS COMPUTER JOINS THE RESEARCH'S FOLDER: a
+    move to the queue picked up again, a Retry or Resume, a restart's resume.
+    The newest of this research's folders that a person could have been
+    attributed in exactly as this attempt is (`submitterUid`, both None
+    included) — so one person's attempt is never written into a folder that
+    is attributed to someone else, and shipped in their Send Logs.
+
+    ⛔⛔ NOTHING THAT READS LIVE, AND NOTHING WHEN ANY FOLDER OF IT DOES. A folder
+    still being written by another process (`_folder_is_live`) would get two
+    writers on one run.log; and while any process still runs this research, a
+    new folder is today's behaviour — never worse.
+
+    ⛔ AN OLDER BUILD'S FOLDER (no `attempts` in its meta) IS LEFT ALONE: the
+    split folders made before this wave age out as they are."""
+    rid = str(research_id or "").strip()
+    if not rid:
+        return None
+    live = {str(s.dir) for s in _RUN_LOG_SINKS}
+    best = None
+    for folder in _run_folders_for_research_any(rid, root):
+        if str(folder) in live or _folder_is_live(folder):
+            return None
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta.get("attempts"), list):
+            continue
+        if meta.get("submitterUid") != submitter_uid:
+            continue
+        key = (_epoch_from_iso(meta.get("startedUtc")), _safe_mtime(folder))
+        if best is None or key > best[0]:
+            best = (key, folder, meta)
+    return (best[1], best[2]) if best is not None else None
+
+
+def _mark_run_log_moved(research_id) -> bool:
+    """Move to queue: the armed folder of THIS research says "moved" now (wave
+    16). The worker that picks the run up continues the folder only once it
+    reads finished, and on Windows a worker that has exited can still read
+    alive for a while (`_pid_alive`) — so the move says it itself, instead of
+    the pick-up depending on how fast the old process lets go."""
+    sink = _active_run_sink()
+    if sink is None or not _same_research(sink.research_id, research_id):
+        return False
+    try:
+        sink.mark_moved()
+        return True
+    except Exception:
+        return False
+
+
 class _RunLogCapture:
     """Arm a per-run log folder for the duration of one pipeline attempt.
+
+    ⭐⭐ WAVE 16: the folder is the RESEARCH's. An attempt of the research whose
+    sink is already armed in this process (the browser-restart retry, the Wave
+    15 rejoin, the one-shot retry) JOINS that sink with one line saying why;
+    with nothing armed, an attempt continues the research's newest finished
+    folder (`_run_log_folder_to_continue`); otherwise a new folder opens.
 
     Never raises into the pipeline: if capture cannot be set up, the run runs.
     A diagnostic that can break the thing it diagnoses is worse than none."""
 
     def __init__(self, research_id=None, attempt=0, submitted_by=None,
-                 claimed_by=None):
+                 claimed_by=None, why=None):
         self.research_id = research_id
         self.attempt = int(attempt or 0)
+        # Why this attempt runs: "browser-restart" / "retry" (the crash retry,
+        # in this process), "moved" / "resumed" (a pick-up), None (a start).
+        self.why = why
+        # True when this capture joined a sink an outer capture armed.
+        self.joined = False
+        self._t0 = time.monotonic()
         # ⛔ PASSED IN, NOT READ FROM `_RUN_SUBMITTER`. That global is bound
         # inside `run_pipeline` (`_set_run_submitter`), which is AFTER the sink
         # below has already written its first meta.json — so reading it here
@@ -4612,22 +4842,55 @@ class _RunLogCapture:
             pass
         try:
             parent = _active_run_sink()
+            self._t0 = time.monotonic()
+            if parent is not None and _same_research(parent.research_id,
+                                                     self.research_id):
+                crashed = self.why == "browser-restart"
+                parent.begin_attempt(self.why or "retry",
+                                     "browser-crashed" if crashed else "failed",
+                                     self.attempt)
+                parent.writer.write_line(
+                    f"=== browser restarted — attempt {self.attempt + 1} of "
+                    f"{BROWSER_CRASH_MAX_RETRIES + 1} ===" if crashed
+                    else "=== tried again from where it got to ===")
+                self.sink = parent
+                self.joined = True
+                tm.tm_emit(tm.Ev.RUN_STARTED,
+                           research_id=_tm_research_id(self.research_id),
+                           worker=WORKER_ID)
+                return self.sink
             started = _utc_iso()
-            base = _run_log_folder_name(self.research_id, started, self.attempt)
             root = _runs_log_root()
             root.mkdir(parents=True, exist_ok=True)
-            folder = root / base
-            suffix = 2
-            while folder.exists():
-                folder = root / f"{base}-{suffix}"
-                suffix += 1
-            folder.mkdir(parents=True)
-            sink = _RunLogSink(
-                folder, research_id=self.research_id, attempt=self.attempt,
-                parent_research_id=(parent.research_id if parent is not None else None),
-                started_utc=started, submitted_by=self.submitted_by,
-                claimed_by=self.claimed_by)
-            sink.writer.write_line("=== super research run ===")
+            carry = None
+            if parent is None:
+                carry = _run_log_folder_to_continue(
+                    self.research_id,
+                    _resolve_run_submitter(self.submitted_by, self.claimed_by)[0])
+            if carry is not None:
+                folder, prior = carry
+                sink = _RunLogSink(
+                    folder, research_id=self.research_id, attempt=self.attempt,
+                    started_utc=started, submitted_by=self.submitted_by,
+                    claimed_by=self.claimed_by, continues=prior,
+                    why=self.why or "picked-up")
+                sink.writer.write_line(
+                    f"=== {_RUN_LOG_PICKUP_LINES.get(self.why, _RUN_LOG_PICKUP_LINE)} ===")
+            else:
+                base = _run_log_folder_name(self.research_id, started)
+                folder = root / base
+                suffix = 2
+                while folder.exists():
+                    folder = root / f"{base}-{suffix}"
+                    suffix += 1
+                folder.mkdir(parents=True)
+                sink = _RunLogSink(
+                    folder, research_id=self.research_id, attempt=self.attempt,
+                    parent_research_id=(parent.research_id if parent is not None
+                                        else None),
+                    started_utc=started, submitted_by=self.submitted_by,
+                    claimed_by=self.claimed_by)
+                sink.writer.write_line("=== super research run ===")
             sink.writer.write_line(
                 f"startedUtc={started} researchId={self.research_id} "
                 f"attempt={self.attempt} "
@@ -4651,8 +4914,6 @@ class _RunLogCapture:
         if sink is None:
             return False
         try:
-            if sink in _RUN_LOG_SINKS:
-                _RUN_LOG_SINKS.remove(sink)
             if exc_type is None:
                 status = "complete"
             elif issubclass(exc_type, asyncio.CancelledError):
@@ -4664,8 +4925,16 @@ class _RunLogCapture:
             extra = {}
             if exc_type is not None:
                 extra["errorClass"] = exc_type.__name__
-            sink.finalize(status, **extra)
-            _RUN_LOG_LAST_DIR = sink.dir
+            if self.joined:
+                # ⭐ A joined attempt ends only ITSELF: the folder is still the
+                # outer capture's, which finalizes it once.
+                sink.close_attempt(status, **extra)
+                sink.write_meta("running")
+            else:
+                if sink in _RUN_LOG_SINKS:
+                    _RUN_LOG_SINKS.remove(sink)
+                sink.finalize(status, **extra)
+                _RUN_LOG_LAST_DIR = sink.dir
             # ⭐ THE OUTCOME SEAM. Not `teardown_firestore_run`, which was
             # measured to be a context-free cleanup with nothing in scope — an
             # event that says nothing. This block is the one place that sees
@@ -4678,8 +4947,9 @@ class _RunLogCapture:
                                 "cancelled": tm.RunOutcome.STOPPED,
                                 "interrupted": tm.RunOutcome.STOPPED}.get(
                                     status, tm.RunOutcome.UNKNOWN),
-                       duration_ms=int(
-                           (time.monotonic() - sink.started_mono) * 1000))
+                       # This attempt's own clock: a joined attempt moves the
+                       # sink's, and telemetry stays per attempt.
+                       duration_ms=int((time.monotonic() - self._t0) * 1000))
             tm.flush_in_background()
         except Exception:
             pass
@@ -10298,6 +10568,9 @@ def _move_run_to_queue(data) -> str:
         log(f"[device-cmds] REQUEUE: upload check failed: {e}", "WARN")
     log(f"[device-cmds] REQUEUE: {rid[:8]}… moved to the front of the queue — "
         f"worker {WORKER_ID} stays off and restarts to let it go", "INFO")
+    # ⭐ WAVE 16: its log folder says "moved" now, so the worker that picks it
+    # up continues that folder instead of waiting for this process to be gone.
+    _mark_run_log_moved(rid)
     _schedule_server_exit("requeue", delay_sec=1.5)
     return "moved"
 
@@ -16770,7 +17043,7 @@ def _send_login_card_down(uid: str, research_id: str, queue_dir) -> None:
 def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: str,
                             email: str, job_queue, loop, worker_id: int,
                             config=None, topic_hint: str = "", queue_doc=None,
-                            login_pause: str = "") -> bool:
+                            login_pause: str = "", submitted_by=None) -> bool:
     """Put a paused run back on the queue from its checkpoint. True if it did.
 
     ⭐⭐ THE ONE RESUME. The Retry on a card (a queue document the start listener
@@ -16782,7 +17055,12 @@ def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: st
     it is given, the run is resumed only if that pause still holds (see
     `_login_pause_holds`). Without it — a Retry — the run is resumed only if it
     is not already queued to continue (`_run_already_queued`). `queue_doc` is
-    the Retry's queue document, deleted at the same point it always was."""
+    the Retry's queue document, deleted at the same point it always was.
+
+    ⭐ `submitted_by` — who asked, carried into the job (wave 16). Without it a
+    resumed attempt was attributed to nobody: its logs never reached the app's
+    Send Logs list, a later move to the queue copied the blank forward, and it
+    could not continue its research's log folder."""
     queue_dir = Path(queue_dir)
     # Merge config into config.json if provided.
     payload_config = config or {}
@@ -16879,11 +17157,13 @@ def _resume_from_checkpoint(queue_dir, *, uid: str, research_id: str, run_id: st
     # (which can race with our just-written "ongoing" flip).
     def _do_resume_enqueue(t=topic, e=email, c=payload_config,
                            r=run_id, u=uid, ri=research_id,
-                           rd_path=str(queue_dir)):
+                           rd_path=str(queue_dir),
+                           sb=str(submitted_by or "").strip()):
         try:
             job_queue.put_nowait({
                 "topic": t, "email": e, "config": c, "run_id": r,
                 "uid": u, "research_id": ri, "resume_dir": rd_path,
+                "submitted_by": sb,
                 # ⛔ ITS OWN CLOCK: the run id and the folder are
                 # as old as the run — see `_job_age_s`.
                 "queued_at_ms": int(time.time() * 1000),
@@ -17727,7 +18007,9 @@ def start_firestore_start_listener(job_queue, loop):
                     run_id=backend_run_id, email=data.get("email") or "",
                     job_queue=job_queue, loop=loop, worker_id=WORKER_ID,
                     config=data.get("config") or {}, topic_hint=rd.get("topic", ""),
-                    queue_doc=doc.reference)
+                    queue_doc=doc.reference,
+                    # Wave 16: the Retry's rules-pinned writer.
+                    submitted_by=data.get("submittedBy"))
                 continue
             if action != "start":
                 continue
@@ -84656,11 +84938,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            api_key=api_key, resume_dir=str(queue_dir),
                            config=config,
                            run_id=run_id, uid=uid, research_id=research_id,
-                           # ⛔ THE RETRY MUST CARRY IT TOO. Attempt 2 arms its
-                           # OWN folder, so a dropped writer here would leave the
-                           # retry — the attempt most likely to be the one worth
-                           # sending — attributable to nobody.
+                           # ⛔ THE RETRY MUST CARRY IT TOO. Attempt 2 joins
+                           # this attempt's folder (wave 16), but a capture
+                           # that cannot join arms a folder of its own, and a
+                           # dropped writer there would leave the retry — the
+                           # attempt most likely to be the one worth sending —
+                           # attributable to nobody.
                            _submitted_by=_run_submitted_by(),
+                           # Wave 16: the line the research's folder gets.
+                           _log_reason=("browser-restart" if _is_browser_crash
+                                        else "retry"),
                            _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries),
                            # 10-01: empty unless Chrome died in Phase 2.
                            _p2_rejoin=_p2_rejoin_next)
@@ -84696,6 +84983,9 @@ async def run_pipeline_captured(*args, **kwargs):
     # pass it are pinned by test, because a silently-dropped kwarg would look
     # exactly like a legacy start doc.
     _claimed = kwargs.pop("_submitted_by", None)
+    # ⭐ WAVE 16: why this attempt runs, for the one line its research's folder
+    # gets — popped like the claim above, because only the capture reads it.
+    _why = kwargs.pop("_log_reason", None)
     _rid, _attempt, _submitter = _run_pipeline_capture_key(args, kwargs)
     # ⭐ SAID BEFORE THE CAPTURE ARMS, so it is the one line of this run the
     # owner's log does get: from here the run's own lines go only to its folder
@@ -84703,9 +84993,10 @@ async def run_pipeline_captured(*args, **kwargs):
     if _is_incognito_research(_rid):
         log(f"[incognito] {_rid[:8]}… keeps nothing — its own lines stay out of "
             f"this log")
+    _capture = _RunLogCapture(research_id=_rid, attempt=_attempt,
+                              submitted_by=_submitter, claimed_by=_claimed, why=_why)
     try:
-        with _RunLogCapture(research_id=_rid, attempt=_attempt,
-                            submitted_by=_submitter, claimed_by=_claimed):
+        with _capture:
             # ⭐ THE RUN'S ORIGIN, around exactly the run's own work — so the
             # capture's own lines and the purge's line below stay the
             # machine's, and a disk that refused the folder still names the run.
@@ -84715,21 +85006,29 @@ async def run_pipeline_captured(*args, **kwargs):
             finally:
                 _LOG_RUN.reset(_origin)
     finally:
-        # ⛔⛔ AND NOW THE FOLDERS GO, for a run that keeps nothing (wave 10.9,
-        # #536). Here rather than at the end of the pipeline body for three
-        # reasons: this runs on EVERY exit, including the eight early returns
-        # the body has; the sink is finalized by the time the `with` has
-        # closed, so the log folder is no longer live and can be removed; and
-        # the auto-retry recursion happens INSIDE the body, so by the time
-        # control reaches this point the last attempt is genuinely the last.
-        #
-        # ⭐ The helper refuses unless `delivery.json` says the run is over, so
-        # a crash card's Retry and a login interrupt's Resume both keep the
-        # checkpoint they resume from.
-        try:
-            _purge_incognito_run_dirs(_run_pipeline_queue_dir(args, kwargs), _rid)
-        except Exception as _pe:
-            log(f"[incognito] run-folder cleanup failed (non-fatal): {_pe}", "WARN")
+        # ⛔⛔ A JOINED ATTEMPT LEAVES THE PURGE TO THE ATTEMPT IT JOINED (wave
+        # 16). Its folder is still being written by the outer attempt, so the
+        # purge would skip it — and then take the queue directory, whose
+        # delivery record is the one thing the outer purge reads to know the
+        # run is over. The folder would outlive the run. The outer attempt's
+        # `finally` always runs after this one, and purges both.
+        if not _capture.joined:
+            # ⛔⛔ AND NOW THE FOLDERS GO, for a run that keeps nothing (wave
+            # 10.9, #536). Here rather than at the end of the pipeline body for
+            # three reasons: this runs on EVERY exit, including the eight early
+            # returns the body has; the sink is finalized by the time the
+            # `with` has closed, so the log folder is no longer live and can be
+            # removed; and the auto-retry recursion happens INSIDE the body, so
+            # by the time control reaches this point the last attempt is
+            # genuinely the last.
+            #
+            # ⭐ The helper refuses unless `delivery.json` says the run is over,
+            # so a crash card's Retry and a login interrupt's Resume both keep
+            # the checkpoint they resume from.
+            try:
+                _purge_incognito_run_dirs(_run_pipeline_queue_dir(args, kwargs), _rid)
+            except Exception as _pe:
+                log(f"[incognito] run-folder cleanup failed (non-fatal): {_pe}", "WARN")
 
 
 def _run_pipeline_queue_dir(args, kwargs) -> "Path | None":
@@ -87466,6 +87765,11 @@ async def run_server(port=8000):
                                      config=job.get("config"), run_id=job.get("run_id"),
                                      uid=job.get("uid"), research_id=job.get("research_id"),
                                      _submitted_by=job.get("submitted_by"),
+                                     # Wave 16: the line a pick-up writes
+                                     # into its research's log folder.
+                                     _log_reason=("moved" if job.get("moved_run")
+                                                  else "resumed" if job.get("resume_dir")
+                                                  else None),
                                      brief_text=job.get("brief_text", ""),
                                      user_sources=job.get("user_sources") or [],
                                      user_links=job.get("user_links") or [],
@@ -90035,6 +90339,9 @@ def _login_auto_resume_plan(queue_dir, *, uid, research_id, email) -> "dict | No
         "uid": str(uid), "research_id": str(research_id), "email": email or "",
         "token": f"{os.getpid()}-{time.time_ns()}",
         "job_queue": job_queue, "loop": loop, "worker_id": WORKER_ID,
+        # ⭐ WAVE 16: who asked for this run, taken while its log folder is
+        # still armed — the run goes on as the same person, in the same folder.
+        "submitted_by": _run_submitted_by(),
     }
 
 
@@ -90139,7 +90446,8 @@ async def _resume_after_login(plan: dict) -> str:
             _resume_from_checkpoint, plan["queue_dir"],
             uid=plan["uid"], research_id=plan["research_id"], run_id=plan["run_id"],
             email=plan["email"], job_queue=plan["job_queue"], loop=plan["loop"],
-            worker_id=plan["worker_id"], login_pause=plan["token"])
+            worker_id=plan["worker_id"], login_pause=plan["token"],
+            submitted_by=plan.get("submitted_by"))
         if not resumed:
             log(f"[login-resume] {rid8}… was resumed another way meanwhile — "
                 f"leaving it", "INFO")
