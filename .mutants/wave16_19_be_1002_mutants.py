@@ -26,6 +26,9 @@ mutated file must still COMPILE. Both are harness faults, counted OUT.
 
   .venv/bin/python .mutants/wave16_19_be_1002_mutants.py
   .venv/bin/python .mutants/wave16_19_be_1002_mutants.py W1 N2
+
+⭐ Run once on 2026-10-02 against 187c1a5: 57/58 killed; the one survivor (W16)
+was equivalent and is retired below with the reason.
 """
 import hashlib
 import os
@@ -103,8 +106,12 @@ MUTANTS = [
                       'folder reads live again',
      [('        if self.forced_status:\n            status = self.forced_status\n',
        '        if False:\n            status = self.forced_status\n')]),
-    ('W16', RESEARCH, 'the finalize writes over the move',
-     [('        status = self.forced_status or status\n', '')]),
+    # W16 RETIRED after the one run (10-02, 57/58 with W16 the survivor): it
+    # dropped `status = self.forced_status or status` from `finalize`, and that
+    # is EQUIVALENT — `write_meta` already puts the forced "moved" on every meta
+    # write (W15 measures that), and the attempt `finalize` would close is
+    # already closed by `mark_moved`. A survivor that no input can tell apart
+    # is a harness fault, not a hole.
     ('W17', RESEARCH, '⛔⛔ a retry of the same research never joins — a folder per attempt again',
      [('            if parent is not None and _same_research(parent.research_id,\n'
        '                                                     self.research_id):\n',
