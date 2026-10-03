@@ -103,6 +103,16 @@ own `do "<the message, verbatim>"`, which resolves the intent **in code** — so
 plain sentence runs the right command (or asks the one missing thing) rather than
 falling back to the chat runtime's own tools.
 
+**A run's name.** A research you start from chat is saved with your whole topic
+as its title. When the Research Computer picks it up, it gives the research its
+one short name — two to five words, made by the app's own namer, or the topic's
+first five words if the namer can't answer — and rewrites the chat's opening line
+in the app to match; the NotebookLM notebook and the podcast carry the same name.
+A name you set yourself in the app is never replaced. `status`, `list` and
+`updates` show that name, and a `[title]` you type still matches words of the
+topic too. (This happens on the computer, so a computer on an older backend
+leaves the topic as the title.)
+
 **Which computer a run goes to** is one decision, made in one place, and the
 sign-in auto-start uses the identical ladder: your saved selection → the sole
 computer on the account → the sole one that's **online** → otherwise it asks,
@@ -228,7 +238,10 @@ quote.
 - **Your runs, and nothing else.** The Research Computer decides what matches the
   person asking, so on a shared machine this never hands over somebody else's
   research. The plan numbers every run; `--runs` takes those numbers or the run
-  names, and `--runs all` is everything listed.
+  names, and `--runs all` is everything listed. On a computer with the current
+  backend a run is one research, however many times it ran there (a browser
+  restart, a move to the queue and a Retry all write into the same folder), so
+  one number sends the whole of it.
 - **`--machine`** adds that computer's *own* logs — its pairing and sign-in
   records and its raw activity trail, which cover every run it has ever done for
   everyone who uses it. **Owner only**; anybody else is refused.
@@ -444,7 +457,7 @@ facade/
                      verbose switch, the parked one-shot sign-in announce)
   session.py         AccountSession — refresh-token / custom-token → ID-token
   firestore_rest.py  minimal Firestore REST (researches/devices, upsert, enqueue, cancel,
-                     agentSessions, the one-field device `visibility` PATCH)
+                     agentSessions, the device `visibility` / `allowAll` PATCHes)
   devicelogin.py     remote-login device-flow client (→ the SR web app broker)
   branding.py        the CLI's branded screens — a self-contained mirror of the backend's
                      `--pair` look; imports nothing from the app
