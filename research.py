@@ -16330,6 +16330,10 @@ async def _p3_publish_audio(audio_path, research_id) -> str:
             update_link_in_firestore("audio_file", audio_url,
                                      label="Podcast Audio (Storage)", phase=3,
                                      verified=True)
+            # ⭐ Wave 17: the podcast is where the app plays it from — the
+            # walkthrough's last card. Both callers (the phase and a resume)
+            # reach it here, and only with a stored URL.
+            _p3_step("podcast_saved", "Podcast saved to your research", stage="podcast")
             # ⛔⛔ RETURNED, NOT JUST WRITTEN. Until 2026-08-28 this URL was
             # written to Firestore and then dropped on the floor — the phase's
             # return carried only `audio_path`, so its own completion gate could
@@ -27882,16 +27886,24 @@ class LinkResult:
     caller of this class survives at all: the only link extraction left in the
     pipeline is phase 3's NotebookLM notebook link. The class is a phase-3 type
     now, and the Gemini tab spam it mentions belongs to a removed extractor.
-    """
-    __slots__ = ("url", "label", "platform", "verified", "error", "cua_attempted")
 
-    def __init__(self, url="", label="", platform="", verified=False, error="", cua_attempted=False):
+    access_set (wave 17 review): True only when the page's own share dialog
+    pressed "Anyone with the link" (or found it already set). The link alone
+    cannot say so — a notebook's private address and its public one look the
+    same, and the extractor falls back to the tab's own address when the share
+    step fails. The NotebookLM pop-up says "Shared" only on this.
+    """
+    __slots__ = ("url", "label", "platform", "verified", "error", "cua_attempted", "access_set")
+
+    def __init__(self, url="", label="", platform="", verified=False, error="", cua_attempted=False,
+                 access_set=False):
         self.url = url
         self.label = label
         self.platform = platform
         self.verified = verified
         self.error = error
         self.cua_attempted = cua_attempted
+        self.access_set = access_set
 
     def to_dict(self):
         return {"url": self.url, "label": self.label, "verified": self.verified}
@@ -28511,8 +28523,11 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
                 f"{url[:100] or '<blank>'}")
         if _dom_err:
             _err += f"; DOM share attempt: {_dom_err}"
+    # ⭐ Wave 17 review: `access_set` goes out with the link. It is the page's
+    # own share dialog pressing "Anyone with the link" — the one thing here that
+    # says the notebook was shared; the tab-address fallback above is not.
     return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm",
-                      verified=verified, error=_err)
+                      verified=verified, error=_err, access_set=access_set)
 
 
 
@@ -29596,6 +29611,69 @@ def start_narration_ticker(phase, agent, narration, interval=30, expected_minute
 
     task = asyncio.create_task(_tick())
     return stop, task
+
+
+#: The reports a Phase 3 notebook is built from, by the file stem they upload as.
+_P3_REPORT_NAMES = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
+
+
+def _p3_timeline_step(step_id, label, state="done", detail="", url="") -> dict:
+    """One row of Phase 3's activity list (wave 17) — the NotebookLM pop-up.
+
+    The app folds these by `id` (dg-research src/lib/activity-timeline.ts): a
+    row sent again updates in place, a new id joins the end. Only the fields
+    given are set, because the app keeps what an update leaves out.
+
+    ⛔⛔ THE WORDS ARE OURS, NEVER THE PAGE'S. A label is built from this run's
+    own file list, its own title, and NotebookLM's state as our code read it —
+    never from page text, an account name or an email address. The pop-up is
+    seen by whoever owns the run, and the computer it ran on may be someone
+    else's: anything NotebookLM's page shows about that account stays off it."""
+    step = {"id": str(step_id)[:100], "label": str(label)[:160], "state": state,
+            "at": int(time.time() * 1000)}
+    if detail:
+        step["detail"] = str(detail)[:160]
+    if url:
+        step["url"] = str(url)
+    return step
+
+
+def _p3_send(rows, stage="uploading", progress="") -> None:
+    """Send Phase 3 activity rows on one `agent_progress` event.
+
+    With `progress`, the tile's line shows it — so an app that does not know
+    the list yet still shows the step; without, the line is left as it is.
+    `stage` is always explicit, so the milestone stepper never has to guess the
+    milestone from the words. Best-effort: a row that cannot be sent never
+    costs the phase anything."""
+    try:
+        data = {"stage": stage, "timeline": list(rows)}
+        if progress:
+            data["progress"] = str(progress)[:160]
+        emit_event("agent_progress", phase=3, agent="notebooklm", **data)
+    except Exception:
+        pass
+
+
+def _p3_step(step_id, label, state="done", stage="uploading", detail="", url="") -> None:
+    """One Phase 3 activity row on its own event, its label on the tile's line."""
+    _p3_send([_p3_timeline_step(step_id, label, state, detail=detail, url=url)],
+             stage=stage, progress=label)
+
+
+def _p3_source_step(file_name, state="done") -> dict:
+    """The activity row for one source landing in the notebook, named by OUR
+    file list: an agent's report by its agent ("ChatGPT report added"), any
+    other file — the person's own — by its own name."""
+    name = str(file_name)
+    who = _P3_REPORT_NAMES.get(Path(name).stem.lower())
+    thing = f"{who} report" if who else name
+    label = {
+        "done": f"{thing} added",
+        "failed": f"{thing} didn't go in",
+        "active": f"Adding {'the ' + thing if who else thing} again",
+    }.get(state, thing)
+    return _p3_timeline_step(f"source:{name}", label, state)
 
 
 async def stop_narration_ticker(stop, task):
@@ -72843,14 +72921,22 @@ async def _nlm_dom_upload_sources(browser, page, md_files, label="NotebookLM"):
                     return set()
             except Exception:
                 return set()
+            # ⭐ Wave 17: the NotebookLM pop-up's first card.
+            _p3_step("notebook", "Notebook created")
         if not await _nlm_dom_add_files(browser, page, md_files, label=label):
             return set()
         # Census until every name shows up (ingestion is async; rows usually
         # appear within seconds, processing continues after).
         present: set = set()
+        shown: set = set()
         for _ in range(30):
             await asyncio.sleep(3)
             present, row_count = await _nlm_visible_source_names(page, expected)
+            # ⭐ Wave 17: each source as it lands, by name, in the order it did.
+            for name in [n for n in expected if n in present and n not in shown]:
+                shown.add(name)
+                row = _p3_source_step(name)
+                _p3_send([row], progress=row["label"])
             if len(present) == len(expected):
                 break
         log(f"[{label}] DOM-first upload census: {sorted(present)} of "
@@ -72965,6 +73051,17 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
     by_name = {p.name: p for p in md_files}
     expected = list(by_name.keys())
     missing: set = set()
+    # ⭐ Wave 17: the sources this check is adding again. Each one's row says so
+    # while it happens, and turns done only on a healthy verdict — a red source
+    # is still in the panel, so being listed is not the same as being repaired.
+    repairing: set = set()
+
+    def _repaired() -> set:
+        if repairing:
+            _p3_send([_p3_source_step(n, "done") for n in sorted(repairing)])
+            repairing.clear()
+        return set()
+
     for _round in range(1, max_rounds + 1):
         # Let async ingestion settle before judging (spinners → ✓ or red).
         await asyncio.sleep(8)
@@ -72975,10 +73072,12 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         if missing:
             log(f"[NotebookLM] source census (round {_round}): "
                 f"{len(present)}/{len(expected)} present — missing {sorted(missing)}", "WARN")
+            repairing.update(missing)
             try:
                 emit_event("agent_progress", phase=3, agent="notebooklm",
                            status="repairing", stage="uploading",
-                           progress=f"Re-adding {len(missing)} missing source(s)…")
+                           progress=f"Re-adding {len(missing)} missing source(s)…",
+                           timeline=[_p3_source_step(n, "active") for n in sorted(missing)])
             except Exception:
                 pass
             _missing_paths = [by_name[n] for n in sorted(missing)]
@@ -73022,11 +73121,11 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
             log(f"[NotebookLM] source census (round {_round}): all "
                 f"{len(expected)} files are listed in the Sources panel — no "
                 f"computer-use check needed")
-            return set()
+            return _repaired()
         if not cua_client:
             log(f"[NotebookLM] source census (round {_round}): all "
                 f"{len(expected)} present (no CUA for red-state check)")
-            return set()
+            return _repaired()
         async def _verify_sources_cua():
             return await agent_loop(
                 cua_client, browser, PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
@@ -73055,12 +73154,12 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         # (never blind-delete/re-add a good source on an ambiguous read).
         if "failed:" not in low:
             log(f"[NotebookLM] source verify (round {_round}): all sources OK")
-            return set()
+            return _repaired()
         failed_part = low.split("failed:", 1)[1]
         # Bail on explicit "no failure" phrasing the model may put after FAILED:.
         if failed_part.strip().split(",")[0].strip() in ("", "none", "n/a", "-", "nothing"):
             log(f"[NotebookLM] source verify (round {_round}): all sources OK")
-            return set()
+            return _repaired()
         # Token-equality match (split on commas/whitespace, trim stray
         # punctuation) — NOT a raw substring scan. A healthy filename mentioned
         # in prose after FAILED: (e.g. "FAILED: claude.md (gemini.md is fine)")
@@ -73071,12 +73170,14 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         if not failed:
             log(f"[NotebookLM] source verify: failure reported but no known filename matched — "
                 f"verdict='{text[:160]}' (skipping repair to avoid touching healthy sources)", "WARN")
-            return set()
+            return _repaired()
         log(f"[NotebookLM] source verify (round {_round}): {len(failed)} failed → re-uploading {failed}", "WARN")
+        repairing.update(failed)
         try:
             emit_event("agent_progress", phase=3, agent="notebooklm", status="repairing",
                        stage="uploading",
-                       progress=f"Re-uploading {len(failed)} source(s) that failed to import…")
+                       progress=f"Re-uploading {len(failed)} source(s) that failed to import…",
+                       timeline=[_p3_source_step(n, "active") for n in failed])
         except Exception:
             pass
         for name in failed:
@@ -73116,9 +73217,14 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
     try:
         present, _ = await _nlm_census_settled(browser.page, expected,
                                                attempts=6, interval=6.0)
-        return {n for n in expected if n not in present}
+        still = {n for n in expected if n not in present}
     except Exception:
-        return missing
+        still = set(missing)
+    # ⭐ Wave 17: the rows being repaired end on what the last census saw.
+    if repairing:
+        _p3_send([_p3_source_step(n, "failed" if n in still else "done")
+                  for n in sorted(repairing)])
+    return still
 
 
 def _p3_browser_gone(where: str) -> RuntimeError:
@@ -73212,7 +73318,9 @@ async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
         "instead of making a new one")
     emit_event("agent_progress", phase=3, agent="notebooklm",
                status="reopening", stage="notebook",
-               progress="Going back to the notebook this research already made…")
+               progress="Going back to the notebook this research already made…",
+               timeline=[_p3_timeline_step("notebook", "Going back to this research's notebook",
+                                           "active")])
     try:
         page = await browser.new_tab(notebook_url)
         await asyncio.sleep(4)
@@ -73264,6 +73372,10 @@ async def _p3_reopen_recorded_notebook(browser, notebook_url, md_files) -> bool:
     log(f"Phase 3: carrying on in the notebook this research made — "
         f"{len(present)} of {len(names)} sources there, podcast {podcast}"
         + (f" (not showing: {', '.join(missing)})" if missing else ""))
+    # ⭐ Wave 17: the notebook card, and the sources it already holds.
+    _p3_send([_p3_timeline_step("notebook", "Went back to this research's notebook")]
+             + [_p3_source_step(n) for n in names if n in present],
+             stage="notebook", progress="Went back to this research's notebook")
     return True
 
 
@@ -73380,6 +73492,9 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     f"fallback: {[p.name for p in _remaining]}",
                     "WARN" if _dom_uploaded else "INFO")
 
+            # The DOM path announced the notebook if it reached one; the
+            # fallback says so with its first confirmed source otherwise.
+            _nb_sent = bool(_dom_uploaded)
             for i, md_path in enumerate(_remaining):
                 log(f"Uploading {md_path.name} ({i+1}/{len(_remaining)}) via CUA fallback...")
                 # stage= (2026-07-06 milestone stepper): P3's three milestones
@@ -73483,6 +73598,14 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                         f"(status={_cua_status or 'unknown'}) — DOM re-add attempt", "WARN")
                     await _nlm_dom_add_files(browser, page, [md_path])
                     # _verify_and_repair below re-censuses and escalates.
+                else:
+                    # ⭐ Wave 17: a source computer use added lands on the
+                    # pop-up the same way — and the first one says the
+                    # notebook exists, which this path may have made itself.
+                    _row = _p3_source_step(md_path.name)
+                    _p3_send(([] if _nb_sent else [_p3_timeline_step("notebook", "Notebook created")])
+                             + [_row], progress=_row["label"])
+                    _nb_sent = True
 
             # Verify each source actually PROCESSED. NotebookLM ingests sources
             # ASYNC after the file lands in the panel, so a source can pass the
@@ -73528,7 +73651,10 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # value-set + Angular events sidesteps the keyboard entirely;
             # CUA stays as fallback (best-effort — nothing downstream gates
             # on the notebook name).
-            if not await _nlm_dom_rename(page, title):
+            # ⭐ Wave 17 review: whether the rename WORKED is kept, so the pop-up
+            # names the notebook only when the page, or computer use, says so.
+            _renamed = bool(await _nlm_dom_rename(page, title))
+            if not _renamed:
                 async def _nlm_rename_cua():
                     return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
                         f"Rename this notebook to: {title}. If Ctrl+A does not select the "
@@ -73537,7 +73663,7 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
                 # #839 act tier: this site TYPES (the only P3 upload-family site
                 # that types into the page).
-                await _shadow_observed_cua(
+                _rename_cua = await _shadow_observed_cua(
                     browser.page, hotspot_id="nlm-rename", phase=3, platform="notebooklm",
                     current_step="rename_notebook",
                     context_hint=f"rename the notebook to '{title}': click the notebook title, "
@@ -73546,6 +73672,16 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     cua_coro_factory=_nlm_rename_cua,
                     mission_prompt=PROMPT_NOTEBOOKLM_RENAME,
                     act_timeout_s=90.0)
+                # Computer use's own word: "done" when it finished the job,
+                # "vision_success" when Vision did. A stop, an error or running
+                # out of turns is not a rename.
+                _renamed = (isinstance(_rename_cua, dict)
+                            and _rename_cua.get("status") in ("done", "vision_success"))
+
+            # ⭐ Wave 17: the notebook card takes this run's own name — only
+            # when the rename worked. A failed one leaves NotebookLM's own name.
+            if _renamed:
+                _p3_step("renamed", f"Named “{title}”", stage="notebook")
 
             # C1: make notebook public (Share → "Anyone with the link" → Save)
             # BEFORE emitting the URL, so the frontend's link is always viewable.
@@ -73569,6 +73705,13 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                 # a separate, honest signal — logged, not gating.
                 if is_notebooklm_url(nlm_share_res.url):
                     notebook_url = nlm_share_res.url
+                    # ⭐ Wave 17: "Shared" only when the share dialog actually
+                    # set "Anyone with the link" (review: a notebook address
+                    # comes back even when sharing failed — the extractor falls
+                    # back to the tab's own address, private or not).
+                    if getattr(nlm_share_res, "access_set", False):
+                        _p3_step("shared", "Shared: anyone with the link can view",
+                                 stage="notebook", url=notebook_url)
                     if nlm_share_res.verified:
                         log(f"NotebookLM public share OK (DOM-verified): {notebook_url}")
                     else:
@@ -74367,6 +74510,12 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                                      dom_ground_truth=_gt_from_box(None, label="Audio Overview",
                                                                    clickedTag="div"))
                 _dom_gen = await _nlm_customise_and_generate(browser.page, podcast_length)
+                if _dom_gen.get("pressed") and _dom_gen.get("format"):
+                    # ⭐ Wave 17: the setting as the page READ IT BACK before the
+                    # press — nothing is pressed until both choices read as taken.
+                    _p3_step("setting", "Podcast setting", stage="podcast",
+                             detail=" · ".join(x for x in (_dom_gen.get("format"),
+                                                           _dom_gen.get("length")) if x))
                 if _dom_gen.get("generated"):
                     _chosen = " + ".join(x for x in (_dom_gen.get("format"),
                                                       _dom_gen.get("length")) if x)
@@ -74538,6 +74687,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
     if not verified:
         log("Could not verify audio generation started", "WARN")
+    elif not _reuse_existing:
+        # ⭐ Wave 17: the page says the podcast is being made.
+        _p3_step("podcast", "Making the podcast", "active", stage="podcast")
 
     # Post-generate invariant check (2026-05-02). If CUA misclicked
     # the Audio Overview tile body during the customize flow, the
@@ -74782,7 +74934,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                        progress=f"NotebookLM still generating audio overview… "
                                 f"({elapsed_min}m total / {_typ_low}–{_typ_high}m typical)",
                        elapsedSec=elapsed_min * 60,
-                       expectedMinutes=_typ_high)
+                       expectedMinutes=_typ_high,
+                       timeline=[_p3_timeline_step(
+                           "podcast", "Making the podcast", "active",
+                           detail=f"{elapsed_min} min so far · usually {_typ_low}–{_typ_high} min")])
         except Exception:
             pass
         interrupt = await _controls.interruptible_sleep(90, check_interval=10)
@@ -74798,6 +74953,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # Download audio
     audio_path = None
     if audio_done:
+        # ⭐ Wave 17: NotebookLM shows the podcast finished.
+        _p3_step("podcast", "Podcast ready", stage="podcast")
         (queue_dir / "podcasts").mkdir(exist_ok=True)
 
         # Fix A (2026-05-27): re-anchor to THIS run's notebook before the
