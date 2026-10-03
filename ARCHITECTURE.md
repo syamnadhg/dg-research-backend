@@ -579,9 +579,13 @@ minting, all of which live there — and a new module has to be added to BOTH
 
 ⭐ **Charts are pictures too (wave 14).** An `<img>` on the page's own `blob:`
 address could not be fetched by anyone but that page, an `<svg>` chart or
-diagram came through as loose words, and a `<canvas>` chart as nothing. Now the
-page draws each of those into a PNG before the report is read
-(`_DOC_FIGURES_JS`, through `_doc_html_read_js`): an `<svg>` with the page's
+diagram came through as loose words, and a `<canvas>` chart as nothing. Now, on
+a page read, the page draws each of those into a PNG before the report is read
+(`_DOC_FIGURES_JS`, through `_doc_html_read_js` for every HTML read and inside
+`_CHATGPT_DR_REPORT_JS` for ChatGPT's frame read). ⛔ Only on a page read:
+ChatGPT's and Claude's own Markdown exports are tried first and draw nothing, so
+on most of their reports this does not run; Gemini's report, the brief and every
+fallback page read do. It draws an `<svg>` with the page's
 computed colours and fonts, a `<canvas>` as it stands, a `blob:` image as it
 shows, each on its own background, at up to twice its size. The copy the
 markdown is made from then holds a `data:` image there, and the rehost above
@@ -619,11 +623,19 @@ catches past the one before it, so a later PDF still counts as later.
 **What is caught, per agent.** ChatGPT (`_chatgpt_dr_export_report`): the
 Markdown export is the document, and the PDF export pressed right after it is
 read only for its sources (next section); with no Markdown caught, the report is
-read off the app's own frame, then the copy tier. Claude
+read off the app's own frame (`_chatgpt_dr_frame_report`), then by the HTML page
+read, then the copy tier. ⛔ The frame read refuses a frame holding less than 90%
+of the text the done check read there a moment before (`done_text_len`), so the
+done check's count must be the report's: it counts a frame's text only when that
+frame is drawn — a body with boxes, in a frame with a size
+(`_CHATGPT_DONE_PROBE_JS`, wave 15). A hidden old report frame answered with its
+whole inline script, 13 MB of it on 10-01, and that length was handed on as the
+report's. Claude
 (`_claude_export_report_by_page`): "Download as Markdown" from the report
 header's menu, caught the same way, with computer use pressing it when the page
-cannot. The podcast is fetched rather than downloaded for the same reason — see
-*Phase 3 completes on a podcast*.
+cannot. The podcast is fetched rather than downloaded for the same reason, with
+Chrome's download kept only as its fallback — see *Phase 3 completes on a
+podcast*.
 ⛔ Removed with this: the env switches `SR_CHATGPT_DR_PAGE_DOWNLOAD` and `SR_CLAUDE_PAGE_DOWNLOAD` (they turned page downloads back on), the `Download.path()` readers for reports, and the in-frame download.
 
 ## Footnotes — each agent's own numbers (wave 14)
@@ -639,8 +651,10 @@ still that row). A number inside a link's words, or with a space before it
 with one log line.
 
 - **Claude** writes `\[n\]` and a numbered list itself.
-- **ChatGPT** (`_chatgpt_pdf_footnotes`, decided with the owner on 10-01:
-  the Markdown stays the document). Its Markdown cites with token runs that name
+- **ChatGPT** (`_chatgpt_dr_export_report` → `_chatgpt_document_from_exports`
+  → `_chatgpt_pdf_numbered` as the exports are read, then `_doc_link_own_numbers`
+  at the write; decided with the owner on 10-01: the Markdown stays the
+  document). Its Markdown cites with token runs that name
   no address; its PDF draws each run as a numbered chip linking one address and
   ends with sources pages. Run *N* of the Markdown, numbered by first use, is
   chip *N* of the PDF (141 of 141 on the owner's pair). Each run becomes
@@ -689,8 +703,10 @@ made into an equation (`_doc_math_markdown`, `_doc_math_join`).
 ## One short name (wave 19)
 
 The chat's title, the NotebookLM notebook, the podcast file (and the title in
-its mp3) and the Podcasts row carry ONE name: two to five words, at most 40
-characters, never cut mid-word (`_shape_research_name`). The web's namer
+its mp3) and the Podcasts row carry ONE name: up to five words and at most 40
+characters, cut between words (`_shape_research_name`). The namer is asked for
+two to five words, but nothing here makes a name longer: a one-word topic gives a
+one-word name, and a first word longer than 40 characters is cut. The web's namer
 (`/api/title`) makes it when the person presses send, and every reader takes the
 record's `title`. This computer makes it only when nothing has
 (`_research_name`), by asking the same namer with its own sign-in
@@ -2027,10 +2043,12 @@ its own section above; what is here is the shape and where to look.*
 the tree after release 0.1.14.** Each item has its own section above; what is
 here is the shape and where to look.*
 
-- ***No Chrome download anywhere in a run (wave 15).*** *Chrome 154 crashes in
-  its own downloads code, so report exports are caught in the page and the
-  podcast is fetched from its own address. See* Report exports are caught in the
-  page *and* Phase 3 completes on a podcast.
+- ***No Chrome download for a report; the podcast only as a fallback (wave
+  15).*** *Chrome 154 crashes in its own downloads code, so report exports are
+  caught in the page and the podcast is fetched from its own address; Chrome
+  still downloads the podcast when that fetch fails or computer use presses
+  Download. See* Report exports are caught in the page *and* Phase 3 completes on
+  a podcast.
 - ***Every agent's footnotes open their sources (wave 14).*** *Claude's own
   numbers, ChatGPT's from its PDF export, Gemini's by row number in its own
   list; the general numbering is the fallback, and a document has exactly one
@@ -2049,7 +2067,8 @@ here is the shape and where to look.*
 - ***Three lows (wave 15):*** *the queued → ongoing flip is a compare-and-set
   (the rules deny this machine a transaction); a 2xx from the Phase 4–5
   hand-off whose body is not the route's JSON is a cut; ChatGPT's done check
-  counts only a drawn report, not a hidden frame's 13 MB script.*
+  counts only a drawn report, not a hidden frame's 13 MB script (see* What is
+  caught, per agent *under* Report exports are caught in the page*).*
 - ***One log folder per research (wave 16).*** *See* One folder per research,
   however many times it runs.
 - ***Phase 3 shows its work (wave 17).*** *Activity rows on `agent_progress`

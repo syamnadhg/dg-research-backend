@@ -405,7 +405,7 @@ A newer FE key wins over a stale BE-local pair key. Owner-submitted runs are unc
 
 **Phases 4 + 5 are FE-owned.** No BE setup needed for either. The frontend handles YouTube upload via `youtube.videos.insert` (Data API + OAuth refresh token, ffmpeg encode in Cloud Run) AND Google Doc creation via the Docs API AND email via Resend — see the FE README for that side's env vars (`GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`, `RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
 
-`BUG_REPORT_EMAIL` is optional — see the env-var table.
+Bug reports are the web's too: `/api/bug` mails them to its own `BUG_REPORT_EMAIL` (see the FE README). The backend reads no bug-report setting.
 
 ### Step 3: Run pair flow
 
@@ -900,7 +900,7 @@ Each key lives in its own document at `users/{uid}/deviceKeys/{deviceId}`, and a
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Advanced are the assumed baseline — see [Before you start](#before-you-start-prerequisites-checklist) for per-seat costs. Non-Pro accounts are flagged with `[Continue with Free] [Retry]` — by the in-phase tier tells by default (verification is opt-in since 2026-07-02), or by Phase 0's vision check when that Setting is on; Retry re-checks after you sign in with a Pro account in the same browser. If you `Continue with Free`, the pipeline runs end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower.
 
-**One short name per research (wave 19).** The chat's title, the NotebookLM notebook, the podcast file (and the title inside the mp3) and the Podcasts row carry one name of two to five words (at most 40 characters, never cut mid-word), made once from the topic. The web's namer makes it when the person presses send; this computer makes it only when nothing has — a research the chat assistant started (its record's title is its whole topic) is named at pick-up, and the chat's opening line follows; one still called "New Research" at the end of Phase 2 is named there — by asking the same namer, with the topic's first five words if it cannot answer (`_research_name`). The person's own rename always wins, a run that keeps nothing asks no one, and the name never reaches the computer's log (only its length). ⛔ The backend no longer renames a research after Phase 2 from its findings, so the name does not change mid-run.
+**One short name per research (wave 19).** The chat's title, the NotebookLM notebook, the podcast file (and the title inside the mp3) and the Podcasts row carry one name of up to five words (at most 40 characters), made once from the topic. The web's namer makes it when the person presses send; this computer makes it only when nothing has — a research the chat assistant started (its record's title is its whole topic) is named at pick-up, and the chat's opening line follows; one still called "New Research" at the end of Phase 2 is named there — by asking the same namer, with the topic's first five words if it cannot answer (`_research_name`). The person's own rename always wins, a run that keeps nothing asks no one, and the name never reaches the computer's log (only its length). ⛔ The backend no longer renames a research after Phase 2 from its findings, so the name does not change mid-run.
 
 **Phase 3 shows its work (wave 17).** Besides its progress line, Phase 3 sends the app a list of steps on `agent_progress` (`timeline`): the notebook made (or gone back to on a resume), each source as it lands, named by its agent ("ChatGPT report added") or by the person's own file name, the notebook named and shared — each only when it really happened — the podcast setting as NotebookLM read it back, minutes so far, ready, and saved. The words come only from this run's own file list and title and from what our code read of NotebookLM's state, never from page text.
 
@@ -960,9 +960,10 @@ Firestore, which open for a reader who is not the owner.
 `link_extracted` is still emitted per agent the moment the in-app primary lands
 (no phase-end batching).
 
-**No Chrome download anywhere in a run (wave 15).** Chrome 154 crashes in its
-own downloads code while a download updates, so a report export and the podcast
-no longer go through Chrome's downloads at all. Before ChatGPT's or Claude's
+**No Chrome download for a report; the podcast only as a fallback (wave 15).**
+Chrome 154 crashes in its own downloads code while a download updates, so a
+report export never goes through Chrome's downloads, and the podcast does only
+when fetching it from its own address fails. Before ChatGPT's or Claude's
 export is pressed, a catcher goes on the top page: it keeps the file the page
 makes and cancels the click that would have downloaded it, and the bytes come
 back to Python from the page (`_export_catch_*`). Nothing is pressed when the
@@ -970,18 +971,24 @@ catcher cannot be put on the page, and every export logs how many downloads
 Chrome started (it should be 0). ChatGPT's Markdown export is the document; its
 PDF export, caught the same way right after it, is read only for its sources'
 addresses (see [Sources + citations](#sources--citations-per-run)). When no
-export is caught, ChatGPT's report is read off the app's own frame. The
-NotebookLM podcast is fetched straight from its own address with the browser's
-own sign-in (`_NlmAudioCatch`); only when that fails does Chrome download it, as
-before, with one log line saying why.
+export is caught, ChatGPT's report is read off the app's own frame, then off the
+page, then copied by computer use. The NotebookLM podcast is fetched straight
+from its own address with the browser's own sign-in (`_NlmAudioCatch`) when the
+page presses its Download; when there is no address or the fetch fails, Chrome
+downloads it as before, with one log line saying why, and so it does whenever
+computer use has to press Download because the page could not.
 
 **Images inside the extracted document are kept (wave 4).** `html_to_markdown`
 no longer throws pictures away — decorative ones are dropped, the rest survive
-into the markdown. ⭐ **And since wave 14 a chart is a picture too:** before a
-report is read, the page itself draws each `<svg>` chart or diagram, each
-`<canvas>` chart and each image on the page's own `blob:` address into a PNG
-(up to `_DOC_FIGURES_MAX` per read; icons and button glyphs never), so it lands
-as an image instead of loose words or nothing. A diagram the agent wrote as
+into the markdown. ⭐ **And since wave 14 a chart is a picture too — on a page
+read:** when a report is read off the page, the page itself first draws each
+`<svg>` chart or diagram, each `<canvas>` chart and each image on the page's own
+`blob:` address into a PNG (up to `_DOC_FIGURES_MAX` per read; icons and button
+glyphs never), so it lands as an image instead of loose words or nothing. A
+page read is every HTML read (Gemini's report, the brief, and the fallbacks
+after an export) and ChatGPT's read off its app's frame. ChatGPT's and Claude's
+own Markdown exports are tried first and draw nothing, so on most of their
+reports this step does not run. A diagram the agent wrote as
 mermaid code stays code, and the web draws it. Every extracted document (the
 brief, the three agent reports, regen and retry saves) then passes **one rewrite
 before any save**: `_rehost_document_images` fetches each image **once per
@@ -1107,9 +1114,11 @@ the only thing keeping the two sides in step.
     first use, is chip *N* of the PDF; each run becomes ChatGPT's own number and
     the document ends with one Sources list shaped like ChatGPT's own sources
     page (each source's title and address, then the numbers that cite it).
-    Every count and order is checked first (`_chatgpt_pdf_footnotes`); on any
-    mismatch nothing is linked and the document ends with the sites ChatGPT
-    visited instead.
+    Every count and order is checked first, as the two exports are read
+    (`_chatgpt_document_from_exports` → `_chatgpt_pdf_numbered`), and the
+    numbers are linked when the document is written (`_doc_link_own_numbers`);
+    on any mismatch nothing is linked and the document ends with the sites
+    ChatGPT visited instead.
   - **Gemini**: citation number *N* is row *N* of Gemini's own "Sources used in
     the report" list, counted down the page — the owner's 10-02 recording
     proved it. The read opens that list if it is closed (its own toggle) and
@@ -1189,8 +1198,8 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 
 - **Phase 0** — browser launch/crash, Playwright profile lock, missing Chromium binary
 - **Phase 1** — brief timeout, brief paste retry per attempt, brief-short (offers `continue_anyway`), brief model error, manual-brief 3h backstop (auto-fail with `pipeline_stopped` reason `manual_brief_wait_backstop_3h`)
-- **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration. **Cloudflare / human-verification is hands-off AND non-blocking** (#955 Gap #1b, `115fe71`): passive detection only (zero interaction with the walled tab) and P2 **no longer pauses** on it — the old blocking `wait_for_verification_clearance` / 600s tier-5 poll was dropped for P2 (the wall sets `_controls.hv_blocked[agent]` and hands to `_hv_setup_fail_card`), so siblings 2B/2C keep starting the moment the wall is hit and one agent's card never freezes the round-robin (non-blocking parked-decision resolver, #953). With the L3 auto-skip toggle ON (default), the walled agent is greyed + its tab closed on the hands-off deadline (`HANDS_OFF_AUTO_SKIP_SEC=300`, ~5 min); off = a **Skip-only** `DecisionCard` (Retry omitted — it would only re-navigate a walled account; unified across ALL walls). Clear it by signing into that platform in real Chrome between runs. (P1/P5 still use the shared *blocking* single-surface verification wait.) Browser crashes emit a passive banner (`emit_browser_recovery_status`) and no Retry/Skip prompt — see the copy note under [§ Stuck-state risk fixes](#stuck-state-risk-fixes-2026-04-30-6545335--be8f7b3--549f079) for what that banner may and may not claim. ⭐ **A crash of the whole browser raises no card at all (wave 15):** a report read that comes back empty asks the browser first, and a dead one unwinds for the silent crash retry — no "Couldn't read the report" card and no agent marked failed, for all three agents; the retry goes back into this run's own chats and takes down every Phase-2 card the crashed attempt raised.
-- **Phase 3** — NotebookLM **notebook-link** extraction failure (Retry / Skip, auto-skippable, with a 24h backstop that moves on without deciding for you), login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents), and a **missing-podcast** skip that names which half failed — `no_audio_generated` vs `audio_generated_but_upload_failed` (the second still has the file on the research computer). The podcast is fetched from its own address rather than downloaded by Chrome (wave 15, see [Phase 2](#phase-2--the-report-is-the-artefact-aug-28)), and a browser that dies during that step unwinds as a crash; a resume on the same worker goes back to the notebook this run made instead of making a new one. Derived stems (`brief.md`, `consolidated.md`) are excluded from NotebookLM uploads via the `_DERIVED_STEMS` filter — never uploads consolidated.md.
+- **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration. **Cloudflare / human-verification is hands-off AND non-blocking** (#955 Gap #1b, `115fe71`): passive detection only (zero interaction with the walled tab) and P2 **no longer pauses** on it — the old blocking `wait_for_verification_clearance` / 600s tier-5 poll was dropped for P2 (the wall sets `_controls.hv_blocked[agent]` and hands to `_hv_setup_fail_card`), so siblings 2B/2C keep starting the moment the wall is hit and one agent's card never freezes the round-robin (non-blocking parked-decision resolver, #953). With the L3 auto-skip toggle ON (default), the walled agent is greyed + its tab closed on the hands-off deadline (`HANDS_OFF_AUTO_SKIP_SEC=300`, ~5 min); off = a **Skip-only** `DecisionCard` (Retry omitted — it would only re-navigate a walled account; unified across ALL walls). Clear it by signing into that platform in real Chrome between runs. (P1/P5 still use the shared *blocking* single-surface verification wait.) Browser crashes emit a passive banner (`emit_browser_recovery_status`) and no Retry/Skip prompt — see the copy note under [§ Stuck-state risk fixes](#stuck-state-risk-fixes-2026-04-30-6545335--be8f7b3--549f079) for what that banner may and may not claim. ⭐ **A crash of the whole browser raises no card at all (wave 15):** a report read that comes back empty asks the browser first, and a dead one unwinds for the silent crash retry — no "Couldn't read the report" card and no agent marked failed, for all three agents; the retry goes back into this run's own chats and takes down every Phase-2 card the crashed attempt raised. ⭐ **A run moved to the queue goes back into its own chats the same way (wave 15):** a move during Phase 2 or before it keeps the run's chats beside it in the queue, and when a worker of this computer takes the run back its Phase 2 goes back into them — an agent whose chat that worker cannot prove is its own (another Chrome profile, signed in to other accounts) starts again. A different computer never sees the run's chats.
+- **Phase 3** — NotebookLM **notebook-link** extraction failure (Retry / Skip, auto-skippable, with a 24h backstop that moves on without deciding for you), login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents), and a **missing-podcast** skip that names which half failed — `no_audio_generated` vs `audio_generated_but_upload_failed` (the second still has the file on the research computer). The podcast is fetched from its own address, with Chrome's download only as the fallback (wave 15, see [Phase 2](#phase-2--the-report-is-the-artefact-aug-28)), and a browser that dies during that step unwinds as a crash; a resume on the same worker goes back to the notebook this run made instead of making a new one. Derived stems (`brief.md`, `consolidated.md`) are excluded from NotebookLM uploads via the `_DERIVED_STEMS` filter — never uploads consolidated.md.
 - **Phase 4** — owned by FE (YouTube upload via Data API). BE no longer surfaces P4 errors; see FE for the alert matrix (`uploadYouTube 401/403/quotaExceeded` map to OAuth-scope / quota-cap actionable copy).
 - **Phase 5** — owned by FE (Doc creation + email). BE no longer surfaces P5 errors; see FE for the alert matrix.
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
@@ -1272,7 +1281,6 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
 | `POLL_DEEP_RESEARCH` | `120` | Seconds between polling cycles (Phase 2 round-robin) |
 | `MIN_AGENT_WAIT_MIN` | `5` | Minimum minutes from research-start before CUA completion check is allowed to fire |
-| `BUG_REPORT_EMAIL` | (optional) | Where bug-report submissions land if FE bug-report uses the BE relay. FE has its own `BUG_REPORT_EMAIL` env on `/api/bug` — see FE README. |
 | `DG_NARRATOR_USE_GEMINI` | `1` | Enable Gemini Flash as the narrator primary (Haiku 4.5 as cross-vendor fallback). Set `0` to force the Haiku path directly. (Renamed from `DG_NARRATOR_USE_HAIKU` 2026-05-28 when the primary swapped.) |
 | `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator fallback. |
 | `DG_VISION_NARRATE` | `0` | Re-enable the retired vision narrator (`narrate.py`, `PHASE_BUDGET=80/phase`). Set `1` if a coverage gap appears in DOM-derived narration. |

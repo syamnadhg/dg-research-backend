@@ -62,8 +62,21 @@ handler instrumentation cannot see them; they are marked rather than credited.
 hides coverage. It named four routes including `/icons/<name>` and
 `/research/<id>`, both of which DO have handler methods (`_icon` and `_research_status`, both defined in facade/bridge.py), while omitting
 `/healthz`, which genuinely is inline in the `do_GET` arm and yet
-carries credits the stated method could not have produced. A marker saying "not
+carried credits the stated method could not have produced. A marker saying "not
 measurable" on a route that is measurable retires the question.
+
+⛔ AND THE TABLE KEPT DISAGREEING WITH THAT PARAGRAPH UNTIL 2026-10-03: it still
+marked `/icons/<name>` as having no handler and still gave `/healthz` nineteen
+credits. Measured on 2026-10-03 by wrapping the dispatcher for one full run, in
+the test process only (a bridge started as a process of its own is not seen):
+`_icon` ran in no test; `/healthz` got past the host check in
+`test_cli_device_commands_795`, `test_connection_code_0925` and
+`test_crossverify_fixes_795`, each through the CLI's own bridge-up check and none
+asserting the route's answer, and was refused 403 in `test_bridge_csrf`;
+`/login/config` was answered in `test_bridge_csrf` and `test_signin_domain_0921`;
+`/login` in none. Only one of the nineteen old `/healthz` credits reached it at
+all, so the row is now marked like the other two inline routes, and the icon row
+is blank.
 
 | Route | Handler exercised by |
 |---|---|
@@ -78,12 +91,12 @@ measurable" on a route that is measurable retires the question.
 | `/devices` | `test_bridge_device`, `test_bridge_routes`, `test_device_projection_795`, `test_e2e_lifecycle`, `test_signin_once_0901`, `test_sr_attention_copy_0831`, `test_sr_client`, `test_wave8_survival_0916` |
 | `/devices/public` | `test_crossverify_fixes_795`, `test_public_devices_792`, `test_sr_client` |
 | `/devices/requests` | `test_owner_verbs_793`, `test_public_devices_792` |
-| `/healthz` | `test_agent_log_out_0826`, `test_bridge_csrf`, `test_bridge_device`, `test_bridge_remote_login`, `test_bridge_resolve_0831`, `test_bridge_routes`, `test_bridge_shutdown`, `test_cli_device_commands_795`, `test_device_projection_795`, `test_e2e_lifecycle`, `test_owner_verbs_793`, `test_public_devices_792`, `test_send_logs_agent_0825`, `test_signin_announce_0826`, `test_signin_once_0901`, `test_sr_attention_copy_0831`, `test_sr_client`, `test_stretch45_agent_0827`, `test_unlink_copy_795` |
-| `/icons/<name>` | ⚠ no dedicated handler — not measurable this way |
+| `/healthz` | ⚠ answered inline, no handler method — not measurable this way |
+| `/icons/<name>` | |
 | `/install-backend` | `test_sr_client` |
-| `/login` | ⚠ no dedicated handler — not measurable this way |
+| `/login` | ⚠ answered inline, no handler method — not measurable this way |
 | `/login/callback` | `test_bridge_csrf`, `test_signin_announce_0826` |
-| `/login/config` | ⚠ no dedicated handler — not measurable this way |
+| `/login/config` | ⚠ answered inline, no handler method — not measurable this way |
 | `/login/remote/pending` | `test_bridge_remote_login`, `test_signin_announce_0826`, `test_sr_client`, `test_stretch45_agent_0827` |
 | `/login/remote/poll` | `test_bridge_remote_login`, `test_e2e_lifecycle`, `test_signin_once_0901` |
 | `/login/remote/start` | `test_bridge_remote_login`, `test_e2e_lifecycle`, `test_signin_announce_0826`, `test_sr_client` |
