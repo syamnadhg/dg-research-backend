@@ -102,8 +102,10 @@ def test_watch_leg_clears_on_research_specific_evidence_not_verify_alone():
     # (_gemini_research_started / done_count), NEVER verify_gemini_generating
     # alone — that green-lights a plan still DRAFTING, which would clear the
     # watch on a slow plan and orphan its late Start.
-    i = POLL_SRC.index('p.get("gemini_watch_start")')
-    blk = POLL_SRC[i:i + 2600]
+    # 10-03: read from the clear condition itself — a window counted from the
+    # watch's first line moved every time the failed-plan code above it grew.
+    i = POLL_SRC.index("_ws_running = (")
+    blk = POLL_SRC[i:i + 1200]
     assert "_gemini_research_started" in blk
     assert 'p.get("done_count", 0) > 0' in blk
     assert "auto-started" in blk
