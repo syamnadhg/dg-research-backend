@@ -46710,7 +46710,9 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         # the first ninety seconds is pressed; a Gemini that started by itself is
         # researching; anything else goes to the round-robin NOT STARTED (None),
         # where the late-Start watch presses a late 'Start research' and the
-        # research is left to finish. No computer use, no Redo, no card.
+        # research is left to finish. No computer use, no refresh, no card here;
+        # a plan that visibly fails gets Gemini's own Redo from the watch (10-03),
+        # at most twice for this new chat.
         # #953 (audit): the module-hoisted, #905-hardened finder
         # (_GEMINI_CLICK_START_JS: enabled + visible + role/aria) — never a
         # disabled skeleton button, which today's auto-start leaves behind.
@@ -48832,6 +48834,38 @@ async def _gemini_kickoff_pending(page):
     return True, "ack-no-card"
 
 
+#: The page's text WITHOUT the person's own turns: Gemini's replies, its side
+#: list and its buttons.
+#:
+#: ⛔⛔ 10-03 — THE FIRST 8,000 CHARACTERS OF THE PAGE ARE THE BRIEF. The two
+#: research reads below used `document.body.innerText.slice(0, 8000)`, and the
+#: brief this run pastes comes first on the page: the 27 real briefs on record
+#: are 46,183 to 73,494 characters (the note above `_TOPIC_GUARD_MIN_CHARS`).
+#: So on a real run neither read ever reached Gemini's "Researching N websites"
+#: card or its completion line. Measured on a page with the smallest real brief:
+#: a research that finished on Gemini's side while the page kept its old
+#: "researching" view was never refreshed, and sat until the 90-minute limit
+#: skipped it; with a 240-character brief the same page was refreshed at 12
+#: minutes and its report collected. Leaving the person's turns out also means a
+#: brief that itself says "researching 12 sources" can no longer read as a
+#: research that started.
+#: Each `user-query`'s own text is cut out of the page's text, once (a string
+#: `replace`: a turn whose text is not found leaves the read as it was before).
+_GEMINI_REPLIES_TEXT_JS = (
+    "() => { let t = document.body.innerText || '';"
+    " for (const q of document.querySelectorAll('user-query'))"
+    "   t = t.replace(q.innerText || '', '');"
+    " return t; }")
+
+
+async def _gemini_replies_text(page) -> str:
+    """`_GEMINI_REPLIES_TEXT_JS`'s answer; `""` on any failure. Never raises."""
+    try:
+        return str(await page.evaluate(_GEMINI_REPLIES_TEXT_JS) or "")
+    except Exception:
+        return ""
+
+
 async def _gemini_research_started(page) -> bool:
     """True when Gemini's DEEP RESEARCH has genuinely started or finished.
 
@@ -48840,12 +48874,11 @@ async def _gemini_research_started(page) -> bool:
     this: it green-lights on ANY stop button / running CSS animation, which a
     plan still DRAFTING also shows, so it can't tell a drafting plan from
     running research (the exact conflation behind the 2026-07-13 auto-start
-    incident). Reads the first 8000 chars of body innerText only; safe every
-    tick. Fail-closed (False) on any error so a probe miss never fakes a start."""
-    try:
-        body = await page.evaluate("""() => (document.body.innerText || "").slice(0, 8000)""")
-    except Exception:
-        return False
+    incident). Reads Gemini's own text, not the person's turns
+    (`_GEMINI_REPLIES_TEXT_JS` — 10-03: the first 8,000 characters of the page
+    were the brief). Fail-closed (False) on any error so a probe miss never
+    fakes a start."""
+    body = await _gemini_replies_text(page)
     if not body:
         return False
     return bool(_GEMINI_RESEARCH_CARD_RE.search(body) or _GEMINI_COMPLETION_RE.search(body))
@@ -48888,6 +48921,75 @@ async def _gemini_watched_plan_failed(page) -> str:
                                    start_present=start_present,
                                    streaming=False, latest_text=latest)
     return " ".join(latest.split())[:200] if verdict == "failed" else ""
+
+
+# ── Gemini's own Redo on a plan that visibly failed (10-03) ──────────────────
+#
+# ⭐⭐ THE OWNER, 10-03: "if the planning fails and if it shows some message and
+# a redo option, we will try redo, but we are not refreshing, because refreshing
+# is making the planning stage go stale. … only during planning we are not
+# refreshing." So while Gemini plans — the plan wait (2D) and, after it, the
+# round-robin while its late-Start watch is armed — a plan that VISIBLY failed
+# gets Gemini's own Redo pressed, and nothing is ever refreshed, navigated or
+# opened in a new chat. "Visibly failed" is all of: Gemini's failure line on the
+# plan turn, the same on two reads two seconds apart (a plan still streaming
+# changes), no research showing, no 'Start research' to press
+# (`_gemini_watched_plan_failed`), and Gemini's Redo on that turn
+# (`_gemini_regen_next_step` says 'click'). A plan that is only slow is never
+# pressed. The press is `_gemini_redraft_plan`: Redo, then the menu's
+# "Don't personalise" row (`data-test-id="regenerate-option"`).
+#: At most this many Redo presses on one chat's failed plan. A press that
+#: touched the page spends one, whatever came of it.
+_GEMINI_PLAN_REDO_MAX = 2
+#: Seconds between two presses — and the time the last press is given to bring
+#: the plan back before the card goes up. The retired plan re-draft's spacing.
+_GEMINI_PLAN_REDO_COOLDOWN_SEC = 45
+
+
+async def _gemini_plan_redo_tick(page, state: dict, label: str) -> "tuple[str, str]":
+    """One look at a Gemini plan that may have failed. `(verdict, failure_text)`.
+
+    `'not_failed'` · no visibly failed plan — slow, streaming, started, or a
+                     'Start research' to press. Nothing is done.
+    `'pressed'`    · Gemini's own Redo was pressed just now (one attempt spent).
+    `'hold'`       · failed, and the last press is less than the cooldown ago,
+                     or the turn could not be read on this look. Nothing is done.
+    `'no_redo'`    · failed, and Gemini shows no Redo to press (or it could not
+                     be pressed). The caller's card is the answer.
+    `'spent'`      · failed after both presses, the last one's cooldown over.
+                     The caller's card is the answer.
+
+    `state` carries the count and the time of the last press between looks
+    (`gemini_plan_redos`, `gemini_plan_redo_at`): the plan wait's own dict, then
+    the round-robin's entry for Gemini, which the plan wait hands them to. Never
+    refreshes, navigates or opens a chat. Never raises."""
+    try:
+        failed = await _gemini_watched_plan_failed(page)
+        if not failed:
+            return "not_failed", ""
+        n = int(state.get("gemini_plan_redos", 0) or 0)
+        if n and time.time() - float(state.get("gemini_plan_redo_at", 0.0) or 0.0) \
+                < _GEMINI_PLAN_REDO_COOLDOWN_SEC:
+            return "hold", failed
+        if n >= _GEMINI_PLAN_REDO_MAX:
+            return "spent", failed
+        step = _gemini_regen_next_step(await _gemini_regen_read(page))[0]
+        if step == "settled":
+            return "not_failed", ""           # it came back since the last read
+        if step == "no_turn":
+            return "hold", failed             # not readable on this look
+        redrafted, acted, _in_flight, why = await _gemini_redraft_plan(page, label)
+    except Exception as e:
+        log(f"[{label}] Gemini plan Redo look failed (non-fatal): {e}", "DEBUG")
+        return "hold", ""
+    if not acted:
+        return "no_redo", failed   # no Redo on it, or it could not be pressed
+    state["gemini_plan_redos"] = n + 1
+    state["gemini_plan_redo_at"] = time.time()
+    log(f"[{label}] Gemini's plan failed (\"{failed}\") — pressed Gemini's own Redo, "
+        f"{n + 1} of {_GEMINI_PLAN_REDO_MAX} ({why}). A plan is never refreshed.",
+        "INFO" if redrafted else "WARN")
+    return "pressed", failed
 
 
 # ── The stale deep research: a BOUNDED CADENCE, not a stall detector ─────────
@@ -48967,14 +49069,15 @@ async def _gemini_research_surface(page) -> "tuple[bool, bool]":
     The same two patterns `_gemini_research_started` ORs together, kept APART
     because the cadence needs them apart: the card is what says a research is
     mounted on this tab, the completion line is what says it must now be left
-    alone. Reads the first 8000 chars of body innerText only; safe every tick.
-    Fail-closed — `(False, False)` on any error, so a probe miss can never
+    alone. Reads Gemini's own text, not the person's turns
+    (`_GEMINI_REPLIES_TEXT_JS`): ⛔ 10-03, it read the first 8,000 characters
+    of the page, which on a real run are all brief, so it never saw the card
+    and the refresh never reloaded a research that went stale — not even one
+    that had finished on Gemini's side while the page kept its "researching"
+    view. Fail-closed — `(False, False)` on any error, so a probe miss can never
     manufacture a reload.
     """
-    try:
-        body = await page.evaluate("""() => (document.body.innerText || "").slice(0, 8000)""")
-    except Exception:
-        return False, False
+    body = await _gemini_replies_text(page)
     if not body:
         return False, False
     return (bool(_GEMINI_RESEARCH_CARD_RE.search(body)),
@@ -48990,6 +49093,13 @@ def _gemini_stale_reload_due(now: float, *, research_started_at: float,
                              max_reloads: "int | None" = None) -> bool:
     """Should the bounded cadence reload this Gemini tab on this tick?
 
+    ⭐ THE OWNER'S RULE (10-03): refresh while the research is going and after
+    it finishes — "sometimes the researching process might go stale even after
+    finishing research, it might not load the completed result" — and never
+    while Gemini plans. A research that finished on Gemini's side while this
+    page kept its "researching" view is exactly a card with no completion line,
+    so it is refreshed here; the page's done check then collects the report.
+
     Every clause is an AND and none of them is a staleness DETECTOR — together
     they are a BOUND on how often a post-Start research tab may be refreshed:
 
@@ -48997,8 +49107,10 @@ def _gemini_stale_reload_due(now: float, *, research_started_at: float,
         `page.goto` of a conversation URL lands on the home (the 2026-07
         finding, which still holds);
       · past Start by a full window — the plan-draft window has its own
-        machinery (the kickoff nudges, the late-Start watch) and must not meet
-        a reload;
+        machinery (the late-Start watch, Gemini's own Redo on a plan that
+        visibly failed) and must not meet a reload: a refresh while Gemini plans
+        makes the plan go stale (the owner, 10-03). The caller does not run this
+        tick at all while the watch is armed;
       · the research card is present and no completion line is — a finished
         research is left alone, always;
       · we hold this run's brief, because without it the identity prover cannot
@@ -49116,7 +49228,10 @@ async def _gemini_stale_reload_tick(p: dict, name: str,
     _flat_for = _now - (p.get("last_growth_time") or p.get("start_time") or _now)
     if not _gemini_stale_reload_due(
             _now,
-            research_started_at=p.get("start_time", 0.0),
+            # The later of the hand-off and the moment the late-Start watch first
+            # saw the research (10-03): the window is 12 minutes of RESEARCH.
+            research_started_at=max(float(p.get("start_time", 0.0) or 0.0),
+                                    float(p.get("gemini_research_seen_at", 0.0) or 0.0)),
             last_reload_at=p.get("gemini_stale_reload_at", 0.0),
             in_conversation=bool(_convo),
             card_present=_card,
@@ -49129,9 +49244,13 @@ async def _gemini_stale_reload_tick(p: dict, name: str,
     # consume its window, or a wedged tab would be hammered every tick.
     p["gemini_stale_reload_at"] = _now
     p["gemini_stale_reloads"] = int(p.get("gemini_stale_reloads", 0) or 0) + 1
-    log(f"[{name}] research tab flat for {int(_flat_for) // 60}m with a research "
-        f"card and no completion line — bounded stale reload "
-        f"#{p['gemini_stale_reloads']} of conversation {_convo[:12]}", "WARN")
+    # ⭐ 10-03, the owner: refresh "during the research … and even after
+    # finishing the research", when the page may not load the finished report —
+    # never while Gemini plans (its watch is armed then, and this tick is not run).
+    log(f"[{name}] its research page has not changed for {int(_flat_for) // 60}m "
+        f"(research showing, no finished report) — refreshing it, "
+        f"#{p['gemini_stale_reloads']} of {_GEMINI_STALE_RELOAD_MAX} "
+        f"(bounded stale reload, chat {_convo[:12]})", "WARN")
     try:
         await p["page"].reload(wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(settle_sec)
@@ -49774,6 +49893,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # slow plan) — the Gemini leg watches for a late 'Start research'
             # button and clicks it, or clears the watch once verified running.
             "gemini_watch_start": bool(agent.get("gemini_watch_start")),
+            # ⭐ 10-03: Gemini's own Redo presses the plan wait already spent on a
+            # failed plan (at most two per chat), and when the last one was.
+            "gemini_plan_redos": int(agent.get("gemini_plan_redos", 0) or 0),
+            "gemini_plan_redo_at": float(agent.get("gemini_plan_redo_at", 0.0) or 0.0),
             # 2026-08-19: did ANY probe ever confirm this agent actually
             # RUNNING? Read by detect_completion_gemini's last resort so it
             # stops calling a started run "pre-research".
@@ -51128,16 +51251,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #   (c) else the plan is still drafting (streaming, no enabled Start
             #       yet) → leave the watch armed and wait.
             if name == "Gemini" and p.get("gemini_watch_start"):
-                # ⭐ Review 10-02: a FAILED plan is not a finished report. One
+                # ⭐ 10-03, the owner: a plan that fails and shows Gemini's Redo
+                # gets that Redo — "we will try redo, but we are not refreshing".
+                # At most two presses per chat (the plan wait's count comes
+                # with it), 45 s apart; nothing on this leg runs while a press
+                # has its moment, and nothing ever refreshes a plan.
+                # ⭐ Review 10-02: a FAILED plan is not a finished report. When
+                # both presses left it failed — or Gemini shows no Redo — one
                 # honest card and the agent parked, exactly as a research that
                 # fails mid-run (kind "agent_error": Retry starts a fresh chat,
                 # the card's window or a Skip ends it) — no done check, no
                 # extraction, no computer use on a page that holds nothing.
-                _ws_failed = await _gemini_watched_plan_failed(p["page"])
-                if _ws_failed:
+                _redo, _ws_failed = await _gemini_plan_redo_tick(p["page"], p, name)
+                if _redo in ("pressed", "hold"):
+                    continue
+                if _redo in ("spent", "no_redo"):
                     _pf_window = unacted_window_sec(_runtime.auto_skip_stuck)
-                    log(f"[{name}] its research plan failed (\"{_ws_failed}\") — asking "
-                        "you: Retry starts a fresh chat, or Skip it", "WARN")
+                    log(f"[{name}] its research plan failed (\"{_ws_failed}\") and "
+                        + ("Gemini's own Redo, pressed twice, did not bring it back"
+                           if _redo == "spent" else "Gemini shows no Redo to press")
+                        + " — asking you: Retry starts a fresh chat, or Skip it", "WARN")
                     fail_agent("gemini", "Gemini's plan failed",
                                f"Gemini showed: {_ws_failed} Retry starts a fresh chat, "
                                "or Skip it.",
@@ -51159,6 +51292,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     if _ws_running:
                         p["gemini_watch_start"] = False
                         p["gemini_running_confirmed"] = True
+                        # ⭐ 10-03: the research is first seen NOW, so its
+                        # 12-minute refresh window starts now — not at the
+                        # hand-off, which would refresh the page the moment a
+                        # research that planned for 12 minutes or more shows.
+                        p["gemini_research_seen_at"] = time.time()
                         log("[Gemini] Watch-start: research is running/complete "
                             "(auto-started without a Start click) — watch cleared ✓")
                         emit_event("agent_progress", phase=2, agent="gemini",
@@ -51511,6 +51649,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # the wiring. The owner's report is "it's getting stuck in working
             # phase, sometimes or mostly", cured today only by them noticing and
             # refreshing by hand.
+            # ⭐ 10-03, THE OWNER'S RULE IN ONE LINE: refresh while the research
+            # is going and after it finishes (a finished report the page never
+            # loaded), NEVER while Gemini plans — so never while its late-Start
+            # watch is armed; a plan that visibly failed gets Gemini's own Redo
+            # from the watch instead.
             if (name == "Gemini" and not _controls.is_stop()
                     and not p.get("gemini_watch_start")
                     and not p.get("needs_start_verify")):
@@ -53255,7 +53398,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # and its "error" verdict was the door to a Redo, a card and a drop —
             # for a plan that starts by itself on a timer. The owner: "wait for
             # the research without refreshing and then let the research finish".
-            # The page's own done check above still runs on every leg.
+            # The page's own done check above still runs on every leg, and a plan
+            # that visibly failed gets Gemini's own Redo from the watch (10-03).
             if name == "Gemini" and p.get("gemini_watch_start"):
                 continue
 
@@ -71667,14 +71811,24 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # by itself on a timer, as ChatGPT does. The owner: "wait for the
         # research without refreshing and then let the research finish … keep it
         # simple without making it complicated and causing alerts". So this wait
-        # never reloads the chat, never presses Stop or Redo, never opens a new
-        # chat, never points computer use at it and never raises a card. It
-        # watches the run's own chat for up to `_start_wait_max_sec` (the owner's
-        # ten minutes, env-settable), presses a 'Start research' that appears (a
-        # plan Gemini did not start by itself), and hands Gemini to the
-        # round-robin when it was pressed, when Gemini finished on its own, or
-        # when the wait is over. The round-robin's late-Start watch presses a
-        # 'Start research' that appears after that, and lets the research finish.
+        # never reloads the chat, never presses Stop, never opens a new chat,
+        # never points computer use at it and never raises a card. It watches the
+        # run's own chat for up to `_start_wait_max_sec` (the owner's ten minutes,
+        # env-settable), presses a 'Start research' that appears (a plan Gemini
+        # did not start by itself), and hands Gemini to the round-robin when it
+        # was pressed, when Gemini finished on its own, or when the wait is over.
+        # The round-robin's late-Start watch presses a 'Start research' that
+        # appears after that, and lets the research finish.
+        #
+        # ⭐⭐ 10-03 — A PLAN THAT VISIBLY FAILED GETS GEMINI'S OWN REDO, NEVER A
+        # REFRESH. The owner: "if the planning fails and if it shows some message
+        # and a redo option, we will try redo, but we are not refreshing, because
+        # refreshing is making the planning stage go stale". Gemini's failure line
+        # on the plan turn, settled, and its Redo showing: the Redo is pressed, at
+        # most twice, 45 s apart (`_gemini_plan_redo_tick`). A plan that is only
+        # slow is never pressed. The count goes with Gemini to the round-robin,
+        # whose watch raises the "Gemini's plan failed" card only when both
+        # presses left the plan failed — never before this wait is over.
         #
         # ⛔⛔ REMOVED, and why each was wrong:
         #   · the six-minute "a plan never streams this long, so Gemini has almost
@@ -71684,9 +71838,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         #   · the two-minute quiet-chat refresh and the reload of a chat that
         #     could not be proven (10-01): on 10-01 and 10-02 the reloaded page came
         #     back showing Gemini's Stop, and the plan took no less time;
-        #   · the plan re-draft (Redo), the computer-use recovery ladder that
-        #     pressed Retry/Regenerate, and the "Gemini couldn't start Deep
-        #     Research" card when the wait gave up.
+        #   · the computer-use recovery ladder that pressed Retry/Regenerate, and
+        #     the "Gemini couldn't start Deep Research" card when the wait gave up.
+        #     (The plan's Redo, removed with them on 10-02, came back on 10-03 for
+        #     a plan that VISIBLY failed — above.)
         # The general run ceiling is unchanged.
         _start_wait_max_sec = int(os.environ.get("GEMINI_PLAN_WAIT_SEC", str(10 * 60)))
         # Shared JS: click the "Start research" button, and a sibling probe for
@@ -71711,6 +71866,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # is never read or pressed (`_gemini_plan_chat_ok`), and never reloaded.
         _chat = {"convo": "", "url": "", "trusted": True}
         _chat_ok = True
+        # ⭐ 10-03: Gemini's own Redo on a plan that visibly failed — how many
+        # presses (at most two) and when the last was. Handed to the round-robin.
+        _plan_redo = {"gemini_plan_redos": 0, "gemini_plan_redo_at": 0.0}
+        _plan_redo_said = False
 
         while True:
             _elapsed = int(time.time() - _loop_start)
@@ -71815,6 +71974,29 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         "re-click (30s watch) — continuing to poll", "WARN")
             except Exception:
                 pass
+
+            # 1b. ⭐ 10-03: a plan that VISIBLY failed — Gemini's failure line,
+            # settled, and its Redo showing — gets Gemini's own Redo, at most
+            # twice, 45 s apart. Never a refresh, never a new chat, never a card
+            # here: the round-robin raises "Gemini's plan failed" after this wait
+            # if both presses left the plan failed.
+            _redo, _redo_failed = await _gemini_plan_redo_tick(gemini_page, _plan_redo, "2D")
+            if _redo == "pressed":
+                try:
+                    emit_event("agent_progress", phase=2, agent="gemini",
+                               status="generating", stage="planning",
+                               progress=(f"Gemini's plan hit an error — pressed its Redo "
+                                         f"({_plan_redo['gemini_plan_redos']} of "
+                                         f"{_GEMINI_PLAN_REDO_MAX})"))
+                except Exception:
+                    pass
+            elif _redo in ("spent", "no_redo") and not _plan_redo_said:
+                _plan_redo_said = True
+                log(f"[2D] Gemini's plan failed (\"{_redo_failed}\") and "
+                    + ("its Redo, pressed twice, did not bring it back"
+                       if _redo == "spent" else "it shows no Redo to press")
+                    + " — waiting out the plan wait with nothing refreshed; the "
+                    "round-robin asks you after it", "WARN")
 
             # 2. Emit a Gemini planning heartbeat every ~15s so the frontend
             # shows smooth live motion while Gemini drafts the plan. No rotation
@@ -71929,6 +72111,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                 # so the un-augmented text answers the same
                                 # question the paste would.
                                 "brief": brief_text,
+                                # ⭐ 10-03: the Redo presses this wait spent on a
+                                # failed plan go with it — two per chat in all.
+                                **_plan_redo,
                                 "needs_start_verify": bool(start_clicked and not verified_b),
                                 # The round-robin's late-Start watch: it presses a
                                 # 'Start research' that appears after hand-off, and

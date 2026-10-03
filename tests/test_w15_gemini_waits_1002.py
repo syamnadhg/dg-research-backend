@@ -14,12 +14,19 @@ THE EVIDENCE
   · 10-02 (CJFYMAB1): the same refresh at 00:19:37, the same 366 s hand-off at
     00:23:42 with "a plan with 'Start research' showing" on the page.
 
-⭐ SO, IN THE PLAN WAIT AND AFTER IT: the chat is never reloaded; Stop and Redo
-are never pressed; no new chat; no computer use; no card. A 'Start research'
-that appears is pressed. The six-minute hand-off is gone; Gemini is handed to
-the round-robin when the wait is over, with the late-Start watch armed, and the
+⭐ SO, IN THE PLAN WAIT AND AFTER IT: the chat is never reloaded; Stop is never
+pressed; no new chat; no computer use; no card. A 'Start research' that appears
+is pressed. The six-minute hand-off is gone; Gemini is handed to the
+round-robin when the wait is over, with the late-Start watch armed, and the
 round-robin lets it be: no "seems stuck" check and no computer-use completion
 look while its research has not started.
+
+⭐ 10-03, THE OWNER: "if the planning fails and if it shows some message and a
+redo option, we will try redo, but we are not refreshing". A plan that VISIBLY
+failed gets Gemini's own Redo, at most twice, and still nothing is refreshed;
+only when both presses left it failed does the "Gemini's plan failed" card go
+up. tests/test_w15_gemini_redo_1003.py measures that; the failed-plan tests here
+were turned round with it.
 
 ── How it is measured ──────────────────────────────────────────────────────
 The plan wait: the REAL `run_phase2` Gemini launch (2C/2D) in headless Chrome
@@ -130,14 +137,17 @@ def test_a_plan_that_arrives_late_in_the_wait_is_started_with_no_reload(launch):
     assert not said(out, NOT_YET)
 
 
-def test_a_failed_plan_is_never_redone_and_raises_nothing(launch):
-    """⛔⛔ No Redo. The owner's captured failed plan: its Redo is never pressed,
-    nothing is raised, and Gemini goes on to the round-robin, watched.
-    Before: three re-drafts within about four minutes, then the card."""
+def test_a_failed_plan_gets_gemini_s_own_redo_twice_and_is_never_refreshed(launch):
+    """⭐ 10-03 (the owner turned this round: "we will try redo, but we are not
+    refreshing"). The owner's captured failed plan: its Redo is pressed twice
+    and no more, the chat is never reloaded, nothing is raised in the wait, and
+    Gemini goes on to the round-robin, watched, with both presses spent — the
+    card is the round-robin's, after the wait. Before (10-02): never pressed."""
     out = launch(lambda cid, n: page("", turn=FAILED_PLAN))
-    assert out.clicks == [], out.clicks
-    assert not said(out, "re-draft") and not said(out, "regenerate")
+    assert out.clicks == ["redo", "redo"], out.clicks
+    assert out.loads == Counter({OURS: 1}), out.loads
     assert out.cards == [] and out.looks == []
+    assert _gemini(out)["gemini_plan_redos"] == 2
     assert _gemini(out)["gemini_watch_start"] is True
 
 

@@ -162,10 +162,13 @@ OBSERVER_FAILED = ('        await _gemini_reattach_observer(p, name)\n'
 #: The adoption call — the only post_start caller there is.
 ADOPT_CALL = ('                p["page"], _brief, name, post_start=True,\n'
               '                lost_convo_id=_convo)')
-#: The surface read's two fail-closed answers.
-SURFACE_RAISE = ('        body = await page.evaluate("""() => (document.body.innerText || "").slice(0, 8000)""")\n'
+#: The surface read's two fail-closed answers. ⭐ 10-03: the read is
+#: `_gemini_replies_text` now (Gemini's own text, not the page's first 8,000
+#: characters, which on a real run are all brief), so a probe that raised is
+#: its `""` — and R16 makes that `""` a research card instead.
+SURFACE_RAISE = ('        return str(await page.evaluate(_GEMINI_REPLIES_TEXT_JS) or "")\n'
                  '    except Exception:\n'
-                 '        return False, False')
+                 '        return ""')
 SURFACE_EMPTY = ('    if not body:\n        return False, False\n'
                  '    return (bool(_GEMINI_RESEARCH_CARD_RE.search(body)),')
 #: THE WIRING: the leg's one call, and run_phase2's brief seed.
@@ -353,8 +356,9 @@ MUTANTS = [
      "target-closed exceptions on a tab that may hold a finished report. "
      "KILLED BY tests/test_gemini_stale_reload_0918.py::"
      "test_the_surface_read_is_fail_closed_so_a_probe_miss_cannot_cause_a_reload",
-     [(SURFACE_RAISE, SURFACE_RAISE.replace("        return False, False",
-                                            "        return True, False"))]),
+     [(SURFACE_RAISE, SURFACE_RAISE.replace("    except Exception:\n        return \"\"",
+                                            "    except Exception:\n"
+                                            "        return \"Researching 12 websites\""))]),
     ("R20", "under",
      "⛔ THE OTHER HALF OF FAIL-CLOSED: an EMPTY body reads as a card. Gemini's "
      "SPA serves an empty `document.body.innerText` for a beat after a "

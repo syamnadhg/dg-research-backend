@@ -354,8 +354,12 @@ class _Tab:
             if self.turn:
                 return json.dumps({"src": "turn", "text": self.turn[:4000]})
             return json.dumps({"src": "body", "text": self.body[:4000]})
-        if "slice(0, 8000)" in js:
-            return self.body[:8000]
+        # 10-03: the research read is Gemini's own text, the person's turns left
+        # out (`_GEMINI_REPLIES_TEXT_JS`, executed against real pages in
+        # tests/test_w15_gemini_redo_1003.py). This tab's body holds no turn of
+        # the person's, so it is that text as it stands.
+        if js is research._GEMINI_REPLIES_TEXT_JS:
+            return self.body
         if "__agentObserver" in js:
             self.observer_injected = True
             return True

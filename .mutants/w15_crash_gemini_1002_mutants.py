@@ -317,8 +317,9 @@ MUTANTS = [
        "            if (_hit_hard_cap and name == \"Gemini\"\n"
        "                    and not p.get(\"hard_cap_asked\")):\n")]),
     ("G19", RESEARCH, "gemini", "⛔⛔ a failed plan is read as a finished report — computer use and 'Couldn't read Gemini's report' every ten minutes",
-     [("                _ws_failed = await _gemini_watched_plan_failed(p[\"page\"])\n",
-       "                _ws_failed = \"\"\n")]),
+     # 10-03: the watch now asks `_gemini_plan_redo_tick` (Redo first, card after).
+     [("                _redo, _ws_failed = await _gemini_plan_redo_tick(p[\"page\"], p, name)\n",
+       "                _redo, _ws_failed = \"not_failed\", \"\"\n")]),
     ("G20", RESEARCH, "gemini", "⛔⛔ the failed plan is not parked — a card on every leg",
      [("                    p[\"awaiting_decision\"] = {\"kind\": \"agent_error\", \"key\": \"gemini\",\n"
        "                                              \"since\": time.time(), \"timeout\": _pf_window}\n"
