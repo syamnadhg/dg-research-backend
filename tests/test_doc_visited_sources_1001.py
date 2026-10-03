@@ -396,7 +396,6 @@ class TestNeverTwice:
         monkeypatch.setattr(research, "save_document_to_firestore",
                             lambda t, c, n=None: resaved.append((t, c)) or True)
         monkeypatch.setattr(research, "_generate_research_summary_async", lambda *a, **k: None)
-        monkeypatch.setattr(research, "_refresh_research_title_async", lambda *a, **k: None)
         asyncio.run(research._p2_persist_reports(
             {"ChatGPT": {"text": CHATGPT_REPORT, "status": "done"}},
             run.dir, "German Shepherd", "a brief"))

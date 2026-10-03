@@ -782,7 +782,7 @@ def _ffmpeg_bin() -> str | None:
     return None
 
 
-def _transcode_audio_to_mp3(src: "Path") -> "Path":
+def _transcode_audio_to_mp3(src: "Path", title: str = "") -> "Path":
     """Transcode a NotebookLM Audio Overview to a streamable CBR mp3.
 
     NotebookLM serves the podcast as an .m4a whose `moov` atom sits at the
@@ -801,7 +801,11 @@ def _transcode_audio_to_mp3(src: "Path") -> "Path":
     Idempotent: an input already ending in .mp3 (a Downloads-folder fallback
     grab, or a future NLM format change) is returned untouched. `-map_metadata
     0` carries any embedded title/metadata across; `-vn` drops a stray cover-
-    art image stream that would otherwise break the mp3 mux."""
+    art image stream that would otherwise break the mp3 mux.
+
+    ⭐ `title` (wave 19) — the research's one short name. Given, it replaces
+    NotebookLM's own audio title inside the file, so a player shows the same
+    name the app does. The resume path passes none and keeps what is there."""
     src = Path(str(src))
     if src.suffix.lower() == ".mp3":
         return src
@@ -812,9 +816,11 @@ def _transcode_audio_to_mp3(src: "Path") -> "Path":
             "stream it; the web app / chat still play it fine)", "WARN")
         return src
     dst = src.with_suffix(".mp3")
+    named = " ".join(str(title or "").split())
     try:
         r = subprocess.run(
             [ffmpeg, "-y", "-i", str(src), "-vn", "-map_metadata", "0",
+             *(["-metadata", f"title={named}"] if named else []),
              "-c:a", "libmp3lame", "-b:a", "160k", str(dst)],
             capture_output=True, text=True, timeout=600,
             creationflags=_PS_NO_WINDOW)
@@ -823,12 +829,16 @@ def _transcode_audio_to_mp3(src: "Path") -> "Path":
                 src.unlink(missing_ok=True)
             except OSError:
                 pass
-            log(f"[Phase3] Transcoded podcast to streamable mp3: {dst.name}")
+            # ⛔ WAVE 19: its length and type, never its name — the file
+            # carries the research's name now, and this line rides the
+            # owner's support bundle.
+            log(f"[Phase3] Transcoded podcast to streamable mp3 "
+                f"({len(dst.stem)}-char name)")
             return dst
         log(f"[Phase3] ffmpeg mp3 transcode failed (rc={r.returncode}) — "
             f"delivering original {src.suffix}: {(r.stderr or '')[-200:]}", "WARN")
     except Exception as e:
-        log(f"[Phase3] ffmpeg mp3 transcode error ({type(e).__name__}: {e}) "
+        log(f"[Phase3] ffmpeg mp3 transcode error ({type(e).__name__}) "
             f"— delivering original {src.suffix}", "WARN")
     try:
         dst.unlink(missing_ok=True)  # never leave a partial/broken mp3 behind
@@ -1679,373 +1689,16 @@ def resolve_gemini_api_key():
 # gap with a tight 1-2 sentence LLM-generated summary, written via the
 # existing _update_firestore_research path. Fire-and-forget on a daemon
 # thread so the pipeline never waits on the LLM call.
-def title_refusal_verdict(title: str, topic: str, corpus: str) -> str:
-    """What to do with a generated title that shares no word with the topic.
-
-    Returns one of:
-      "accept"        — write it;
-      "refuse_silent" — keep the topic-derived name, say nothing to the user;
-      "refuse_loud"   — keep it AND raise a card, because the corpus agrees the
-                        run went off-topic.
-
-    ⭐⭐ 2026-08-06 — CORROBORATE BEFORE YOU ACCUSE. The tripwire below was built
-    after a run whose notebook ended up titled "Golden Retriever Health, Breeding,
-    and Ownership Evidence" on a topic about NVIDIA agent security, and refusing
-    that title is exactly right. But it judged drift from THE TITLE ALONE, and on
-    2026-08-06 it fired on:
-
-        REFUSING the generated title 'NVIDIA Agent Stack Architecture And
-        Security Boundaries' — it shares none of the topic's distinctive terms
-        (nemoclaw, nemohermes, nemotron, openshell).
-
-    (Quoted as it was written that day. The line now prints the title's LENGTH
-    rather than the title — `backend.log` is the machine's and its tail ships in
-    the owner's support bundle; see `_log_job_ref`.)
-
-    NVIDIA is the vendor of Nemotron. The sources were docs.nvidia.com and
-    build.nvidia.com. The corpus had already been through `apply_off_topic_sweep`
-    and passed — no "OFF-TOPIC text REJECTED" line anywhere in the run. So the
-    loud path fired on a three-to-seven-word string, the one artefact too short
-    to be evidence, while the artefact that IS evidence had already voted.
-
-    And the alert it raised was worse than useless: the phase was already
-    Complete, the heal had already worked, and the card carried a Skip button
-    that had nothing left to skip.
-
-    A pure function of its three inputs so both polarities are testable without a
-    thread, a browser or Firestore. Refusing the title never depends on the
-    corpus — that half was always right and is unchanged. Only the ALERT does.
-    """
-    _t = (title or "").strip()
-    if not _t:
-        return "accept"
-    # ⭐ 2026-09-02 — was a hand-rolled copy of the presence rule, written out
-    # again here because the shared predicate had a 20,000-character floor and a
-    # title is thirty characters. The floor now belongs to the CALLER, so this
-    # asks the one rule directly and applies its own bar, which for a title is
-    # "not empty" — the line above. `None` means the topic is not guardable at
-    # all, which is the same abstain the hand-rolled anchor count produced.
-    if topic_presence(_t, topic) is not False:
-        return "accept"
-    # The title is anchor-free. Ask the corpus, which is the only witness with
-    # enough text to be believed. `text_is_off_topic` abstains (False) on a short
-    # or unguardable corpus, so an un-corroborated refusal routes to silent —
-    # the project's standing asymmetry, everything uncertain stays quiet.
-    return "refuse_loud" if text_is_off_topic(corpus or "", topic) else "refuse_silent"
-
-
-def _refresh_research_title_async(topic, brief_text="", findings_text=""):
-    """Spawn a daemon thread that refines Research.title post-research.
-
-    Goal: improve the title now that the pipeline has the actual research
-    findings, not just the raw user input. The FE's /api/title gave the
-    sidebar tile a clean 4-8 word title at startup based ONLY on the user's
-    input — which can be a paragraph-long brief with sections like
-    "Goal:" and "Already sorted (don't research):". Post-P2, the agents
-    have produced concrete findings; a refreshed title can reflect what
-    was ACTUALLY researched, not what the user planned to research.
-
-    User-edit guard (2026-05-11): reads research.titleLocked before
-    writing. The FE renameResearch sets titleLocked=true sticky-once on
-    the first user rename — once true, this helper bails without
-    writing. User's choice is final and never gets overwritten by any
-    automated path.
-
-    Hard-capped to 3-7 words / ≤70 chars via _shape_title.
-    """
-    _topic = (topic or "").strip()[:200]
-    _brief = (brief_text or "").strip()[:600]
-    # ⚠ TWO different strings, deliberately. `_findings` is the LLM's prompt
-    # material and stays capped. `_corpus` is the evidence the drift check is
-    # corroborated against, and it must NOT be capped: `text_is_off_topic`
-    # abstains below `_TOPIC_GUARD_MIN_CHARS` (20_000), so passing the 5_000-char
-    # sample would make the corroboration abstain on every run and silently turn
-    # every refusal into a silent one — a guard that always agrees is not a guard.
-    _corpus = (findings_text or "").strip()
-    _findings = _corpus[:5000]
-    if not _topic and not _brief and not _findings:
-        return
-    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH (wave 10.9, last repair). The
-    # worker is a raw thread with a model call in front of its write, and the
-    # run can end while that call is out: teardown clears the pipeline globals,
-    # the worker dequeues the next member's run at once, and setup points them
-    # at THAT person's research. Read at write time, this run's title — made
-    # from its topic and findings — went onto their record, into their sidebar.
-    # So the worker reads and writes the research that dispatched it, by name.
-    _uid, _rid = _fb_uid, _fb_research_id
-    # ⛔ AND A RUN THAT KEEPS NOTHING DISPATCHES NO REFRESH AT ALL. Its record is
-    # purged when it ends, so a better name is worth nothing to it — and the
-    # worker is a model call on its private topic and findings that outlives it.
-    if _is_incognito_research(_rid):
-        return
-
-    def _worker():
-        try:
-            # 2026-05-11: user-edit guard. titleLocked is sticky-once-true,
-            # set by FE renameResearch the moment the user manually renames.
-            # If true, never overwrite — the user's choice is final, even
-            # post-P2 with richer findings. Asymmetric with the FE startup
-            # /api/title (which has its own heuristic guard) — both honor
-            # the lock.
-            if _firebase_db and _uid and _rid:
-                try:
-                    snap = _firebase_db.collection("users").document(_uid) \
-                        .collection("researches").document(_rid).get()
-                    if snap.exists:
-                        data = snap.to_dict() or {}
-                        if bool(data.get("titleLocked")):
-                            log("[title-refresh] titleLocked=True — user renamed, skipping refresh", "INFO")
-                            return
-                except Exception as _re:
-                    log(f"[title-refresh] titleLocked read failed ({_re}) — bailing safe (no overwrite)", "WARN")
-                    return
-            text = _try_llm_title(_topic, _brief, _findings)
-            text = _shape_title(text)
-            # ⭐ 2026-08-05 — THE FREE TRIPWIRE, and it is ours.
-            #
-            # On the incident run the notebook ended up titled "Golden Retriever
-            # Health, Breeding, and Ownership Evidence" — which reads like
-            # NotebookLM auto-titling from its sources, and is not: Phase 3 TYPES
-            # a title, and that title comes from here, generated by our own model
-            # from the consolidated corpus. So this function had the run's answer
-            # in its hands before Phase 3 spent 30-45 minutes generating a Deep
-            # Dive podcast, and wrote it out as the run's name.
-            #
-            # A titler that summarises the findings and produces something sharing
-            # NOT ONE distinctive word with the topic is telling us the corpus
-            # drifted. Refuse the write — keeping the title derived from the
-            # user's own input — and say so loudly. One string comparison, no
-            # race, nothing threaded through, and it runs after Phase 2 and before
-            # Phase 3.
-            #
-            # Presence-only, per the abstain rule: `topic_anchors` returning fewer
-            # than the minimum means the topic is not guardable, and a title is
-            # far too short for the length threshold, so the check is applied
-            # directly rather than through `text_is_off_topic`.
-            if text:
-                _verdict = title_refusal_verdict(text, _topic, _corpus)
-                if _verdict != "accept":
-                    _t_anchors = topic_anchors(_topic)
-                    # The heal itself is IDENTICAL on both refusal paths, and it
-                    # is the part that was never in doubt: drop the title, keep
-                    # the topic-derived name, which is what `smart_title` reads
-                    # and what P3 types into the notebook.
-                    # ⛔⛔ NOT THE TITLE — see `_log_job_ref`. The generated
-                    # title is a research subject, and both of these lines go to
-                    # the machine-wide `backend.log`, whose tail ships in the
-                    # OWNER's support bundle: measured 2026-09-22 in this
-                    # owner's live log, 57 characters of another member's title
-                    # in the archive that goes to support. Its LENGTH is what
-                    # this line is read for; the title itself is on the research
-                    # doc. ⭐ The anchors stay, for the reason the Phase 1 gate
-                    # gives, and the bundle takes them out of the copy that
-                    # travels. (A run that keeps nothing never gets here — it
-                    # dispatches no refresh.)
-                    _anchor_words = ", ".join(_t_anchors[:6])
-                    if _verdict == "refuse_loud":
-                        log(f"[title-refresh] REFUSING the generated title "
-                            f"({len(text)} chars) — it shares none of the topic's "
-                            f"distinctive terms ({_anchor_words}), AND "
-                            f"neither does the corpus it was written from. The "
-                            f"research went off-topic.", "ERROR")
-                        # ⛔⛔ ONLY WHILE THIS RUN IS STILL THE ONE RUNNING.
-                        # `emit_event` writes to whatever research the globals
-                        # name NOW, and this card quotes the generated title —
-                        # after the run has ended it would land in the next
-                        # member's chat. A card about a run that has ended is
-                        # one nobody reads, so it is simply not raised.
-                        try:
-                            if (_fb_uid, _fb_research_id) == (_uid, _rid):
-                                emit_event(
-                                    "pipeline_warning", phase=2,
-                                    # `message=`, not `error=`: the web app's warning
-                                    # branch reads message/warning and falls back to
-                                    # the literal string "Backend warning", which is
-                                    # what the user saw on the card.
-                                    message="The findings may not match your topic",
-                                    details=(f"We named this research from its own findings "
-                                             f"and got \"{text}\", which does not mention "
-                                             f"your topic at all — and neither does the "
-                                             f"research it was written from. One of the "
-                                             f"agents may have reported on something else."),
-                                    # Explicit empty list, not omitted: the web app
-                                    # invents a [Skip] for a phase alert whose actions
-                                    # are undefined, and phase 2 is already Complete
-                                    # by the time this can fire — there is nothing to
-                                    # skip. `[]` means "informational", and it is what
-                                    # every other warning in this file already passes.
-                                    actions=[], alert_id="phase2_topic_mismatch",
-                                    alertType="warn", dismissible=True)
-                        except Exception:
-                            pass
-                    else:
-                        # ⭐ SILENT. The corpus passed the topic guard, so this is
-                        # our own summariser choosing a vendor-level name — a
-                        # naming quirk, not drift. Nothing for a human to do, so
-                        # nothing is shown. Logged, because "the title we picked
-                        # was thrown away" should still be greppable.
-                        log(f"[title-refresh] keeping the topic-derived name: the "
-                            f"generated title ({len(text)} chars) shares none of the "
-                            f"topic's distinctive terms "
-                            f"({_anchor_words}), but the corpus does "
-                            f"— no alert raised.", "WARN")
-                    text = ""
-            if text:
-                _update_research_doc(_uid, _rid, {"title": text, "updatedAt": int(time.time() * 1000)})
-        except Exception as e:
-            try:
-                log(f"[title-refresh] worker failed: {e}", "WARN")
-            except Exception:
-                pass
-
-    try:
-        # ⛔ UNDER A COPY OF THE RUN'S CONTEXT (wave 10.10). A raw thread starts
-        # with an empty one, so its lines had no run origin and went into
-        # whatever folder was armed when they were written — the next run's,
-        # after a long model call. The copy carries `_LOG_RUN`, so a late line
-        # stays out of another run's folder (`_line_is_another_runs`).
-        _threading.Thread(target=_log_contextvars.copy_context().run, args=(_worker,),
-                          name="research-title-refresh", daemon=True).start()
-    except Exception as e:
-        try:
-            log(f"[title-refresh] dispatch failed: {e}", "WARN")
-        except Exception:
-            pass
-
-
-def _try_llm_title(topic, brief, findings=""):
-    """Haiku 4.5 first, Gemini Flash fallback. Returns empty string on
-    any failure — caller falls through to skipping the title update."""
-    system = (
-        "Output ONLY a Title-Case research title, 3-7 words, no quotes "
-        "or prefixes, no trailing punctuation. Preserve named entities "
-        "(people, products, places, numbers) verbatim. Strip filler "
-        '("the", "a", "about", "what is", "how does"). When research '
-        "findings are provided, base the title on what was actually "
-        "found, not on the original question. Ignore any "
-        '"already sorted" / "out of scope" sections from the brief.'
-    )
-    if findings:
-        user_msg = (
-            f"Original topic: {topic}\n\n"
-            f"Brief excerpt:\n{brief or '(brief not supplied)'}\n\n"
-            f"Consolidated findings (first 5000 chars):\n{findings}\n\n"
-            f"Output: a Title-Case title (3-7 words) that reflects what the research found."
-        )
-    elif brief:
-        user_msg = f"Topic: {topic}\n\nBrief (first 600 chars):\n{brief}\n\nOutput: a Title-Case title (3-7 words)."
-    else:
-        user_msg = f"Topic: {topic}\n\nOutput: a Title-Case title (3-7 words)."
-    # Haiku 4.5
-    try:
-        import anthropic as _anth
-        _key = resolve_api_key()
-        if _key:
-            _cli = _anth.Anthropic(api_key=_key, timeout=8.0)
-            resp = _cli.messages.create(
-                model=TITLE_HAIKU,
-                max_tokens=40,
-                system=system,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            txt = "".join(
-                getattr(b, "text", "") for b in resp.content
-                if getattr(b, "type", "") == "text"
-            ).strip()
-            if txt:
-                return txt
-    except Exception as e:
-        try:
-            log(f"[title-refresh] Haiku failed ({type(e).__name__}: {str(e)[:120]}) — trying Gemini Flash", "WARN")
-        except Exception:
-            pass
-    # Gemini Flash fallback
-    try:
-        gemini_key = resolve_gemini_api_key()
-        if not gemini_key:
-            return ""
-        import requests as _requests
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_TEXT}:generateContent?key={gemini_key}"
-        )
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-            "systemInstruction": {"parts": [{"text": system}]},
-            # 2026-08-13: 120 → 600. Thinking is ON here by default —
-            # `_gemini_gen_config` sends `thinkingConfig` only when the env
-            # override is exported, and OMITTING it is what the live endpoint
-            # accepts (see that builder). A ceiling sized for a non-thinking
-            # request gets spent on reasoning and returns HTTP 200 with
-            # `finishReason=MAX_TOKENS` and a candidate carrying no parts: the
-            # status check below passes, the .get() chain walks to "" without
-            # raising, and the title is silently never refreshed. The narrator
-            # took the same removal and went 200 → 800; this leg was raised only
-            # to 120. A title is 3-7 words, so the extra headroom is for the
-            # reasoning, not the answer.
-            "generationConfig": _gemini_gen_config(temperature=0.3, max_tokens=600),
-        }
-        resp = _requests.post(url, json=payload, timeout=8.0)
-        # ⭐ 2026-08-05 — CHECK THE STATUS BEFORE PARSING. On a 400 the body is
-        # `{"error": {...}}`, so `.get("candidates", [{}])` returns the default and
-        # the whole chain walks to "" without raising — which means the `except`
-        # below never runs and a hard refusal is reported as "the model had
-        # nothing to say". The corpus confirms the silence: zero
-        # "[title-refresh] Gemini Flash failed" lines anywhere, across every run,
-        # while the same payload shape was being rejected on every call.
-        if getattr(resp, "status_code", 200) != 200:
-            log(f"[title-refresh] Gemini {GEMINI_TEXT} refused — "
-                f"HTTP {resp.status_code} {_gemini_error_detail(resp, payload.get('generationConfig'))}", "WARN")
-            return ""
-        j = resp.json()
-        text = (
-            j.get("candidates", [{}])[0]
-             .get("content", {})
-             .get("parts", [{}])[0]
-             .get("text", "")
-        )
-        # ⭐ SAY WHY A 200 CAME BACK EMPTY. This is the other half of the status
-        # check above: a refusal is now visible, but an ACCEPTED call that spent
-        # its whole budget thinking was not — same silent "" out of this
-        # function, and no line anywhere naming the cause. `_gemini_empty_reason`
-        # reads the finishReason/blockReason the response already carries, which
-        # separates "budget spent on reasoning" (a config value) from "the
-        # prompt was blocked" (ours to change).
-        if not (text or "").strip():
-            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "
-                f"{_gemini_empty_reason(j)}", "WARN")
-        return (text or "").strip()
-    except Exception as e:
-        try:
-            log(f"[title-refresh] Gemini Flash failed ({type(e).__name__}: {str(e)[:120]})", "WARN")
-        except Exception:
-            pass
-        return ""
-
-
-def _shape_title(text):
-    """Hard-cap: 3-7 words, ≤70 chars. Strips wrapping quotes / trailing
-    punctuation / "Title:" prefix that the LLM sometimes emits."""
-    s = (text or "").strip()
-    if not s:
-        return ""
-    if s and s[0] in ('"', "'", "`") and s[-1] in ('"', "'", "`"):
-        s = s[1:-1].strip()
-    for prefix in ("Title:", "Title -", "title:", "**Title**:", "**Title:**"):
-        if s.startswith(prefix):
-            s = s[len(prefix):].strip()
-            break
-    # Strip trailing punctuation (the LLM sometimes adds a period)
-    while s and s[-1] in ".!?,;:":
-        s = s[:-1].rstrip()
-    words = s.split()
-    if len(words) < 3:
-        return ""  # Too short to be a real title — let the FE keep what it has
-    if len(words) > 7:
-        s = " ".join(words[:7])
-    if len(s) > 70:
-        s = s[:70].rstrip()
-    return s
+#
+# ⛔⛔ WAVE 19 — THE AFTER-PHASE-2 RENAME IS GONE (`_refresh_research_title_async`,
+# `_try_llm_title`, `_shape_title`, `title_refusal_verdict`). It named the
+# research a SECOND time, from the findings, and wrote over the name the chat
+# already showed — so the chat's name changed halfway through the run and the
+# notebook got the second one. The owner (10-02): ONE short name, made once from
+# the topic and reused everywhere. It is made by the web's namer when the person
+# presses send, and by the computer only when nothing has made it yet
+# (`_research_name`). Its off-topic card went with it: the per-report wrong-
+# topic check still keeps an off-topic report out of the research.
 
 
 def _generate_research_summary_async(topic, brief_text="", findings_text=""):
@@ -2075,10 +1728,12 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
     _findings = (findings_text or "").strip()[:5000]
     if not _topic and not _brief and not _findings:
         return
-    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH, and no summary at all for a
-    # run that keeps nothing — see `_refresh_research_title_async`. A summary is
-    # "what the research found": written at write time, it landed on the next
-    # member's /researches tile.
+    # ⛔⛔ WHOSE RESEARCH THIS IS, read at DISPATCH (wave 10.9, last repair), and
+    # no summary at all for a run that keeps nothing. The worker is a raw thread
+    # with a model call in front of its write, and the run can end while that
+    # call is out: teardown clears the pipeline globals and the next member's
+    # run sets them. A summary is "what the research found": written at write
+    # time, it landed on the next member's /researches tile.
     _uid, _rid = _fb_uid, _fb_research_id
     if _is_incognito_research(_rid):
         return
@@ -2172,7 +1827,11 @@ def _try_llm_summary(topic, brief, findings=""):
             "generationConfig": _gemini_gen_config(temperature=0.2, max_tokens=900),
         }
         resp = _requests.post(url, json=payload, timeout=8.0)
-        # Same silent-swallow as the title path above — see the note there.
+        # ⭐ 2026-08-05 — CHECK THE STATUS BEFORE PARSING. On a 400 the body is
+        # `{"error": {...}}`, so `.get("candidates", [{}])` returns the default
+        # and the chain walks to "" without raising — a hard refusal reported
+        # as "the model had nothing to say". (The title leg this was first
+        # written for was retired in wave 19.)
         if getattr(resp, "status_code", 200) != 200:
             log(f"[summary] Gemini {GEMINI_TEXT} refused — "
                 f"HTTP {resp.status_code} {_gemini_error_detail(resp, payload.get('generationConfig'))}", "WARN")
@@ -2184,7 +1843,9 @@ def _try_llm_summary(topic, brief, findings=""):
              .get("parts", [{}])[0]
              .get("text", "")
         )
-        # Same empty-200 blind spot as the title path — see the note there. 900
+        # ⭐ SAY WHY A 200 CAME BACK EMPTY: an ACCEPTED call that spent its whole
+        # budget thinking returns the same "" as a blocked prompt, and
+        # `_gemini_empty_reason` reads which one it was. 900
         # tokens is enough headroom that MAX_TOKENS is unlikely here, which is
         # exactly why the log matters: if it ever does fire, the reason is the
         # only thing that distinguishes it from a blocked prompt.
@@ -4764,7 +4425,7 @@ def _run_log_folder_to_continue(research_id, submitter_uid, root=None):
     live = {str(s.dir) for s in _RUN_LOG_SINKS}
     best = None
     for folder in _run_folders_for_research_any(rid, root):
-        if str(folder) in live or _folder_is_live(folder):
+        if _folder_is_live(folder) or str(folder) in live:
             return None
         try:
             meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
@@ -16375,7 +16036,10 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
         f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o/"
         f"{_quote(object_path, safe='')}?alt=media&token={token}"
     )
-    log(f"Audio uploaded via Storage REST: gs://{bucket}/{object_path}")
+    # ⛔ WAVE 19: never the object's path — its last part is the research's
+    # name now, and this line rides the owner's support bundle.
+    log(f"Audio uploaded via Storage REST ({len(local_path.stem)}-char name, "
+        f"{local_path.suffix.lower() or 'no type'})")
     return public_url
 
 
@@ -16643,14 +16307,13 @@ async def _p3_publish_audio(audio_path, research_id) -> str:
         # biggest single blocker — easily blew past the 30s offline window.
         audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
         # Use the filename stem as doc id so re-runs upsert in place
-        # instead of stacking duplicates. Display name = research
-        # title from Firestore (set by FE's /api/title early in P1)
-        # so the Podcasts page shows one human-readable title instead
-        # of the auto-generated underscore .m4a filename. If the
-        # Firestore title isn't set (rare P3-before-P1-write race),
-        # smart_title falls back to a stem-derived topic with
-        # underscores swapped for spaces — still readable.
-        display_name = smart_title(audio_path.stem.replace("_", " "))
+        # instead of stacking duplicates. ⭐ WAVE 19: the display name is the
+        # research's one short name (`_research_name`), the one the chat and
+        # the notebook carry; the stem, underscores as spaces, only when no
+        # name can be had at all.
+        display_name = (await asyncio.to_thread(
+            _research_name, _p3_run_topic(audio_path.parent.parent), _fb_uid,
+            research_id) or audio_path.stem.replace("_", " "))
         # B2: sync Firestore .set() — small payload but on slow links
         # still worth offloading.
         await asyncio.to_thread(save_audio_to_firestore,
@@ -16688,6 +16351,44 @@ async def _p3_publish_audio(audio_path, research_id) -> str:
 #: The podcast files a run's `podcasts/` folder can hold — the suffixes the
 #: download fallback in `run_phase3_audio` keeps a file under.
 _P3_PODCAST_SUFFIXES = (".m4a", ".m4b", ".mp3", ".wav", ".webm", ".ogg")
+
+#: The podcast file's name, at most: the research's name made file-safe.
+_P3_PODCAST_NAME_MAX = 40
+
+
+def _p3_run_topic(queue_dir) -> str:
+    """The run's topic, from its checkpoint — "" when there is none. What the
+    research's name is made from when nothing has named it yet."""
+    try:
+        return str((load_checkpoint(queue_dir) or {}).get("topic") or "")
+    except Exception:
+        return ""
+
+
+def _p3_name_podcast_file(audio_path, name) -> "Path":
+    """WAVE 19: the podcast file carries the research's one short name — not
+    NotebookLM's audio title, Chrome's suggested name, or the random id the
+    fallback scan gave it (10-02: 'OpenAI_Decisions_API_versus_TypeSafe_Jev').
+    The Storage object, the `audios` row and the share link all follow the
+    file's name. Returns the renamed path, or the old one when the rename could
+    not be made. Fresh Phase 3 only: a resumed run's podcast keeps its name, so
+    it never gets a second Podcasts row."""
+    path = Path(audio_path)
+    if not str(name or "").strip():
+        return path  # no name to give it: it keeps the one it came with
+    stem = safe_name(str(name), max_len=_P3_PODCAST_NAME_MAX).strip("_") or "podcast"
+    target = path.with_name(f"{stem}{path.suffix.lower()}")
+    if target == path:
+        return path
+    try:
+        os.replace(path, target)
+    except OSError as e:
+        log(f"[Phase3] the podcast could not take the research's name "
+            f"({type(e).__name__}) — it keeps the one it came with", "WARN")
+        return path
+    log(f"[Phase3] the podcast file now carries the research's name "
+        f"({len(stem)} chars, {path.suffix.lower() or 'no type'})")
+    return target
 
 
 def _p3_podcast_on_disk(queue_dir, cp) -> "Path | None":
@@ -16745,8 +16446,8 @@ async def _p3_publish_on_resume(queue_dir, cp, research_id) -> "tuple[Path | Non
     audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)
     stored = await _p3_publish_audio(audio_path, research_id)
     if not stored:
-        log(f"Phase 3: the podcast on disk ({audio_path.name}) did not reach the app "
-            f"on this resume — going on without it", "WARN")
+        log(f"Phase 3: the podcast on disk ({audio_path.suffix.lower() or 'no type'}) "
+            f"did not reach the app on this resume — going on without it", "WARN")
         return audio_path, ""
     nb = str((cp or {}).get("notebook_url") or "")
     links = ([{"label": "NotebookLM Notebook", "url": nb, "verified": True}]
@@ -16754,7 +16455,8 @@ async def _p3_publish_on_resume(queue_dir, cp, research_id) -> "tuple[Path | Non
     emit_event("phase_complete", phase=3, durationSec=0, links=links,
                summary="NotebookLM notebook created, audio generated"
                        + (", notebook link recorded" if links else ""))
-    log(f"Phase 3: the podcast on disk ({audio_path.name}) is in the app again")
+    log(f"Phase 3: the podcast on disk ({audio_path.suffix.lower() or 'no type'}) "
+        f"is in the app again")
     return audio_path, stored
 
 
@@ -22306,30 +22008,174 @@ def _write_phase_terminal_status(phase_num: int, status: str):
         log(f"Failed to dispatch phase-status thread (phase={phase_num}, status={status}): {e}", "WARN")
 
 
-def _read_firestore_research_title(fallback=""):
-    """Read the current `title` field from the research doc in Firestore.
-    Frontend's /api/title fills this with a smart 4–8 word title right after
-    pipeline start. Returns the fallback (typically topic[:60]) if empty."""
-    if not _firebase_db or not _fb_uid or not _fb_research_id:
-        return fallback
+# ── Wave 19: the research's ONE short name ─────────────────────────────────
+# The owner (10-02): the chat's title, the NotebookLM notebook, the podcast
+# (file and title) and the YouTube video carry ONE short name — "a few words
+# meaningfully making the research's name, not too many" — made once from the
+# topic and reused everywhere.
+#
+# ⭐ IT IS MADE BY THE WEB'S NAMER (`/api/title`) WHEN THE PERSON PRESSES SEND:
+# it runs first, the chat shows it in a second, and the computer and the cloud
+# both read the same `title` field. The computer makes it only when nothing has
+# — a run the chat assistant started (its record's title is its whole topic),
+# or a web run whose tab closed before its name landed — and then by asking the
+# SAME namer, with the five-word fallback the web uses when it cannot answer.
+# Nothing else ever makes or rewrites a name.
+
+#: What the web's chat calls a research before its real name lands. Not a name.
+_RESEARCH_NAME_PLACEHOLDERS = frozenset({"new research", "new chat"})
+#: The one short name's size — owner question 1 (10-02), the recommendation
+#: taken: two to five words, about forty characters, never cut mid-word.
+_RESEARCH_NAME_MAX_WORDS = 5
+_RESEARCH_NAME_MAX_CHARS = 40
+#: How long the computer waits for the web's namer before using the fallback.
+_RESEARCH_NAME_TIMEOUT_S = 10
+#: Names THIS process made, by (uid, researchId): a name is made once, so the
+#: notebook, the podcast file and its row agree even if the write-back failed.
+_RESEARCH_NAMES_MADE: "dict[tuple[str, str], str]" = {}
+
+
+def _shape_research_name(text) -> str:
+    """At most five words and about forty characters, cut between words, on one
+    line, without wrapping quotes or trailing punctuation."""
+    s = " ".join(str(text or "").split())
+    s = s.strip().strip("\"'`").strip()
+    while s and s[-1] in ".,;:!?":
+        s = s[:-1].rstrip()
+    words = s.split()[:_RESEARCH_NAME_MAX_WORDS]
+    out = ""
+    for word in words:
+        longer = f"{out} {word}".strip()
+        if len(longer) > _RESEARCH_NAME_MAX_CHARS:
+            break
+        out = longer
+    if not out and words:
+        out = words[0][:_RESEARCH_NAME_MAX_CHARS]
+    return out
+
+
+def _research_name_from_topic(topic) -> str:
+    """The fallback name: the topic's first line, its first five words — the
+    shape of the web's own fallback (`truncateForDisplay`, clean-title.ts)."""
+    for line in str(topic or "").splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return _shape_research_name(line)
+    return ""
+
+
+def _is_the_topic(title, topic) -> bool:
+    """Is this title the topic itself? Compared with every run of whitespace as
+    one space: the record keeps the topic as it was typed, and `run_pipeline`
+    collapses the topic's line breaks before anything here sees it."""
+    t = " ".join(str(title or "").split())
+    return bool(t) and t == " ".join(str(topic or "").split())
+
+
+def _research_name_missing(title, topic) -> bool:
+    """Is this record's title not yet a name? Empty, the chat's placeholder, or
+    the topic itself — the chat assistant creates its research with
+    `title: topic` (agent/facade/bridge.py)."""
+    t = str(title or "").strip()
+    return (not t or t.lower() in _RESEARCH_NAME_PLACEHOLDERS
+            or _is_the_topic(t, topic))
+
+
+def _read_research_record(uid, research_id) -> "tuple[bool, dict]":
+    """(read and found, the record). (False, {}) when it could not be read or
+    is not there — so a caller never writes on a guess."""
+    if not (_firebase_db and uid and research_id):
+        return False, {}
     try:
-        snap = _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id).get()
-        if snap.exists:
-            data = snap.to_dict() or {}
-            title = (data.get("title") or "").strip()
-            if title:
-                return title
+        snap = (_firebase_db.collection("users").document(uid)
+                .collection("researches").document(research_id).get())
+        if not snap.exists:
+            return False, {}
+        return True, (snap.to_dict() or {})
     except Exception as e:
-        log(f"Firestore title read failed: {e}", "WARN")
-    return fallback
+        log(f"[name] the research's record could not be read ({type(e).__name__})",
+            "WARN")
+        return False, {}
 
 
-def smart_title(topic: str) -> str:
-    """Return the best short title for this run. Prefers the frontend-generated
-    smart title in Firestore; falls back to topic[:60] cleaned up."""
-    clean_fallback = (topic or "").strip().split("\n", 1)[0][:60].strip()
-    return _read_firestore_research_title(fallback=clean_fallback) or clean_fallback
+def _ask_web_namer(topic) -> str:
+    """The web's namer (`/api/title`), asked with this computer's own sign-in —
+    the same pattern as the cloud hand-off (`_post_fe_p4p5_trigger`). "" when it
+    cannot answer; never logs the topic or the name."""
+    try:
+        token = _fresh_user_mode_id_token()
+        if not token:
+            return ""
+        import requests as _requests
+        from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+        resp = _requests.post(f"{_FE_BASE_URL}/api/title",
+                              headers={"Authorization": f"Bearer {token}"},
+                              json={"topic": str(topic)[:1200]},
+                              timeout=_RESEARCH_NAME_TIMEOUT_S)
+        if getattr(resp, "status_code", 0) != 200:
+            log(f"[name] the web's namer answered {getattr(resp, 'status_code', '?')} "
+                f"— using the topic's first words", "INFO")
+            return ""
+        return _shape_research_name((resp.json() or {}).get("title") or "")
+    except Exception as e:
+        log(f"[name] the web's namer did not answer ({type(e).__name__}) — using "
+            f"the topic's first words", "INFO")
+        return ""
+
+
+def _research_name(topic, uid=None, research_id=None) -> str:
+    """The research's ONE short name — the record's `title` when it already is
+    one, otherwise made here ONCE and written back (wave 19).
+
+    `uid`/`research_id` default to the running pipeline's; an async caller
+    passes them, read at dispatch, because this runs on a thread.
+
+    ⛔ THE PERSON'S OWN RENAME WINS (`titleLocked`): it is used as it is and
+    never written over. ⛔ A RUN THAT KEEPS NOTHING never asks the web and is
+    never written back — its record is purged when it ends. ⛔ The log line
+    carries the name's LENGTH only: backend.log is the machine owner's, and its
+    tail rides their support bundle (`_log_job_ref`)."""
+    uid = str((_fb_uid if uid is None else uid) or "").strip()
+    rid = str((_fb_research_id if research_id is None else research_id) or "").strip()
+    found, record = _read_research_record(uid, rid)
+    title = str(record.get("title") or "").strip()
+    if title and (bool(record.get("titleLocked"))
+                  or not _research_name_missing(title, topic)):
+        return title
+    made = _RESEARCH_NAMES_MADE.get((uid, rid)) if rid else None
+    if made:
+        return made
+    if not str(topic or "").strip():
+        return ""
+    private = _is_incognito_research(rid)
+    # ⛔ ONLY A COMPUTER CONNECTED TO THE APP ASKS THE APP: with no Firestore
+    # (the terminal's local runs) there is no sign-in to ask with, and the
+    # topic's first words name it.
+    asks = bool(_firebase_db) and not private
+    name = (_ask_web_namer(topic) if asks else "") or _research_name_from_topic(topic)
+    if not name:
+        return ""
+    if rid:
+        _RESEARCH_NAMES_MADE[(uid, rid)] = name
+    if found and not private and not bool(record.get("titleLocked")):
+        _update_research_doc(uid, rid, {"title": name,
+                                        "updatedAt": int(time.time() * 1000)})
+    log(f"[name] made this research's name here ({len(name)} chars)", "INFO")
+    return name
+
+
+def _name_an_agent_started_run(uid, research_id, topic) -> str:
+    """At pick-up: name a research whose record's title IS its topic — a run
+    the chat assistant started, which has no web page to name it — so it has
+    its short name before its first share link is minted. A web run still
+    showing "New Research" is left alone: the web is naming it, and nothing
+    races. Returns the name made, or ""."""
+    found, record = _read_research_record(uid, research_id)
+    title = str(record.get("title") or "").strip()
+    if (not found or bool(record.get("titleLocked"))
+            or not _is_the_topic(title, topic)):
+        return ""
+    return _research_name(topic, uid, research_id)
 
 
 def _write_config_to_disk(cfg_updates):
@@ -33219,7 +33065,8 @@ def topic_presence(text: str, topic: str):
     ⭐⭐ 2026-09-02 — ONE RULE, NOT ONE PER ARTEFACT. "Does this text mention a
     distinctive word of the topic?" was written out twice with two different
     length policies: once inside `text_is_off_topic` behind a 20,000-character
-    floor, and once by hand inside `title_refusal_verdict` with no floor at all,
+    floor, and once by hand inside `title_refusal_verdict` (retired in wave 19)
+    with no floor at all,
     because a title is thirty characters and could never clear that floor. The
     second copy carries a comment explaining why it had to be written again. That
     is the shape this file elsewhere refuses — a predicate reused, never
@@ -33310,7 +33157,8 @@ def brief_topic_verdict(brief: str, topic: str) -> str:
     and no user-written brief ever reaches.
 
     Pure, so both polarities are testable without a browser, a thread or a run
-    directory — the same reason `title_refusal_verdict` is pure.
+    directory — the same reason `title_refusal_verdict` (retired in wave 19)
+    was pure.
     """
     _b = (brief or "").strip()
     if len(_b) < _BRIEF_TOPIC_MIN_CHARS:
@@ -33400,7 +33248,8 @@ def report_second_opinion(text: str, topic: str, witness: str) -> str:
     document has fewer chances to name its subject, so a zero means less. Two
     witnesses raise the confidence enough to TELL somebody; they do not raise it
     enough to fail a leg the user waited an hour for. `title_refusal_verdict`
-    settled the same argument the same way on 2026-08-06, after a correct title
+    (retired in wave 19, with the after-Phase-2 rename it judged) settled the
+    same argument the same way on 2026-08-06, after a correct title
     was refused loudly on a corpus that had already voted the other way.
 
     Pure, so every one of the four verdicts is reachable in a test without a
@@ -33616,8 +33465,8 @@ def _second_opinion_on_agent(text: str, topic: str, agent_key: str,
         except Exception:
             pass
     elif verdict == "extraction_suspect":
-        # ⭐ SILENT, and for the same reason `title_refusal_verdict` has a silent
-        # arm. The two witnesses DISAGREE: the panel was on topic, so the leg did
+        # ⭐ SILENT, and for the same reason `title_refusal_verdict` (retired in
+        # wave 19) had a silent arm. The two witnesses DISAGREE: the panel was on topic, so the leg did
         # the right work and only the document we pulled back is doubtful. There
         # is nothing here for a person to do, an anchor test on a short report is
         # exactly where a false zero lives, and the run already has length-sanity
@@ -73598,9 +73447,11 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     f"notebook is missing {len(_still_missing)} source(s) after "
                     f"upload + repair: {sorted(_still_missing)}")
 
-            # Rename notebook — use the smart title (Firestore-synced) so NotebookLM,
-            # YouTube, and the email subject all line up on the same short name.
-            title = smart_title(topic)
+            # Rename notebook — WAVE 19: the research's one short name, the same
+            # one the chat, the podcast and YouTube carry (`_research_name`).
+            # Read at dispatch, on a thread: making it may ask the web.
+            title = (await asyncio.to_thread(_research_name, topic, _fb_uid,
+                                             _fb_research_id)) or "Research"
             # ⛔ THE LENGTH, NOT THE TITLE — see `_log_job_ref`. The smart title
             # IS the topic, and this line goes to the machine-wide backend.log.
             # The length is what this line was ever read for: the FIFA run's
@@ -74157,8 +74008,9 @@ async def _nlm_fetch_audio(browser, url: str, dest_dir: Path, label="Audio"):
         except Exception:
             pass
         return None
-    log(f"Audio fetched straight from its address, no Chrome download: {dest.name} "
-        f"({len(body)} bytes)")
+    # ⛔ Wave 19: its type and size, never its name (the research's name).
+    log(f"Audio fetched straight from its address, no Chrome download: "
+        f"{dest.suffix.lower() or 'no type'} ({len(body)} bytes)")
     return dest
 
 
@@ -74943,7 +74795,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 await download.save_as(str(dest))
                 if not download_future.done():
                     download_future.set_result(dest)
-                log(f"Audio downloaded via Playwright: {dest.name}")
+                log(f"Audio downloaded via Playwright: "
+                    f"{dest.suffix.lower() or 'no type'}")
             except Exception as e:
                 log(f"Download save failed: {e}", "WARN")
                 if not download_future.done():
@@ -75164,8 +75017,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # Fallback: scan by CONTENT, not by extension — see `_find_recent_audio`.
             _found, _ext, _may_move = _find_recent_audio(_audio_search_plan(browser))
             if _found is not None and not _is_settled(_found):
-                log(f"Audio candidate {_found.name} is still being written — "
-                    f"leaving it alone", "WARN")
+                log(f"Audio candidate ({_found.suffix.lower() or 'no type'}) is "
+                    f"still being written — leaving it alone", "WARN")
                 _found = None
             if _found is not None:
                 _suffix_ok = _found.suffix.lower() in (
@@ -75187,8 +75040,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                         f"{'moved' if _may_move else 'copied'}) — the download "
                         f"event never reached us")
                 except Exception as _mv:
-                    log(f"Audio found at {_found} but could not be taken: {_mv}",
-                        "WARN")
+                    log(f"Audio found ({_found.suffix.lower() or 'no type'}) but "
+                        f"could not be taken ({type(_mv).__name__})", "WARN")
 
         try:
             browser.page.remove_listener("download", _on_download)
@@ -75234,7 +75087,13 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # extension-driven (Storage content-type, /audio server, bridge), so no
     # other change is needed; old runs stay .m4a and still resolve correctly.
     if audio_path and audio_path.exists():
-        audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path)
+        # ⭐ WAVE 19: first the file takes the research's one short name, and
+        # the mp3 carries it as its title too, so players show it.
+        _podcast_name = await asyncio.to_thread(
+            _research_name, _p3_run_topic(queue_dir), _fb_uid, _fb_research_id)
+        audio_path = _p3_name_podcast_file(audio_path, _podcast_name)
+        audio_path = await asyncio.to_thread(_transcode_audio_to_mp3, audio_path,
+                                             title=_podcast_name)
 
     # Strict-keep cleanup (moved 2026-05-02). Was inside the poll loop at
     # the audio-complete detection point — but cleanup-before-download is
@@ -80141,22 +80000,9 @@ async def _p2_persist_reports(results, queue_dir, topic, brief_text) -> None:
             )
         except Exception as _sum_e:
             log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
-        # 2026-05-11: also refresh research.title now that we have
-        # actual findings (not just the user's raw brief). The FE
-        # /api/title call at pipeline start gave us a 4-8 word
-        # startup title based ONLY on the user's input — often a
-        # paragraph with "Goal:" / "Already sorted" sections that
-        # produces a less-focused title. Post-P2 the agents have
-        # produced concrete findings; the refresh reflects what
-        # was actually researched.
-        try:
-            _refresh_research_title_async(
-                topic,
-                brief_text,
-                _consolidated_md,
-            )
-        except Exception as _tit_e:
-            log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")
+        # ⛔ WAVE 19: the research is NOT renamed here from its findings. Its
+        # one short name was made from the topic (`_research_name`), and the
+        # chat, the notebook and the podcast all keep it.
 
 
 # ── Browser-crash recovery (#725) ───────────────────────────────────────────
@@ -80652,6 +80498,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     if uid:
         # Use frontend research_id for Firestore paths (not run_id which is the backend dir name)
         setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop(), run_id=run_id)
+        # ⭐ WAVE 19: a run the chat assistant started is named here, once —
+        # its record's title is its whole topic, and no web page will name it.
+        # On a thread: the namer is a network call, and this loop also beats
+        # the computer's heartbeat.
+        try:
+            await asyncio.to_thread(_name_an_agent_started_run, uid,
+                                    research_id or run_id, topic)
+        except Exception as _nm_e:
+            log(f"[name] naming at pick-up failed ({type(_nm_e).__name__}) — the "
+                f"notebook names it later", "WARN")
         # ⭐ Wave 15: a crash's own retry takes down the cards the crashed
         # attempt raised — a crash that recovers leaves no alert behind.
         if _crash_retries > 0:
@@ -85012,7 +84868,7 @@ async def run_pipeline_captured(*args, **kwargs):
         # delivery record is the one thing the outer purge reads to know the
         # run is over. The folder would outlive the run. The outer attempt's
         # `finally` always runs after this one, and purges both.
-        if not _capture.joined:
+        if not getattr(_capture, "joined", False):
             # ⛔⛔ AND NOW THE FOLDERS GO, for a run that keeps nothing (wave
             # 10.9, #536). Here rather than at the end of the pipeline body for
             # three reasons: this runs on EVERY exit, including the eight early

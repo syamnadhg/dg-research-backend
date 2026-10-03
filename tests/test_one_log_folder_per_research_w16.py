@@ -193,6 +193,20 @@ def test_the_one_shot_retry_says_it_tried_again(pipeline, monkeypatch):
     assert [a["status"] for a in _meta(folders[0])["attempts"]] == ["failed", "complete"]
 
 
+def test_a_different_research_nested_inside_keeps_a_folder_of_its_own():
+    """Only the SAME research joins. Anything else nested inside a run (never
+    seen, but possible) still gets its own folder, names its parent, and the
+    outer run is armed again the moment it ends."""
+    with research._RunLogCapture(research_id=RID) as outer:
+        with research._RunLogCapture(research_id="chat_1790000000016_9") as inner:
+            assert research._active_run_sink() is inner
+        assert research._active_run_sink() is outer, "the outer run was disarmed"
+    assert inner is not outer and inner.dir != outer.dir
+    assert _meta(inner.dir)["parentResearchId"] == RID
+    assert _meta(inner.dir)["status"] == "complete"
+    assert len(_meta(outer.dir)["attempts"]) == 1
+
+
 # ══ 2. a later pick-up continues the research's folder ═══════════════════════
 
 def test_a_resume_continues_the_finished_folder_with_everything_carried(monkeypatch):

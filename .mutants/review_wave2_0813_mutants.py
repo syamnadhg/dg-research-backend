@@ -86,38 +86,33 @@ MUTANTS = [
        '    stem = base[:-4] if base.lower().endswith(".exe") else base')]),
 
     # ═══════════ 5 — a Gemini 200 with no text says why ═════════════════════
+    # ⭐ RE-ANCHORED 10-02 (wave 19): the TITLE leg is retired with the
+    # after-Phase-2 rename; the same Gemini leg lives on in the SUMMARY, and
+    # T1/T3/T4/T5/T7 now measure it there. (T2 was the title leg's twin of T6.)
     ("T1", "research.py", "under",
-     "⭐ the title ceiling goes back to 120 — thinking spends it and the title "
-     "is never refreshed",
-     [('            "generationConfig": _gemini_gen_config(temperature=0.3, max_tokens=600),',
-       '            "generationConfig": _gemini_gen_config(temperature=0.3, max_tokens=120),')]),
-    ("T2", "research.py", "under",
-     "the empty-200 log is gone from the title leg — the silent swallow",
-     [('        if not (text or "").strip():\n'
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "\n'
-       '                f"{_gemini_empty_reason(j)}", "WARN")\n', "")]),
+     "⭐ the summary ceiling drops to 120 — thinking spends it and the summary "
+     "comes back empty",
+     [('            "generationConfig": _gemini_gen_config(temperature=0.2, max_tokens=900),',
+       '            "generationConfig": _gemini_gen_config(temperature=0.2, max_tokens=120),')]),
     ("T3", "research.py", "under",
      "the log fires but drops the reason, so a spent budget and a blocked "
      "prompt read identically",
-     # RE-ANCHORED 08-23: the summary path grew the same log line, so the
-     # one-liner matched twice. Pinned to the TITLE-REFRESH call by its own
-     # preceding line.
-     [('            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "\n'
+     [('            log(f"[summary] Gemini {GEMINI_TEXT} returned no text — "\n'
        '                f"{_gemini_empty_reason(j)}", "WARN")',
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "\n'
+       '            log(f"[summary] Gemini {GEMINI_TEXT} returned no text — "\n'
        '                f"(no text)", "WARN")')]),
     ("T4", "research.py", "over",
      "⛔ the empty-200 log fires on EVERY call, including every success — the "
      "line becomes noise and stops being read",
      [('        if not (text or "").strip():\n'
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "',
+       '            log(f"[summary] Gemini {GEMINI_TEXT} returned no text — "',
        '        if True:\n'
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "')]),
+       '            log(f"[summary] Gemini {GEMINI_TEXT} returned no text — "')]),
     ("T5", "research.py", "over",
-     "⛔ an empty 200 now RAISES instead of returning '' — the caller loses its "
-     "non-LLM fallback and the run has no title at all",
+     "⛔ an empty 200 now RAISES instead of returning '' — the reason is lost "
+     "in a generic failure line",
      [('        if not (text or "").strip():\n'
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} returned no text — "\n'
+       '            log(f"[summary] Gemini {GEMINI_TEXT} returned no text — "\n'
        '                f"{_gemini_empty_reason(j)}", "WARN")\n'
        '        return (text or "").strip()',
        '        if not (text or "").strip():\n'
@@ -132,9 +127,9 @@ MUTANTS = [
     ("T7", "research.py", "under",
      "the status check is dropped, so a 400 is parsed as an empty answer again",
      [('        if getattr(resp, "status_code", 200) != 200:\n'
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} refused — "',
+       '            log(f"[summary] Gemini {GEMINI_TEXT} refused — "',
        '        if False:\n'
-       '            log(f"[title-refresh] Gemini {GEMINI_TEXT} refused — "')]),
+       '            log(f"[summary] Gemini {GEMINI_TEXT} refused — "')]),
 
     # ═══════════ 6 — the cache cleaner owns one distribution ════════════════
     ("C1", "agent/facade/selfupdate.py", "under",

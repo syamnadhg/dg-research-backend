@@ -330,18 +330,12 @@ LOGIN_TITLE = "                    if not _is_incognito_research(_queue_dir_rese
 # ── anchors: the late writers name their run (last repair) ─────────────────
 # ⛔ THE COMMENT LINE IS PART OF EACH SKIP ANCHOR: the title and the summary
 # open with the same capture and the same test at the same indent.
-TITLE_SKIP = ("    # worker is a model call on its private topic and findings that outlives it.\n"
-              "    if _is_incognito_research(_rid):\n"
-              "        return")
-SUMMARY_SKIP = ("    # member's /researches tile.\n"
+# ⚠ 2026-10-02 re-anchored (wave 19): the comment above the summary's skip was
+# rewritten when the title refresh it pointed to was retired.
+SUMMARY_SKIP = ("    # time, it landed on the next member's /researches tile.\n"
                 "    _uid, _rid = _fb_uid, _fb_research_id\n"
                 "    if _is_incognito_research(_rid):\n"
                 "        return")
-TITLE_LOCK_READ = ("                    snap = _firebase_db.collection(\"users\").document(_uid) \\\n"
-                   "                        .collection(\"researches\").document(_rid).get()")
-TITLE_WRITE = ('                _update_research_doc(_uid, _rid, {"title": text, '
-               '"updatedAt": int(time.time() * 1000)})')
-TITLE_CARD = "                            if (_fb_uid, _fb_research_id) == (_uid, _rid):"
 SUMMARY_WRITE = '                _update_research_doc(_uid, _rid, {"summary": text})'
 # ⚠ 2026-09-23 re-anchored (wave 10.10): the dispatch also hands over the
 # runtime it copied and `scans_only`, on the lines after this one.
@@ -970,29 +964,12 @@ MUTANTS = [
     # ⛔ B14-B16 measured the anchor masking of a private run's title-refusal
     # line. A private run now dispatches no refresh, so that code was deleted
     # rather than left behind as a guard nothing can reach.
-    ("LW1", "under", "⛔⛔ a private run dispatches the title refresh again — a "
-     "model call on its topic and findings that outlives it, onto a record "
-     "that is purged",
-     [(TITLE_SKIP, "    # worker is a model call on its private topic and findings that outlives it.\n"
-                   "    if False:\n"
-                   "        return")]),
-    ("LW2", "under", "⛔⛔ the late title goes back through the globals — onto the "
-     "NEXT member's record, into their sidebar",
-     [(TITLE_WRITE, '                _update_firestore_research({"title": text, '
-                    '"updatedAt": int(time.time() * 1000)})')]),
-    ("LW3", "under", "the rename lock is read off the next member's record, so "
-     "one person's rename decides whether another's title is written",
-     [(TITLE_LOCK_READ, "                    snap = _firebase_db.collection(\"users\").document(_fb_uid) \\\n"
-                        "                        .collection(\"researches\").document(_fb_research_id).get()")]),
-    ("LW4", "under", "⛔⛔ the off-topic card is raised whoever is running now — "
-     "quoting one person's generated title in another person's chat",
-     [(TITLE_CARD, "                            if True:")]),
-    ("LW5", "over", "the off-topic card is never raised, even on the run that "
-     "is still going — the guard's whole reason to exist",
-     [(TITLE_CARD, "                            if False:")]),
+    # LW1–LW5 retired 10-02 (wave 19): the title refresh they measured is gone
+    # — the research is named once, from its topic (`_research_name`, whose
+    # own mutants are in wave19_names_w16_logs_1002_mutants.py).
     ("LW6", "under", "⛔⛔ a private run dispatches the summary again — 'what the "
      "research found', made from its findings, outliving it",
-     [(SUMMARY_SKIP, "    # member's /researches tile.\n"
+     [(SUMMARY_SKIP, "    # time, it landed on the next member's /researches tile.\n"
                      "    _uid, _rid = _fb_uid, _fb_research_id\n"
                      "    if False:\n"
                      "        return")]),

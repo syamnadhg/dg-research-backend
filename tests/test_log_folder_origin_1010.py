@@ -215,22 +215,20 @@ def test_a_thread_the_first_run_left_behind_writes_nothing_into_the_second_runs_
         assert SECRET in out, "an ordinary run's late line vanished from backend.log"
 
 
-# ══ 3. the run's own late threads — title refresh, summary, phase-3 save ═══
+# ══ 3. the run's own late threads — summary, phase-3 save ═════════════════
 #
-# ⛔⛔ THE KNOWN THREE (wave 10.10 repair). Each is a RAW thread the run starts
-# and does not wait for: a model call for the title and the summary, an ffprobe
-# per podcast for the phase-3 save. A raw thread starts with an empty context,
-# so its lines had NO origin and went into whatever folder was armed when they
-# were written — the next run's. Each is dispatched through its REAL function
-# from inside the first run; only the slow call it waits on is replaced, and
-# that replacement writes the line once the second run is running.
+# ⛔⛔ THE KNOWN THREE (wave 10.10 repair), TWO SINCE WAVE 19 retired the title
+# refresh. Each is a RAW thread the run starts and does not wait for: a model
+# call for the summary, an ffprobe per podcast for the phase-3 save. A raw
+# thread starts with an empty context, so its lines had NO origin and went into
+# whatever folder was armed when they were written — the next run's. Each is
+# dispatched through its REAL function from inside the first run; only the slow
+# call it waits on is replaced, and that replacement writes the line once the
+# second run is running.
 
 def _late_dispatch(monkeypatch, which, write_late):
     monkeypatch.setattr(research, "_firebase_db", None)
     monkeypatch.setattr(research, "_update_research_doc", lambda *a, **k: True)
-    if which == "title":
-        monkeypatch.setattr(research, "_try_llm_title", lambda *a, **k: write_late() or "")
-        return lambda: research._refresh_research_title_async(SECRET, "brief", "findings")
     if which == "summary":
         monkeypatch.setattr(research, "_try_llm_summary", lambda *a, **k: write_late() or "")
         return lambda: research._generate_research_summary_async(SECRET, "brief", "findings")
@@ -238,7 +236,7 @@ def _late_dispatch(monkeypatch, which, write_late):
     return lambda: research._save_meta_in_background("unused", SECRET, 3)
 
 
-@pytest.mark.parametrize("which", ["title", "summary", "phase3-save"])
+@pytest.mark.parametrize("which", ["summary", "phase3-save"])
 def test_a_late_thread_of_the_run_writes_nothing_into_the_next_runs_folder(
         tmp_path, monkeypatch, capsys, which):
     monkeypatch.setattr(research, "__file__", str(tmp_path / "research.py"))

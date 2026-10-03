@@ -171,9 +171,9 @@ def test_the_panel_narrator_opts_out_of_the_budget_rather_than_forgetting_it():
     )
 
 
+# Wave 19: `_try_llm_title` is retired with the after-Phase-2 rename.
 @pytest.mark.parametrize("fn", [
     research._call_text_narrator,
-    research._try_llm_title,
     research._try_llm_summary,
 ])
 def test_each_gemini_text_builder_routes_through_the_shared_config(fn):
@@ -332,7 +332,6 @@ def test_an_unparseable_body_never_returns_an_empty_string():
 # ── The two sites that swallowed a 400 in silence ─────────────────────────
 
 @pytest.mark.parametrize("fn,tag", [
-    (research._try_llm_title, "title-refresh"),
     (research._try_llm_summary, "summary"),
 ])
 def test_a_refusal_is_logged_before_the_body_is_parsed(fn, tag):
@@ -347,7 +346,7 @@ def test_a_refusal_is_logged_before_the_body_is_parsed(fn, tag):
     assert "refused" in src
 
 
-@pytest.mark.parametrize("fn", [research._try_llm_title, research._try_llm_summary])
+@pytest.mark.parametrize("fn", [research._try_llm_summary])
 def test_a_refusal_returns_empty_so_the_caller_still_falls_back(fn):
     """Behaviour must not change — only the silence. Both have a non-LLM
     fallback and must keep reaching it."""
@@ -356,7 +355,7 @@ def test_a_refusal_returns_empty_so_the_caller_still_falls_back(fn):
     assert 'return ""' in tail[:400]
 
 
-@pytest.mark.parametrize("fn", [research._try_llm_title, research._try_llm_summary])
+@pytest.mark.parametrize("fn", [research._try_llm_summary])
 def test_the_refusal_log_carries_googles_reason(fn):
     assert "_gemini_error_detail(" in code_only(fn), (
         "logging the bare status repeats what we already knew — the cause is in "

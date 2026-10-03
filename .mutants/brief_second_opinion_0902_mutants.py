@@ -95,9 +95,6 @@ T_DECIDE = ('    low = (text or "").lower()\n'
 F_FLOOR = ('    if len(text or "") < _TOPIC_GUARD_MIN_CHARS:\n'
            "        return False")
 F_DECIDE = "    return topic_presence(text, topic) is False"
-TT_ACCEPT = ('    if topic_presence(_t, topic) is not False:\n'
-             '        return "accept"')
-
 B_CONST = "_BRIEF_TOPIC_MIN_CHARS = 2_000"
 B_FLOOR = ('    if len(_b) < _BRIEF_TOPIC_MIN_CHARS:')
 B_STRIP = '    _b = (brief or "").strip()'
@@ -187,17 +184,9 @@ MUTANTS = [
      "the subject is rejected. Every healthy long report is thrown away",
      [(F_DECIDE, "    return topic_presence(text, topic) is not None")]),
 
-    # ═════════ TT — the title check still has no floor of its own ═══════════
-    ("TT1", "under",
-     "the title check stops refusing anything — the 2026-08-05 notebook name "
-     "'Golden Retriever Health, Breeding, and Ownership Evidence' is written "
-     "out as the run's title again",
-     [(TT_ACCEPT, '    if True:\n        return "accept"')]),
-    ("TT2", "over",
-     "an unguardable topic makes the title check REFUSE instead of accept, so "
-     "a perfectly good bland topic loses its generated title on every run",
-     [(TT_ACCEPT, '    if topic_presence(_t, topic) is True:\n'
-                  '        return "accept"')]),
+    # ═════════ TT — retired in wave 19 ═══════════════════════════════════════
+    # The title check (`title_refusal_verdict`) went with the after-Phase-2
+    # rename it judged: the research is named once, from its topic.
 
     # ═════════ B — the brief's verdict ══════════════════════════════════════
     ("B1", "over",

@@ -124,21 +124,6 @@ def _text_is_off_topic_ORIGINAL(text, topic):
     return not any(a in low for a in anchors)
 
 
-def _title_refusal_verdict_ORIGINAL(title, topic, corpus):
-    """`title_refusal_verdict` exactly as it stood before 2026-09-02."""
-    _t = (title or "").strip()
-    if not _t:
-        return "accept"
-    anchors = research.topic_anchors(topic)
-    if len(anchors) < research._TOPIC_GUARD_MIN_ANCHORS:
-        return "accept"
-    low = _t.lower()
-    if any(a in low for a in anchors):
-        return "accept"
-    return ("refuse_loud" if _text_is_off_topic_ORIGINAL(corpus or "", topic)
-            else "refuse_silent")
-
-
 _FLOOR = research._TOPIC_GUARD_MIN_CHARS
 _MATRIX_TEXTS = [
     "", None,
@@ -175,34 +160,18 @@ def test_the_report_predicate_is_byte_for_byte_the_old_one(text, topic):
         text, topic), (text[:40] if text else text, topic)
 
 
-@pytest.mark.parametrize("title", ["", "   ", "Nemotron Security Review",
-                                   "Golden Retriever Ownership Evidence"])
-@pytest.mark.parametrize("corpus", ["", "golden retrievers",
-                                    ("golden retriever " * 2000),
-                                    ("nemoclaw " * 4000)],
-                         ids=["empty", "short-no-anchor",
-                              "huge-no-anchor", "huge-anchor"])
-@pytest.mark.parametrize("topic", [TOPIC, BLAND_TOPIC])
-def test_the_title_verdict_is_byte_for_byte_the_old_one(title, corpus, topic):
-    assert research.title_refusal_verdict(title, topic, corpus) == \
-        _title_refusal_verdict_ORIGINAL(title, topic, corpus)
+# ⭐ Wave 19: the title verdict's byte-for-byte pins went with
+# `title_refusal_verdict` itself — the after-Phase-2 rename it judged is retired.
 
 
-def test_the_title_check_still_judges_a_thirty_character_title():
-    """The refactor's whole risk: the title check had NO floor by hand, and the
-    shared rule it now calls must not have acquired one."""
-    assert research.title_refusal_verdict(
-        "Golden Retriever Health Evidence", TOPIC,
-        ("golden retriever " * 2000)) == "refuse_loud"
-
-
-def test_the_predicate_is_still_consulted_in_exactly_two_places():
+def test_the_predicate_is_still_consulted_in_exactly_one_place():
     """⛔ The invariant `test_reject_off_topic_text_is_the_only_place_the_decision
     _is_made` protects, restated here because this step was the obvious place to
-    break it: the temptation was to add a third caller with a lower floor. The
-    floor moved to the callers instead, so the count is untouched."""
+    break it: the temptation was to add a caller with a lower floor. The floor
+    moved to the callers instead. ⭐ Wave 19 retired the title verdict, so the
+    count is the definition and `reject_off_topic_text` alone."""
     src = code_only(open(research.__file__, encoding="utf-8").read())
-    assert src.count("text_is_off_topic(") == 3
+    assert src.count("text_is_off_topic(") == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

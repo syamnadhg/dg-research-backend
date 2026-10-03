@@ -389,55 +389,48 @@ def test_login_still_names_an_ordinary_run_by_its_title(tmp_path, monkeypatch):
     assert run["title"] == SECRET
 
 
-# ══ 5. a thread the run leaves behind ═════════════════════════════════════
+# ══ 5. the research's name, made on this computer ═════════════════════════
 #
-# ⛔ A RAW THREAD CARRIES NO RUN'S ORIGIN, so its lines are the machine's and
-# reach `backend.log` — and for a run that keeps nothing, phases 3 and 4 are
-# off, so the run ends seconds after the title refresh is dispatched. Such a run
-# dispatches no refresh at all (its record is purged, and the model call on its
-# topic would outlive it); where its words could go is pinned in
-# `test_late_writers_name_their_run_109.py`.
+# ⭐ WAVE 19: the after-Phase-2 title refresh (a raw thread, a model call on the
+# topic and findings, and a refusal line printing the topic's words) is
+# retired. The computer now makes a research's one short name only when nothing
+# has (`_research_name`). For a run that keeps nothing it asks no one, writes
+# nothing back, and its line carries only the name's length.
 
-class _LateThread:
-    """Runs the worker when started — AFTER the run has ended, which is when a
-    slow title model answers."""
+class _Record:
+    """`users/{uid}/researches/{rid}` answering with `data`."""
 
-    started: "list" = []
+    def __init__(self, data):
+        self._data = data
 
-    def __init__(self, target=None, args=(), kwargs=None, **_kw):
-        self._target, self._args, self._kwargs = target, args, kwargs or {}
+    def collection(self, _n):
+        return self
 
-    def start(self):
-        _LateThread.started.append(self._target)
-        research._fb_research_id = None
-        self._target(*self._args, **self._kwargs)
+    document = collection
+
+    def get(self):
+        return types.SimpleNamespace(exists=True, to_dict=lambda: dict(self._data))
 
 
-@pytest.mark.parametrize("verdict", ["refuse_loud", "refuse_silent"])
 @pytest.mark.parametrize("rid", [INCOG, CHAT])
-def test_a_late_title_refusal_names_no_incognito_topic_words(
-        monkeypatch, logged, rid, verdict):
-    """The refusal lines print the topic's distinctive WORDS — the anchors — so
-    an operator can see why a title was thrown away. For a run that keeps
-    nothing those words are its subject, and it starts no refresh to print them."""
-    monkeypatch.setattr(research, "_firebase_db", None)
-    monkeypatch.setattr(research, "_try_llm_title", lambda *a, **k: "Golden Retriever Care")
-    monkeypatch.setattr(research, "title_refusal_verdict", lambda *a, **k: verdict)
-    monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
-    monkeypatch.setattr(_LateThread, "started", [])
-    monkeypatch.setattr(research, "_threading",
-                        types.SimpleNamespace(Thread=_LateThread))
-    monkeypatch.setattr(research, "_fb_research_id", rid)
+def test_a_name_made_here_says_nothing_of_the_topic(monkeypatch, logged, rid):
+    asked, wrote = [], []
+    monkeypatch.setattr(research, "_firebase_db", _Record({"title": SECRET}))
+    monkeypatch.setattr(research, "_ask_web_namer",
+                        lambda topic: asked.append(topic) or "Kept Name")
+    monkeypatch.setattr(research, "_update_research_doc",
+                        lambda u, r, p: wrote.append(p) or True)
+    monkeypatch.setattr(research, "_RESEARCH_NAMES_MADE", {})
 
-    research._refresh_research_title_async(SECRET, "", "findings")
-    blob = "\n".join(logged)
-
+    name = research._research_name(SECRET, SHARER, rid)
+    _says_nothing_of_it("\n".join(logged))
     if rid == INCOG:
-        assert _LateThread.started == [], "a run that keeps nothing started a refresh"
-        _says_nothing_of_it(blob)
+        assert asked == [] and wrote == [], "a run that keeps nothing was named out loud"
+        assert name and name in SECRET
     else:
-        assert "[title-refresh]" in blob, "the refusal branch was not reached"
-        assert "divorce, settlement" in blob, "an ordinary refusal lost its anchors"
+        assert asked == [SECRET] and wrote == [{"title": "Kept Name",
+                                                "updatedAt": wrote[0]["updatedAt"]}]
+        assert name == "Kept Name"
 
 
 # ══ 6. the traceback of a run that dies ═══════════════════════════════════

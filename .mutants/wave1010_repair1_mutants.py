@@ -60,9 +60,6 @@ DUP_GATE = '                if _rd_status == "ongoing" or _rd_found is None:'
 DUP_SCAN = ('                    _siblings = _scan_sibling_locks_for_research(\n'
             '                        research_id, WORKER_ID\n'
             '                    )')
-TITLE_THREAD = ('        _threading.Thread(target=_log_contextvars.copy_context().run, '
-                'args=(_worker,),\n'
-                '                          name="research-title-refresh", daemon=True).start()')
 SUMMARY_THREAD = ('        _threading.Thread(target=_log_contextvars.copy_context().run, '
                   'args=(_worker,),\n'
                   '                          name="research-summary", daemon=True).start()')
@@ -107,12 +104,8 @@ MUTANTS = [
      RESEARCH, PICKUP),
 
     # ══ 6. the run's late threads keep its log origin ══════════════════════
-    ("O1", "under", "⛔ the title refresh starts with an empty context: its late "
-     "line lands in the next run's folder",
-     [(TITLE_THREAD, '        _threading.Thread(target=_worker,\n'
-                     '                          name="research-title-refresh", '
-                     'daemon=True).start()')],
-     RESEARCH, ORIGIN),
+    # O1 retired 10-02 (wave 19): the title refresh thread is gone — the
+    # research is named once, from its topic.
     ("O2", "under", "⛔ the summary starts with an empty context",
      [(SUMMARY_THREAD, '        _threading.Thread(target=_worker,\n'
                        '                          name="research-summary", '

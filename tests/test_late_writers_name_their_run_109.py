@@ -1,6 +1,8 @@
 """A thread a run leaves behind writes to THAT run's record — never the next one's.
 
-Wave 10.9, last repair. The title refresh and the summary are raw threads with
+Wave 10.9, last repair. (Wave 19 retired the title refresh; the research's
+name is now made once, on a thread handed its run's ids — section 1.)
+The title refresh and the summary were raw threads with
 a model call in front of their write, and the phase-3 `save_meta` thread has an
 ffprobe per podcast in front of its own. All three wrote through
 `_update_firestore_research`, which picks its target from the pipeline globals
@@ -98,7 +100,6 @@ def world(monkeypatch):
     monkeypatch.setattr(_NextRunFirst, "switch", True)
     monkeypatch.setattr(research, "emit_event", lambda *a, **k: events.append((a, k)))
     monkeypatch.setattr(research, "log", lambda *a, **k: None)
-    monkeypatch.setattr(research, "_try_llm_title", lambda *a, **k: TITLE)
     monkeypatch.setattr(research, "_try_llm_summary", lambda *a, **k: SUMMARY)
     monkeypatch.setattr(research, "_fb_uid", A_UID)
     monkeypatch.setattr(research, "_fb_research_id", A_RID)
@@ -111,56 +112,39 @@ def _nothing_on_b(db):
         f"a write or read for member A's run landed on member B's record: {touched}")
 
 
-# ══ 1. the title ══════════════════════════════════════════════════════════
+# ══ 1. the name ═══════════════════════════════════════════════════════════
+#
+# ⭐ WAVE 19: the after-Phase-2 title refresh is retired — the research is
+# named ONCE, from its topic (`_research_name`). The name is made on a thread
+# (`asyncio.to_thread`), so it is handed the run's ids read at DISPATCH, and
+# the record it reads and writes is the one it was handed.
 
-def test_a_late_title_lands_on_the_run_that_asked_for_it(world, monkeypatch):
-    """⛔⛔ THE REVIEWER'S REPRODUCTION. The title — made from A's topic and
-    findings — went onto B's record, into B's sidebar."""
-    monkeypatch.setattr(research, "title_refusal_verdict", lambda *a, **k: "accept")
+def test_a_name_made_on_a_thread_lands_on_the_run_that_asked_for_it(world, monkeypatch):
+    """⛔⛔ The reviewer's reproduction, for the one place a name is still made
+    by the computer: by the time the thread runs, the globals name B's run."""
+    monkeypatch.setattr(research, "_ask_web_namer", lambda topic: TITLE)
+    monkeypatch.setattr(research, "_RESEARCH_NAMES_MADE", {})
+    monkeypatch.setattr(research, "_fb_uid", B_UID)
+    monkeypatch.setattr(research, "_fb_research_id", B_RID)
 
-    research._refresh_research_title_async(TOPIC, "", "findings")
+    assert research._research_name(TOPIC, A_UID, A_RID) == TITLE
 
     _nothing_on_b(world.db)
     assert [(p, d["title"]) for p, d in world.db.writes] == [(_record(A_UID, A_RID), TITLE)], (
-        "the title did not reach the run that asked for it")
-    # ⭐ AND THE LOCK IT HONOURS IS A's: the user-rename guard reads the same
-    # record it would overwrite.
+        "the name did not reach the run that asked for it")
+    # ⭐ AND THE LOCK IT HONOURS IS A's: the person's-rename guard reads the
+    # same record it would write.
     assert world.db.reads == [_record(A_UID, A_RID)]
 
 
-def test_a_late_off_topic_card_is_not_raised_on_somebody_elses_chat(world, monkeypatch):
-    """⛔⛔ THE CARD QUOTES THE GENERATED TITLE, and `emit_event` writes to
-    whatever research the globals name when it runs. After A has ended that is
-    B's chat. A card about a run that is over is read by nobody, so it is not
-    raised."""
-    monkeypatch.setattr(research, "title_refusal_verdict", lambda *a, **k: "refuse_loud")
+def test_a_run_that_keeps_nothing_writes_no_name(world, monkeypatch):
+    """⛔⛔ ITS RECORD IS PURGED WHEN IT ENDS, and its topic goes to nobody."""
+    asked = []
+    monkeypatch.setattr(research, "_ask_web_namer", lambda topic: asked.append(1) or TITLE)
+    monkeypatch.setattr(research, "_RESEARCH_NAMES_MADE", {})
 
-    research._refresh_research_title_async(TOPIC, "", "findings")
-
-    assert world.events == [], "A's off-topic card was raised while B was running"
-    assert world.db.writes == []
-
-
-def test_the_off_topic_card_still_reaches_the_run_while_it_is_running(world, monkeypatch):
-    """⭐ ACCEPT POLARITY. The card exists for a run that is still going — phase
-    3 is thirty minutes of podcast — and it must still arrive there."""
-    monkeypatch.setattr(research, "title_refusal_verdict", lambda *a, **k: "refuse_loud")
-    monkeypatch.setattr(_NextRunFirst, "switch", False)
-
-    research._refresh_research_title_async(TOPIC, "", "findings")
-
-    assert [a[0] for a, _k in world.events] == ["pipeline_warning"]
-
-
-def test_a_run_that_keeps_nothing_starts_no_title_refresh(world, monkeypatch):
-    """⛔⛔ ITS RECORD IS PURGED WHEN IT ENDS, and the worker is a model call on
-    its private topic and findings that outlives it."""
-    monkeypatch.setattr(research, "_fb_research_id", A_PRIVATE)
-
-    research._refresh_research_title_async(TOPIC, "", "findings")
-
-    assert _NextRunFirst.started == [], "a run that keeps nothing started a title refresh"
-    assert world.db.reads == [] and world.db.writes == [] and world.events == []
+    assert research._research_name(TOPIC, A_UID, A_PRIVATE)
+    assert asked == [] and world.db.writes == [] and world.events == []
 
 
 # ══ 2. the summary ════════════════════════════════════════════════════════

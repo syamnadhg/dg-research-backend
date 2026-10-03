@@ -203,7 +203,8 @@ def _run(chrome, monkeypatch, tmp_path, *, how="same_tab", api=None):
     monkeypatch.setattr(research, "_observe_dom_success", lambda *a, **k: None)
     monkeypatch.setattr(research, "_dump_nlm_audio_dom", _none)
     monkeypatch.setattr(research, "_shadow_observed_cua", _cua)
-    monkeypatch.setattr(research, "_transcode_audio_to_mp3", lambda p: p)
+    # Wave 19: the fresh Phase 3 hands the transcode the research's name.
+    monkeypatch.setattr(research, "_transcode_audio_to_mp3", lambda p, title="": p)
     monkeypatch.setattr(research, "_p3_publish_audio", _published)
     monkeypatch.setattr(research, "_find_recent_audio", lambda *_a, **_k: (None, "", False))
 

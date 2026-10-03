@@ -54,6 +54,7 @@ SRC = "research.py"
 MUTATED_FILES = [SRC]
 
 T_CAP = "tests/test_run_log_capture_0818.py"
+T_W16 = "tests/test_one_log_folder_per_research_w16.py"
 T_BRIDGE = "tests/test_stdlib_log_bridge_0817.py"
 T_SERVE = "tests/test_serve_cli_consistency.py"
 ALL = [T_CAP, T_BRIDGE, T_SERVE]
@@ -78,15 +79,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "run — a guard that fires on every real input",
      [('    key = rid if safe else "local"', '    key = "local"')],
      [T_CAP]),
-    ("K4", "under", "a retry attempt is not marked, so the two attempts of one "
-     "run are indistinguishable",
-     [('    if attempt:\n        name = f"{name}_retry{int(attempt)}"',
-       '    if False:\n        name = f"{name}_retry{int(attempt)}"')],
-     [T_CAP]),
+    # K4 retired 10-02 (wave 16): a retry no longer has a folder name of its
+    # own — it joins its research's folder, and the attempts live in meta.json.
     ("K5", "under", "the folder-key function grows a run_id parameter again — "
      "the leak becomes representable",
-     [('def _run_log_folder_name(research_id, started_utc, attempt=0) -> str:',
-       'def _run_log_folder_name(research_id, started_utc, attempt=0, run_id=None) -> str:')],
+     [('def _run_log_folder_name(research_id, started_utc) -> str:',
+       'def _run_log_folder_name(research_id, started_utc, run_id=None) -> str:')],
      [T_CAP]),
 
     # ══ meta at arm, and deriving the corpse ═══════════════════════════
@@ -231,16 +229,20 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]], list[str]]] = [
      "its parent's sink and the outer run's tail goes nowhere",
      [('            _RUN_LOG_SINKS.append(sink)', '            _RUN_LOG_SINKS[:] = [sink]')],
      [T_CAP]),
+    # Re-anchored 10-02 (wave 16): only a DIFFERENT research nested inside a
+    # run gets a folder of its own now; the same research's retry joins.
     ("N2", "under", "disarm clears the whole stack, so the outer run never "
-     "resumes after a retry finishes",
-     [('            if sink in _RUN_LOG_SINKS:\n                _RUN_LOG_SINKS.remove(sink)',
-       '            _RUN_LOG_SINKS.clear()')],
-     [T_CAP]),
-    ("N3", "under", "the retry no longer records its parent, so two folders sit "
+     "resumes after a nested run finishes",
+     [('                if sink in _RUN_LOG_SINKS:\n'
+       '                    _RUN_LOG_SINKS.remove(sink)',
+       '                _RUN_LOG_SINKS.clear()')],
+     [T_W16]),
+    ("N3", "under", "a nested run no longer records its parent, so two folders sit "
      "side by side with nothing linking them",
-     [('                parent_research_id=(parent.research_id if parent is not None else None),',
-       '                parent_research_id=None,')],
-     [T_CAP]),
+     [('                    parent_research_id=(parent.research_id if parent is not None\n'
+       '                                        else None),',
+       '                    parent_research_id=None,')],
+     [T_W16]),
     ("N4", "under", "re-entering one capture strands a sink on the stack and "
      "every later line in the process writes to a folder nobody finalizes",
      [('        if self.sink is not None:\n            return self.sink',
