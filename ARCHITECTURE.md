@@ -37,7 +37,7 @@ pip install -r requirements.txt
 python research.py --pair
 ```
 
-> **Chrome:** `--pair` and `--doctor` now auto-fetch the patchright Chrome wrapper (`patchright install chrome`). Real Google Chrome remains an OS-level prerequisite.
+> **Chrome:** `--pair` auto-fetches the patchright Chrome wrapper (`patchright install chrome`, via `_ensure_chrome_ready()` before it opens the login tabs). ⛔ `--doctor` does not — it only probes the launch and prints that command as a manual step (this line used to credit both). Real Google Chrome remains an OS-level prerequisite.
 
 > **Chat-runtime agent (separate package):** the `/sr` chat skill is installed differently — `pipx run superresearch-agent connect`. The backend's own front door `superresearch agent <verb>` (installed build) delegates to `pipx run superresearch-agent <verb>`; a source checkout runs the in-tree agent. Don't conflate the two packages.
 
@@ -86,6 +86,7 @@ A backend can run **N concurrent pipelines** in parallel when `research_config.j
 - **On-disk worker lock** (`safe_enqueue_lock_*`) — prevents two workers from claiming the same queue doc on a back-to-back supervisor restart (one-cycle race).
 - **Listener `_pending_enq` counter** — prevents back-to-back claims caused by Firestore listener replay (the listener re-fires on reconnect; counter blocks dual-enqueue of the same `research_id`).
 - **Pre-claim status re-check** (added 2026-05-22, commit `bcc4f84`) — between the claim scan and the actual `_safe_enqueue`, the worker re-reads `research.status`. If the doc transitioned to a terminal status (`stopped`, `completed`, `archived`, `terminated_by_user_discard`, `stopped_by_watchdog`) in the meantime, the claim is dropped. Closes a cross-worker race where worker A could claim a doc that worker B already cancelled.
+- **The queued → ongoing flip is a compare-and-set, not a transaction** (wave 15). It used to be a Firestore transaction and failed on every run, a sharer's included, at `BeginTransaction`: the rules deny this machine's synth user a transaction on the user tree. It is now a read plus an update preconditioned on the record's update time — the same compare-and-set the queue claim uses — so a cancel that lands between the read and the write still wins, and the record is read again.
 
 **Cross-worker HARD_RESET:** Reset Pair Code writes a single `hard_reset` command to `devices/{deviceId}/commands/`. Every worker subscribes to the same subcollection — each processes the command independently, touches `.stop` on its own active run dir, flips its own active research doc to `cancelled`, and schedules `os._exit(0)` so the daemon-loop respawns it with a fresh listener subscription. No zombie runs across N workers.
 
@@ -110,19 +111,19 @@ Queue ordering and per-doc position numbers stay coherent across cross-account, 
 **Where each phase runs:**
 - Phases 0-3 run **BE-side** (Python daemon on user's PC — needs the local browser for ChatGPT / Gemini / Claude / NotebookLM).
 - Phases 4-5 run **FE-side** (Firebase App Hosting / Cloud Run — Data API + Resend, no browser needed). FE-P4 fires off BE's `phase_complete:3` (or `phase_skipped:3` for the no-audio path), then chains directly into FE-P5 on success or fast-path skip. BE exits cleanly after P3 with `delivery.status="completed"`; the user-visible `research.status` stays "ongoing" until FE-P5's `markFeP5Completed` flips it to "completed".
-- **BE-driven P4/P5 (autonomous, #742 / BE `79d943f`)** — the live `phase_complete:3` event is one trigger, **not the only one**. So a run finishes even when the chat app never opens, after P3 the BE also calls `_post_fe_p4p5_trigger(uid, research_id)` (research.py) from a detached daemon thread: it writes a `needsFeTrigger` marker AND POSTs `{FE_BASE_URL}/api/uploadYouTube {research_id, ownerUid}`, authenticated with the synth-device user's own fresh ID token; the route runs P4 then chains P5. `casRouteP4` dedups this against the live-event FE catch-up so both triggers coexist.
+- **BE-driven P4/P5 (autonomous, #742 / BE `79d943f`)** — the live `phase_complete:3` event is one trigger, **not the only one**. So a run finishes even when the chat app never opens, after P3 the BE also calls `_post_fe_p4p5_trigger(uid, research_id)` (research.py) from a detached daemon thread: it writes a `needsFeTrigger` marker AND POSTs `{FE_BASE_URL}/api/uploadYouTube {research_id, ownerUid}`, authenticated with the synth-device user's own fresh ID token; the route runs P4 then chains P5. `casRouteP4` dedups this against the live-event FE catch-up so both triggers coexist. ⛔ **A 2xx is not proof the route answered (wave 15).** The route streams keep-alive spaces first, so the status goes out at once; when the cloud's front door cuts the call at 300 s the body ends in its "Internal Server Error" page under that 200. `_route_answered` accepts only the route's own JSON; anything else is read as a cut, the way the web reads it — the cloud has the request and carries on, it is not asked again, and the error page is not quoted in the log (`_dispatch_verdict`).
 
 ---
 
 ## Event Types
 
-All events are JSON objects written to `events.jsonl` (one per line) AND mirrored to Firestore `users/{uid}/researches/{id}/pipeline_events/` for real-time frontend delivery.
+All events are JSON objects written to Firestore `users/{uid}/researches/{id}/pipeline_events/` for real-time frontend delivery — the only event store. ⛔ The `events.jsonl` disk mirror this line used to name was removed on 2026-04-29 (`emit_event`); what a run's log folder keeps is `events.json`, a list of each event's type, phase and agent with no payload.
 
 | Event Type | Phase | Fields | When |
 |-----------|-------|--------|------|
 | `phase_start` | 0-5 | `{agents?: string[], description: string}` | Phase begins |
 | `phase_restart` | 1-2 | `{phase, reason, chars, attempt?}` | Phase rerun after pause+input+resume (mid-phase or boundary) |
-| `agent_progress` | 1-2 | `{status, stage, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration}` | During Phase 1/2 polling (~120s interval, `POLL_DEEP_RESEARCH` default). `stage` (`"planning" \| "researching" \| "writing"`) drives the FE milestone stepper — it advances an agent off "Submitted" the moment a real counter is scrape-blind. P1 emits it from `poll_until_done` (#924); P2 emits it continuously from the round-robin poller + launch sites + hard-retry (#930), with `"planning"` gated on the scraper's plan-page signal so a planning Gemini stays on "Submitted" by design. Empty `stage` is omitted so it never clobbers a prior value in the FE merge. `scrapeSource: "dom" \| "vision"` records which tier produced the data. `visionNarration` is populated by the agent-side-panel walker when DG_VISION_NARRATE=1 OR when the vision-narrator fallback is exercised (see `_vision_narration` / `_vision_narration_p2` emits at the P1 + P2 sites); when neither fires it's empty string. FE renders verbatim when present. |
+| `agent_progress` | 1-3 | `{status, stage, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration, timeline}` | During Phase 1/2 polling (~120s interval, `POLL_DEEP_RESEARCH` default). ⭐ **Phase 3 sends it too** (`agent="notebooklm"`): the narration ticker and the notebook-link read always did, and since wave 17 `timeline` carries Phase 3's activity rows for the app's NotebookLM pop-up — `{id, label, state, at, detail?, url?}`, folded by `id` in the app (a row sent again updates in place), built by `_p3_timeline_step` from this run's own file list, title and what our code read of NotebookLM's state, never from page text. "Shared" is sent only when the share dialog itself set "Anyone with the link", and "Named" only when the rename worked. `stage` (`"planning" \| "researching" \| "writing"`) drives the FE milestone stepper — it advances an agent off "Submitted" the moment a real counter is scrape-blind. P1 emits it from `poll_until_done` (#924); P2 emits it continuously from the round-robin poller + launch sites + hard-retry (#930), with `"planning"` gated on the scraper's plan-page signal so a planning Gemini stays on "Submitted" by design. Empty `stage` is omitted so it never clobbers a prior value in the FE merge. `scrapeSource: "dom" \| "vision"` records which tier produced the data. `visionNarration` is populated by the agent-side-panel walker when DG_VISION_NARRATE=1 OR when the vision-narrator fallback is exercised (see `_vision_narration` / `_vision_narration_p2` emits at the P1 + P2 sites); when neither fires it's empty string. FE renders verbatim when present. |
 | `agent_skipped` | 2 | `{agent: string}` | Disabled agent in Phase 2 config |
 | `agent_verified` | 2 | `{agent: string, verified: bool}` | Agent confirmed running |
 | `link_extracting` | 3 | `{agent: string}` | Notebook-link read starting. ⛔ Phase 3 only — all three of these come from `extract_with_retry`, whose one caller is NotebookLM |
@@ -264,6 +265,15 @@ signal, its durable decision cleared (`_retract_crashed_attempt_cards`). A card 
 automatic skip ended is not up any more and is not retracted
 (`_drop_agent_card_stamp`), and a crash after Phase 2 retracts none of Phase 2's
 cards (`_forget_research_cards`).
+⭐ **And a crash is never reported as a failed read** (10-01, all three agents
+measured in wave 15). An extraction that comes back empty asks the browser
+first, at both Phase-2 read sites (after the page said done, and after computer
+use said done): a dead one unwinds for the silent retry at once
+(`_p2_unwind_if_browser_gone`) — no "Couldn't read the report" card, no
+`failed` status, nothing saved as `errored`. Only a live browser gets the card.
+Phase 3 does the same at the podcast step (`_p3_browser_gone`), and a resume on
+the same worker goes back into the notebook that run made
+(`_p3_reopen_recorded_notebook`).
 
 **B. One agent's tab dies inside the Phase 2 round-robin** — nothing is rebuilt
 and nothing resumes. The per-tick crash sweep runs before any per-agent work,
@@ -342,13 +352,17 @@ Prevents soft-retrying a corpse forever — soft-retry on a dead page just re-fa
 the exclusions stay anyway because runs made before that day still carry the
 file. The stacked document was one H1 plus each agent's report verbatim, with no
 reader of its own left: the app synthesises the real combined document at P5 from
-**the three per-agent reports**, never from the stack. ⛔⛔ The **Firestore
-mirror** of the `consolidated` doc type is pinned PRESENT on purpose — the app's
-P5 Summary document reads it as its only source and refuses without it, and on
-both P5 legs the summary runs BEFORE the synthesis, so deleting the mirror today
-would cost every run its Summary silently. The merged text also still reaches its
-two in-memory readers (the post-P2 summary refresh and the title refresh), which
-is why the BUILD outlived the write.
+**the three per-agent reports**, never from the stack. ⛔⛔ **And since
+2026-09-22 (wave 10.9) the Firestore mirror of the `consolidated` doc type is
+gone too.** This paragraph used to pin it PRESENT, because the app's P5 Summary
+read it as its only source; the Summary now reads the Super Research document
+(the web's synthesis), so no surface needs the stack. Runs made before then keep
+their saved `consolidated` document, and the app still shows it for a run that
+has no synthesis. The merged
+text is still BUILT in memory (`_p2_persist_reports`) for its one remaining
+reader, the research's one-paragraph `summary` field. ⛔ The title refresh this
+paragraph also named as a reader was removed in wave 19 — the backend no longer
+renames a research from its findings.
 
 ## NotebookLM Strict-Keep Cleanup (`a52bd7b`, `2a93af0`)
 
@@ -372,7 +386,7 @@ found nothing, and skipped the video in silence. Completion and delivery
 disagreed about the same run.
 
 The gate now says it out loud: the phase completes when nothing skipped it **and
-the Storage upload returned a URL** — the downloaded-and-uploaded podcast, not a
+the Storage upload returned a URL** — the saved-and-uploaded podcast, not a
 link. Otherwise it emits `phase_skipped phase=3` naming which of the two failed:
 
 | reason | what happened | what the user is told |
@@ -392,6 +406,23 @@ how the app would render it. The app injects that row itself from the playable
 Storage file. ⛔ What did NOT change: the notebook URL is still the navigation
 target for the audio step, so the loop that recovers it stays — what stopped
 being true is that a link decides whether the phase succeeded.
+
+**The podcast is fetched, not downloaded (wave 15).** A NotebookLM audio
+download is the same crash class as a report export (see *Report exports are
+caught in the page* below): on 09-16 two of them killed Chrome the instant they
+were pressed. While the page's own Download is pressed, `_NlmAudioCatch` puts a
+route on the browser CONTEXT for the audio's own address
+(`lh3.googleusercontent.com/notebooklm/…`), answers that request `204` before
+Chrome can make it a download (closing a tab the press opened, never one of the
+run's own), and the file is fetched straight from that address with the
+context's own request API — its cookies, its redirects. It must be audio by its
+content and at least `_NLM_AUDIO_MIN_BYTES`; it is then named after the
+research's one short name (`_p3_name_podcast_file`, and the same name goes into
+the mp3's title) and goes on to the upload as before. ⛔ The address is a
+credential and is never logged. If no address comes, or the fetch is refused,
+too small or not audio, the catch comes off and Chrome downloads it exactly as
+before, with one log line saying why; computer use, when the page could not
+press Download, also still downloads through Chrome.
 
 ## Auto-Retry Kwarg Forwarding (2026-04-30 `549f079`)
 
@@ -546,6 +577,149 @@ boundaries*): it needs `log`, the per-run uid / research id and the token
 minting, all of which live there — and a new module has to be added to BOTH
 `py-modules` and `TOP_MODULES`, where a miss ships readable source.
 
+⭐ **Charts are pictures too (wave 14).** An `<img>` on the page's own `blob:`
+address could not be fetched by anyone but that page, an `<svg>` chart or
+diagram came through as loose words, and a `<canvas>` chart as nothing. Now the
+page draws each of those into a PNG before the report is read
+(`_DOC_FIGURES_JS`, through `_doc_html_read_js`): an `<svg>` with the page's
+computed colours and fonts, a `<canvas>` as it stands, a `blob:` image as it
+shows, each on its own background, at up to twice its size. The copy the
+markdown is made from then holds a `data:` image there, and the rehost above
+stores it like any other (a `data:` address never stays in a document). ⛔ Not a
+picture: anything under `_DOC_IMG_MIN_PX` on a side, or inside a button, a link,
+an equation or another `<svg>`. At most `_DOC_FIGURES_MAX` (20) per read, each
+within `_DOC_FIGURES_WAIT_MS`, all within `_DOC_FIGURES_BUDGET_MS`; a picture
+past a limit, or one the page cannot draw, stays as the page shows it and the
+log counts it. A diagram written as mermaid CODE stays code — the web draws it.
+
+## Report exports are caught in the page (wave 15)
+
+⛔⛔ **No report reaches the machine through a Chrome download any more.** Chrome
+154 crashes in its own downloads code while a download updates, whoever presses
+Export: 4 of the 49 ChatGPT report exports in every log read were followed by a
+browser crash in Chrome's download toolbar code
+(`#Dev/wave15/crash/crash-analysis-1001.json`). The owner's recording shows how
+the export makes its file: on the TOP chatgpt.com page (not the Deep-research
+frame that only holds the button), a `Blob` turned into an address, then a
+click on an `<a download>` holding it. Claude's export is the same shape.
+
+**The catcher.** Before ChatGPT's or Claude's export is pressed, a script goes on
+the TOP page (`_export_catch_arm`): it keeps each `Blob` the page turns into an
+address, and stops the click that would download it — a link's click, the
+element's own `click()`, a `dispatchEvent` click (the FileSaver.js shape, which
+cannot be cancelled) and a real press on a link inside a shadow root. The file's
+bytes come back to Python a megabyte at a time (`_export_catch_read`). The
+export is pressed as before, by the page or by computer use, and computer use
+stops at the catch (`_cua_export_caught`). ⛔ Nothing is pressed when the catcher
+cannot be put on the page, and a catcher put back after a navigation numbers its
+catches past the one before it, so a later PDF still counts as later.
+`_ChromeDownloadWatch` logs every download Chrome still starts during an export
+— the count should be 0.
+
+**What is caught, per agent.** ChatGPT (`_chatgpt_dr_export_report`): the
+Markdown export is the document, and the PDF export pressed right after it is
+read only for its sources (next section); with no Markdown caught, the report is
+read off the app's own frame, then the copy tier. Claude
+(`_claude_export_report_by_page`): "Download as Markdown" from the report
+header's menu, caught the same way, with computer use pressing it when the page
+cannot. The podcast is fetched rather than downloaded for the same reason — see
+*Phase 3 completes on a podcast*.
+⛔ Removed with this: the env switches `SR_CHATGPT_DR_PAGE_DOWNLOAD` and `SR_CLAUDE_PAGE_DOWNLOAD` (they turned page downloads back on), the `Download.path()` readers for reports, and the in-frame download.
+
+## Footnotes — each agent's own numbers (wave 14)
+
+The general numbering (`_number_document_sources`: our `[\[n\]](url)` marker at
+each cited sentence and one `##### Sources` list) is the fallback now. First,
+`_doc_link_own_numbers` links each of the report's OWN `\[n\]` to row *n* of its
+own trailing sources list, in place, and that list stays the one list. ⛔ Only
+when they match one for one — every number cited has a row and every row is
+cited (Gemini's list excepted: row *N* is number *N*, so a row nobody cites is
+still that row). A number inside a link's words, or with a space before it
+("Step \[1\]"), is never linked. Any mismatch leaves the numbers as written,
+with one log line.
+
+- **Claude** writes `\[n\]` and a numbered list itself.
+- **ChatGPT** (`_chatgpt_pdf_footnotes`, decided with the owner on 10-01:
+  the Markdown stays the document). Its Markdown cites with token runs that name
+  no address; its PDF draws each run as a numbered chip linking one address and
+  ends with sources pages. Run *N* of the Markdown, numbered by first use, is
+  chip *N* of the PDF (141 of 141 on the owner's pair). Each run becomes
+  ChatGPT's own number and the document ends with ONE Sources list in the shape
+  of ChatGPT's sources page — each source's title and address, then the numbers
+  citing it. Checked before anything is written: chips = runs, in the same
+  order; one number → one address; the sources pages = the body; no number glued
+  to a line's bullet, list number or heading mark. On any mismatch nothing is
+  written and the document ends with the sites ChatGPT visited.
+- **Gemini** (`_gemini_footnoted`, the owner's 10-02 recording). Citation
+  number *N* is row *N* of Gemini's own "Sources used in the report", counted
+  down the page — not the number the page shows beside a chip, which counts per
+  paragraph. The list's rows are only in the page while it is open, so the read
+  presses its toggle (a button, never a link), reads, and presses it again. The
+  list ends where its own box ends; a row of another kind, or words in no row,
+  keep the document exactly as it was. A row we never put in a document (an
+  agent's own site, the owner's own Drive or Gmail) is listed by title only and
+  its number stays plain text.
+
+**Exactly one sources section** (wave 13): when our list is added, the report's
+own trailing sources section that holds no public link is replaced by it, and a
+report citing fewer than `_DOC_VISITED_MIN_CITED` public sources ends with the
+sites the agent visited (`_p2_visited_sources`). ⛔ **`brief.md` is still never
+numbered** — it is what the agents are handed. Only the brief the app shows (the
+copy `save_document_to_firestore` writes) turns ChatGPT's source chips into
+numbers and ends with one list. A crash retry reads a saved report back with
+the numbers unlinked (`_doc_own_numbers_unlinked`), so the next write links them
+again rather than twice.
+
+## Equations keep their source (wave 14)
+
+A page read writes each equation from the TeX the page keeps beside its drawing
+(`_doc_math_source`): Gemini's `data-math` on `.math-block` / `.math-inline`, or
+the `application/x-tex` annotation KaTeX leaves on ChatGPT's and Claude's pages.
+The drawing is never read — it came out as one glyph per KaTeX box with a
+zero-width space after every subscript. Inside a sentence the equation is
+`$$ tex $$` (one space inside each side, so a TeX ending in `\$` still closes);
+on its own line it is a `$$` block with the delimiters on lines of their own —
+the one shape the web's renderer reads (remark-math, single-dollar maths off).
+⛔ Inside a table cell, a heading, bold, italics, a link or a quote a block is
+written inline, because those marks hold one line. ⛔ In a table cell a bare `|`
+is written `\vert` — the same single bar — never `\|`, which KaTeX draws as the
+DOUBLE bar. ⛔ Nothing here writes `\[` or `\(`, so a citation `\[7\]` is never
+made into an equation (`_doc_math_markdown`, `_doc_math_join`).
+
+## One short name (wave 19)
+
+The chat's title, the NotebookLM notebook, the podcast file (and the title in
+its mp3) and the Podcasts row carry ONE name: two to five words, at most 40
+characters, never cut mid-word (`_shape_research_name`). The web's namer
+(`/api/title`) makes it when the person presses send, and every reader takes the
+record's `title`. This computer makes it only when nothing has
+(`_research_name`), by asking the same namer with its own sign-in
+(`_ask_web_namer`), or with the topic's first five words when it cannot answer:
+
+- **at pick-up**, for a research the chat assistant started — its record has
+  `viaAgent: true` and `title` = its whole topic — and then the chat's opening
+  line (`messages/intro-{id}`) is rewritten to that name in the web's own words
+  (`_name_an_agent_started_run`, `_rename_agent_intro`; an update only, never a
+  create);
+- **at the end of Phase 2**, for a record still "New Research" or "New Chat", or
+  an assistant's topic its pick-up failed to name (`_name_a_research_left_unnamed`)
+  — with the podcast off nothing later would name it, and Phase 5 would put the
+  placeholder into the mail and the share links;
+- inside Phase 3, for the notebook and the podcast, reusing a name made once.
+
+⛔ Only the assistant's own record counts "title equals topic" as unnamed: a web
+research named exactly like its short topic IS named. The person's own rename
+(`titleLocked`) always wins, a run that keeps nothing asks no one and writes
+nothing, a computer not connected to the app asks no one, and the log carries
+the name's length only.
+
+⛔ **The after-Phase-2 rename from the findings is gone** (wave 19): it named
+the research a second time, so the chat's name changed mid-run and the notebook
+got the other one.
+⛔ Retired with it: `_refresh_research_title_async`, `_try_llm_title`, and the "the findings may not match your topic" card.
+The per-report off-topic guard (*The topic guard*) still keeps a wrong report
+out.
+
 ## Phase 5 — FE-owned
 
 Phase 5 (Google Doc creation + email delivery) is owned by the frontend. After P4 success the FE mints a durable snapshot page for each document this run produced, builds the Doc from those, sends the email via Resend, and emits its own `phase_complete phase=5` so the P5 dropdown populates like every other phase. BE has no Doc/email code path.
@@ -615,22 +789,23 @@ against paid third-party services.
 | at 2026-08-25 | 75,965 |
 | at 2026-08-28, after the share step came out | 74,663 |
 | at 2026-09-19 | 83,374 |
-| **today (2026-09-30)** | **96,156** |
-| the seven sibling modules, between them | 7,249 |
+| at 2026-09-30 | 96,156 |
+| **today (2026-10-03)** | **100,876** |
+| the seven sibling modules, between them | 7,401 |
 
-So the file has grown by roughly **64%** in the fifty-six days since the
-decision, and holds **93%** of the non-test Python outside `agent/` (counting
-the agent package's own tracked sources it is 72%; the number only means
-something with the boundary stated). An unbounded trajectory is a real objection and none of the reasoning
+So the file has grown by roughly **72%** in the fifty-nine days since the
+decision, and holds **93%** of the Python in `research.py` and its seven sibling
+modules (counting the agent package's own non-test sources too it is 73%; the
+number only means something with the boundary stated). An unbounded trajectory is a real objection and none of the reasoning
 above answers it.
 
 ⭐ **The only fall on record is the step between the 2026-08-25 and 2026-08-28
 rows above, −1,302 lines**, over the days stretch 6.6B removed the P2 platform
 share step. ⛔ Read it as what it is: subtraction between two rows measured three
 days apart, so it is the NET of everything that landed in that window — additions
-included — and not a measurement of the removal. The growth table itself was
-re-measured on 2026-09-19; this figure is still derived from it and nobody has
-re-counted the commit. It is worth writing down because it is the
+included — and not a measurement of the removal. The table's newest rows were
+re-measured on 2026-09-19, 2026-09-30 and 2026-10-03; this figure is still
+derived from the two August rows and nobody has re-counted the commit. It is worth writing down because it is the
 only evidence in this table that the trajectory is not one-directional — and
 because of what it took to get: 2.2 minutes and 21.7 CUA calls per run bought a
 link nothing in the pipeline gated on. The lines came out because the FEATURE
@@ -640,7 +815,8 @@ was wrong, not because anyone set out to shrink the file.
 decision; `telemetry.py` (2026-08-18) and `logquiet.py` (2026-08-19) were both
 created after it, by this rule, for work that would previously have landed in
 `research.py`. The rule bounds *new* subsystems and does nothing about growth
-inside the existing flow — which is where the 17,000 lines came from. Both
+inside the existing flow — which is where the ~42,000 lines added since the
+decision came from. Both
 statements are true and neither cancels the other.
 
 **Revisit the decision if any of these becomes true**
@@ -776,6 +952,43 @@ folder, where the existing walk ships them with no collector change and no edit
 to the bundle contract. ⚠ It writes into a sealed folder on purpose: the folder
 is finalized within milliseconds of the pipeline returning while P4/P5 run for
 minutes afterwards, so there is no version of this that lands before the seal.
+
+### One folder per research, however many times it runs (wave 16, 2026-10-02)
+
+⛔⛔ **A research used to be split across folders.** `_RunLogCapture` opened a
+new folder for every attempt: the browser-restart retry and the crash rejoin
+got a nested `<id>_<stamp>_retryN`, and every later pick-up — Move to queue,
+Retry/Resume, a restart's resume — got a fresh `<id>_<new stamp>`. Measured on
+this Mac, one research sat in four folders written within five minutes, two of
+them attributed to nobody, because a Retry dropped the person. And "send 1 run"
+sent only the newest attempt.
+
+**Now the folder is the research's.** An attempt of a research whose sink is
+already armed in this process (the browser-restart retry, the Wave 15 rejoin,
+the one-shot retry) JOINS that sink, with one line saying why (`=== browser
+restarted — attempt 2 of 3 ===`, `=== tried again from where it got to ===`).
+With nothing armed, a pick-up continues the research's newest finished folder
+(`_run_log_folder_to_continue`), carrying its first start, counters, attempts
+and events, with a line saying how it came back (`_RUN_LOG_PICKUP_LINES`:
+"picked up again after a move to the queue", "picked up again from where it
+stopped"); the reason rides `run_pipeline_captured`'s `_log_reason`.
+`meta.json` keeps every attempt's start, end and outcome; a joined attempt
+counts its own time.
+
+⛔ **Never continued:** a folder another process is still writing, any folder
+of the research while one is live, a folder attributed to a different person
+(`submitterUid` must match exactly, so one person's attempt never lands in
+somebody else's Send Logs), and an older build's split folder (no `attempts` in
+its meta) — those age out as they are. The folder name is the research id and
+its first start (`_run_log_folder_name` takes no run id and no attempt, so no
+topic can reach it). Move to queue marks the folder `moved` at once
+(`_mark_run_log_moved`), so the next pick-up never waits on the old process
+letting go. The dead-or-alive ceiling counts from the CURRENT attempt's start,
+so a research picked up days later never reads dead while it runs, and a
+reopened `run.log` keeps its newest overflow pieces and goes on numbering.
+Retry and the login auto-resume now carry the person who asked, so a resumed
+attempt appears in Send Logs. Bundles, the published list and `--select` all
+count folders, so they count researches now.
 
 ### Retention — thirty days, with a clock (2026-09-01)
 
@@ -1022,7 +1235,7 @@ Stored in `{queue_dir}/config.json`:
 | POST | `/api/runs` | Start new pipeline `{topic, email?, config?}` → `{id, status}` |
 | GET | `/api/runs` | List all runs |
 | GET | `/api/runs/{id}` | Get run details (meta, checkpoint, delivery) |
-| GET | `/api/runs/{id}/documents/{type}` | Get document content (brief/chatgpt/gemini/claude). ⛔ `consolidated` was retired here on 2026-09-18 (wave 10): this route reads the run folder and nothing else (`documents/{type}.md`, with a legacy sibling fallback), and the stacked document no longer reaches disk — it survives only as a Firestore mirror, so the route 404s it for every run made since. See *NotebookLM Upload Filter* |
+| GET | `/api/runs/{id}/documents/{type}` | Get document content (brief/chatgpt/gemini/claude). ⛔ `consolidated` was retired here on 2026-09-18 (wave 10): this route reads the run folder and nothing else (`documents/{type}.md`, with a legacy sibling fallback), and the stacked document no longer reaches disk — nor, since 2026-09-22, its Firestore mirror — so the route 404s it for every run made since. See *NotebookLM Upload Filter* |
 | GET | `/api/runs/{id}/audio/{filename}` | Stream audio file |
 | POST | `/api/runs/{id}/stop` | Stop pipeline |
 | POST | `/api/runs/{id}/pause` | Pause pipeline |
@@ -1100,7 +1313,7 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 | `clear-logs` | — | **Owner-only (by the default-closed command rule, not a check here), worker-1.** Settings → Manage Data → Clear logs, the LOCAL half: run folders, session logs, raw tails, local bundles, telemetry spool. The app deletes this device's cloud bundles itself — the two halves are reported separately and neither pretends to be the other. |
 | `send-logs` · `send-logs-limited` · `send-logs-selected` | `{code, requestId, submittedBy, runs? (limited), runNames? (selected), includeMachine?}` | Build a support bundle and upload it under a support code. **Three action NAMES, not one action with a field** — a build one release behind ignores an unknown field and would collect the newest thirty against a request for two, so the skew has to fail as "nothing left the machine" rather than as over-collection. The names come from `bundle-contract.json`, pinned byte-identical in both repos (the installed wheel packs no `.json`, so `BUNDLE_CONTRACT_FALLBACK` is what every field build actually reads). `send-logs-selected` is the one a **sharer** may fire: what it contains is decided at the sink, never by the request — the runs attributed to that submitter and nothing else, with the machine-level material (pairing and sign-in sessions, the raw device tails) owner-only AND opt-in. Every guard that can refuse writes a refusal row, because worker 1 deletes the command before dispatch and a bare return is indistinguishable from a build too old to understand the request. |
 
-> **App-driven backend update + source-checkout.** Worker-1 publishes `version`, `updateAvailable`, `updateStatus`, `versionCheckedAt`, and `sourceCheckout` to `devices/{deviceId}` from the heartbeat loop — ⛔ **decoupled from the liveness write and best-effort by design**, throttled to ~5 min and written only when a value changed: these fields are a SEPARATE allow-list entry, so a 403 from rules that have not been deployed yet must not flip the device offline; the app's Settings → About shows a real-time BE version **per owned device** with an inline Check → Update control (no popups; sharers / no-device users see no version row). A source-tree BE (`git clone` + `python research.py`) sets `sourceCheckout:true` — gated on the authoritative PATH probe `_is_source_checkout()`, NOT the version string (an editable install still reports a real version) — so the About row reads "Source checkout · update with `git pull`" with no Check button; only a pipx build is app-updatable.
+> **App-driven backend update + source-checkout.** Worker-1 publishes `version`, `updateAvailable`, `updateStatus`, `versionCheckedAt`, and `sourceCheckout` to `devices/{deviceId}` from the heartbeat loop — ⛔ **decoupled from the liveness write and best-effort by design**, throttled to ~5 min and written only when a value changed: these fields are a SEPARATE allow-list entry, so a 403 from rules that have not been deployed yet must not flip the device offline; the app's Settings → About shows a real-time BE version **per owned device** with an inline Check → Update control (no popups; sharers / no-device users see no version row). A source-tree BE (`git clone` + `python research.py`) sets `sourceCheckout:true` — gated on `_is_source_checkout()`, a FILESYSTEM test for the in-tree `agent/facade/__main__.py` (present only in a checkout, never in a wheel; it consults nothing on `$PATH` — this line used to call it "the authoritative PATH probe"), NOT the version string (an editable install still reports a real version) — so the About row reads "Source checkout · update with `git pull`" with no Check button; only a pipx build is app-updatable.
 
 > **Dispatcher resume-contract (2026-05-18)**: every action that acknowledges a paused alert MUST call `_controls.request_resume()` so the pipeline doesn't stay paused after the user clicks the action button. The per-action helpers (`request_skip_agent`, `request_retry_agent`, `set_continue_anyway`, etc.) already clear `pause_event` + set `resume_event`; the dispatcher's explicit `request_resume()` ALSO clears `pause_reason` + `pause_target_agent` — a state-leak class that previously kept FE rendering "paused" even after Retry. The 8 actions the fix covered: `skip_init_verify`, `retry_init_verify`, `skip_agent`, `retry_agent`, `continue_partial_agent`, `poke_agent`, `wait_longer_agent`, `continue_anyway`. Plus the already-correct ones — `resume`, `skip_phase`, `retry_phase`, `agent_decision`; those last three join the 8 in the test's `REQUIRED_RESUME_ACTIONS` list, 11 names in all. ⛔ **The tallies in this line were wrong in both directions and are corrected 2026-09-19:** `pause` was counted twice, once as "already correct", and the intentionally-not-resumed group was labelled 8 while listing 7. It is seven, and `pause` is one of them — `pause`, `stop`, `discard_run`, `ping`, `add_context`, `config`, `dismiss_alert`. Static-analysis test `tests/test_dispatcher_resume_contract.py` enforces the contract — adding a new resume-required action without wiring `request_resume` fails CI.
 
@@ -1252,12 +1465,13 @@ Retry counters: hard-capped (P1=2, P3=2, P4=1) so a misbehaving platform can't s
 | Agent send-button fallback | start_agent_no_gemini_wait | 90 s | `[Retry]` · `[Skip]` | Re-run `PROMPT_CLICK_SEND` CUA loop |
 | Claude 2-artifact hard-fail | Inline (elapsed ≥ 80% of wait AND <2 artifacts) | 5 min | `[Retry]` · `[Skip]` | Retry closes + reopens Claude tab via hard-mode `retry_agent` |
 | Workspace cap | Phase 2 platform constraint hit | — | **`[End research]` only** (`stop`) | n/a |
-| Stuck-agent (L1 card) | Inline (`no_growth > 15m` [`STUCK_NO_GROWTH_SEC`] AND `elapsed > 10m` [`STUCK_MIN_ELAPSED_SEC`] AND status NOT in `{planning, thinking, researching, searching}` AND scrape `phase != planning`), then confirmed by a CUA vision arbiter before the card fires | async (non-blocking) | `[Retry]` · `[Skip]` (#921/#929 single-alert design) | Retry = hard-mode tab close+reopen |
+| Stuck-agent (L1 card) | Inline (`no_growth > 15m` [`STUCK_NO_GROWTH_SEC`] AND `elapsed > 10m` [`STUCK_MIN_ELAPSED_SEC`] AND status NOT in `{planning, thinking, researching, searching}` AND scrape `phase != planning` AND not a Gemini whose research has not started), then confirmed by a CUA vision arbiter before the card fires | async (non-blocking) | `[Retry]` · `[Skip]` (#921/#929 single-alert design) | Retry = hard-mode tab close+reopen |
 | Stuck-agent (L3 auto-skip) | L1 card left unacted `> 30m` (`AUTO_SKIP_UNACTED_SEC`, since #929) | async | Auto-skip this agent (toggleable via Settings → Pipeline, default ON) | Partial output salvaged; tab closes |
 | Session expiry | Inline (requires 2× consecutive confirms spaced 2 min) | 30 min | `[I've logged in — Retry]` · `[Skip]` | Reload tab + keep polling |
 
 **False-alarm suppression baked into the detectors:**
 - Stuck-agent: 10-min elapsed floor + 15-min no-growth threshold (#929), checks text AND source growth, skips during known active statuses (incl. the scraper's `phase == "planning"` for Gemini), and a CUA vision arbiter must confirm genuinely-stuck before the card fires.
+- ⭐ **Gemini just waits (wave 15).** While a Gemini research has not started (its late-Start watch, `gemini_watch_start`, is armed), the round-robin runs no stuck check and no computer-use completion look on it at all — Gemini starts its research by itself on a timer, and a plan sat for 47 minutes on 10-01. The plan wait (`GEMINI_PLAN_WAIT_SEC`, ten minutes) only watches the run's own chat and presses a 'Start research' that appears; it never refreshes, never presses Redo, never opens a new chat and raises no card. With auto-skip off, the person is asked once at `PER_AGENT_HARD_CAP_SEC`; a plan that visibly failed is one card, "Gemini's plan failed".
 - Session-expiry: 2 consecutive confirmations 2 min apart; distinct from HV (CAPTCHA/Cloudflare) which has its own detector.
 - Brief-short: only fires in 100-500 char window (never on truly empty output — that's a different path with its own handling).
 - Every alert is dedup'd on `(phase, type, title, details)` so duplicates from polling loops don't spam the dropdown.
@@ -1806,3 +2020,42 @@ its own section above; what is here is the shape and where to look.*
   named it.*** *It is the thing standing between a wrong extraction and
   `documents/chatgpt.md`; the* Document images *section had been citing it as an
   ordering constraint for a section that did not exist. It does now.*
+
+---
+
+*Updated: 2026-10-03 — **waves 13 to 19, read against backend master `61de075`,
+the tree after release 0.1.14.** Each item has its own section above; what is
+here is the shape and where to look.*
+
+- ***No Chrome download anywhere in a run (wave 15).*** *Chrome 154 crashes in
+  its own downloads code, so report exports are caught in the page and the
+  podcast is fetched from its own address. See* Report exports are caught in the
+  page *and* Phase 3 completes on a podcast.
+- ***Every agent's footnotes open their sources (wave 14).*** *Claude's own
+  numbers, ChatGPT's from its PDF export, Gemini's by row number in its own
+  list; the general numbering is the fallback, and a document has exactly one
+  sources section. See* Footnotes — each agent's own numbers.
+- ***Equations keep their TeX and charts become pictures (wave 14).*** *See*
+  Equations keep their source *and the last paragraph of* Document images.
+- ***A crash goes back into this run's own chats, and so does a move to the
+  queue (wave 15).*** *No card for a crash that recovers, the crashed attempt's
+  cards taken down, and a dead browser is never a failed read. See* Browser
+  death, case A.
+- ***Gemini just waits (wave 15).*** *No refresh, no plan re-draft, no
+  six-minute hand-off and no planning card; no stuck check while its research
+  has not started. See the false-alarm list under* Retry / Continue / Skip
+  Decision Gates. *Its Redo on a research that DIED, and the bounded stale
+  reload while a research runs, are unchanged.*
+- ***Three lows (wave 15):*** *the queued → ongoing flip is a compare-and-set
+  (the rules deny this machine a transaction); a 2xx from the Phase 4–5
+  hand-off whose body is not the route's JSON is a cut; ChatGPT's done check
+  counts only a drawn report, not a hidden frame's 13 MB script.*
+- ***One log folder per research (wave 16).*** *See* One folder per research,
+  however many times it runs.
+- ***Phase 3 shows its work (wave 17).*** *Activity rows on `agent_progress`
+  for the app's NotebookLM pop-up — see the* Event Types *row.*
+- ***One short name (wave 19).*** *Made once, from the topic; the backend's
+  after-Phase-2 rename is gone. See* One short name.
+- ***Two stale claims corrected on the way:*** *the `consolidated` Firestore
+  mirror went on 2026-09-22 (it was described as pinned present), and
+  `events.jsonl` has not been written since 2026-04-29.*
